@@ -1,0 +1,48 @@
+# Linux kernel module build outputs
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Qt / helper build outputs
+build-*/
+20_uvc_camera/qt_camera_display/build-mp157/
+20_uvc_camera/uvc_fb_preview
+
+# Example user-space binaries built beside source files
+01_chrdevbase/chrdevbaseAPP
+02_led/ledAPP
+03_newchrled/ledAPP
+05_dtsled/ledAPP
+06_gpioled/ledAPP
+07_lock/lockapp
+08_key/keyapp
+09_timer/timerapp
+10_key_nvic/keyapp
+11_platformled/ledApp
+12_miscbeep/miscbeepapp
+13_inputkey/inputkeyapp
+15_iictouch/iictouchapp
+16_uart/uartapp
+
+# Local runtime secrets / cookies
+cos-upload.env
+*.env
+*cookie*
+*.pem
+id_rsa*
+id_ed25519*
+
+# Local editor / OS noise
+.vscode/
+*.swp
+*~
+
+# Accidentally-created empty command-name directories
+/cp/
+/echo/
+/backup_dir=*/

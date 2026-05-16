@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# 作用：
+#   Buildroot SysV init 早期显示静默脚本，用于在 Qt 工业界面启动前尽早压掉 LCD 上的
+#   framebuffer 控制台光标和残留文本。
+#
+# 主要流程：
+#   1. 尽早写 /sys/class/graphics/fbcon/cursor_blink=0，关闭 "_" 光标闪烁。
+#   2. 如果 /dev/tty0 已经可用，发送清屏转义序列，减少 logo 关闭后的黑底残留字符。
+#   3. 不解绑 vtconsole，不改串口 console，保留板端串口排障能力。
+#
+# 返回值：
+#   start/stop/restart/status 都返回 0；早期节点不存在时静默跳过，不阻塞系统启动。
+
+# PATH 增加常见系统目录，避免 init 早期环境过窄导致 printf、test 等基础命令找不到。
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+# FB_BOOT_SPLASH_BIN 是 Qt/GPU 启动前的静态首帧绘制器，部署脚本会放到 /root/qt_camera_display。
+FB_BOOT_SPLASH_BIN="${FB_BOOT_SPLASH_BIN:-/root/qt_camera_display/fb_boot_splash}"
+
+# FB_DEV 是 RGB LCD framebuffer 节点；早期脚本只写这个节点，不依赖 Qt 或 DRM。
+FB_DEV="${FB_DEV:-/dev/fb0}"
+
+# FB_BOOT_SPLASH_ENABLE 控制是否绘制早期静态图；调试纯黑屏或 framebuffer 问题时可设为 0 跳过。
+FB_BOOT_SPLASH_ENABLE="${FB_BOOT_SPLASH_ENABLE:-1}"
+
+hide_fbcon_cursor()
+{
+    # 如果内核已经导出 fbcon 光标控制节点，就写 0 关闭闪烁。
+    # 该节点通常在 framebuffer console 注册后出现；不存在说明当前阶段还不可控，直接跳过。
+    if [ -w /sys/class/graphics/fbcon/cursor_blink ]; then
+        echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true
+    fi
+}
+
+clear_lcd_console()
+{
+    # /dev/tty0 是当前前台虚拟终端；如果节点已创建，写入 ANSI 清屏序列。
+    # 这里不依赖 clear 命令，避免精简 rootfs 没有 terminfo 或 clear 程序。
+    if [ -w /dev/tty0 ]; then
+        printf '\033[2J\033[H' > /dev/tty0 2>/dev/null || true
+    fi
+}
+
+show_boot_splash()
+{
+    # 早期静态图只在工具和 framebuffer 都可用时执行，避免 init 阶段因 rootfs 或 fb0 尚未准备好而阻塞启动。
+    if [ "$FB_BOOT_SPLASH_ENABLE" != "1" ]; then
+        return 0
+    fi
+
+    # 如果部署包还没更新，保持原有静默行为，不把缺少工具当作启动失败。
+    if [ ! -x "$FB_BOOT_SPLASH_BIN" ]; then
+        return 0
+    fi
+
+    # 如果 /dev/fb0 尚未出现，说明 LCD 驱动还没注册，后续 S90uvc-camera 会再尝试绘制一次。
+    if [ ! -e "$FB_DEV" ]; then
+        return 0
+    fi
+
+    # 使用 -q 静默绘制，避免控制台日志覆盖刚刚写入 LCD 的静态首帧。
+    "$FB_BOOT_SPLASH_BIN" -f "$FB_DEV" -q >/dev/null 2>&1 || true
+}
+
+case "${1:-start}" in
+    start|restart)
+        hide_fbcon_cursor
+        clear_lcd_console
+        show_boot_splash
+        ;;
+    stop)
+        hide_fbcon_cursor
+        ;;
+    status)
+        hide_fbcon_cursor
+        ;;
+    *)
+        echo "用法：$0 {start|stop|restart|status}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,10 @@
+<!--
+  作用：
+    qml.qrc 把 QML 文件嵌入到 Qt 资源系统，避免板端部署时遗漏 QML 文件。
+-->
+<RCC>
+    <qresource prefix="/">
+        <file>qml/Main.qml</file>
+        <file>qml/GstVideoSurface.qml</file>
+    </qresource>
+</RCC>

@@ -1,0 +1,676 @@
+#!/bin/sh
+#
+# 作用：
+#   STM32MP157 开发板 SD/TF 卡自动挂载与安全拔卡脚本。
+#   开机后自动挂载外置 SD 卡到 /mnt/sdcard；需要拔卡时执行 safe-remove，
+#   脚本会同步缓存、卸载文件系统，并给出“现在可以安全拔卡”的明确提示。
+#
+# 主要流程：
+#   1. 通过 /sys/block/mmcblk*/device/type 优先寻找 SD/SDHC/SDXC，避免误操作板载 eMMC；
+#   2. 挂载前自动调用 FAT 检查工具修复脏标记，再挂载外置 SD 上真正的 FAT/vfat 分区到 /mnt/sdcard；
+#   3. safe-remove 先建立等待拔卡锁，再 sync + umount，防止后台监控立刻重新挂载；
+#   4. 用户真正拔卡后，后台监控检测到 SD 分区消失并自动清除等待锁；
+#   5. 如果用户不拔卡或修复后重新插回，可执行 resume 主动清除等待锁并重新挂载。
+#
+# 常用命令：
+#   /etc/init.d/S85sdcard-mount status       查看状态
+#   /etc/init.d/S85sdcard-mount safe-remove  同步并卸载，看到提示后拔卡
+#   /etc/init.d/S85sdcard-mount resume       取消等待拔卡并恢复自动挂载
+
+# PATH 是脚本运行时查找 mount、umount、fsck、blkid 等工具的基础路径。
+# TEST_SDCARD_PATH 只给本地回归测试使用，用于把命令桩放到 PATH 最前面；板端正常运行时仍使用固定系统路径。
+if [ -n "${TEST_SDCARD_PATH:-}" ]; then
+    PATH="$TEST_SDCARD_PATH"
+else
+    PATH=/sbin:/bin:/usr/sbin:/usr/bin
+fi
+
+# MOUNT_POINT 是应用程序保存图片、日志、检测结果时使用的统一目录。
+[ -n "$MOUNT_POINT" ] || MOUNT_POINT=/mnt/sdcard
+
+# SD_DEV 可用于手动指定分区；默认留空时由 find_sd_partition 自动寻找外置 SD 卡。
+[ -n "$SD_DEV" ] || SD_DEV=""
+
+# TEST_SDCARD_SYS_BLOCK_DIR、TEST_SDCARD_DEV_DIR 和 TEST_SDCARD_MOUNT_SOURCE_ONLY 只给本地回归测试使用。
+# 作用：
+#   1. 回归测试可以把 /sys/block 和 /dev 替换成临时目录，模拟不同分区布局；
+#   2. 当 TEST_SDCARD_MOUNT_SOURCE_ONLY=1 时，脚本只定义函数，不启动服务主流程，方便源文件被 source 后直接调用函数。
+[ -n "${TEST_SDCARD_SYS_BLOCK_DIR:-}" ] || TEST_SDCARD_SYS_BLOCK_DIR=/sys/block
+[ -n "${TEST_SDCARD_DEV_DIR:-}" ] || TEST_SDCARD_DEV_DIR=/dev
+[ -n "${TEST_SDCARD_MOUNT_SOURCE_ONLY:-}" ] || TEST_SDCARD_MOUNT_SOURCE_ONLY=0
+
+# CHECK_INTERVAL 是后台检测周期，单位秒；数值太小会增加轮询开销，太大则插拔响应变慢。
+[ -n "$CHECK_INTERVAL" ] || CHECK_INTERVAL=2
+
+# EJECT_WAIT_TIMEOUT 是 safe-remove 打印“现在可以安全拔卡”后继续等待真实拔卡的最长时间。
+# 作用：前台命令会在用户拔卡时立即清除等待锁，避免后台轮询刚好错过“拔出又插回”的短暂窗口。
+[ -n "$EJECT_WAIT_TIMEOUT" ] || EJECT_WAIT_TIMEOUT=60
+
+# MOUNT_OPTIONS 是 FAT32 挂载参数；safe-remove 会负责最终 sync，因此默认不启用同步挂载以免图片写入变慢。
+[ -n "$MOUNT_OPTIONS" ] || MOUNT_OPTIONS=rw,noatime
+
+# FSCK_BEFORE_MOUNT 控制是否在挂载前自动修复 FAT 脏标记；默认开启，只影响挂载前检查，不改变挂载后的传输速度。
+[ -n "$FSCK_BEFORE_MOUNT" ] || FSCK_BEFORE_MOUNT=1
+
+# FAT_FSCK_TOOLS 按优先级列出 FAT 检查工具；Buildroot 启用 dosfstools 后会提供 fsck.fat/fsck.vfat/dosfsck。
+[ -n "$FAT_FSCK_TOOLS" ] || FAT_FSCK_TOOLS="fsck.vfat fsck.fat dosfsck"
+
+# PID_FILE 用于记录后台监控进程，避免重复启动多个循环同时操作挂载点。
+[ -n "$PID_FILE" ] || PID_FILE=/var/run/sdcard-mount.pid
+
+# LOG_FILE 记录挂载、卸载、异常信息，方便串口之外排查自动挂载问题。
+[ -n "$LOG_FILE" ] || LOG_FILE=/var/log/sdcard-mount.log
+
+# EJECT_LOCK_FILE 表示用户已经执行 safe-remove，但卡还没有真正拔出。
+# 后台监控看到这个文件时不会立刻重新挂载，避免“刚提示可拔卡又自动挂回去”。
+[ -n "$EJECT_LOCK_FILE" ] || EJECT_LOCK_FILE=/var/run/sdcard-eject-pending
+
+# device_exists 统一封装“设备是否存在”的判断。
+# 说明：
+#   1. 正常板端环境必须是块设备，使用 -b 防止误把普通文件当成磁盘分区；
+#   2. 只读回归测试会把普通文件当成假分区，因此在 TEST_SDCARD_MOUNT_SOURCE_ONLY=1 时允许 -e。
+device_exists()
+{
+    dev="$1"
+
+    if [ "$TEST_SDCARD_MOUNT_SOURCE_ONLY" = "1" ]; then
+        [ -e "$dev" ]
+    else
+        [ -b "$dev" ]
+    fi
+}
+
+# log_msg 用统一格式记录脚本状态；日志目录创建失败时仍允许主流程继续执行。
+log_msg()
+{
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo "S85sdcard-mount: $*" | tee -a "$LOG_FILE" >/dev/null 2>&1 || echo "S85sdcard-mount: $*"
+}
+
+# is_mounted 判断挂载点是否已经出现在 /proc/mounts 中，避免重复 mount。
+is_mounted()
+{
+    grep -qs " $MOUNT_POINT " /proc/mounts
+}
+
+# mounted_device 返回当前挂载点对应的块设备路径，用于日志和安全拔卡提示。
+mounted_device()
+{
+    awk -v mp="$MOUNT_POINT" '$2 == mp { print $1; exit }' /proc/mounts
+}
+
+# find_fat_fsck_tool 从 PATH 中寻找可用 FAT 检查工具。
+# 返回值：
+#   0：找到工具，并在标准输出打印完整命令路径；
+#   1：没有找到 fsck.vfat、fsck.fat 或 dosfsck，调用方只能跳过自动修复。
+# 说明：
+#   BusyBox 自带的通用 fsck 不一定包含 FAT 修复能力，因此这里明确查找 dosfstools 提供的 FAT 工具。
+find_fat_fsck_tool()
+{
+    for tool in $FAT_FSCK_TOOLS; do
+        tool_path="$(command -v "$tool" 2>/dev/null || true)"
+        if [ -n "$tool_path" ] && [ -x "$tool_path" ]; then
+            echo "$tool_path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# repair_fat_before_mount 在 SD 卡真正挂载前自动修复 FAT 脏标记。
+# 参数：
+#   $1：准备挂载的 SD 卡分区，例如 /dev/mmcblk0p1 或 /dev/mmcblk0p3。
+# 返回值：
+#   0：未启用检查、工具缺失但允许保持原行为、文件系统干净，或脏标记已经修复；
+#   1：fsck 报告仍有未修复错误，此时必须跳过挂载，避免继续写坏文件系统。
+# 说明：
+#   这个函数只在挂载前运行一次，不给 mount 增加 sync 参数，因此不会拖慢后续图片、日志等正常传输。
+repair_fat_before_mount()
+{
+    dev="$1"
+
+    # 显式关闭时直接返回，便于现场临时排障或对比开关行为。
+    if [ "$FSCK_BEFORE_MOUNT" != "1" ]; then
+        return 0
+    fi
+
+    # 没有分区路径说明调用方逻辑异常，直接失败，避免对空设备名执行 fsck。
+    if [ -z "$dev" ]; then
+        log_msg "pre-mount FAT repair skipped: empty device"
+        return 1
+    fi
+
+    # 已挂载的文件系统不能执行 fsck，否则可能破坏正在使用的数据结构。
+    if is_mounted; then
+        log_msg "pre-mount FAT repair skipped because $MOUNT_POINT is already mounted"
+        return 0
+    fi
+
+    fsck_tool="$(find_fat_fsck_tool 2>/dev/null || true)"
+
+    # rootfs 暂未安装 dosfstools 时保持原挂载行为，但写日志提醒需要补齐 fsck 工具。
+    if [ -z "$fsck_tool" ]; then
+        log_msg "pre-mount FAT repair skipped for $dev: fsck.vfat/fsck.fat/dosfsck not found"
+        return 0
+    fi
+
+    log_msg "pre-mount FAT repair started: $fsck_tool -a $dev"
+    "$fsck_tool" -a "$dev" >> "$LOG_FILE" 2>&1
+    fsck_rc="$?"
+
+    case "$fsck_rc" in
+        0)
+            # 返回 0 表示文件系统本来就是干净状态，可以继续挂载。
+            log_msg "pre-mount FAT repair clean: $dev"
+            return 0
+            ;;
+        1|2|3)
+            # fsck.fat 使用位掩码返回值；1 表示已修复，2 表示建议重启，3 表示两者同时出现。
+            # 对外置 SD 卡来说，关键是脏标记已经被工具处理，因此允许继续挂载。
+            log_msg "pre-mount FAT repair completed for $dev, fsck rc=$fsck_rc"
+            return 0
+            ;;
+        *)
+            # 4 及以上通常表示仍有未修复错误、操作失败或参数错误；此时禁止自动挂载。
+            log_msg "pre-mount FAT repair failed for $dev, fsck rc=$fsck_rc; mount skipped"
+            return 1
+            ;;
+    esac
+}
+
+# mmc_remove_count 统计内核启动以来检测到的 MMC/SD 拔卡事件次数。
+# 作用：即使用户在后台轮询间隔内完成“拔卡又插回”，脚本也能通过 dmesg 事件知道卡确实拔过。
+mmc_remove_count()
+{
+    dmesg 2>/dev/null | grep -E "mmc[0-9][0-9]*: card .* removed" | wc -l | awk '{ print $1 }'
+}
+
+# sd_card_id 读取当前外置 SD 卡的稳定标识，用于区分“同一张卡仍未拔出”和“新卡插入”。
+sd_card_id()
+{
+    for sysdev in "$TEST_SDCARD_SYS_BLOCK_DIR"/mmcblk*; do
+        [ -d "$sysdev" ] || continue
+
+        base="$(basename "$sysdev")"
+        type="$(cat "$sysdev/device/type" 2>/dev/null || true)"
+
+        case "$type" in
+            SD|SDHC|SDXC)
+                cid="$(cat "$sysdev/device/cid" 2>/dev/null || true)"
+                name="$(cat "$sysdev/device/name" 2>/dev/null || true)"
+                echo "$base:$type:$name:$cid"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+# is_fat_partition 判断分区是否为 FAT/vfat。
+# 参数：
+#   $1：块设备路径，例如 /dev/mmcblk0p3。
+# 返回值：
+#   0 表示 blkid 识别到 FAT/vfat；1 表示不是 FAT/vfat 或无法识别。
+is_fat_partition()
+{
+    dev="$1"
+
+    # blkid 能稳定识别多数 FAT/vfat 分区，优先用它判断真实保存分区，避免格式化后分区号变化导致挂错盘。
+    if command -v blkid >/dev/null 2>&1; then
+        if blkid "$dev" 2>/dev/null | grep -qiE 'TYPE="(vfat|fat|msdos)"|LABEL=.*K230'; then
+            return 0
+        fi
+    fi
+
+    # 有些 BusyBox/Buildroot 环境的 blkid 只输出 LABEL/UUID，不输出 TYPE。
+    # 这种情况下继续用 fdisk 分区表类型兜底识别 FAT/FAT32，解决格式化后 p1 只有 LABEL 的场景。
+    if command -v fdisk >/dev/null 2>&1; then
+        dev_dir="$(dirname "$dev")"
+        parent="$dev_dir/$(basename "$dev" | sed 's/p[0-9][0-9]*$//')"
+
+        if fdisk -l "$parent" 2>/dev/null | awk -v part="$dev" '$1 == part && $0 ~ /FAT|W95|Win95|LBA/ { found = 1 } END { exit found ? 0 : 1 }'; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# find_sd_partition 优先从 sysfs 找类型为 SD/SDHC/SDXC 的 mmc 设备，再在该卡的分区中选择真正的 FAT/vfat 分区。
+find_sd_partition()
+{
+    # 用户显式指定 SD_DEV 时，只要设备存在就直接使用，便于临时调试不同分区。
+    if [ -n "$SD_DEV" ] && device_exists "$SD_DEV"; then
+        echo "$SD_DEV"
+        return 0
+    fi
+
+    # 遍历内核枚举出的 mmcblk 设备，读取 type 区分外置 SD 卡和板载 MMC/eMMC。
+    for sysdev in "$TEST_SDCARD_SYS_BLOCK_DIR"/mmcblk*; do
+        [ -d "$sysdev" ] || continue
+
+        base="$(basename "$sysdev")"
+        type="$(cat "$sysdev/device/type" 2>/dev/null || true)"
+
+        case "$type" in
+            SD|SDHC|SDXC)
+                for part in "$TEST_SDCARD_DEV_DIR/$base"p3 "$TEST_SDCARD_DEV_DIR/$base"p2 "$TEST_SDCARD_DEV_DIR/$base"p1; do
+                    if device_exists "$part" && is_fat_partition "$part"; then
+                        echo "$part"
+                        return 0
+                    fi
+                done
+                ;;
+        esac
+    done
+
+    # 当前板子实测外置 SD 卡历史上可能是 mmcblk0p1；格式化工具也可能把 FAT32 放到 mmcblk0p3。
+    # 作为最后兜底，只返回真实存在且可识别为 FAT 的分区，避免把 loader/boot 分区误挂到 /mnt/sdcard。
+    for part in "$TEST_SDCARD_DEV_DIR/mmcblk0p3" "$TEST_SDCARD_DEV_DIR/mmcblk0p2" "$TEST_SDCARD_DEV_DIR/mmcblk0p1"; do
+        if device_exists "$part" && is_fat_partition "$part"; then
+            echo "$part"
+            return 0
+        fi
+    done
+
+    # 兼容仍然使用单分区卡的老布局，但只有在它被识别为 FAT/vfat 时才允许挂载。
+    if device_exists /dev/mmcblk0p1 && is_fat_partition /dev/mmcblk0p1; then
+        echo /dev/mmcblk0p1
+        return 0
+    fi
+
+    return 1
+}
+
+# write_eject_lock 记录 safe-remove 时的 SD 卡标识，后续用于决定何时恢复自动挂载。
+write_eject_lock()
+{
+    mkdir -p "$(dirname "$EJECT_LOCK_FILE")" 2>/dev/null || true
+    {
+        echo "dev=$1"
+        echo "card_id=$(sd_card_id 2>/dev/null || true)"
+        echo "remove_count=$(mmc_remove_count 2>/dev/null || echo 0)"
+    } > "$EJECT_LOCK_FILE"
+}
+
+# clear_eject_lock 清除等待拔卡锁，并记录原因，便于排查状态转换。
+clear_eject_lock()
+{
+    if [ -f "$EJECT_LOCK_FILE" ]; then
+        rm -f "$EJECT_LOCK_FILE"
+        log_msg "safe-remove lock cleared: $1"
+    fi
+}
+
+# locked_card_id 读取等待拔卡锁中记录的卡标识。
+locked_card_id()
+{
+    sed -n 's/^card_id=//p' "$EJECT_LOCK_FILE" 2>/dev/null | head -n 1
+}
+
+# locked_remove_count 读取 safe-remove 时记录的拔卡事件计数。
+locked_remove_count()
+{
+    sed -n 's/^remove_count=//p' "$EJECT_LOCK_FILE" 2>/dev/null | head -n 1
+}
+
+# handle_eject_lock 在 safe-remove 后暂停自动重挂载，直到检测到卡已真正拔出或用户主动 resume。
+handle_eject_lock()
+{
+    [ -f "$EJECT_LOCK_FILE" ] || return 1
+
+    current_id="$(sd_card_id 2>/dev/null || true)"
+    old_id="$(locked_card_id)"
+    old_remove_count="$(locked_remove_count)"
+    current_remove_count="$(mmc_remove_count 2>/dev/null || echo 0)"
+
+    # 如果内核拔卡事件计数增加，说明用户确实拔过卡；即使同一张卡已经重新插回，也允许自动挂载。
+    if [ -n "$old_remove_count" ] && [ -n "$current_remove_count" ]; then
+        if [ "$current_remove_count" -gt "$old_remove_count" ] 2>/dev/null; then
+            clear_eject_lock "card removal event observed"
+            return 1
+        fi
+    fi
+
+    # 找不到 SD 卡说明用户已经拔卡，清锁后允许下一次插卡自动挂载。
+    if [ -z "$current_id" ]; then
+        clear_eject_lock "card removed"
+        return 1
+    fi
+
+    # 如果检测到不同卡，说明用户已经完成拔插或换卡，清锁并允许自动挂载。
+    if [ -n "$old_id" ] && [ "$current_id" != "$old_id" ]; then
+        clear_eject_lock "different card detected"
+        return 1
+    fi
+
+    # 同一张卡仍在槽内且没有新的拔卡事件，保持卸载状态，等待用户拔卡或执行 resume。
+    return 0
+}
+
+# wait_for_card_removal 在 safe-remove 前台命令中等待用户真实拔卡。
+# 参数：
+#   $1：safe-remove 时准备卸载的块设备，例如 /dev/mmcblk0p1 或 /dev/mmcblk0p3。
+# 返回值：
+#   0：命令流程完成；检测到拔卡时会清除等待锁，超时时保留等待锁。
+# 说明：
+#   这里不是等待“写入完成”，写入完成在进入本函数前已经通过 sync + umount 完成；
+#   这里等待的是物理拔卡事件，用于避免后台监控进程漏掉短时间拔插。
+wait_for_card_removal()
+{
+    wait_dev="$1"
+    waited=0
+
+    echo "正在等待检测 SD 卡拔出；拔出后下次插入会自动挂载"
+
+    while [ "$waited" -lt "$EJECT_WAIT_TIMEOUT" ]; do
+        current_remove_count="$(mmc_remove_count 2>/dev/null || echo 0)"
+        old_remove_count="$(locked_remove_count)"
+        current_id="$(sd_card_id 2>/dev/null || true)"
+
+        # 内核拔卡计数增加，说明硬件卡槽已经产生过一次真实拔卡事件。
+        if [ -n "$old_remove_count" ] && [ -n "$current_remove_count" ]; then
+            if [ "$current_remove_count" -gt "$old_remove_count" ] 2>/dev/null; then
+                clear_eject_lock "card removal observed by safe-remove"
+                echo "已检测到 SD 卡拔出；重新插入后会自动挂载"
+                return 0
+            fi
+        fi
+
+        # SD 卡 sysfs 标识消失，说明当前卡已经离开卡槽。
+        if [ -z "$current_id" ]; then
+            clear_eject_lock "card removed while safe-remove was waiting"
+            echo "已检测到 SD 卡拔出；重新插入后会自动挂载"
+            return 0
+        fi
+
+        # 块设备节点消失也表示内核已经撤销当前 SD 分区。
+        if [ -n "$wait_dev" ] && [ ! -b "$wait_dev" ]; then
+            clear_eject_lock "block device disappeared while safe-remove was waiting"
+            echo "已检测到 SD 卡拔出；重新插入后会自动挂载"
+            return 0
+        fi
+
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    echo "暂未检测到拔卡，系统会继续保持等待拔卡状态"
+    echo "如果你想继续使用当前这张卡，请执行：sdcard-resume"
+    log_msg "safe-remove wait timeout, still waiting for physical card removal"
+    return 0
+}
+
+# mount_sd_once 执行一次挂载尝试；没有插卡时安静返回，避免开机刷屏。
+mount_sd_once()
+{
+    # 用户已经执行 safe-remove 时，先让锁处理函数判断是否已经真实拔过卡。
+    # 如果仍是同一张卡留在槽内，则保持卸载；如果已经拔插过，则清锁后继续挂载。
+    if [ -f "$EJECT_LOCK_FILE" ]; then
+        if handle_eject_lock; then
+            return 1
+        fi
+    fi
+
+    dev="$(find_sd_partition 2>/dev/null || true)"
+
+    # 没有设备说明未插卡或分区尚未生成，交给下一轮检测。
+    if [ -z "$dev" ]; then
+        return 1
+    fi
+
+    # 已经挂载时不重复挂载，避免 busybox mount 返回 busy。
+    if is_mounted; then
+        return 0
+    fi
+
+    # 挂载前先修复 FAT 脏标记，解决突然断电后下次启动出现未正常卸载警告的问题。
+    if ! repair_fat_before_mount "$dev"; then
+        return 1
+    fi
+
+    # 创建挂载点，确保应用程序有稳定路径可写。
+    mkdir -p "$MOUNT_POINT" || {
+        log_msg "create mount point failed: $MOUNT_POINT"
+        return 1
+    }
+
+    # FAT32 使用 vfat 驱动；默认 noatime，减少频繁读写时的无意义写放大。
+    if mount -t vfat -o "$MOUNT_OPTIONS" "$dev" "$MOUNT_POINT"; then
+        mkdir -p "$MOUNT_POINT/images" "$MOUNT_POINT/logs" 2>/dev/null || true
+        log_msg "mounted $dev on $MOUNT_POINT with options $MOUNT_OPTIONS"
+        return 0
+    fi
+
+    log_msg "mount failed: $dev -> $MOUNT_POINT"
+    return 1
+}
+
+# unmount_if_card_gone 在检测不到挂载设备时尝试卸载挂载点。
+unmount_if_card_gone()
+{
+    # 未挂载时无需处理。
+    if ! is_mounted; then
+        return 0
+    fi
+
+    dev="$(mounted_device)"
+
+    # 设备仍存在说明卡还在，保持挂载状态。
+    if [ -n "$dev" ] && [ -b "$dev" ]; then
+        return 0
+    fi
+
+    # 设备已经消失时同步缓存并尝试卸载；普通卸载失败再用 lazy umount 兜底。
+    sync
+    if umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null; then
+        log_msg "unmounted $MOUNT_POINT because card device disappeared"
+        return 0
+    fi
+
+    log_msg "unmount failed after card disappeared: $MOUNT_POINT"
+    return 1
+}
+
+# safe_remove 用于给用户一个明确的“传输完成，可以拔卡”提示。
+safe_remove()
+{
+    echo "正在同步 SD 卡数据，请稍等..."
+
+    dev="$(mounted_device)"
+    [ -n "$dev" ] || dev="$(find_sd_partition 2>/dev/null || true)"
+
+    # 先写入等待拔卡锁，避免 sync/umount 过程中后台监控抢先重新挂载。
+    if [ -n "$dev" ]; then
+        write_eject_lock "$dev"
+    fi
+
+    sync
+
+    if is_mounted; then
+        if umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null; then
+            log_msg "safe-remove completed for $dev"
+            echo "========================================"
+            echo "传输完成：SD 卡数据已经同步并卸载"
+            echo "现在可以安全拔卡"
+            echo "========================================"
+            wait_for_card_removal "$dev"
+            return 0
+        fi
+
+        rm -f "$EJECT_LOCK_FILE"
+        echo "========================================"
+        echo "传输未完成：卸载 $MOUNT_POINT 失败，请不要拔卡"
+        echo "请检查是否有程序正在使用 /mnt/sdcard"
+        echo "========================================"
+        log_msg "safe-remove failed: umount $MOUNT_POINT failed"
+        return 1
+    fi
+
+    if [ -n "$dev" ]; then
+        log_msg "safe-remove completed while card was already unmounted: $dev"
+        echo "========================================"
+        echo "传输完成：SD 卡当前未挂载，已进入等待拔卡状态"
+        echo "现在可以安全拔卡"
+        echo "如需继续使用这张卡，请执行：sdcard-resume"
+        echo "========================================"
+        wait_for_card_removal "$dev"
+        return 0
+    fi
+
+    rm -f "$EJECT_LOCK_FILE"
+    echo "========================================"
+    echo "当前没有检测到 SD 卡"
+    echo "无需拔卡操作"
+    echo "========================================"
+    log_msg "safe-remove requested with no card present"
+    return 0
+}
+
+# resume 用于取消“等待拔卡”状态，并立即尝试重新挂载 SD 卡。
+resume()
+{
+    clear_eject_lock "resume requested"
+
+    if mount_sd_once; then
+        echo "SD 卡自动挂载已恢复：$(mounted_device) -> $MOUNT_POINT"
+        return 0
+    fi
+
+    echo "已取消等待拔卡状态，但当前没有找到可挂载的 SD 卡分区"
+    return 1
+}
+
+# monitor_loop 是后台常驻循环，用于处理开机后插卡和拔卡。
+monitor_loop()
+{
+    while true; do
+        if handle_eject_lock; then
+            sleep "$CHECK_INTERVAL"
+            continue
+        fi
+
+        unmount_if_card_gone >/dev/null 2>&1 || true
+        mount_sd_once >/dev/null 2>&1 || true
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+# start 启动自动挂载服务，并先同步执行一次挂载，保证后续服务尽早看到 /mnt/sdcard。
+start()
+{
+    # 手动 start 表示用户希望恢复自动挂载，因此清除可能残留的安全拔卡锁。
+    clear_eject_lock "start requested"
+
+    if [ -f "$PID_FILE" ]; then
+        oldpid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+            echo "S85sdcard-mount already running, pid $oldpid"
+            mount_sd_once >/dev/null 2>&1 || true
+            return 0
+        fi
+    fi
+
+    mount_sd_once >/dev/null 2>&1 || log_msg "no sdcard partition found at start"
+
+    "$0" monitor >/dev/null 2>&1 &
+    echo "$!" > "$PID_FILE"
+    echo "S85sdcard-mount started, pid $(cat "$PID_FILE")"
+    log_msg "monitor started, pid $(cat "$PID_FILE")"
+}
+
+# stop 停止后台循环，并在当前已挂载时同步后卸载 SD 卡。
+stop()
+{
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    clear_eject_lock "stop requested"
+
+    if is_mounted; then
+        sync
+        umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null || true
+        log_msg "service stopped and mount point unmounted"
+    else
+        log_msg "service stopped"
+    fi
+}
+
+# status 打印当前后台进程、挂载状态和安全拔卡等待状态，便于人工调试。
+status()
+{
+    # status 不只展示状态，也顺手执行一次锁状态自检。
+    # 这样即使后台监控进程短时间没来得及处理，用户查询状态时也能自动恢复。
+    if [ -f "$EJECT_LOCK_FILE" ]; then
+        if ! handle_eject_lock; then
+            mount_sd_once >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "S85sdcard-mount is running, pid $pid"
+        else
+            echo "S85sdcard-mount pid file exists but process is not running"
+        fi
+    else
+        echo "S85sdcard-mount is not running"
+    fi
+
+    if is_mounted; then
+        echo "mounted: $(mounted_device) -> $MOUNT_POINT"
+    else
+        echo "mounted: no"
+    fi
+
+    if [ -f "$EJECT_LOCK_FILE" ]; then
+        echo "safe-remove: waiting for card removal"
+        echo "hint: 看到“现在可以安全拔卡”后请拔卡；如果已拔出又插回但仍未挂载，请执行 sdcard-resume"
+        echo "debug: remove_count $(locked_remove_count) -> $(mmc_remove_count 2>/dev/null || echo 0)"
+    else
+        echo "safe-remove: no pending removal"
+    fi
+}
+
+if [ "$TEST_SDCARD_MOUNT_SOURCE_ONLY" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        status
+        ;;
+    safe-remove|eject)
+        safe_remove
+        ;;
+    resume)
+        resume
+        ;;
+    monitor)
+        monitor_loop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|safe-remove|eject|resume}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

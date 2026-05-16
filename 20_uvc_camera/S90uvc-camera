@@ -1,0 +1,416 @@
+#!/bin/sh
+#
+# 作用：
+#   Buildroot SysV init 开机脚本，用于在 STM32MP157 开发板启动后自动加载
+#   galcore GPU 模块，并默认启动 Qt + KMS overlay 工业检测界面。
+#
+# 主要流程：
+#   1. 先尝试 modprobe galcore，让 GPU 内核模块自动加载；
+#   2. 等待 /dev/fb0 和 /dev/video0 等设备节点由内核/mdev 创建；
+#   3. 默认调用 /root/qt_camera_display/run_qt_kms_overlay_display.sh，
+#      由 Qt 绘制界面壳，由 uvc_kms_overlay 使用 KMS overlay plane 绘制摄像头；
+#   4. 把后台进程 PID 写入 /var/run/uvc-camera.pid，方便 stop/restart 管理。
+#
+# 可调变量：
+#   VIDEO_DEV：摄像头节点，默认 /dev/video0；
+#   FB_DEV：framebuffer 节点，默认 /dev/fb0；
+#   WIDTH/HEIGHT：采集尺寸，默认 640x480；
+#   CAMERA_FPS：Qt + KMS overlay 后端采集帧率，默认 10；
+#   UVC_BACKEND：显示后端，默认 qt-kms-overlay，可选 fb-preview、gst-raw 或 gst-mjpeg。
+
+# PATH 增加常见系统目录，避免 init 环境过窄导致 modprobe、mkdir 等命令找不到。
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+# UVC_ROOT 是持久化部署的 GStreamer/libv4l 轻量运行包目录，不使用 /tmp，避免被 tmpfs 覆盖。
+UVC_ROOT="${UVC_ROOT:-/root/uvc-rootfs}"
+
+# PREVIEW_BIN 是已经验证可用的轻量 V4L2 到 framebuffer 预览程序。
+PREVIEW_BIN="${PREVIEW_BIN:-/root/uvc_fb_preview}"
+
+# RUN_GST 是 GStreamer 显示脚本，作为需要 MJPEG/raw pipeline 时的可选后端。
+RUN_GST="${RUN_GST:-$UVC_ROOT/run_gst_fbdev.sh}"
+
+# QT_KMS_RUN 是当前正式 Qt + KMS overlay 显示链路的控制脚本。
+QT_KMS_RUN="${QT_KMS_RUN:-/root/qt_camera_display/run_qt_kms_overlay_display.sh}"
+
+# FB_BOOT_SPLASH_BIN 是 Qt/GPU 启动前的静态首帧绘制器，用来填补 Qt 启动画面出现前的黑屏时间。
+FB_BOOT_SPLASH_BIN="${FB_BOOT_SPLASH_BIN:-/root/qt_camera_display/fb_boot_splash}"
+
+# VIDEO_DEV 默认使用已经验证可出画面的 /dev/video0。
+VIDEO_DEV="${VIDEO_DEV:-/dev/video0}"
+
+# FB_DEV 默认使用 RGB 屏对应的 framebuffer 节点。
+FB_DEV="${FB_DEV:-/dev/fb0}"
+
+# FB_BOOT_SPLASH_ENABLE 控制是否在正式预览启动前绘制早期静态图，调试显示链路时可设为 0。
+FB_BOOT_SPLASH_ENABLE="${FB_BOOT_SPLASH_ENABLE:-1}"
+
+# WIDTH/HEIGHT 默认使用当前摄像头和 RGB 屏测试通过的 640x480。
+WIDTH="${WIDTH:-640}"
+HEIGHT="${HEIGHT:-480}"
+
+# CAMERA_FPS 默认使用当前 Qt + KMS overlay 正式路线验证过的 10fps。
+CAMERA_FPS="${CAMERA_FPS:-10}"
+
+# UVC_BACKEND 控制显示方式；默认使用当前已正规化的 Qt + KMS overlay 工业界面。
+UVC_BACKEND="${UVC_BACKEND:-qt-kms-overlay}"
+
+# WAIT_SECONDS 限制等待设备节点的时间，避免摄像头未插入时阻塞系统启动。
+WAIT_SECONDS="${WAIT_SECONDS:-15}"
+
+# PID_FILE 记录后台预览程序进程号，stop/restart 时按这个文件关闭。
+PID_FILE="${PID_FILE:-/var/run/uvc-camera.pid}"
+
+# LOG_FILE 记录开机脚本与预览程序输出，便于串口之外排查问题。
+LOG_FILE="${LOG_FILE:-/var/log/uvc-camera.log}"
+
+# log_msg 用于统一输出带脚本名前缀的日志，既写控制台也写日志文件。
+log_msg()
+{
+    # 创建日志目录；如果 rootfs 是只读或目录创建失败，则忽略，不影响主流程。
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+    # 打印当前状态，tee 失败时继续，避免日志文件权限问题阻止摄像头启动。
+    echo "S90uvc-camera: $*" | tee -a "$LOG_FILE" >/dev/null 2>&1 || echo "S90uvc-camera: $*"
+}
+
+# hide_display_console 的作用：
+#   在 Qt 工业界面启动前尽早关闭 framebuffer 控制台光标，避免内核 logo 隐藏后 LCD 上只剩 "_" 闪烁。
+#
+# 主要流程：
+#   1. 如果内核导出了 fbcon/cursor_blink，就写 0 关闭控制台光标闪烁。
+#   2. 不解绑 vtconsole，避免影响串口/控制台排障，只处理 LCD 上最明显的闪烁光标。
+#
+# 返回值：
+#   无返回值；sysfs 节点不存在或写入失败时静默跳过，不阻塞摄像头界面启动。
+hide_display_console()
+{
+    if [ -w /sys/class/graphics/fbcon/cursor_blink ]; then
+        echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true
+    fi
+}
+
+# show_boot_splash 的作用：
+#   在 Qt/eglfs 和 KMS overlay 启动前直接把静态首帧写入 framebuffer。
+#
+# 主要流程：
+#   1. 确认功能开关、工具路径和 /dev/fb0 都可用。
+#   2. 用 -q 静默运行 fb_boot_splash，避免启动日志覆盖 LCD 首帧。
+#   3. 失败时只写入日志，不阻塞后续 Qt 正式界面启动。
+#
+# 返回值：
+#   总是返回 0；早期静态图是视觉兜底，不应影响正式启动链路。
+show_boot_splash()
+{
+    if [ "$FB_BOOT_SPLASH_ENABLE" != "1" ]; then
+        return 0
+    fi
+
+    if [ ! -x "$FB_BOOT_SPLASH_BIN" ]; then
+        log_msg "fb_boot_splash not executable: $FB_BOOT_SPLASH_BIN"
+        return 0
+    fi
+
+    if [ ! -e "$FB_DEV" ]; then
+        return 0
+    fi
+
+    if "$FB_BOOT_SPLASH_BIN" -f "$FB_DEV" -q >/dev/null 2>&1; then
+        log_msg "early static splash drawn on $FB_DEV"
+    else
+        log_msg "early static splash draw failed on $FB_DEV"
+    fi
+
+    return 0
+}
+
+# wait_for_node 用于等待字符设备节点出现，避免 init 脚本早于 mdev/USB 枚举执行。
+wait_for_node()
+{
+    # node 是要等待的设备节点路径，例如 /dev/video0 或 /dev/fb0。
+    node="$1"
+
+    # remain 是剩余等待秒数；每秒检查一次，避免 busy-loop 占用 CPU。
+    remain="$WAIT_SECONDS"
+
+    # 循环直到设备节点存在，或等待超时。
+    while [ "$remain" -gt 0 ]; do
+        # -e 表示路径已经存在；字符设备由 mdev 创建后即可通过。
+        if [ -e "$node" ]; then
+            return 0
+        fi
+
+        # 每次等待 1 秒，给 USB 摄像头枚举和 framebuffer 初始化留时间。
+        sleep 1
+        remain=$((remain - 1))
+    done
+
+    # 超时后返回失败，由 start 流程决定是否放弃启动。
+    return 1
+}
+
+# pick_video_dev 在默认节点不存在时自动寻找第一个可用 /dev/videoN。
+pick_video_dev()
+{
+    # 如果用户显式指定的 VIDEO_DEV 存在，直接使用它。
+    if [ -e "$VIDEO_DEV" ]; then
+        echo "$VIDEO_DEV"
+        return 0
+    fi
+
+    # 遍历常见 video 节点，兼容摄像头实际落到 /dev/video1 的情况。
+    for dev in /dev/video0 /dev/video1 /dev/video2 /dev/video3; do
+        if [ -e "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+    done
+
+    # 没找到节点时返回失败。
+    return 1
+}
+
+# load_gpu 用于加载 galcore 模块；Qt 界面依赖 GPU，旧 framebuffer 链路可在 GPU 失败时继续尝试。
+load_gpu()
+{
+    # 如果 /dev/galcore 已存在，说明 GPU 模块已经加载或内建初始化完成。
+    if [ -e /dev/galcore ]; then
+        log_msg "galcore already available"
+        return 0
+    fi
+
+    # modprobe 按 /lib/modules/$(uname -r)/modules.dep 自动查找 galcore.ko。
+    if modprobe galcore >>"$LOG_FILE" 2>&1; then
+        log_msg "galcore loaded"
+        return 0
+    fi
+
+    # GPU 加载失败时返回失败，由调用者根据后端决定是否还能继续。
+    log_msg "galcore load failed"
+    return 1
+}
+
+# is_qt_kms_running 判断 Qt UI 和 overlay 视频进程是否同时存在。
+is_qt_kms_running()
+{
+    # qt_camera_display 是 Qt Quick 工业检测界面进程。
+    qt_pids="$(pidof qt_camera_display 2>/dev/null || true)"
+
+    # uvc_kms_overlay 是 KMS overlay 摄像头视频进程。
+    overlay_pids="$(pidof uvc_kms_overlay 2>/dev/null || true)"
+
+    # 两个进程同时存在，才认为当前 Qt + KMS overlay 链路正在运行。
+    [ -n "$qt_pids" ] && [ -n "$overlay_pids" ]
+}
+
+# is_running 判断 PID_FILE 记录的进程是否仍在运行。
+is_running()
+{
+    # Qt + KMS overlay 后端由两个后台进程组成，不能只依赖单个 PID 文件判断。
+    if [ "$UVC_BACKEND" = "qt-kms-overlay" ]; then
+        is_qt_kms_running
+        return $?
+    fi
+
+    # 没有 PID 文件说明脚本没有记录后台进程。
+    [ -f "$PID_FILE" ] || return 1
+
+    # 读取 PID；如果文件为空则认为没有运行。
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [ -n "$pid" ] || return 1
+
+    # kill -0 只检测进程是否存在，不发送实际信号。
+    kill -0 "$pid" 2>/dev/null
+}
+
+# start_preview 按选定后端启动摄像头显示。
+start_preview()
+{
+    # 启动越早越需要先关控制台光标，否则隐藏内核 logo 后 LCD 会先出现闪烁 "_"。
+    hide_display_console
+
+    # 如果已有后台进程，避免重复启动两个程序同时写 /dev/fb0。
+    if is_running; then
+        if [ "$UVC_BACKEND" = "qt-kms-overlay" ]; then
+            log_msg "camera preview already running, qt $(pidof qt_camera_display 2>/dev/null || echo none), overlay $(pidof uvc_kms_overlay 2>/dev/null || echo none)"
+        else
+            log_msg "camera preview already running, pid $(cat "$PID_FILE")"
+        fi
+        return 0
+    fi
+
+    # GPU 模块自动加载；Qt + KMS overlay 必须有 galcore，旧 framebuffer 后端可在失败时继续尝试。
+    if ! load_gpu && [ "$UVC_BACKEND" = "qt-kms-overlay" ]; then
+        log_msg "galcore is required by qt-kms-overlay backend"
+        return 1
+    fi
+
+    # framebuffer 是 RGB 屏显示出口；即使 Qt + KMS 走 DRM，也等待它出现以避开过早启动时的显示初始化窗口。
+    if ! wait_for_node "$FB_DEV"; then
+        log_msg "missing framebuffer node $FB_DEV"
+        return 1
+    fi
+
+    # framebuffer 可用后立即绘制静态首帧，后续等待摄像头、GPU 和 Qt 时 LCD 不再保持纯黑。
+    show_boot_splash
+
+    # 自动选择摄像头节点，优先 /dev/video0，兼容实际枚举到 /dev/video1。
+    selected_video="$(pick_video_dev || true)"
+    if [ -z "$selected_video" ]; then
+        log_msg "missing video node, camera may be unplugged"
+        return 1
+    fi
+
+    # 确认选中的摄像头节点已经稳定存在。
+    if ! wait_for_node "$selected_video"; then
+        log_msg "video node $selected_video did not become ready"
+        return 1
+    fi
+
+    # 根据后端选择启动命令；默认使用当前正式 Qt + KMS overlay 工业界面。
+    case "$UVC_BACKEND" in
+        qt-kms-overlay)
+            # 缺少 Qt + KMS overlay 控制脚本时无法启动当前正式界面。
+            if [ ! -x "$QT_KMS_RUN" ]; then
+                log_msg "Qt KMS overlay script not executable: $QT_KMS_RUN"
+                return 1
+            fi
+
+            # 通过正式控制脚本启动 Qt 界面和 KMS overlay 视频；SKIP_UVC_INIT_STOP 避免脚本反向调用本 init 脚本 stop。
+            SKIP_UVC_INIT_STOP=1 \
+                VIDEO_DEV="$selected_video" \
+                CAMERA_WIDTH="$WIDTH" \
+                CAMERA_HEIGHT="$HEIGHT" \
+                CAMERA_FPS="$CAMERA_FPS" \
+                "$QT_KMS_RUN" start >>"$LOG_FILE" 2>&1
+
+            # 启动后读取两个正式进程 PID，写入 PID 文件便于日志追踪。
+            qt_pids="$(pidof qt_camera_display 2>/dev/null || true)"
+            overlay_pids="$(pidof uvc_kms_overlay 2>/dev/null || true)"
+            if [ -z "$qt_pids" ] || [ -z "$overlay_pids" ]; then
+                log_msg "qt-kms-overlay did not stay running, qt=$qt_pids overlay=$overlay_pids"
+                return 1
+            fi
+            echo "qt=$qt_pids overlay=$overlay_pids" > "$PID_FILE"
+            log_msg "camera preview started, backend=$UVC_BACKEND, video=$selected_video, size=${WIDTH}x${HEIGHT}@${CAMERA_FPS}, qt=$qt_pids, overlay=$overlay_pids"
+            return 0
+            ;;
+        fb-preview)
+            # 缺少预览程序时无法启动，给出明确日志。
+            if [ ! -x "$PREVIEW_BIN" ]; then
+                log_msg "preview binary not executable: $PREVIEW_BIN"
+                return 1
+            fi
+
+            # 后台启动轻量预览程序，标准输出和错误输出写入日志。
+            "$PREVIEW_BIN" -d "$selected_video" -f "$FB_DEV" -w "$WIDTH" -h "$HEIGHT" >>"$LOG_FILE" 2>&1 &
+            ;;
+        gst-raw)
+            # GStreamer raw 模式依赖运行包脚本和插件。
+            if [ ! -x "$RUN_GST" ]; then
+                log_msg "GStreamer script not executable: $RUN_GST"
+                return 1
+            fi
+
+            # 使用 env 显式传 UVC_ROOT，让脚本从 /root/uvc-rootfs 找工具和库。
+            UVC_ROOT="$UVC_ROOT" "$RUN_GST" raw "$selected_video" "$FB_DEV" "$WIDTH" "$HEIGHT" >>"$LOG_FILE" 2>&1 &
+            ;;
+        gst-mjpeg)
+            # MJPEG 模式适合多数只高效输出 MJPEG 的 USB 摄像头。
+            if [ ! -x "$RUN_GST" ]; then
+                log_msg "GStreamer script not executable: $RUN_GST"
+                return 1
+            fi
+
+            # 使用 image/jpeg + jpegdec pipeline 显示到 framebuffer。
+            UVC_ROOT="$UVC_ROOT" "$RUN_GST" mjpeg "$selected_video" "$FB_DEV" "$WIDTH" "$HEIGHT" >>"$LOG_FILE" 2>&1 &
+            ;;
+        *)
+            # 未知后端直接报错，避免启动了用户没有预期的显示链路。
+            log_msg "unknown UVC_BACKEND: $UVC_BACKEND"
+            return 1
+            ;;
+    esac
+
+    # 记录后台进程 PID，供 stop/restart 使用。
+    echo "$!" > "$PID_FILE"
+    log_msg "camera preview started, backend=$UVC_BACKEND, video=$selected_video, fb=$FB_DEV, size=${WIDTH}x${HEIGHT}, pid=$(cat "$PID_FILE")"
+    return 0
+}
+
+# stop_preview 停止后台摄像头显示进程。
+stop_preview()
+{
+    # Qt + KMS overlay 后端由控制脚本统一停止，避免只杀一个进程后留下显示 plane 占用。
+    if [ "$UVC_BACKEND" = "qt-kms-overlay" ]; then
+        if [ -x "$QT_KMS_RUN" ]; then
+            SKIP_UVC_INIT_STOP=1 "$QT_KMS_RUN" stop >>"$LOG_FILE" 2>&1 || true
+        else
+            killall qt_camera_display >/dev/null 2>&1 || true
+            killall uvc_kms_overlay >/dev/null 2>&1 || true
+        fi
+
+        # 清理 PID 文件，表示当前没有 init 脚本托管的显示链路。
+        rm -f "$PID_FILE"
+        log_msg "camera preview stopped"
+        return 0
+    fi
+
+    # 如果没有运行，就清理可能残留的 PID 文件并返回成功。
+    if ! is_running; then
+        rm -f "$PID_FILE"
+        log_msg "camera preview not running"
+        return 0
+    fi
+
+    # 读取 PID 并发送 SIGTERM，让程序走正常资源释放流程。
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" 2>/dev/null || true
+
+    # 等待进程退出，最多等待 3 秒，避免 stop 卡死。
+    for _ in 1 2 3; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    # 如果进程仍存在，发送 SIGKILL 兜底，释放 framebuffer 和 video 设备占用。
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    # 删除 PID 文件，表示当前没有脚本管理的预览进程。
+    rm -f "$PID_FILE"
+    log_msg "camera preview stopped"
+}
+
+# 根据 init 传入的动作执行 start/stop/restart/status。
+case "$1" in
+    start)
+        start_preview
+        ;;
+    stop)
+        stop_preview
+        ;;
+    restart)
+        stop_preview
+        start_preview
+        ;;
+    status)
+        if is_running; then
+            if [ "$UVC_BACKEND" = "qt-kms-overlay" ]; then
+                echo "uvc camera preview is running, qt $(pidof qt_camera_display 2>/dev/null || echo none), overlay $(pidof uvc_kms_overlay 2>/dev/null || echo none)"
+            else
+                echo "uvc camera preview is running, pid $(cat "$PID_FILE")"
+            fi
+            exit 0
+        fi
+        echo "uvc camera preview is stopped"
+        exit 1
+        ;;
+    *)
+        echo "用法：$0 {start|stop|restart|status}" >&2
+        exit 1
+        ;;
+esac

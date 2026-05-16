@@ -1,0 +1,716 @@
+#!/bin/sh
+#
+# 作用：
+#   把 Qt 保存按钮生成的 JPG 和 PNG 图片上传到云端 COS，并登记到同一条检测记录。
+#
+# 主要流程：
+#   1. 校验 --jpg 和 --png 指向的本地文件已经存在且非空。
+#   2. 先读取板端本地默认账号配置，再使用后端登录 Cookie 调用云端 API；
+#      Cookie 缺失时可用 CLOUD_ACCOUNT/CLOUD_PASSWORD 登录。
+#   3. 创建检测记录，再分别为 JPG(source) 和 PNG(annotated) 申请 COS 预签名上传地址。
+#   4. 使用 curl PUT 上传到 COS，并把 ETag、对象路径和文件大小登记回检测记录。
+#
+# 返回值：
+#   全部上传和登记成功返回 0；任一步失败返回非 0，并在 stderr 输出可排查原因。
+
+set -eu
+
+# CLOUD_UPLOAD_ENV_FILE 是板端本地私有配置文件路径，用来保存默认上传账号。
+# 这个文件不进入 Git；部署或板端手工写入时应设置为 600 权限。
+CLOUD_UPLOAD_ENV_FILE="${CLOUD_UPLOAD_ENV_FILE:-/root/qt_camera_display/cos-upload.env}"
+
+# 这些 *_OVERRIDE 变量记录调用者显式传入的运行时覆盖值。
+# 后面读取 cos-upload.env 后会把非空覆盖值恢复回来，使“本地配置”只作为默认值。
+CLOUD_BASE_URL_OVERRIDE="${CLOUD_BASE_URL:-}"
+CLOUD_COOKIE_FILE_OVERRIDE="${CLOUD_COOKIE_FILE:-}"
+CLOUD_ACCOUNT_OVERRIDE="${CLOUD_ACCOUNT:-}"
+CLOUD_PASSWORD_OVERRIDE="${CLOUD_PASSWORD:-}"
+CLOUD_DEVICE_ID_OVERRIDE="${CLOUD_DEVICE_ID:-}"
+CLOUD_PART_ID_OVERRIDE="${CLOUD_PART_ID:-}"
+CLOUD_RESULT_OVERRIDE="${CLOUD_RESULT:-}"
+CLOUD_HEALTH_URL_OVERRIDE="${CLOUD_HEALTH_URL:-}"
+CLOUD_TIME_TZ_OVERRIDE="${CLOUD_TIME_TZ:-}"
+CLOUD_TIME_OFFSET_OVERRIDE="${CLOUD_TIME_OFFSET:-}"
+CLOUD_TIME_NOW_CMD_OVERRIDE="${CLOUD_TIME_NOW_CMD:-}"
+SOURCE_HEADERS_OVERRIDE="${SOURCE_HEADERS:-}"
+ANNOTATED_HEADERS_OVERRIDE="${ANNOTATED_HEADERS:-}"
+
+# jpg_file/png_file 分别保存命令行传入的两种图片路径。
+jpg_file=""
+png_file=""
+
+show_usage()
+{
+    echo "用法：$0 --jpg /mnt/sdcard/images/a.jpg --png /mnt/sdcard/images/a.png" >&2
+    echo "自检：$0 --self-test-json-parser" >&2
+}
+
+fail()
+{
+    echo "上传失败：$*" >&2
+    exit 1
+}
+
+load_upload_env_file()
+{
+    # 读取板端本地默认上传账号配置。
+    # 这样保存按钮不需要每次通过命令行传入账号密码，源码中也不会硬编码真实凭据。
+    if [ ! -e "$CLOUD_UPLOAD_ENV_FILE" ]; then
+        return 0
+    fi
+
+    # 文件存在但不可读时直接报错，避免用户以为已经配置账号却仍然走到登录失败。
+    if [ ! -r "$CLOUD_UPLOAD_ENV_FILE" ]; then
+        fail "默认上传账号配置不可读：$CLOUD_UPLOAD_ENV_FILE"
+    fi
+
+    # 本配置文件只应由 root 维护，内容格式为 POSIX shell 变量赋值。
+    # shellcheck disable=SC1090
+    . "$CLOUD_UPLOAD_ENV_FILE"
+}
+
+json_escape()
+{
+    # 这个函数只处理本脚本生成的短字符串，主要转义反斜杠和双引号，避免 JSON 被路径或账号破坏。
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+extract_json_string()
+{
+    # 轻量提取顶层字符串字段；当前后端响应字段稳定，避免在板端额外依赖 jq。
+    field="$1"
+    file="$2"
+    sed -n 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1
+}
+
+extract_json_number()
+{
+    # 轻量提取第一个数字字段，用于零件/设备列表里第一个可用对象的 id。
+    # 注意：创建检测记录响应不能用这个通用函数，因为响应后面还会带 part.id/device.id。
+    field="$1"
+    file="$2"
+    tr ',{}[]' '\n\n\n\n\n' < "$file" \
+        | sed -n 's/^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | head -n 1
+}
+
+record_response_top_level_fields()
+{
+    # record_response_top_level_fields 的作用：
+    #   只保留创建记录响应中进入 part/device/files 嵌套对象之前的顶层字段。
+    # 主要流程：
+    #   1. 从第一个 part、device 或 files 关系字段开始截断响应，避开嵌套对象里的 id。
+    #   2. 把逗号和花括号拆成多行，方便后续用行首匹配读取顶层字段。
+    # 参数：
+    #   file：保存创建记录响应 JSON 的文件路径。
+    # 返回值：
+    #   输出拆行后的顶层字段片段。
+    file="$1"
+    sed 's/"part"[[:space:]]*:.*//; s/"device"[[:space:]]*:.*//; s/"files"[[:space:]]*:.*//' "$file" \
+        | tr ',{}[]' '\n\n\n\n\n'
+}
+
+extract_created_record_id()
+{
+    # extract_created_record_id 的作用：
+    #   专门解析 POST /api/v1/records 创建记录响应里的顶层检测记录 id。
+    # 主要流程：
+    #   1. 先截掉 part/device/files 等嵌套关系字段。
+    #   2. 再从剩余顶层字段里读取 id，避免把旧零件/旧设备 id 当成 record_id。
+    # 参数：
+    #   file：保存创建记录响应 JSON 的文件路径。
+    # 返回值：
+    #   成功时输出顶层 record_id；匹配不到时不输出。
+    file="$1"
+    record_response_top_level_fields "$file" \
+        | sed -n 's/^[[:space:]]*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | head -n 1
+}
+
+extract_created_record_no()
+{
+    # extract_created_record_no 的作用：
+    #   专门解析 POST /api/v1/records 创建记录响应里的顶层 record_no。
+    # 主要流程：
+    #   只从响应开头的顶层 id + record_no 结构中取记录编号，不从嵌套对象里猜测路径。
+    # 参数：
+    #   file：保存创建记录响应 JSON 的文件路径。
+    # 返回值：
+    #   成功时输出云端确认的 record_no；匹配不到时不输出。
+    file="$1"
+    record_response_top_level_fields "$file" \
+        | sed -n 's/^[[:space:]]*"record_no"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+}
+
+is_positive_number()
+{
+    # is_positive_number 的作用：
+    #   检查传入值是不是大于 0 的十进制数字，防止空值、0、旧字符串继续进入上传链路。
+    # 参数：
+    #   $1：待检查的字符串。
+    # 返回值：
+    #   是正整数返回 0；否则返回 1。
+    value="$1"
+
+    case "$value" in
+        ""|*[!0-9]*|0)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+iso8601_local_now()
+{
+    # iso8601_local_now 的作用：
+    #   生成带本地时区偏移的 ISO-8601 时间，避免云端把无时区时间当成另一种时区显示。
+    # 主要流程：
+    #   1. 直接读取板端当前墙钟时间，不再通过 TZ 二次换算。
+    #   2. 给墙钟时间追加 CLOUD_TIME_OFFSET，默认 +08:00，明确告诉后端这是北京时间。
+    #   3. CLOUD_TIME_NOW_CMD 只供自检注入固定 date 命令，正常运行不要设置。
+    # 返回值：
+    #   输出类似 2026-05-08T13:07:02+08:00 的时间字符串。
+    if [ -n "$CLOUD_TIME_NOW_CMD" ]; then
+        wall_clock="$($CLOUD_TIME_NOW_CMD '+%Y-%m-%dT%H:%M:%S')"
+    else
+        wall_clock="$(date '+%Y-%m-%dT%H:%M:%S')"
+    fi
+
+    printf '%s%s\n' "$wall_clock" "$CLOUD_TIME_OFFSET"
+}
+
+log_upload_step()
+{
+    # log_upload_step 的作用：
+    #   把 record_no、record_id、prepare object_key、登记 URL 等关键链路信息打到板端日志。
+    # 参数：
+    #   $1：已经格式化好的日志文本。
+    # 返回值：
+    #   只写 stderr，不影响 stdout 最后一行“上传成功：...”给 Qt 状态栏读取。
+    printf '%s\n' "$1" >&2
+}
+
+extract_etag_header()
+{
+    # COS 返回头通常是 ETag: "xxxx"，登记时只需要把这一行的值转回 JSON 字符串。
+    header_file="$1"
+    sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*\(.*\)[[:space:]]*$/\1/p' "$header_file" | tr -d '\r' | head -n 1
+}
+
+run_json_parser_self_test()
+{
+    # run_json_parser_self_test 的作用：
+    #   在不访问网络的情况下复现云端创建记录响应里“顶层 id 是新记录、嵌套 id 是旧零件/设备”的解析场景。
+    # 主要流程：
+    #   1. 写入一份模拟后端响应，顶层记录 id=8，后面的 part/device id=3。
+    #   2. 调用当前脚本使用的 JSON 数字解析函数。
+    #   3. 断言解析结果必须是顶层记录 id=8，避免后续 prepare/register 又打到旧记录 3。
+    # 参数：
+    #   无。
+    # 返回值：
+    #   解析正确返回 0；解析到旧嵌套 id 或缺失 id 时返回非 0。
+    tmp_file="${TMPDIR:-/tmp}/defect-cos-json-parser-self-test.$$"
+    trap 'rm -f "$tmp_file"' EXIT HUP INT TERM
+
+    cat > "$tmp_file" <<'JSON'
+{"id":8,"record_no":"MP157-20260507-221151","part":{"id":3,"part_no":"SIM-DIANPIAN"},"device":{"id":3,"device_no":"MP157"}}
+JSON
+
+    parsed_id=$(extract_created_record_id "$tmp_file")
+    if [ "$parsed_id" != "8" ]; then
+        fail "JSON 解析自检失败：期望顶层 record_id=8，实际解析到 $parsed_id"
+    fi
+
+    parsed_no=$(extract_created_record_no "$tmp_file")
+    if [ "$parsed_no" != "MP157-20260507-221151" ]; then
+        fail "JSON 解析自检失败：期望 record_no=MP157-20260507-221151，实际解析到 $parsed_no"
+    fi
+}
+
+run_time_format_self_test()
+{
+    # run_time_format_self_test 的作用：
+    #   验证业务时间不会把板端当前墙钟二次换算成未来 8 小时。
+    # 主要流程：
+    #   1. 注入固定 date 命令，让墙钟时间固定为 2026-05-08T13:07:02。
+    #   2. 设置 CLOUD_TIME_OFFSET=+08:00，模拟中国本地业务时间。
+    #   3. 断言输出必须保持 13:07:02+08:00，不能变成 21:07:02+08:00。
+    # 参数：
+    #   无。
+    # 返回值：
+    #   时间格式正确返回 0；出现二次时区换算返回非 0。
+    old_cmd="${CLOUD_TIME_NOW_CMD:-}"
+    old_offset="${CLOUD_TIME_OFFSET:-}"
+
+    CLOUD_TIME_NOW_CMD="printf 2026-05-08T13:07:02"
+    CLOUD_TIME_OFFSET="+08:00"
+    parsed_time="$(iso8601_local_now)"
+
+    CLOUD_TIME_NOW_CMD="$old_cmd"
+    CLOUD_TIME_OFFSET="$old_offset"
+
+    if [ "$parsed_time" != "2026-05-08T13:07:02+08:00" ]; then
+        fail "时间格式自检失败：期望 2026-05-08T13:07:02+08:00，实际 $parsed_time"
+    fi
+}
+
+http_json()
+{
+    # 统一发送 JSON 请求；调用者通过返回文件读取响应体，HTTP 非 2xx 时 curl 会返回失败。
+    method="$1"
+    url="$2"
+    body="$3"
+    out_file="$4"
+
+    curl -fsS \
+        -b "$CLOUD_COOKIE_FILE" \
+        -c "$CLOUD_COOKIE_FILE" \
+        -H "Content-Type: application/json" \
+        -X "$method" \
+        "$url" \
+        -d "$body" \
+        -o "$out_file"
+}
+
+http_get()
+{
+    # 统一发送带 Cookie 的 GET 请求，用于自动发现当前账号可访问的零件和设备。
+    url="$1"
+    out_file="$2"
+
+    curl -fsS \
+        -b "$CLOUD_COOKIE_FILE" \
+        -c "$CLOUD_COOKIE_FILE" \
+        "$url" \
+        -o "$out_file"
+}
+
+load_upload_env_file
+
+apply_runtime_overrides()
+{
+    # apply_runtime_overrides 的作用：
+    #   让命令行环境变量优先级高于 cos-upload.env，便于临时切换账号或指定云端对象。
+    # 主要流程：
+    #   逐个检查脚本启动时记录的非空覆盖值；如果存在，就覆盖配置文件读取到的默认值。
+    # 参数：
+    #   无显式参数；读取上面的 *_OVERRIDE 变量。
+    # 返回值：
+    #   只修改当前 shell 变量，不输出内容。
+    [ -z "$CLOUD_BASE_URL_OVERRIDE" ] || CLOUD_BASE_URL="$CLOUD_BASE_URL_OVERRIDE"
+    [ -z "$CLOUD_COOKIE_FILE_OVERRIDE" ] || CLOUD_COOKIE_FILE="$CLOUD_COOKIE_FILE_OVERRIDE"
+    [ -z "$CLOUD_ACCOUNT_OVERRIDE" ] || CLOUD_ACCOUNT="$CLOUD_ACCOUNT_OVERRIDE"
+    [ -z "$CLOUD_PASSWORD_OVERRIDE" ] || CLOUD_PASSWORD="$CLOUD_PASSWORD_OVERRIDE"
+    [ -z "$CLOUD_DEVICE_ID_OVERRIDE" ] || CLOUD_DEVICE_ID="$CLOUD_DEVICE_ID_OVERRIDE"
+    [ -z "$CLOUD_PART_ID_OVERRIDE" ] || CLOUD_PART_ID="$CLOUD_PART_ID_OVERRIDE"
+    [ -z "$CLOUD_RESULT_OVERRIDE" ] || CLOUD_RESULT="$CLOUD_RESULT_OVERRIDE"
+    [ -z "$CLOUD_HEALTH_URL_OVERRIDE" ] || CLOUD_HEALTH_URL="$CLOUD_HEALTH_URL_OVERRIDE"
+    [ -z "$CLOUD_TIME_TZ_OVERRIDE" ] || CLOUD_TIME_TZ="$CLOUD_TIME_TZ_OVERRIDE"
+    [ -z "$CLOUD_TIME_OFFSET_OVERRIDE" ] || CLOUD_TIME_OFFSET="$CLOUD_TIME_OFFSET_OVERRIDE"
+    [ -z "$CLOUD_TIME_NOW_CMD_OVERRIDE" ] || CLOUD_TIME_NOW_CMD="$CLOUD_TIME_NOW_CMD_OVERRIDE"
+    [ -z "$SOURCE_HEADERS_OVERRIDE" ] || SOURCE_HEADERS="$SOURCE_HEADERS_OVERRIDE"
+    [ -z "$ANNOTATED_HEADERS_OVERRIDE" ] || ANNOTATED_HEADERS="$ANNOTATED_HEADERS_OVERRIDE"
+}
+
+apply_runtime_overrides
+
+# CLOUD_BASE_URL 是云端后端地址，默认使用当前项目已验证的轻量服务器地址。
+CLOUD_BASE_URL="${CLOUD_BASE_URL:-http://119.91.65.122}"
+
+# CLOUD_COOKIE_FILE 保存后端登录态 Cookie，避免每次点击按钮都重复登录。
+CLOUD_COOKIE_FILE="${CLOUD_COOKIE_FILE:-/tmp/cloud_cookie.txt}"
+
+# CLOUD_ACCOUNT/CLOUD_PASSWORD 只在 Cookie 不存在时使用；可以来自环境变量或本地 cos-upload.env。
+CLOUD_ACCOUNT="${CLOUD_ACCOUNT:-}"
+CLOUD_PASSWORD="${CLOUD_PASSWORD:-}"
+
+# CLOUD_DEVICE_ID/CLOUD_PART_ID 可显式指定云端已有的 MP157 设备和零件 ID。
+# 留空时脚本会在登录后自动取当前账号可访问的第一条设备/零件，避免默认 ID 不属于当前公司时创建记录失败。
+CLOUD_DEVICE_ID="${CLOUD_DEVICE_ID:-}"
+CLOUD_PART_ID="${CLOUD_PART_ID:-}"
+
+# CLOUD_RESULT 是这次最小闭环使用的检测结果，占位阶段默认 good，后续可由真实检测服务覆盖。
+CLOUD_RESULT="${CLOUD_RESULT:-good}"
+
+# CLOUD_HEALTH_URL 默认访问后端 /health，验证 HTTP 服务是否在线。
+CLOUD_HEALTH_URL="${CLOUD_HEALTH_URL:-$CLOUD_BASE_URL/health}"
+
+# CLOUD_TIME_TZ 是旧版本保留变量，不再参与时间换算；避免板端墙钟已经是北京时间时又被加 8 小时。
+CLOUD_TIME_TZ="${CLOUD_TIME_TZ:-CST-8}"
+
+# CLOUD_TIME_OFFSET 是写入后端业务时间时携带的时区偏移；默认 +08:00 表示中国本地业务时间。
+CLOUD_TIME_OFFSET="${CLOUD_TIME_OFFSET:-+08:00}"
+CLOUD_TIME_ZONE="${CLOUD_TIME_ZONE:-CST-8}"
+
+# 导出北京时间时区，保证保存图片上传时读取的是业务本地墙钟。
+# 板端校时后系统 UTC 是正确的，但 BusyBox/登录环境不一定自动读取 /etc/TZ；
+# 如果这里不显式导出，date 可能输出 UTC 小时，最终 captured_at/uploaded_at 会少 8 小时。
+export TZ="$CLOUD_TIME_ZONE"
+
+# CLOUD_TIME_NOW_CMD 只供自检注入固定时间命令，正式运行保持为空。
+CLOUD_TIME_NOW_CMD="${CLOUD_TIME_NOW_CMD:-}"
+
+# 上传响应头保存位置，便于开发板 SSH 排查 COS 返回的 ETag 和 HTTP 状态。
+SOURCE_HEADERS="${SOURCE_HEADERS:-/tmp/source_upload_headers.txt}"
+ANNOTATED_HEADERS="${ANNOTATED_HEADERS:-/tmp/annotated_upload_headers.txt}"
+
+ensure_cloud_session()
+{
+    # Cookie 文件存在且非空时直接复用；否则使用 CLOUD_ACCOUNT/CLOUD_PASSWORD 登录。
+    if [ -s "$CLOUD_COOKIE_FILE" ]; then
+        return 0
+    fi
+
+    if [ -z "$CLOUD_ACCOUNT" ] || [ -z "$CLOUD_PASSWORD" ]; then
+        fail "缺少登录 Cookie，且未设置 CLOUD_ACCOUNT/CLOUD_PASSWORD"
+    fi
+
+    account_json=$(json_escape "$CLOUD_ACCOUNT")
+    password_json=$(json_escape "$CLOUD_PASSWORD")
+    login_body="{\"account\":\"$account_json\",\"password\":\"$password_json\"}"
+
+    http_json "POST" "$CLOUD_BASE_URL/api/v1/auth/login" "$login_body" "/tmp/defect-cos-login.json" \
+        || fail "登录后端失败，请检查 CLOUD_ACCOUNT/CLOUD_PASSWORD"
+}
+
+resolve_cloud_ids()
+{
+    # 如果部署现场没有指定 ID，就读取当前账号能访问的第一条零件和设备。
+    # 这样脚本不会把源码里的固定默认值误当成所有公司的通用 ID。
+    if [ -z "$CLOUD_PART_ID" ]; then
+        http_get "$CLOUD_BASE_URL/api/v1/parts?limit=1" "/tmp/defect-cos-parts.json" \
+            || fail "自动查询零件列表失败，请手动设置 CLOUD_PART_ID"
+
+        CLOUD_PART_ID=$(extract_json_number "id" "/tmp/defect-cos-parts.json")
+        if [ -z "$CLOUD_PART_ID" ]; then
+            fail "当前账号没有可用零件，请先在云端创建零件或设置 CLOUD_PART_ID"
+        fi
+    fi
+
+    if [ -z "$CLOUD_DEVICE_ID" ]; then
+        http_get "$CLOUD_BASE_URL/api/v1/devices?limit=1" "/tmp/defect-cos-devices.json" \
+            || fail "自动查询设备列表失败，请手动设置 CLOUD_DEVICE_ID"
+
+        CLOUD_DEVICE_ID=$(extract_json_number "id" "/tmp/defect-cos-devices.json")
+        if [ -z "$CLOUD_DEVICE_ID" ]; then
+            fail "当前账号没有可用设备，请先在云端创建设备或设置 CLOUD_DEVICE_ID"
+        fi
+    fi
+}
+
+validate_file()
+{
+    # 保存按钮返回成功后仍在上传前做一次文件非空检查，避免网络流程上传空文件。
+    path="$1"
+    label="$2"
+
+    if [ ! -f "$path" ]; then
+        fail "$label 文件不存在：$path"
+    fi
+
+    if [ ! -s "$path" ]; then
+        fail "$label 文件为空：$path"
+    fi
+}
+
+create_record()
+{
+    # create_record 的作用：
+    #   创建云端检测主记录，并只返回本次新建记录的顶层 record_id。
+    # 主要流程：
+    #   1. 用本地时间生成 record_no，方便云端详情页和板端日志人工对账。
+    #   2. captured_at/detected_at 使用带时区的本地时间，避免 UTC 无时区显示成 8 小时前。
+    #   3. POST /api/v1/records 后，只解析响应顶层 id，不能读取嵌套 part.id/device.id。
+    #   4. 校验云端返回的 record_no 与本次请求一致，防止后端复用旧演示记录。
+    # 参数：
+    #   无显式参数；读取 CLOUD_PART_ID/CLOUD_DEVICE_ID/CLOUD_RESULT。
+    # 返回值：
+    #   stdout 输出正整数 record_id；失败时终止脚本。
+    record_no="MP157-$(date '+%Y%m%d-%H%M%S')"
+    captured_at="$(iso8601_local_now)"
+    record_body="{
+\"record_no\":\"$record_no\",
+\"part_id\":$CLOUD_PART_ID,
+\"device_id\":$CLOUD_DEVICE_ID,
+\"result\":\"$CLOUD_RESULT\",
+\"captured_at\":\"$captured_at\",
+\"detected_at\":\"$captured_at\"
+}"
+
+    http_json "POST" "$CLOUD_BASE_URL/api/v1/records" "$record_body" "/tmp/defect-cos-record.json" \
+        || fail "创建检测记录失败"
+
+    record_id=$(extract_created_record_id "/tmp/defect-cos-record.json")
+    if ! is_positive_number "$record_id"; then
+        fail "创建检测记录响应缺少 id"
+    fi
+
+    created_record_no=$(extract_created_record_no "/tmp/defect-cos-record.json")
+    if [ -z "$created_record_no" ]; then
+        fail "创建检测记录响应缺少 record_no"
+    fi
+
+    if [ "$created_record_no" != "$record_no" ]; then
+        fail "云端返回 record_no 与本次请求不一致：request=$record_no response=$created_record_no"
+    fi
+
+    log_upload_step "record_no=$created_record_no"
+    log_upload_step "created_record_id=$record_id"
+
+    printf '%s\n' "$record_id"
+}
+
+prepare_upload()
+{
+    # prepare_upload 的作用：
+    #   为本次记录的一张图片申请 COS 预签名上传地址，并防止 prepare 落到旧记录路径。
+    # 主要流程：
+    #   1. 校验 record_id 是创建记录返回的正整数。
+    #   2. POST /api/v1/uploads/cos/prepare，body 中携带同一个 record_id。
+    #   3. 检查 prepare 返回启用状态、object_key，并断言 object_key 包含当前 record_no。
+    # 参数：
+    #   $1 record_id：创建记录返回的新记录 id。
+    #   $2 record_no：创建记录返回的新记录编号。
+    #   $3 file_kind：source 或 annotated。
+    #   $4 file_path：本地 JPG/PNG 路径。
+    #   $5 content_type：image/jpeg 或 image/png。
+    # 返回值：
+    #   成功时生成 /tmp/defect-cos-prepare-<kind>.json；失败时终止脚本。
+    record_id="$1"
+    record_no="$2"
+    file_kind="$3"
+    file_path="$4"
+    content_type="$5"
+    file_name="$(basename "$file_path")"
+    file_name_json=$(json_escape "$file_name")
+
+    if ! is_positive_number "$record_id"; then
+        fail "prepare 收到非法 record_id：$record_id"
+    fi
+
+    prepare_body="{
+\"record_id\":$record_id,
+\"file_kind\":\"$file_kind\",
+\"file_name\":\"$file_name_json\",
+\"content_type\":\"$content_type\"
+}"
+
+    http_json "POST" "$CLOUD_BASE_URL/api/v1/uploads/cos/prepare" "$prepare_body" "/tmp/defect-cos-prepare-$file_kind.json" \
+        || fail "COS prepare 失败：$file_kind"
+
+    enabled=$(sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "/tmp/defect-cos-prepare-$file_kind.json" | head -n 1)
+    if [ "$enabled" != "true" ]; then
+        message=$(extract_json_string "message" "/tmp/defect-cos-prepare-$file_kind.json")
+        fail "COS prepare 未启用：$file_kind ${message:-unknown}"
+    fi
+
+    object_key=$(extract_json_string "object_key" "/tmp/defect-cos-prepare-$file_kind.json")
+    if [ -z "$object_key" ]; then
+        fail "prepare 响应缺少 object_key：$file_kind"
+    fi
+
+    case "$object_key" in
+        *"$record_no"*)
+            ;;
+        *)
+            fail "prepare object_key 未包含当前 record_no：file_kind=$file_kind record_no=$record_no object_key=$object_key"
+            ;;
+    esac
+
+    log_upload_step "prepare_file_kind=$file_kind prepare_record_id=$record_id"
+    log_upload_step "prepare_object_key=$object_key"
+}
+
+put_to_cos()
+{
+    # COS 预签名 URL 要求 PUT 时 Content-Type 和 prepare 请求保持一致。
+    file_kind="$1"
+    file_path="$2"
+    content_type="$3"
+    header_file="$4"
+    prepare_file="/tmp/defect-cos-prepare-$file_kind.json"
+    upload_url=$(extract_json_string "upload_url" "$prepare_file")
+
+    if [ -z "$upload_url" ]; then
+        fail "prepare 响应缺少 upload_url：$file_kind"
+    fi
+
+    http_code=$(curl -sS \
+        -X PUT "$upload_url" \
+        -H "Content-Type: $content_type" \
+        -D "$header_file" \
+        -o /tmp/defect-cos-put-body.txt \
+        -w "%{http_code}" \
+        -T "$file_path")
+
+    if [ "$http_code" != "200" ]; then
+        fail "COS PUT 失败：$file_kind HTTP_CODE=$http_code"
+    fi
+
+    etag=$(extract_etag_header "$header_file")
+    if [ -z "$etag" ]; then
+        fail "COS PUT 成功但响应头缺少 ETag：$file_kind"
+    fi
+}
+
+register_file()
+{
+    # register_file 的作用：
+    #   把 COS 对象元数据登记回创建记录返回的新 record_id，云端详情页才能生成 preview_url。
+    # 主要流程：
+    #   1. 读取 prepare 返回的 bucket、region、object_key。
+    #   2. 读取 COS PUT 响应头里的 ETag 和本地文件字节数。
+    #   3. POST /api/v1/records/{record_id}/files，URL 中必须继续使用本次新 record_id。
+    #   4. uploaded_at 使用带本地时区的时间，短期规避后端 UTC fallback 显示偏移。
+    # 参数：
+    #   $1 record_id：创建记录返回的新记录 id。
+    #   $2 file_kind：source 或 annotated。
+    #   $3 file_path：本地 JPG/PNG 路径。
+    #   $4 content_type：image/jpeg 或 image/png。
+    #   $5 header_file：COS PUT 响应头文件。
+    # 返回值：
+    #   成功时生成 /tmp/defect-cos-register-<kind>.json；失败时终止脚本。
+    record_id="$1"
+    file_kind="$2"
+    file_path="$3"
+    content_type="$4"
+    header_file="$5"
+    prepare_file="/tmp/defect-cos-prepare-$file_kind.json"
+
+    if ! is_positive_number "$record_id"; then
+        fail "登记文件收到非法 record_id：$record_id"
+    fi
+
+    bucket_name=$(extract_json_string "bucket_name" "$prepare_file")
+    region=$(extract_json_string "region" "$prepare_file")
+    object_key=$(extract_json_string "object_key" "$prepare_file")
+    etag=$(extract_etag_header "$header_file")
+    size_bytes=$(wc -c < "$file_path" | tr -d ' ')
+    uploaded_at="$(iso8601_local_now)"
+    bucket_json=$(json_escape "$bucket_name")
+    region_json=$(json_escape "$region")
+    object_key_json=$(json_escape "$object_key")
+    etag_json=$(json_escape "$etag")
+    uploaded_at_json=$(json_escape "$uploaded_at")
+
+    if [ -z "$bucket_name" ] || [ -z "$region" ] || [ -z "$object_key" ]; then
+        fail "prepare 响应缺少对象元数据：$file_kind"
+    fi
+
+    register_body="{
+\"file_kind\":\"$file_kind\",
+\"storage_provider\":\"cos\",
+\"bucket_name\":\"$bucket_json\",
+\"region\":\"$region_json\",
+\"object_key\":\"$object_key_json\",
+\"content_type\":\"$content_type\",
+\"size_bytes\":$size_bytes,
+\"etag\":\"$etag_json\",
+\"uploaded_at\":\"$uploaded_at_json\"
+}"
+
+    log_upload_step "register_url=/api/v1/records/$record_id/files"
+    log_upload_step "register_file_kind=$file_kind"
+
+    http_json "POST" "$CLOUD_BASE_URL/api/v1/records/$record_id/files" "$register_body" "/tmp/defect-cos-register-$file_kind.json" \
+        || fail "登记文件对象失败：$file_kind"
+}
+
+verify_record_detail()
+{
+    # verify_record_detail 的作用：
+    #   上传完成后回查本次新记录，确认详情里至少能看到 source 和 annotated 两类文件。
+    # 主要流程：
+    #   1. GET /api/v1/records/{record_id} 保存到 /tmp/defect-cos-record-detail.json。
+    #   2. 检查详情响应包含 source 与 annotated，避免只登记了一张图还误报成功。
+    #   3. 粗略统计 file_kind 数量；若不是 2，直接失败，避免界面把记录隔离异常显示成上传成功。
+    # 参数：
+    #   $1 record_id：创建记录返回的新记录 id。
+    # 返回值：
+    #   两类文件都存在返回 0；缺失或回查失败时终止脚本。
+    record_id="$1"
+
+    if ! is_positive_number "$record_id"; then
+        fail "回查检测记录收到非法 record_id：$record_id"
+    fi
+
+    curl -fsS -b "$CLOUD_COOKIE_FILE" "$CLOUD_BASE_URL/api/v1/records/$record_id" -o /tmp/defect-cos-record-detail.json \
+        || fail "上传后回查检测记录失败：record_id=$record_id"
+
+    if ! grep -q '"file_kind"[[:space:]]*:[[:space:]]*"source"' /tmp/defect-cos-record-detail.json; then
+        fail "记录详情缺少 source 文件：record_id=$record_id"
+    fi
+
+    if ! grep -q '"file_kind"[[:space:]]*:[[:space:]]*"annotated"' /tmp/defect-cos-record-detail.json; then
+        fail "记录详情缺少 annotated 文件：record_id=$record_id"
+    fi
+
+    file_count=$(tr ',{}[]' '\n\n\n\n\n' < /tmp/defect-cos-record-detail.json \
+        | sed -n 's/^[[:space:]]*"file_kind"[[:space:]]*:.*/x/p' \
+        | wc -l \
+        | tr -d ' ')
+    if [ "$file_count" != "2" ]; then
+        fail "记录详情文件数量异常：record_id=$record_id expected=2 actual=$file_count"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --jpg)
+            [ "$#" -ge 2 ] || fail "--jpg 缺少路径"
+            jpg_file="$2"
+            shift 2
+            ;;
+        --png)
+            [ "$#" -ge 2 ] || fail "--png 缺少路径"
+            png_file="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        --self-test-json-parser)
+            run_json_parser_self_test
+            run_time_format_self_test
+            exit 0
+            ;;
+        *)
+            show_usage
+            fail "未知参数：$1"
+            ;;
+    esac
+done
+
+[ -n "$jpg_file" ] || fail "缺少 --jpg"
+[ -n "$png_file" ] || fail "缺少 --png"
+
+validate_file "$jpg_file" "JPG"
+validate_file "$png_file" "PNG"
+
+curl -fsS "$CLOUD_HEALTH_URL" -o /tmp/defect-cos-health.json \
+    || fail "云端 health 检查失败：$CLOUD_HEALTH_URL"
+
+ensure_cloud_session
+resolve_cloud_ids
+record_id=$(create_record)
+created_record_no=$(extract_created_record_no "/tmp/defect-cos-record.json")
+
+if [ -z "$created_record_no" ]; then
+    fail "创建检测记录后无法读取 record_no"
+fi
+
+prepare_upload "$record_id" "$created_record_no" "source" "$jpg_file" "image/jpeg"
+put_to_cos "source" "$jpg_file" "image/jpeg" "$SOURCE_HEADERS"
+register_file "$record_id" "source" "$jpg_file" "image/jpeg" "$SOURCE_HEADERS"
+
+prepare_upload "$record_id" "$created_record_no" "annotated" "$png_file" "image/png"
+put_to_cos "annotated" "$png_file" "image/png" "$ANNOTATED_HEADERS"
+register_file "$record_id" "annotated" "$png_file" "image/png" "$ANNOTATED_HEADERS"
+
+verify_record_detail "$record_id"
+
+echo "上传成功：record_id=$record_id record_no=$created_record_no jpg_kind=source png_kind=annotated"

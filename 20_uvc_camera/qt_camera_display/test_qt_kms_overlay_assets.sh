@@ -1,0 +1,288 @@
+#!/bin/sh
+#
+# 作用：
+#   对 Qt + KMS overlay 正规化交付物做轻量静态检查。
+#   这个脚本不访问开发板硬件，只验证源码、构建脚本和运行控制脚本的关键契约是否存在。
+#
+# 主要流程：
+#   1. 确认可维护的 KMS overlay C 源码已经进入项目目录。
+#   2. 确认构建脚本会使用交叉编译器和 libdrm 生成板端程序。
+#   3. 确认运行控制脚本使用 nohup 后台启动 overlay 与 Qt，并保留 start/stop/status 控制面。
+#   4. 确认 KMS overlay 界面保留触摸控制按钮，并且启动脚本默认允许 Qt 接收触摸事件。
+#
+# 返回值：
+#   所有检查通过返回 0；任一契约缺失返回 1。
+
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+fail()
+{
+    echo "FAIL: $*" >&2
+    exit 1
+}
+
+require_file()
+{
+    path="$SCRIPT_DIR/$1"
+    [ -f "$path" ] || fail "缺少文件：$1"
+}
+
+require_grep()
+{
+    pattern="$1"
+    file="$2"
+    grep -Eq -- "$pattern" "$SCRIPT_DIR/$file" || fail "$file 缺少模式：$pattern"
+}
+
+require_file "uvc_kms_overlay.c"
+require_file "build_uvc_kms_overlay.sh"
+require_file "run_qt_kms_overlay_display.sh"
+require_file "fb_boot_splash.c"
+require_file "build_fb_boot_splash.sh"
+require_file "qml/Main.qml"
+require_file "../S90uvc-camera"
+require_file "../S05display-quiet"
+require_file "main.cpp"
+require_file "defect-cos-upload"
+require_file "deploy_qt_camera_display.sh"
+
+require_grep "drmModeSetPlane" "uvc_kms_overlay.c"
+require_grep "x dst-x" "uvc_kms_overlay.c"
+require_grep "KMS_OVERLAY_X" "run_qt_kms_overlay_display.sh"
+require_grep "KMS_OVERLAY_Y" "run_qt_kms_overlay_display.sh"
+require_grep "KMS_OVERLAY_W" "run_qt_kms_overlay_display.sh"
+require_grep "KMS_OVERLAY_H" "run_qt_kms_overlay_display.sh"
+require_grep "FB_BOOT_SPLASH_BIN" "run_qt_kms_overlay_display.sh"
+require_grep "show_boot_splash" "run_qt_kms_overlay_display.sh"
+require_grep "fb_boot_splash" "run_qt_kms_overlay_display.sh"
+require_grep 'nohup "\$OVERLAY_BIN"' "run_qt_kms_overlay_display.sh"
+require_grep "VIDEO_BACKEND=kms-overlay" "run_qt_kms_overlay_display.sh"
+require_grep "start\\|stop\\|restart\\|status" "run_qt_kms_overlay_display.sh"
+require_grep "hide_display_console" "run_qt_kms_overlay_display.sh"
+require_grep "fbcon/cursor_blink" "run_qt_kms_overlay_display.sh"
+require_grep "wait_for_node" "run_qt_kms_overlay_display.sh"
+require_grep "send_overlay_command" "run_qt_kms_overlay_display.sh"
+require_grep "VISIBLE 0" "run_qt_kms_overlay_display.sh"
+require_grep "VISIBLE 1" "run_qt_kms_overlay_display.sh"
+require_grep "-V 0" "run_qt_kms_overlay_display.sh"
+require_grep "hide_display_console" "../S90uvc-camera"
+require_grep "fbcon/cursor_blink" "../S90uvc-camera"
+require_grep "show_boot_splash" "../S90uvc-camera"
+require_grep "fb_boot_splash" "../S90uvc-camera"
+require_grep "fbcon/cursor_blink" "../S05display-quiet"
+require_grep "/dev/tty0" "../S05display-quiet"
+require_grep "show_boot_splash" "../S05display-quiet"
+require_grep "fb_boot_splash" "../S05display-quiet"
+require_grep "S05display-quiet" "deploy_qt_camera_display.sh"
+require_grep "S90uvc-camera" "deploy_qt_camera_display.sh"
+require_grep "FB_SPLASH_SRC" "deploy_qt_camera_display.sh"
+require_grep "fb_boot_splash" "deploy_qt_camera_display.sh"
+require_grep "uvc_kms_overlay.c" "build_uvc_kms_overlay.sh"
+require_grep "ldrm" "build_uvc_kms_overlay.sh"
+require_grep "OVERLAY_CC" "build_uvc_kms_overlay.sh"
+require_grep "fb_boot_splash.c" "build_fb_boot_splash.sh"
+require_grep "SPLASH_CC" "build_fb_boot_splash.sh"
+if grep -Eq 'CC="\$\{CC:-' "$SCRIPT_DIR/build_fb_boot_splash.sh"; then
+    fail "build_fb_boot_splash.sh 不能继承外部 CC，避免 ST Qt SDK 的 CC='编译器 参数' 破坏 splash 构建"
+fi
+if grep -Eq 'CC="\$\{CC:-' "$SCRIPT_DIR/build_uvc_kms_overlay.sh"; then
+    fail "build_uvc_kms_overlay.sh 不能继承外部 CC，避免 ST Qt SDK 的 CC='编译器 参数' 破坏 overlay 构建"
+fi
+
+qt_start_line="$(grep -n 'if ! start_qt_shell' "$SCRIPT_DIR/run_qt_kms_overlay_display.sh" | tail -n 1 | cut -d: -f1)"
+overlay_start_line="$(grep -n 'if ! start_overlay' "$SCRIPT_DIR/run_qt_kms_overlay_display.sh" | tail -n 1 | cut -d: -f1)"
+if [ -z "$qt_start_line" ] || [ -z "$overlay_start_line" ] || [ "$qt_start_line" -ge "$overlay_start_line" ]; then
+    fail "run_qt_kms_overlay_display.sh 必须先启动 overlay 并隐藏视频 plane，再启动 Qt splash，避免摄像头画面抢在启动动画前显示"
+fi
+require_grep "wait_for_qt_boot_surface" "run_qt_kms_overlay_display.sh"
+require_grep "boot overlay visible false" "run_qt_kms_overlay_display.sh"
+
+require_grep "id: overlayControls" "qml/Main.qml"
+require_grep "开始" "qml/Main.qml"
+require_grep "暂停" "qml/Main.qml"
+require_grep "继续" "qml/Main.qml"
+require_grep "停止" "qml/Main.qml"
+require_grep "保存图片" "qml/Main.qml"
+require_grep "安全卸载" "qml/Main.qml"
+require_grep "storageToastTimer" "qml/Main.qml"
+require_grep "storageToastVisible" "qml/Main.qml"
+require_grep "showStorageToast" "qml/Main.qml"
+require_grep "historyPageVisible" "qml/Main.qml"
+require_grep "historyDetailVisible" "qml/Main.qml"
+require_grep "historyListView" "qml/Main.qml"
+require_grep "historyListPanel" "qml/Main.qml"
+require_grep "historyDetailPanel" "qml/Main.qml"
+require_grep "backToHistoryList" "qml/Main.qml"
+require_grep "deleteHistoryRecord" "qml/Main.qml"
+require_grep "cloudStatusSummary" "qml/Main.qml"
+require_grep "historyMetricGrid" "qml/Main.qml"
+require_grep "historyAnalysisPanel" "qml/Main.qml"
+require_grep "statsPageVisible" "qml/Main.qml"
+require_grep "statsSummary" "qml/Main.qml"
+require_grep "statsRecentBars" "qml/Main.qml"
+require_grep "statsDistributionBars" "qml/Main.qml"
+require_grep "statsRecentRows" "qml/Main.qml"
+require_grep "openHistoryDetailFromStats" "qml/Main.qml"
+require_grep "id: statsPage" "qml/Main.qml"
+require_grep "id: statsKpiGrid" "qml/Main.qml"
+require_grep "id: statsTrendPanel" "qml/Main.qml"
+require_grep "id: statsDistributionPanel" "qml/Main.qml"
+require_grep "id: statsCloudPanel" "qml/Main.qml"
+require_grep "id: statsRecentPanel" "qml/Main.qml"
+require_grep "id: statsRecentListView" "qml/Main.qml"
+require_grep "manualPageVisible" "qml/Main.qml"
+require_grep "manualMode" "qml/Main.qml"
+require_grep "manualCommandLog" "qml/Main.qml"
+require_grep "handleManualAction" "qml/Main.qml"
+require_grep "appendManualCommandLog" "qml/Main.qml"
+require_grep "id: manualPage" "qml/Main.qml"
+require_grep "id: manualBeltPanel" "qml/Main.qml"
+require_grep "id: manualArmPanel" "qml/Main.qml"
+require_grep "id: manualLightPanel" "qml/Main.qml"
+require_grep "id: manualSafetyPanel" "qml/Main.qml"
+require_grep "id: manualCommandLogView" "qml/Main.qml"
+require_grep "夹爪开" "qml/Main.qml"
+require_grep "夹爪关" "qml/Main.qml"
+require_grep "背光常亮" "qml/Main.qml"
+require_grep "settingsPageVisible" "qml/Main.qml"
+require_grep "alarmPageVisible" "qml/Main.qml"
+require_grep "splashOverlayVisible" "qml/Main.qml"
+require_grep "splashStageIndex" "qml/Main.qml"
+require_grep "splashStageModel" "qml/Main.qml"
+require_grep "advanceSplashStage" "qml/Main.qml"
+require_grep "finishSplashAnimation" "qml/Main.qml"
+require_grep "storageController.setOverlayVisible\\(false\\)" "qml/Main.qml"
+require_grep "storageController.setOverlayVisible\\(true\\)" "qml/Main.qml"
+require_grep "startBootOverlayRestore" "qml/Main.qml"
+require_grep "bootOverlayRestoreTimer" "qml/Main.qml"
+require_grep "id: splashOverlay" "qml/Main.qml"
+require_grep "id: splashScanLine" "qml/Main.qml"
+require_grep "id: splashProgressFill" "qml/Main.qml"
+require_grep "工业缺陷检测系统" "qml/Main.qml"
+require_grep "STM32MP157 Vision Inspection Terminal" "qml/Main.qml"
+require_grep "加载相机" "qml/Main.qml"
+require_grep "初始化检测模型" "qml/Main.qml"
+require_grep "连接运动控制" "qml/Main.qml"
+require_grep "挂载存储" "qml/Main.qml"
+require_grep "进入检测界面" "qml/Main.qml"
+require_grep "settingsApplyAction" "qml/Main.qml"
+require_grep "id: settingsPage" "qml/Main.qml"
+require_grep "id: settingsProcessPanel" "qml/Main.qml"
+require_grep "id: settingsVisionPanel" "qml/Main.qml"
+require_grep "id: settingsMotionPanel" "qml/Main.qml"
+require_grep "id: settingsStoragePanel" "qml/Main.qml"
+require_grep "id: settingsActionPanel" "qml/Main.qml"
+require_grep "参数摘要" "qml/Main.qml"
+require_grep "恢复默认" "qml/Main.qml"
+require_grep "alarmHistoryModel" "qml/Main.qml"
+require_grep "handleAlarmAction" "qml/Main.qml"
+require_grep "id: alarmPage" "qml/Main.qml"
+require_grep "id: alarmCurrentPanel" "qml/Main.qml"
+require_grep "id: alarmHealthPanel" "qml/Main.qml"
+require_grep "id: alarmHistoryPanel" "qml/Main.qml"
+require_grep "id: alarmAdvicePanel" "qml/Main.qml"
+require_grep "0x0007" "qml/Main.qml"
+require_grep "保存诊断" "qml/Main.qml"
+if grep -Eq "吸盘|背光关|背光开|backlight-toggle|manualBacklightEnabled" "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "qml/Main.qml 手动控制页显示必须符合硬件事实：背光常亮，末端执行器只显示夹爪，不显示吸盘或背光开关"
+fi
+require_grep "上下滑动查看更多" "qml/Main.qml"
+require_grep "uploadHistory" "qml/Main.qml"
+require_grep "selectedHistoryIndex" "qml/Main.qml"
+require_grep "selectedHistoryRecord" "qml/Main.qml"
+require_grep "imageCarousel" "qml/Main.qml"
+require_grep "flickDeceleration" "qml/Main.qml"
+require_grep "maximumFlickVelocity" "qml/Main.qml"
+require_grep "setOverlayVisible" "qml/Main.qml"
+require_grep "requestSaveCurrentFrameToSdCard" "qml/Main.qml"
+require_grep "saveCurrentFrameFinished" "qml/Main.qml"
+require_grep "safeRemoveSdCard" "qml/Main.qml"
+require_grep "saveAlarmSnapshotToSdCard" "qml/Main.qml"
+require_grep "/mnt/sdcard/logs/qt_alarm_snapshot.txt" "qml/Main.qml"
+require_grep "MouseArea" "qml/Main.qml"
+require_grep "DEFAULT_BOARD_TIME_ZONE" "main.cpp"
+require_grep "qputenv\\(\"TZ\", DEFAULT_BOARD_TIME_ZONE\\)" "main.cpp"
+require_grep "CameraStorageController" "main.cpp"
+require_grep "saveCurrentFrameToSdCard" "main.cpp"
+require_grep "requestSaveCurrentFrameToSdCard" "main.cpp"
+require_grep "saveCurrentFrameFinished" "main.cpp"
+require_grep "safeRemoveSdCard" "main.cpp"
+require_grep "saveAlarmSnapshotToSdCard" "main.cpp"
+require_grep "DEFAULT_SDCARD_LOG_DIR" "main.cpp"
+require_grep "DEFAULT_ALARM_SNAPSHOT_FILE" "main.cpp"
+require_grep "storage action alarm-snapshot" "main.cpp"
+require_grep "alarm-snapshot-self-test" "main.cpp"
+require_grep "run_alarm_snapshot_self_test" "main.cpp"
+require_grep "fsync" "main.cpp"
+require_grep "UploadHistoryModel" "main.cpp"
+require_grep "appendUploadHistoryRecord" "main.cpp"
+require_grep "removeRecord" "main.cpp"
+require_grep "removeHistoryImageFiles" "main.cpp"
+require_grep "compactUploadStatus" "main.cpp"
+require_grep "uploadHistory" "main.cpp"
+require_grep "upload_history.json" "main.cpp"
+require_grep "setOverlayVisible" "main.cpp"
+require_grep "storage-self-test" "main.cpp"
+require_grep "storage action save-image" "main.cpp"
+require_grep "std::fopen\\(\"/proc/mounts\", \"r\"\\)" "main.cpp"
+require_grep "sdcard-safe-remove" "main.cpp"
+
+if grep -Eq 'currentIndex:[[:space:]]*root\.selectedHistoryIndex' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "historyListView 不能把 currentIndex 绑定到 selectedHistoryIndex，否则点选卡片会触发 ListView 自动滚动"
+fi
+
+if grep -Eq 'highlightRangeMode:[[:space:]]*ListView\.ApplyRange' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "historyListView 不能使用 ApplyRange 强制高亮范围，否则选中历史卡片会把列表拉到当前项"
+fi
+
+if grep -Eq 'storageState[[:space:]]*=[[:space:]]*storageController\.saveCurrentFrameToSdCard[[:space:]]*\(' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "保存图片不能在 QML 主线程同步调用 saveCurrentFrameToSdCard()，必须通过 requestSaveCurrentFrameToSdCard() 后台执行"
+fi
+require_grep "uvc-kms-overlay-control.sock" "uvc_kms_overlay.c"
+require_grep "工业缺陷检测系统" "fb_boot_splash.c"
+require_grep "STM32MP157 Vision Inspection Terminal" "fb_boot_splash.c"
+require_grep "/dev/fb0" "fb_boot_splash.c"
+require_grep "FBIOGET_VSCREENINFO" "fb_boot_splash.c"
+require_grep "mmap" "fb_boot_splash.c"
+require_grep "draw_splash" "fb_boot_splash.c"
+require_grep "msync" "fb_boot_splash.c"
+require_grep "VISIBLE " "uvc_kms_overlay.c"
+require_grep "set_kms_plane_visible" "uvc_kms_overlay.c"
+require_grep "initial_visible" "uvc_kms_overlay.c"
+require_grep "初始视频层可见性" "uvc_kms_overlay.c"
+require_grep "SAVE " "uvc_kms_overlay.c"
+require_grep "SAVE_DUAL " "uvc_kms_overlay.c"
+require_grep "P6" "uvc_kms_overlay.c"
+require_grep "write_rgb24_as_jpeg" "uvc_kms_overlay.c"
+require_grep "write_rgb24_as_png" "uvc_kms_overlay.c"
+require_grep "write_latest_frame_as_jpeg_and_png" "uvc_kms_overlay.c"
+require_grep "jpeglib.h" "uvc_kms_overlay.c"
+require_grep "png.h" "uvc_kms_overlay.c"
+require_grep "fsync" "uvc_kms_overlay.c"
+require_grep "ljpeg" "build_uvc_kms_overlay.sh"
+require_grep "lpng" "build_uvc_kms_overlay.sh"
+require_grep "defect-cos-upload" "main.cpp"
+require_grep "source" "defect-cos-upload"
+require_grep "annotated" "defect-cos-upload"
+require_grep "uploads/cos/prepare" "defect-cos-upload"
+require_grep 'records/\$record_id/files' "defect-cos-upload"
+require_grep "CLOUD_UPLOAD_ENV_FILE" "defect-cos-upload"
+require_grep "cos-upload.env" "defect-cos-upload"
+require_grep "CLOUD_UPLOAD_ENV_FILE" "deploy_qt_camera_display.sh"
+require_grep "cos-upload.env" "deploy_qt_camera_display.sh"
+require_grep "install -m 600" "deploy_qt_camera_display.sh"
+require_grep "QT_QPA_EGLFS_DISABLE_INPUT=\"\\$\\{QT_QPA_EGLFS_DISABLE_INPUT:-0\\}\"" "run_qt_camera_display.sh"
+require_grep "pick_touch_dev" "run_qt_camera_display.sh"
+require_grep "QT_QPA_GENERIC_PLUGINS" "run_qt_camera_display.sh"
+require_grep "QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS" "run_qt_camera_display.sh"
+require_grep "QT_QPA_EGLFS_DISABLE_INPUT=\"\\$\\{QT_QPA_EGLFS_DISABLE_INPUT:-0\\}\"" "run_qt_kms_overlay_display.sh"
+require_grep "TZ=\"\\$\\{TZ:-CST-8\\}\"" "run_qt_camera_display.sh"
+require_grep "TZ=\"\\$\\{TZ:-CST-8\\}\"" "run_qt_kms_overlay_display.sh"
+require_grep "UVC_BACKEND=\"\\$\\{UVC_BACKEND:-qt-kms-overlay\\}\"" "../S90uvc-camera"
+
+# 运行上传脚本内置 JSON 解析自检，复现“创建记录返回新 id，但嵌套 part/device id 把解析结果带回旧记录”的回归场景。
+sh "$SCRIPT_DIR/defect-cos-upload" --self-test-json-parser
+
+echo "PASS: Qt KMS overlay assets contract"

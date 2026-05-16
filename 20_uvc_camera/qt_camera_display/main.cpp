@@ -1,0 +1,2574 @@
+/*
+ * main.cpp
+ *
+ * 作用：
+ *   STM32MP157 工业缺陷检测 Qt 主界面的程序入口。
+ *   这个入口负责设置 Qt Quick 的 OpenGL ES 渲染环境、解析摄像头设备参数、
+ *   加载 QML 主界面，并以全屏方式显示到 7 寸 1024x600 屏幕。
+ *
+ * 主要流程：
+ *   1. 在 QGuiApplication 创建前设置 OpenGL ES 属性，避免退回软件渲染。
+ *   2. 初始化 GStreamer，必要时创建 qmlglsink 视频管线。
+ *   3. 通过命令行解析 --camera、--video-backend 和 --windowed，便于板端调试。
+ *   4. 把摄像头设备节点和视频后端传给 QML，让界面选择安全 V4L2 预览或 GL 视频预览。
+ *   5. 加载 qrc:/qml/Main.qml，并默认全屏显示工业检测主界面。
+ *
+ * 参数：
+ *   --camera /dev/video0  指定 UVC 摄像头设备，默认 /dev/video0。
+ *   --width 320           指定 V4L2 采集宽度，默认 320。
+ *   --height 240          指定 V4L2 采集高度，默认 240。
+ *   --fps 10              指定 V4L2 采集帧率，默认 10。
+ *   --video-backend qt-safe  使用自定义 V4L2VideoItem 安全预览，默认值。
+ *   --video-backend gst-qml  使用 GStreamer qmlglsink 嵌入 Qt Quick。
+ *   --video-backend kms-overlay  使用外部 DRM/KMS overlay plane 显示视频，Qt 只绘制界面壳。
+ *   --gst-io-mode mmap    指定 gst-qml 后端的 v4l2src io-mode，默认 mmap。
+ *   --storage-self-test   不启动 QML，只走 Qt 保存控制器保存一张 SD 卡图片，便于 SSH 验证按钮同路径逻辑。
+ *   --alarm-snapshot-self-test  不启动 QML，只写一份告警诊断快照，便于 SSH 验证日志落盘逻辑。
+ *   --windowed            使用 1024x600 窗口模式，便于桌面或远程调试。
+ *
+ * 返回值：
+ *   QML 加载失败返回 EXIT_FAILURE；正常进入 Qt 事件循环后返回 app.exec()。
+ */
+
+#include "v4l2_video_item.h"  /* V4L2VideoItem 提供不依赖 QtMultimedia 的 UVC 预览控件。 */
+
+#include <QAbstractListModel>   /* QAbstractListModel 用于把上传历史记录以模型形式暴露给 QML ListView。 */
+#include <QCommandLineOption>   /* QCommandLineOption 用于定义 --camera 等命令行选项。 */
+#include <QCommandLineParser>   /* QCommandLineParser 负责解析用户传入的调试参数。 */
+#include <QCoreApplication>     /* QCoreApplication 提供 qputenv 和应用元信息接口。 */
+#include <QDateTime>            /* QDateTime 用于记录每次上传完成时的本地时间。 */
+#include <QDebug>               /* QDebug/qWarning 用于输出 GStreamer 初始化失败原因。 */
+#include <QDir>                 /* QDir 用于创建 SD 卡图片保存目录和历史记录目录。 */
+#include <QFile>                /* QFile 用于读写上传历史 JSON 文件。 */
+#include <QFileInfo>            /* QFileInfo 用于判断 COS 上传脚本、图片文件和历史文件状态。 */
+#include <QGuiApplication>      /* QGuiApplication 是 Qt Quick 图形程序的应用对象。 */
+#include <QHash>                /* QHash 用于声明 QML 模型角色名映射。 */
+#include <QJsonArray>           /* QJsonArray 用于把历史记录数组保存到 JSON。 */
+#include <QJsonDocument>        /* QJsonDocument 用于解析和生成上传历史 JSON 文档。 */
+#include <QJsonObject>          /* QJsonObject 用于保存单条上传历史记录字段。 */
+#include <QJsonValue>           /* QJsonValue 用于读取历史 JSON 中的字符串或数字字段。 */
+#include <QProcess>             /* QProcess 用于调用现有 sdcard-safe-remove 命令。 */
+#include <QProcessEnvironment>  /* QProcessEnvironment 用于给 sdcard-safe-remove 传入短等待环境变量。 */
+#include <QQmlEngine>           /* qmlRegisterType 需要 Qt QML 类型系统声明。 */
+#include <QQmlContext>          /* QQmlContext 用于把 C++ 变量暴露给 QML。 */
+#include <QQuickItem>           /* QQuickItem 用于在 QML 树中查找 GstGLVideoItem。 */
+#include <QQuickView>           /* QQuickView 用于加载并显示 QML 根界面。 */
+#include <QQuickWindow>         /* QQuickWindow 提供 scheduleRenderJob，用于在渲染线程安全启动管线。 */
+#include <QRunnable>            /* QRunnable 用于把 GStreamer 状态切换安排到 Qt Quick 渲染阶段。 */
+#include <QSharedPointer>       /* QSharedPointer 用于在线程完成信号中安全保存后台任务结果。 */
+#include <QSurfaceFormat>       /* QSurfaceFormat 用于声明 OpenGL ES 渲染格式。 */
+#include <QTextStream>          /* QTextStream 用于自检入口输出保存结果，也用于写告警诊断文本。 */
+#include <QThread>              /* QThread 用于把图片保存和 COS 上传放到后台线程，避免阻塞 Qt 触摸事件循环。 */
+#include <QUrl>                 /* QUrl 用于表达 qrc 资源中的 QML 路径。 */
+#include <QVariantList>         /* QVariantList 用于把多张历史图片作为数组返回给 QML。 */
+#include <QVariantMap>          /* QVariantMap 用于向 QML 返回当前选中历史记录详情。 */
+#include <QVector>              /* QVector 用于保存内存中的上传历史记录列表。 */
+#include <cstdlib>              /* EXIT_SUCCESS/EXIT_FAILURE 是 main 返回值语义。 */
+#include <ctime>                /* tzset 用于让运行时立刻重新读取 TZ 时区变量。 */
+
+#include <gst/gst.h>            /* GStreamer C API 用于创建 v4l2src->glupload->qmlglsink 管线。 */
+
+#include <cerrno>               /* errno 保存 Unix socket 调用失败原因。 */
+#include <cstdio>               /* fopen/fscanf/fclose 用于可靠读取 procfs；stdout 用于自检入口输出保存结果。 */
+#include <cstring>              /* strerror 用于把 errno 转成人可读文本。 */
+
+#include <sys/socket.h>         /* socket/connect 负责与 overlay 控制端点通信。 */
+#include <sys/un.h>             /* sockaddr_un 描述 Unix domain socket 地址。 */
+#include <unistd.h>             /* close/read/write 处理 socket 文件描述符。 */
+
+/* 默认摄像头设备节点：当前 UVC 摄像头已经验证通常枚举为 /dev/video0。 */
+static const char *DEFAULT_CAMERA_DEVICE = "/dev/video0";
+
+/* 默认采集宽度：先用 320，减少 USB/V4L2 拷贝和 OpenGL 纹理上传压力。 */
+static const int DEFAULT_CAPTURE_WIDTH = 320;
+
+/* 默认采集高度：先用 240，和 320 宽度组成 4:3 预览画面。 */
+static const int DEFAULT_CAPTURE_HEIGHT = 240;
+
+/* 默认采集帧率：10fps 足够调试工业检测界面，同时明显降低 CPU 占用。 */
+static const int DEFAULT_CAPTURE_FPS = 10;
+
+/* Qt 安全预览后端名称：使用自定义 V4L2VideoItem，保留稳定兜底路线。 */
+static const char *BACKEND_QT_SAFE = "qt-safe";
+
+/* GStreamer QML GL 后端名称：使用 qmlglsink 把 GL 视频嵌入 Qt Quick。 */
+static const char *BACKEND_GST_QML = "gst-qml";
+
+/* KMS overlay 后端名称：摄像头由外部 DRM plane 进程显示，Qt 只负责 UI 与状态。 */
+static const char *BACKEND_KMS_OVERLAY = "kms-overlay";
+
+/* gst-qml 默认采集模式：mmap 会让 glupload 创建普通 GL 纹理，避开 Vivante 绘制 DMABUF 纹理时的用户态段错误。 */
+static const char *DEFAULT_GST_IO_MODE = "mmap";
+
+/* overlay 控制 socket 默认路径，需要与 uvc_kms_overlay.c 保持一致。 */
+static const char *DEFAULT_OVERLAY_CONTROL_SOCKET = "/tmp/uvc-kms-overlay-control.sock";
+
+/* SD 卡默认挂载点，保存按钮只允许写入这个挂载点下的 images 目录。 */
+static const char *DEFAULT_SDCARD_MOUNT_POINT = "/mnt/sdcard";
+
+/* SD 卡图片保存目录，overlay 收到 SAVE 请求后会在这里生成 PPM 图片。 */
+static const char *DEFAULT_SDCARD_IMAGE_DIR = "/mnt/sdcard/images";
+
+/* SD 卡诊断日志目录，告警维护页保存诊断时会把文本快照写到这里。 */
+static const char *DEFAULT_SDCARD_LOG_DIR = "/mnt/sdcard/logs";
+
+/* 告警诊断快照固定文件名；重复点击会覆盖旧快照，方便 SSH 直接查看最新状态。 */
+static const char *DEFAULT_ALARM_SNAPSHOT_FILE = "/mnt/sdcard/logs/qt_alarm_snapshot.txt";
+
+/* 板端 COS 上传脚本默认部署路径，保存按钮会在本地 JPG/PNG 落盘后调用它。 */
+static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-cos-upload";
+
+/* 上传历史默认文件：放在 SD 卡图片目录内，随图片一起保留，重启 Qt 后仍能恢复历史界面。 */
+static const char *DEFAULT_UPLOAD_HISTORY_FILE = "/mnt/sdcard/images/upload_history.json";
+
+/* Qt 界面默认业务时区：POSIX TZ 中 CST-8 表示 UTC+8，也就是北京时间。 */
+static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
+
+/*
+ * SetGstPipelineStateJob 的作用：
+ *   把 GStreamer 管线状态切换放到 Qt Quick 渲染同步阶段执行。
+ *
+ * 主要流程：
+ *   1. 构造时引用 pipeline，防止渲染任务执行前对象被释放。
+ *   2. run() 中调用 gst_element_set_state 切换到目标状态。
+ *   3. 析构时释放引用，避免 GStreamer 对象泄漏。
+ *
+ * 关键说明：
+ *   qmlglsink 官方示例要求在 QQuickWindow::BeforeSynchronizingStage 切到 PLAYING，
+ *   这样 sink 能在 Qt Quick/OpenGL 上下文准备好之后再绑定视频纹理。
+ */
+class SetGstPipelineStateJob : public QRunnable
+{
+public:
+    /* pipeline 是要切换状态的 GStreamer 管线；state 是目标状态，例如 GST_STATE_PLAYING。 */
+    SetGstPipelineStateJob(GstElement *pipeline, GstState state)
+        : m_pipeline(pipeline ? GST_ELEMENT(gst_object_ref(pipeline)) : nullptr),
+          m_state(state)
+    {
+    }
+
+    /* 析构函数释放构造时保存的 GStreamer 对象引用。 */
+    ~SetGstPipelineStateJob() override
+    {
+        if (m_pipeline) {
+            gst_object_unref(m_pipeline);
+        }
+    }
+
+    /* run 在 Qt Quick 渲染线程的同步阶段执行，负责真正切换 pipeline 状态。 */
+    void run() override
+    {
+        if (m_pipeline) {
+            gst_element_set_state(m_pipeline, m_state);
+        }
+    }
+
+private:
+    /* m_pipeline 保存被引用的 GStreamer 管线对象，确保异步任务执行时对象仍有效。 */
+    GstElement *m_pipeline;
+
+    /* m_state 保存本次任务要切换到的 GStreamer 状态。 */
+    GstState m_state;
+};
+
+/*
+ * UploadHistoryEntry 的作用：
+ *   保存一次“本地 JPG/PNG 落盘 + 云端上传尝试”的历史记录。
+ *
+ * 字段说明：
+ *   uploadTime 是用户第一层历史卡片看到的具体上传时间。
+ *   resultText 是本次检测结果摘要，目前沿用占位“良品”，后续可由真实模型覆盖。
+ *   workflowText 是上传发生时的流程状态或人工备注，详情页右侧用于补足上下文。
+ *   jpgPath/pngPath 分别是 SD 卡上的原图和结果图，本地详情页用它们直接预览。
+ *   uploadStatus 保存上传脚本返回的一行结果，成功和失败都要保留，便于追查云端问题。
+ *   recordId/recordNo 是云端检测记录身份，用于和后台详情页、日志、COS 对象对账。
+ *   jpgSizeBytes/pngSizeBytes 是落盘文件大小，用于确认历史记录指向的图片不是空文件。
+ */
+struct UploadHistoryEntry
+{
+    QString uploadTime;
+    QString resultText;
+    QString workflowText;
+    QString jpgPath;
+    QString pngPath;
+    QString uploadStatus;
+    QString recordId;
+    QString recordNo;
+    qint64 jpgSizeBytes;
+    qint64 pngSizeBytes;
+};
+
+/*
+ * UploadHistoryModel 的作用：
+ *   把上传历史记录提供给 QML 的 ListView、Repeater 和详情页。
+ *
+ * 主要流程：
+ *   1. 启动时从 `/mnt/sdcard/images/upload_history.json` 读取历史记录。
+ *   2. 每次保存/上传完成后追加一条新记录，并立即写回 JSON 文件。
+ *   3. QML 通过角色名读取时间、图片路径、检测结果、云端记录号等字段。
+ *   4. 用户删除某条历史记录时，模型同步删除 JSON 记录和该记录指向的 JPG/PNG 图片文件。
+ *
+ * 关键说明：
+ *   这个模型只负责本地历史展示，不直接访问云端；云端上传仍由 `defect-cos-upload`
+ *   负责，避免 UI 模型和网络脚本的职责混在一起。
+ */
+class UploadHistoryModel : public QAbstractListModel
+{
+    Q_OBJECT
+    Q_PROPERTY(int count READ count NOTIFY countChanged)
+
+public:
+    /*
+     * HistoryRole 枚举定义 QML 能读取的字段名。
+     * Qt::UserRole 之后的数字只在模型内部使用，QML 通过 roleNames() 暴露的中文业务字段访问。
+     */
+    enum HistoryRole {
+        UploadTimeRole = Qt::UserRole + 1,
+        ResultTextRole,
+        WorkflowTextRole,
+        JpgPathRole,
+        PngPathRole,
+        UploadStatusRole,
+        RecordIdRole,
+        RecordNoRole,
+        JpgSizeBytesRole,
+        PngSizeBytesRole,
+        ImageCountRole
+    };
+
+    /*
+     * 构造函数的作用：
+     *   保存历史文件路径，并在对象创建时加载已有历史记录。
+     *
+     * 参数：
+     *   historyFilePath 是 JSON 历史文件路径。
+     *   parent 是 Qt 对象树父对象。
+     */
+    explicit UploadHistoryModel(const QString &historyFilePath, QObject *parent = nullptr)
+        : QAbstractListModel(parent),
+          m_historyFilePath(historyFilePath)
+    {
+        loadFromDisk();
+    }
+
+    /*
+     * rowCount 的作用：
+     *   返回当前历史记录数量，供 QML ListView 决定需要创建多少张横向卡片。
+     *
+     * 参数：
+     *   parent 是 Qt 模型树父索引，列表模型不使用它。
+     *
+     * 返回值：
+     *   顶层返回记录数量；非根索引返回 0。
+     */
+    int rowCount(const QModelIndex &parent = QModelIndex()) const override
+    {
+        if (parent.isValid()) {
+            return 0;
+        }
+
+        return m_entries.size();
+    }
+
+    /*
+     * data 的作用：
+     *   按 QML 请求的角色返回单条历史记录中的具体字段。
+     *
+     * 参数：
+     *   index 是记录行号。
+     *   role 是 QML 请求的字段角色。
+     *
+     * 返回值：
+     *   返回 QVariant 封装的字符串、数字或图片数量；索引非法时返回空 QVariant。
+     */
+    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override
+    {
+        if (!index.isValid() || index.row() < 0 || index.row() >= m_entries.size()) {
+            return QVariant();
+        }
+
+        const UploadHistoryEntry &entry = m_entries.at(index.row());
+
+        switch (role) {
+        case UploadTimeRole:
+            return entry.uploadTime;
+        case ResultTextRole:
+            return entry.resultText;
+        case WorkflowTextRole:
+            return entry.workflowText;
+        case JpgPathRole:
+            return entry.jpgPath;
+        case PngPathRole:
+            return entry.pngPath;
+        case UploadStatusRole:
+            return entry.uploadStatus;
+        case RecordIdRole:
+            return entry.recordId;
+        case RecordNoRole:
+            return entry.recordNo;
+        case JpgSizeBytesRole:
+            return entry.jpgSizeBytes;
+        case PngSizeBytesRole:
+            return entry.pngSizeBytes;
+        case ImageCountRole:
+            return imageCountForEntry(entry);
+        default:
+            return QVariant();
+        }
+    }
+
+    /*
+     * roleNames 的作用：
+     *   把 C++ 角色枚举映射成 QML 中可读的字段名。
+     *
+     * 返回值：
+     *   返回 role -> name 的映射，例如 QML 中可写 `model.uploadTime`。
+     */
+    QHash<int, QByteArray> roleNames() const override
+    {
+        QHash<int, QByteArray> roles;
+
+        roles.insert(UploadTimeRole, "uploadTime");
+        roles.insert(ResultTextRole, "resultText");
+        roles.insert(WorkflowTextRole, "workflowText");
+        roles.insert(JpgPathRole, "jpgPath");
+        roles.insert(PngPathRole, "pngPath");
+        roles.insert(UploadStatusRole, "uploadStatus");
+        roles.insert(RecordIdRole, "recordId");
+        roles.insert(RecordNoRole, "recordNo");
+        roles.insert(JpgSizeBytesRole, "jpgSizeBytes");
+        roles.insert(PngSizeBytesRole, "pngSizeBytes");
+        roles.insert(ImageCountRole, "imageCount");
+
+        return roles;
+    }
+
+    /*
+     * count 的作用：
+     *   给 QML 提供无需调用 rowCount() 的记录数量属性。
+     *
+     * 返回值：
+     *   返回当前历史记录数量。
+     */
+    Q_INVOKABLE int count() const
+    {
+        return m_entries.size();
+    }
+
+    /*
+     * entryAt 的作用：
+     *   按索引返回一条历史记录的完整字段，方便详情页一次性绑定。
+     *
+     * 参数：
+     *   row 是历史记录索引。
+     *
+     * 返回值：
+     *   返回 QVariantMap；索引非法时返回默认空记录。
+     */
+    Q_INVOKABLE QVariantMap entryAt(int row) const
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            return entryToVariantMap(UploadHistoryEntry());
+        }
+
+        return entryToVariantMap(m_entries.at(row));
+    }
+
+    /*
+     * latestEntry 的作用：
+     *   返回最近一次上传记录，便于首页“最近记录”摘要显示。
+     *
+     * 返回值：
+     *   有记录时返回最后一条；无记录时返回空记录。
+     */
+    Q_INVOKABLE QVariantMap latestEntry() const
+    {
+        if (m_entries.isEmpty()) {
+            return entryToVariantMap(UploadHistoryEntry());
+        }
+
+        return entryToVariantMap(m_entries.constLast());
+    }
+
+    /*
+     * appendRecord 的作用：
+     *   把一次新的保存/上传结果追加到历史记录模型，并写回磁盘。
+     *
+     * 参数：
+     *   entry 是已经填好本地路径、云端信息和状态的历史记录。
+     *
+     * 返回值：
+     *   无返回值；磁盘写入失败会输出日志，但不阻断界面展示。
+     */
+    void appendRecord(const UploadHistoryEntry &entry)
+    {
+        /*
+         * 如果程序启动时 SD 卡尚未挂载，loadFromDisk() 会得到空列表。
+         * 第一次保存前若历史文件已经随着 SD 卡出现，这里重新加载一次，避免覆盖旧历史。
+         */
+        if (m_entries.isEmpty() && QFileInfo::exists(m_historyFilePath)) {
+            loadFromDisk();
+        }
+
+        const int insertRow = m_entries.size();
+
+        beginInsertRows(QModelIndex(), insertRow, insertRow);
+        m_entries.append(entry);
+        endInsertRows();
+
+        emit countChanged();
+
+        if (!saveToDisk()) {
+            qWarning() << "upload history save failed" << m_historyFilePath;
+        }
+    }
+
+    /*
+     * removeRecord 的作用：
+     *   删除 QML 指定的一条上传历史记录，并同步删除该记录对应的 JPG/PNG 图片文件。
+     *
+     * 主要流程：
+     *   1. 先校验 row，避免 QML 传入过期索引导致越界访问。
+     *   2. 从模型内存中移除记录并写回 upload_history.json。
+     *   3. 只有历史 JSON 写回成功后，才删除记录里保存的 JPG/PNG 实体文件，避免历史仍在但图片先丢失。
+     *   4. 如果 JSON 写回失败，把记录插回原位置，让界面和磁盘状态尽量保持一致。
+     *
+     * 参数：
+     *   row 是 QML 中要删除的历史记录索引。
+     *
+     * 返回值：
+     *   返回中文结果文本；以“删除失败”开头表示记录没有被成功删除。
+     */
+    Q_INVOKABLE QString removeRecord(int row)
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            qWarning() << "upload history remove invalid row" << row << "count" << m_entries.size();
+            return QStringLiteral("删除失败：记录不存在");
+        }
+
+        const UploadHistoryEntry removedEntry = m_entries.at(row);
+
+        beginRemoveRows(QModelIndex(), row, row);
+        m_entries.removeAt(row);
+        endRemoveRows();
+        emit countChanged();
+
+        if (!saveToDisk()) {
+            qWarning() << "upload history remove save failed, rollback row" << row << m_historyFilePath;
+
+            beginInsertRows(QModelIndex(), row, row);
+            m_entries.insert(row, removedEntry);
+            endInsertRows();
+            emit countChanged();
+
+            return QStringLiteral("删除失败：历史文件写入失败");
+        }
+
+        return removeHistoryImageFiles(removedEntry);
+    }
+
+signals:
+    /* countChanged 在历史记录数量变化时发出，QML 可用它刷新空状态和统计卡。 */
+    void countChanged();
+
+private:
+    /*
+     * imageCountForEntry 的作用：
+     *   统计一条历史记录中实际有几张可展示图片。
+     *
+     * 参数：
+     *   entry 是待统计的历史记录。
+     *
+     * 返回值：
+     *   JPG 路径非空加 1，PNG 路径非空加 1。
+     */
+    int imageCountForEntry(const UploadHistoryEntry &entry) const
+    {
+        int count = 0;
+
+        if (!entry.jpgPath.isEmpty()) {
+            count++;
+        }
+        if (!entry.pngPath.isEmpty()) {
+            count++;
+        }
+
+        return count;
+    }
+
+    /*
+     * entryToJson 的作用：
+     *   把 C++ 历史记录转换成 JSON 对象，便于持久化到 SD 卡。
+     *
+     * 参数：
+     *   entry 是待转换的历史记录。
+     *
+     * 返回值：
+     *   返回字段名稳定的 JSON 对象。
+     */
+    QJsonObject entryToJson(const UploadHistoryEntry &entry) const
+    {
+        QJsonObject object;
+
+        object.insert(QStringLiteral("upload_time"), entry.uploadTime);
+        object.insert(QStringLiteral("result_text"), entry.resultText);
+        object.insert(QStringLiteral("workflow_text"), entry.workflowText);
+        object.insert(QStringLiteral("jpg_path"), entry.jpgPath);
+        object.insert(QStringLiteral("png_path"), entry.pngPath);
+        object.insert(QStringLiteral("upload_status"), entry.uploadStatus);
+        object.insert(QStringLiteral("record_id"), entry.recordId);
+        object.insert(QStringLiteral("record_no"), entry.recordNo);
+        object.insert(QStringLiteral("jpg_size_bytes"), QString::number(entry.jpgSizeBytes));
+        object.insert(QStringLiteral("png_size_bytes"), QString::number(entry.pngSizeBytes));
+
+        return object;
+    }
+
+    /*
+     * entryFromJson 的作用：
+     *   从 JSON 对象恢复一条历史记录。
+     *
+     * 参数：
+     *   object 是 JSON 中的一条记录。
+     *
+     * 返回值：
+     *   返回 UploadHistoryEntry；缺失字段会保留为空字符串或 0。
+     */
+    UploadHistoryEntry entryFromJson(const QJsonObject &object) const
+    {
+        UploadHistoryEntry entry;
+
+        entry.uploadTime = object.value(QStringLiteral("upload_time")).toString();
+        entry.resultText = object.value(QStringLiteral("result_text")).toString();
+        entry.workflowText = object.value(QStringLiteral("workflow_text")).toString();
+        entry.jpgPath = object.value(QStringLiteral("jpg_path")).toString();
+        entry.pngPath = object.value(QStringLiteral("png_path")).toString();
+        entry.uploadStatus = object.value(QStringLiteral("upload_status")).toString();
+        entry.recordId = object.value(QStringLiteral("record_id")).toString();
+        entry.recordNo = object.value(QStringLiteral("record_no")).toString();
+        entry.jpgSizeBytes = jsonIntegerString(object, QStringLiteral("jpg_size_bytes"));
+        entry.pngSizeBytes = jsonIntegerString(object, QStringLiteral("png_size_bytes"));
+
+        return entry;
+    }
+
+    /*
+     * entryToVariantMap 的作用：
+     *   把 C++ 记录转换为 QML 易消费的 QVariantMap。
+     *
+     * 参数：
+     *   entry 是待转换记录。
+     *
+     * 返回值：
+     *   返回包含所有详情字段和图片数组的 map。
+     */
+    QVariantMap entryToVariantMap(const UploadHistoryEntry &entry) const
+    {
+        QVariantMap map;
+        QVariantList images;
+
+        if (!entry.jpgPath.isEmpty()) {
+            QVariantMap jpgImage;
+
+            jpgImage.insert(QStringLiteral("label"), QStringLiteral("JPG原图"));
+            jpgImage.insert(QStringLiteral("path"), entry.jpgPath);
+            jpgImage.insert(QStringLiteral("sizeBytes"), entry.jpgSizeBytes);
+            images.append(jpgImage);
+        }
+
+        if (!entry.pngPath.isEmpty()) {
+            QVariantMap pngImage;
+
+            pngImage.insert(QStringLiteral("label"), QStringLiteral("PNG结果图"));
+            pngImage.insert(QStringLiteral("path"), entry.pngPath);
+            pngImage.insert(QStringLiteral("sizeBytes"), entry.pngSizeBytes);
+            images.append(pngImage);
+        }
+
+        map.insert(QStringLiteral("uploadTime"), entry.uploadTime);
+        map.insert(QStringLiteral("resultText"), entry.resultText);
+        map.insert(QStringLiteral("workflowText"), entry.workflowText);
+        map.insert(QStringLiteral("jpgPath"), entry.jpgPath);
+        map.insert(QStringLiteral("pngPath"), entry.pngPath);
+        map.insert(QStringLiteral("uploadStatus"), entry.uploadStatus);
+        map.insert(QStringLiteral("recordId"), entry.recordId);
+        map.insert(QStringLiteral("recordNo"), entry.recordNo);
+        map.insert(QStringLiteral("jpgSizeBytes"), entry.jpgSizeBytes);
+        map.insert(QStringLiteral("pngSizeBytes"), entry.pngSizeBytes);
+        map.insert(QStringLiteral("imageCount"), images.size());
+        map.insert(QStringLiteral("images"), images);
+
+        return map;
+    }
+
+    /*
+     * jsonIntegerString 的作用：
+     *   从 JSON 字段中读取 qint64，兼容旧记录把数字保存为字符串的格式。
+     *
+     * 参数：
+     *   object 是 JSON 对象。
+     *   key 是字段名。
+     *
+     * 返回值：
+     *   成功返回字段值；缺失或非法时返回 0。
+     */
+    qint64 jsonIntegerString(const QJsonObject &object, const QString &key) const
+    {
+        const QJsonValue value = object.value(key);
+
+        if (value.isDouble()) {
+            return static_cast<qint64>(value.toDouble());
+        }
+
+        if (value.isString()) {
+            bool ok = false;
+            const qint64 number = value.toString().toLongLong(&ok);
+
+            return ok ? number : 0;
+        }
+
+        return 0;
+    }
+
+    /*
+     * removeHistoryImageFiles 的作用：
+     *   删除单条历史记录中保存的 JPG 和 PNG 图片实体文件。
+     *
+     * 主要流程：
+     *   1. 分别处理 jpgPath 和 pngPath，路径为空时跳过。
+     *   2. 每个路径必须位于历史 JSON 所在目录下，避免损坏 JSON 时误删其他目录文件。
+     *   3. 已经不存在的图片视为可接受状态，因为记录已经没有可展示实体文件。
+     *   4. 删除失败只通过返回文本和日志提示，不再恢复历史记录，避免 JSON 与界面反复抖动。
+     *
+     * 参数：
+     *   entry 是刚从历史模型中删除的记录。
+     *
+     * 返回值：
+     *   返回给 QML 的中文删除结果摘要。
+     */
+    QString removeHistoryImageFiles(const UploadHistoryEntry &entry) const
+    {
+        int deletedCount = 0;
+        int missingCount = 0;
+        int failedCount = 0;
+
+        removeOneHistoryImageFile(entry.jpgPath, &deletedCount, &missingCount, &failedCount);
+        removeOneHistoryImageFile(entry.pngPath, &deletedCount, &missingCount, &failedCount);
+
+        if (failedCount > 0) {
+            return QStringLiteral("删除完成：记录已删除，%1 张图片删除失败").arg(failedCount);
+        }
+
+        if (deletedCount > 0) {
+            return QStringLiteral("删除完成：记录和 %1 张图片已删除").arg(deletedCount);
+        }
+
+        if (missingCount > 0) {
+            return QStringLiteral("删除完成：记录已删除，图片文件原本不存在");
+        }
+
+        return QStringLiteral("删除完成：记录已删除，无图片路径");
+    }
+
+    /*
+     * removeOneHistoryImageFile 的作用：
+     *   删除一张历史图片，并把删除、缺失、失败数量累加到调用者提供的计数器中。
+     *
+     * 主要流程：
+     *   1. 使用历史文件所在目录作为允许删除的根目录。
+     *   2. 清理待删图片的绝对路径，确认它仍在允许目录下。
+     *   3. 只删除普通文件，不删除目录或其他特殊节点。
+     *   4. 调用 QFile::remove 删除图片，并把结果写入 Qt 日志，方便板端排查。
+     *
+     * 参数：
+     *   filePath 是历史记录保存的图片路径。
+     *   deletedCount 统计成功删除的图片数量。
+     *   missingCount 统计删除前已经不存在的图片数量。
+     *   failedCount 统计因路径越界、非文件或 remove 失败而没有删除的图片数量。
+     *
+     * 返回值：
+     *   无返回值；结果通过计数器和日志传出。
+     */
+    void removeOneHistoryImageFile(const QString &filePath,
+                                   int *deletedCount,
+                                   int *missingCount,
+                                   int *failedCount) const
+    {
+        if (filePath.isEmpty()) {
+            return;
+        }
+
+        const QFileInfo historyFileInfo(m_historyFilePath);
+        const QDir historyDir(historyFileInfo.absolutePath());
+        const QString historyDirPath = QDir::cleanPath(historyDir.absolutePath());
+        const QString historyDirPrefix = historyDirPath.endsWith(QLatin1Char('/'))
+            ? historyDirPath
+            : historyDirPath + QLatin1Char('/');
+
+        const QFileInfo imageFileInfo(filePath);
+        const QString imagePath = QDir::cleanPath(imageFileInfo.absoluteFilePath());
+
+        if (!imagePath.startsWith(historyDirPrefix)) {
+            (*failedCount)++;
+            qWarning() << "upload history image remove skipped outside history dir"
+                       << "image" << imagePath
+                       << "historyDir" << historyDirPath;
+            return;
+        }
+
+        if (!imageFileInfo.exists()) {
+            (*missingCount)++;
+            qInfo() << "upload history image already missing" << imagePath;
+            return;
+        }
+
+        if (!imageFileInfo.isFile()) {
+            (*failedCount)++;
+            qWarning() << "upload history image remove skipped non-file" << imagePath;
+            return;
+        }
+
+        if (QFile::remove(imagePath)) {
+            (*deletedCount)++;
+            qInfo() << "upload history image removed" << imagePath;
+            return;
+        }
+
+        (*failedCount)++;
+        qWarning() << "upload history image remove failed" << imagePath;
+    }
+
+    /*
+     * loadFromDisk 的作用：
+     *   程序启动时从 SD 卡历史文件恢复记录列表。
+     *
+     * 主要流程：
+     *   1. 如果文件不存在，保留空列表，这不是错误。
+     *   2. 如果文件存在，读取并解析为 JSON 数组。
+     *   3. 只追加包含上传时间或图片路径的记录，避免损坏项污染界面。
+     *
+     * 返回值：
+     *   加载成功或文件不存在返回 true；文件读取/解析失败返回 false。
+     */
+    bool loadFromDisk()
+    {
+        QFile file(m_historyFilePath);
+
+        if (!file.exists()) {
+            return true;
+        }
+
+        if (!file.open(QIODevice::ReadOnly)) {
+            qWarning() << "upload history open failed" << m_historyFilePath << file.errorString();
+            return false;
+        }
+
+        const QByteArray payload = file.readAll();
+        const QJsonDocument document = QJsonDocument::fromJson(payload);
+
+        if (!document.isArray()) {
+            qWarning() << "upload history json is not array" << m_historyFilePath;
+            return false;
+        }
+
+        beginResetModel();
+        m_entries.clear();
+
+        const QJsonArray array = document.array();
+        for (const QJsonValue &value : array) {
+            if (!value.isObject()) {
+                continue;
+            }
+
+            const UploadHistoryEntry entry = entryFromJson(value.toObject());
+            if (!entry.uploadTime.isEmpty() || !entry.jpgPath.isEmpty() || !entry.pngPath.isEmpty()) {
+                m_entries.append(entry);
+            }
+        }
+
+        endResetModel();
+        emit countChanged();
+        return true;
+    }
+
+    /*
+     * saveToDisk 的作用：
+     *   把当前内存历史记录写回 SD 卡 JSON 文件。
+     *
+     * 主要流程：
+     *   1. 确保历史文件所在目录存在。
+     *   2. 先写入 `.tmp` 临时文件并 flush。
+     *   3. 再用 rename/replace 变成正式文件，降低断电时留下半截 JSON 的概率。
+     *
+     * 返回值：
+     *   写入成功返回 true；任一步失败返回 false。
+     */
+    bool saveToDisk() const
+    {
+        QFileInfo fileInfo(m_historyFilePath);
+        const QString dirPath = fileInfo.absolutePath();
+        const QString tempPath = m_historyFilePath + QStringLiteral(".tmp");
+        QJsonArray array;
+
+        if (!QDir().mkpath(dirPath)) {
+            qWarning() << "upload history mkdir failed" << dirPath;
+            return false;
+        }
+
+        for (const UploadHistoryEntry &entry : m_entries) {
+            array.append(entryToJson(entry));
+        }
+
+        QFile tempFile(tempPath);
+        if (!tempFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            qWarning() << "upload history temp open failed" << tempPath << tempFile.errorString();
+            return false;
+        }
+
+        tempFile.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
+        if (!tempFile.flush()) {
+            qWarning() << "upload history flush failed" << tempPath << tempFile.errorString();
+            tempFile.close();
+            return false;
+        }
+
+        /*
+         * QFile::flush 只保证 Qt 用户态缓冲写出；这里再调用 fsync，把历史 JSON 推到内核文件系统，
+         * 避免用户保存后马上安全卸载或断电时丢失最后一条上传记录。
+         */
+        if (::fsync(tempFile.handle()) != 0) {
+            qWarning() << "upload history fsync failed" << tempPath << QString::fromLocal8Bit(strerror(errno));
+            tempFile.close();
+            return false;
+        }
+        tempFile.close();
+
+        QFile::remove(m_historyFilePath);
+        if (!QFile::rename(tempPath, m_historyFilePath)) {
+            qWarning() << "upload history rename failed" << tempPath << m_historyFilePath;
+            QFile::remove(tempPath);
+            return false;
+        }
+
+        return true;
+    }
+
+    QVector<UploadHistoryEntry> m_entries; /* m_entries 保存内存中的历史记录，顺序就是界面横向叠加顺序。 */
+    QString m_historyFilePath;             /* m_historyFilePath 保存 SD 卡历史 JSON 文件路径。 */
+};
+
+/*
+ * CameraStorageController 的作用：
+ *   给 QML 提供真实的 SD 卡图片保存和安全卸载操作。
+ *
+ * 主要流程：
+ *   1. saveCurrentFrameToSdCard() 先确认 /mnt/sdcard 是真实挂载点，再连接 overlay 控制 socket。
+ *   2. 发送 SAVE /mnt/sdcard/images，让 uvc_kms_overlay 保存当前正在显示的摄像头帧。
+ *   3. safeRemoveSdCard() 调用现有 sdcard-safe-remove 命令，复用已经验证的同步和卸载脚本。
+ *
+ * 关键说明：
+ *   KMS overlay 模式下摄像头画面不在 Qt Quick scene 内，Qt 截屏不会得到真实视频；
+ *   因此保存图片必须让 overlay 进程自己从当前显示帧落盘。
+ */
+class CameraStorageController : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool saveInProgress READ saveInProgress NOTIFY saveInProgressChanged)
+
+public:
+    explicit CameraStorageController(QObject *parent = nullptr)
+        : QObject(parent),
+          m_socketPath(QString::fromLatin1(DEFAULT_OVERLAY_CONTROL_SOCKET)),
+          m_mountPoint(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
+          m_imageDir(QString::fromLatin1(DEFAULT_SDCARD_IMAGE_DIR)),
+          m_logDir(QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR)),
+          m_alarmSnapshotFile(QString::fromLatin1(DEFAULT_ALARM_SNAPSHOT_FILE)),
+          m_historyModel(nullptr),
+          m_appendHistoryInSave(true),
+          m_saveInProgress(false)
+    {
+    }
+
+    /*
+     * saveInProgress 的作用：
+     *   告诉 QML 当前是否已有保存图片后台任务正在运行。
+     *
+     * 主要流程：
+     *   直接返回主线程维护的 m_saveInProgress 标志；后台线程不能直接写这个标志，
+     *   必须通过 Qt queued signal 回到控制器线程后再更新。
+     *
+     * 返回值：
+     *   true 表示保存和上传任务尚未结束，QML 应禁止重复点击保存；
+     *   false 表示可以发起新的保存请求。
+     */
+    bool saveInProgress() const
+    {
+        return m_saveInProgress;
+    }
+
+    /*
+     * setHistoryModel 的作用：
+     *   把 main 中创建的上传历史模型交给保存控制器。
+     *
+     * 主要流程：
+     *   保存控制器只持有指针，不拥有模型生命周期；模型对象由 main 栈变量和 Qt 对象树管理。
+     *
+     * 参数：
+     *   model 是要追加记录的 UploadHistoryModel。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setHistoryModel(UploadHistoryModel *model)
+    {
+        m_historyModel = model;
+    }
+
+    /*
+     * setStoragePaths 的作用：
+     *   允许后台保存线程复用主控制器的 socket、挂载点、图片目录和诊断目录配置。
+     *
+     * 主要流程：
+     *   只复制路径字符串，不复制 QObject 指针或 QML 模型，避免跨线程访问主线程对象。
+     *
+     * 参数：
+     *   socketPath 是 overlay 控制 socket 路径。
+     *   mountPoint 是 SD 卡挂载点。
+     *   imageDir 是 JPG/PNG 图片保存目录。
+     *   logDir 是诊断日志目录。
+     *   alarmSnapshotFile 是告警快照固定文件路径。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setStoragePaths(const QString &socketPath,
+                         const QString &mountPoint,
+                         const QString &imageDir,
+                         const QString &logDir,
+                         const QString &alarmSnapshotFile)
+    {
+        m_socketPath = socketPath;
+        m_mountPoint = mountPoint;
+        m_imageDir = imageDir;
+        m_logDir = logDir;
+        m_alarmSnapshotFile = alarmSnapshotFile;
+    }
+
+    /*
+     * setAppendHistoryInSave 的作用：
+     *   控制 saveCurrentFrameToSdCard() 内部是否直接追加上传历史记录。
+     *
+     * 主要流程：
+     *   同步自检和旧同步调用保持默认 true；异步保存的后台控制器设置为 false，
+     *   因为异步路径必须回到 Qt 主线程后再更新 UploadHistoryModel。
+     *
+     * 参数：
+     *   enabled 为 true 时同步保存函数内部追加历史；false 时只返回保存/上传结果。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setAppendHistoryInSave(bool enabled)
+    {
+        m_appendHistoryInSave = enabled;
+    }
+
+    /*
+     * setOverlayVisible 的作用：
+     *   通知 KMS overlay 进程隐藏或恢复实时视频 plane。
+     *
+     * 主要流程：
+     *   1. 根据 visible 拼出 `VISIBLE 1` 或 `VISIBLE 0` 控制命令。
+     *   2. 通过同一个 Unix socket 发给 overlay 进程。
+     *   3. 返回 overlay 的中文结果，便于必要时放进日志或界面诊断。
+     *
+     * 参数：
+     *   visible 为 true 时恢复实时视频，false 时隐藏实时视频。
+     *
+     * 返回值：
+     *   成功返回“视频层已显示/已隐藏”；失败返回原因文本。
+     */
+    Q_INVOKABLE QString setOverlayVisible(bool visible)
+    {
+        const QString result = sendOverlayCommand(visible
+            ? QStringLiteral("VISIBLE 1")
+            : QStringLiteral("VISIBLE 0"));
+
+        qInfo() << "overlay visibility requested" << visible << "result" << result;
+        return result;
+    }
+
+    /*
+     * saveCurrentFrameToSdCard 的作用：
+     *   响应 QML 的“保存图片”按钮，把 overlay 当前帧保存到 SD 卡。
+     *
+     * 返回值：
+     *   成功返回“保存成功：<路径>”；失败返回“保存失败：<原因>”。
+     */
+    Q_INVOKABLE QString saveCurrentFrameToSdCard()
+    {
+        QString mountError;
+        QString result;
+
+        qInfo() << "storage action save-image requested"
+                << "mount" << m_mountPoint
+                << "imageDir" << m_imageDir
+                << "socket" << m_socketPath;
+
+        if (!isMountPointMounted(m_mountPoint, &mountError)) {
+            result = QStringLiteral("保存失败：") + mountError;
+            qWarning() << "storage action save-image result" << result;
+            return result;
+        }
+
+        if (!QDir().mkpath(m_imageDir)) {
+            result = QStringLiteral("保存失败：无法创建 ") + m_imageDir;
+            qWarning() << "storage action save-image result" << result;
+            return result;
+        }
+
+        result = sendOverlayCommand(QStringLiteral("SAVE_DUAL ") + m_imageDir);
+        if (result.startsWith(QStringLiteral("保存成功："))) {
+            qInfo() << "storage action save-image result" << result;
+        } else {
+            qWarning() << "storage action save-image result" << result;
+        }
+        return result;
+    }
+
+    /*
+     * requestSaveCurrentFrameToSdCard 的作用：
+     *   给 QML 使用的异步保存入口，避免点击“保存图片”时阻塞 Qt 主线程和其它页面触摸。
+     *
+     * 主要流程：
+     *   1. 如果已有保存任务在运行，只记录日志并忽略重复请求，防止 QML 忙状态被提前清除。
+     *   2. 把保存目录、挂载点、socket 等当前配置复制出来，交给后台线程使用。
+     *   3. 后台线程创建独立 CameraStorageController，复用原同步保存逻辑完成本地保存和 COS 上传。
+     *   4. 任务结束后回到主线程追加历史记录、清除忙标志并发出 saveCurrentFrameFinished。
+     *
+     * 返回值：
+     *   无直接返回值；QML 通过 saveCurrentFrameFinished(resultText) 获取最终结果。
+     */
+    Q_INVOKABLE void requestSaveCurrentFrameToSdCard()
+    {
+        if (m_saveInProgress) {
+            qWarning() << "storage action save-image ignored because previous save is still running";
+            return;
+        }
+
+        /* 先把忙标志置位，让 QML 立即显示保存中并阻止重复保存。 */
+        setSaveInProgress(true);
+
+        /* socketPath 保存本次后台任务使用的 overlay 控制端点，复制后可安全跨线程读取。 */
+        const QString socketPath = m_socketPath;
+
+        /* mountPoint 保存 SD 卡挂载点，后台线程用它确认不会误写 rootfs。 */
+        const QString mountPoint = m_mountPoint;
+
+        /* imageDir 保存 JPG/PNG 输出目录，后台线程会请求 overlay 写入这里。 */
+        const QString imageDir = m_imageDir;
+
+        /* logDir 保存诊断日志目录，保持后台控制器和主控制器路径配置一致。 */
+        const QString logDir = m_logDir;
+
+        /* alarmSnapshotFile 保存告警快照路径，保持后台控制器完整复制主控制器配置。 */
+        const QString alarmSnapshotFile = m_alarmSnapshotFile;
+
+        /* workerResult 保存后台线程执行结果，线程结束后主线程从这里读取并更新 QML。 */
+        const QSharedPointer<QString> workerResult(new QString(QStringLiteral("保存失败：后台保存线程没有返回结果")));
+
+        /* workerThread 承载耗时的保存和上传逻辑，避免阻塞 Qt 主线程的触摸事件循环。 */
+        QThread *workerThread = QThread::create([socketPath,
+                                                 mountPoint,
+                                                 imageDir,
+                                                 logDir,
+                                                 alarmSnapshotFile,
+                                                 workerResult]() {
+            CameraStorageController workerController;
+
+            workerController.setStoragePaths(socketPath,
+                                             mountPoint,
+                                             imageDir,
+                                             logDir,
+                                             alarmSnapshotFile);
+            workerController.setAppendHistoryInSave(false);
+
+            *workerResult = workerController.saveCurrentFrameToSdCard();
+        });
+
+        if (workerThread == nullptr) {
+            setSaveInProgress(false);
+            emit saveCurrentFrameFinished(QStringLiteral("保存失败：无法创建后台保存线程"));
+            return;
+        }
+
+        connect(workerThread, &QThread::finished, this, [this, workerResult]() {
+            appendUploadHistoryRecordFromResult(*workerResult);
+
+            setSaveInProgress(false);
+            emit saveCurrentFrameFinished(*workerResult);
+        }, Qt::QueuedConnection);
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+
+        workerThread->start();
+    }
+
+    /*
+     * safeRemoveSdCard 的作用：
+     *   响应 QML 的“安全卸载”按钮，执行现有 sdcard-safe-remove 命令。
+     *
+     * 返回值：
+     *   命令成功返回“卸载完成：...”；失败返回“卸载失败：...”。
+     */
+    Q_INVOKABLE QString safeRemoveSdCard()
+    {
+        QProcess process;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        QString result;
+
+        qInfo() << "storage action safe-remove requested";
+
+        /* Qt 按钮只负责发起同步和卸载；物理拔卡检测继续由后台脚本维护，避免界面长时间卡在等待拔卡。 */
+        env.insert(QStringLiteral("EJECT_WAIT_TIMEOUT"), QStringLiteral("1"));
+
+        process.setProcessEnvironment(env);
+        process.setProgram(QStringLiteral("sdcard-safe-remove"));
+        process.start();
+
+        if (!process.waitForStarted(2000)) {
+            result = QStringLiteral("卸载失败：无法启动 sdcard-safe-remove");
+            qWarning() << "storage action safe-remove result" << result;
+            return result;
+        }
+
+        if (!process.waitForFinished(70000)) {
+            process.kill();
+            process.waitForFinished(1000);
+            result = QStringLiteral("卸载失败：sdcard-safe-remove 超时");
+            qWarning() << "storage action safe-remove result" << result;
+            return result;
+        }
+
+        const QString stdoutText = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        const QString stderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
+
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            if (!stderrText.isEmpty()) {
+                result = QStringLiteral("卸载失败：") + firstUsefulLine(stderrText);
+                qWarning() << "storage action safe-remove result" << result;
+                return result;
+            }
+            if (!stdoutText.isEmpty()) {
+                result = QStringLiteral("卸载失败：") + firstUsefulLine(stdoutText);
+                qWarning() << "storage action safe-remove result" << result;
+                return result;
+            }
+            result = QStringLiteral("卸载失败：sdcard-safe-remove 返回异常");
+            qWarning() << "storage action safe-remove result" << result;
+            return result;
+        }
+
+        if (!stdoutText.isEmpty()) {
+            result = QStringLiteral("卸载完成：") + firstUsefulLine(stdoutText);
+            qInfo() << "storage action safe-remove result" << result;
+            return result;
+        }
+
+        result = QStringLiteral("卸载完成：SD 卡已同步并卸载");
+        qInfo() << "storage action safe-remove result" << result;
+        return result;
+    }
+
+    /*
+     * saveAlarmSnapshotToSdCard 的作用：
+     *   响应告警维护页“保存诊断”按钮，把 QML 汇总的告警状态写入 SD 卡日志文件。
+     *
+     * 主要流程：
+     *   1. 先确认 /mnt/sdcard 是真实挂载点，避免 SD 卡未挂载时误写 rootfs。
+     *   2. 创建 /mnt/sdcard/logs 目录，保证用户进入该目录能看到快照文件。
+     *   3. 用 UTF-8 文本覆盖写入最新快照，随后 flush 并 fsync，确保数据进入内核文件系统。
+     *
+     * 参数：
+     *   snapshotText 是 QML 组装的告警码、处理状态、设备健康和参数摘要。
+     *
+     * 返回值：
+     *   成功返回“诊断已保存：/mnt/sdcard/logs/qt_alarm_snapshot.txt”；
+     *   失败返回“诊断保存失败：<原因>”。
+     */
+    Q_INVOKABLE QString saveAlarmSnapshotToSdCard(const QString &snapshotText)
+    {
+        QString mountError;
+        QString result;
+
+        qInfo() << "storage action alarm-snapshot requested"
+                << "mount" << m_mountPoint
+                << "logDir" << m_logDir
+                << "snapshot" << m_alarmSnapshotFile;
+
+        if (!isMountPointMounted(m_mountPoint, &mountError)) {
+            result = QStringLiteral("诊断保存失败：") + mountError;
+            qWarning() << "storage action alarm-snapshot result" << result;
+            return result;
+        }
+
+        if (!QDir().mkpath(m_logDir)) {
+            result = QStringLiteral("诊断保存失败：无法创建 ") + m_logDir;
+            qWarning() << "storage action alarm-snapshot result" << result;
+            return result;
+        }
+
+        QFile snapshotFile(m_alarmSnapshotFile);
+        if (!snapshotFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            result = QStringLiteral("诊断保存失败：无法打开 ")
+                + m_alarmSnapshotFile
+                + QStringLiteral("：")
+                + snapshotFile.errorString();
+            qWarning() << "storage action alarm-snapshot result" << result;
+            return result;
+        }
+
+        QTextStream stream(&snapshotFile);
+        stream.setCodec("UTF-8");
+        stream << snapshotText;
+        if (!snapshotText.endsWith(QLatin1Char('\n'))) {
+            stream << '\n';
+        }
+        stream.flush();
+
+        if (stream.status() != QTextStream::Ok) {
+            result = QStringLiteral("诊断保存失败：写入文本流失败");
+            qWarning() << "storage action alarm-snapshot result" << result;
+            snapshotFile.close();
+            return result;
+        }
+
+        if (!snapshotFile.flush()) {
+            result = QStringLiteral("诊断保存失败：flush 失败：") + snapshotFile.errorString();
+            qWarning() << "storage action alarm-snapshot result" << result;
+            snapshotFile.close();
+            return result;
+        }
+
+        if (::fsync(snapshotFile.handle()) != 0) {
+            result = QStringLiteral("诊断保存失败：fsync 失败：")
+                + QString::fromLocal8Bit(strerror(errno));
+            qWarning() << "storage action alarm-snapshot result" << result;
+            snapshotFile.close();
+            return result;
+        }
+
+        snapshotFile.close();
+        result = QStringLiteral("诊断已保存：") + m_alarmSnapshotFile;
+        qInfo() << "storage action alarm-snapshot result" << result;
+        return result;
+    }
+
+signals:
+    /* saveInProgressChanged 在后台保存开始或结束时通知 QML 刷新按钮状态。 */
+    void saveInProgressChanged();
+
+    /* saveCurrentFrameFinished 在异步保存任务结束后发送完整中文结果，QML 用它更新提示条。 */
+    void saveCurrentFrameFinished(const QString &resultText);
+
+private:
+    /*
+     * SavedImagePair 的作用：
+     *   保存 overlay 一次 SAVE_DUAL 请求返回的两种本地图片路径。
+     *
+     * 字段说明：
+     *   jpgPath 是 JPG 原图路径，后续按云端 file_kind=source 上传。
+     *   pngPath 是 PNG 结果图路径，后续按云端 file_kind=annotated 上传。
+     */
+    struct SavedImagePair
+    {
+        QString jpgPath;
+        QString pngPath;
+    };
+
+    /*
+     * firstUsefulLine 的作用：
+     *   从脚本多行输出中提取适合放到界面状态栏的一行。
+     */
+    QString firstUsefulLine(const QString &text) const
+    {
+        const QStringList lines = text.split(QLatin1Char('\n'), QString::SkipEmptyParts);
+
+        for (const QString &line : lines) {
+            const QString trimmed = line.trimmed();
+
+            if (!trimmed.isEmpty() && !trimmed.startsWith(QStringLiteral("===="))) {
+                return trimmed;
+            }
+        }
+
+        return text.left(80);
+    }
+
+    /*
+     * isMountPointMounted 的作用：
+     *   用 POSIX 文件接口读取 /proc/mounts，确认保存目标是真实 SD 卡挂载点。
+     *
+     * 主要流程：
+     *   1. 打开 /proc/mounts，这个文件由内核动态生成，不能依赖普通文件大小。
+     *   2. 逐行解析设备名和挂载点字段，只要挂载点等于 /mnt/sdcard 就认为 SD 卡在线。
+     *   3. 没找到时返回明确错误，让界面提示和 SSH 自检都能定位到挂载问题。
+     *
+     * 关键说明：
+     *   这里不用 QTextStream::atEnd()，因为 procfs 文件大小经常显示为 0，
+     *   在板端会导致 Qt 侧误判“未挂载”，而 shell/overlay 进程都能看到真实挂载。
+     */
+    bool isMountPointMounted(const QString &mountPoint, QString *errorText) const
+    {
+        FILE *mounts = std::fopen("/proc/mounts", "r");
+        QByteArray expectedMount = mountPoint.toLocal8Bit();
+        char device[256];
+        char path[4096];
+
+        if (mounts == nullptr) {
+            if (errorText) {
+                *errorText = QStringLiteral("无法读取 /proc/mounts：")
+                    + QString::fromLocal8Bit(strerror(errno));
+            }
+            return false;
+        }
+
+        while (std::fscanf(mounts, "%255s %4095s %*s %*s %*d %*d\n", device, path) == 2) {
+            if (std::strcmp(path, expectedMount.constData()) == 0) {
+                std::fclose(mounts);
+                return true;
+            }
+        }
+
+        std::fclose(mounts);
+
+        if (errorText) {
+            *errorText = mountPoint + QStringLiteral(" 未挂载");
+        }
+        return false;
+    }
+
+    /*
+     * writeAllToFd 的作用：
+     *   向 Unix socket 完整发送命令文本，处理短写和 EINTR。
+     */
+    bool writeAllToFd(int fd, const QByteArray &payload, QString *errorText) const
+    {
+        const char *cursor = payload.constData();
+        qint64 remaining = payload.size();
+
+        while (remaining > 0) {
+            const ssize_t written = ::write(fd, cursor, static_cast<size_t>(remaining));
+
+            if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errorText) {
+                    *errorText = QString::fromLocal8Bit(strerror(errno));
+                }
+                return false;
+            }
+
+            if (written == 0) {
+                if (errorText) {
+                    *errorText = QStringLiteral("socket 写入返回 0");
+                }
+                return false;
+            }
+
+            cursor += written;
+            remaining -= written;
+        }
+
+        return true;
+    }
+
+    /*
+     * readReplyFromFd 的作用：
+     *   读取 overlay 返回的一行 OK/ERR 结果。
+     */
+    QString readReplyFromFd(int fd, QString *errorText) const
+    {
+        QByteArray reply;
+        char buffer[256];
+
+        while (true) {
+            const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
+
+            if (nread < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errorText) {
+                    *errorText = QString::fromLocal8Bit(strerror(errno));
+                }
+                return QString();
+            }
+
+            if (nread == 0) {
+                break;
+            }
+
+            reply.append(buffer, static_cast<int>(nread));
+            if (reply.contains('\n')) {
+                break;
+            }
+        }
+
+        return QString::fromUtf8(reply).trimmed();
+    }
+
+    /*
+     * parseDualSaveReply 的作用：
+     *   解析 overlay 返回的 "OK JPG <path> PNG <path>" 双格式保存结果。
+     *
+     * 参数：
+     *   reply 是 overlay 返回的完整一行文本。
+     *   pair 用于返回 JPG/PNG 路径。
+     *   errorText 用于返回解析失败原因。
+     *
+     * 返回值：
+     *   解析成功返回 true；格式错误或路径缺失返回 false。
+     */
+    bool parseDualSaveReply(const QString &reply, SavedImagePair *pair, QString *errorText) const
+    {
+        const QString markerJpg = QStringLiteral("OK JPG ");
+        const QString markerPng = QStringLiteral(" PNG ");
+        const int pngMarkerIndex = reply.indexOf(markerPng);
+
+        if (!reply.startsWith(markerJpg) || pngMarkerIndex <= markerJpg.length()) {
+            if (errorText) {
+                *errorText = QStringLiteral("overlay 返回格式不是双格式图片路径");
+            }
+            return false;
+        }
+
+        pair->jpgPath = reply.mid(markerJpg.length(), pngMarkerIndex - markerJpg.length()).trimmed();
+        pair->pngPath = reply.mid(pngMarkerIndex + markerPng.length()).trimmed();
+
+        if (pair->jpgPath.isEmpty() || pair->pngPath.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("overlay 返回的 JPG/PNG 路径为空");
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    /*
+     * parseTokenValue 的作用：
+     *   从脚本返回行中提取 `key=value` 形式的短字段。
+     *
+     * 参数：
+     *   text 是上传脚本 stdout/stderr 中的一行或多行文本。
+     *   key 是要查找的字段名，例如 record_id 或 record_no。
+     *
+     * 返回值：
+     *   找到时返回 value；找不到时返回空字符串。
+     */
+    QString parseTokenValue(const QString &text, const QString &key) const
+    {
+        const QString marker = key + QLatin1Char('=');
+        const int markerIndex = text.indexOf(marker);
+
+        if (markerIndex < 0) {
+            return QString();
+        }
+
+        const int valueStart = markerIndex + marker.length();
+        int valueEnd = valueStart;
+
+        while (valueEnd < text.length()
+               && !text.at(valueEnd).isSpace()
+               && text.at(valueEnd) != QLatin1Char(';')) {
+            valueEnd++;
+        }
+
+        return text.mid(valueStart, valueEnd - valueStart).trimmed();
+    }
+
+    /*
+     * compactUploadStatus 的作用：
+     *   把 defect-cos-upload 的原始输出压缩成适合历史页显示的短状态。
+     *
+     * 主要流程：
+     *   1. 复用 parseTokenValue 提取 record_id 和 record_no。
+     *   2. 上传成功时只保存“上传成功 + 关键编号”，避免脚本长文本或旧编码问题挤爆界面。
+     *   3. 上传失败时保留第一行失败原因，但限制长度，避免异常日志占满历史卡片。
+     *
+     * 参数：
+     *   uploadResult 是 uploadSavedImagesToCos 返回的完整状态文本。
+     *
+     * 返回值：
+     *   返回用于 upload_history.json 的短状态文本。
+     */
+    QString compactUploadStatus(const QString &uploadResult) const
+    {
+        const QString recordId = parseTokenValue(uploadResult, QStringLiteral("record_id"));
+        const QString recordNo = parseTokenValue(uploadResult, QStringLiteral("record_no"));
+
+        if (uploadResult.startsWith(QStringLiteral("上传成功："))) {
+            QString status = QStringLiteral("上传成功");
+
+            if (!recordId.isEmpty()) {
+                status += QStringLiteral(" ID ") + recordId;
+            }
+
+            if (!recordNo.isEmpty()) {
+                status += QStringLiteral(" ") + recordNo;
+            }
+
+            return status;
+        }
+
+        if (uploadResult.startsWith(QStringLiteral("上传失败："))) {
+            return uploadResult.left(80);
+        }
+
+        return uploadResult.left(80);
+    }
+
+    /*
+     * appendUploadHistoryRecord 的作用：
+     *   把本次保存/上传结果变成历史记录，追加到 UploadHistoryModel。
+     *
+     * 主要流程：
+     *   1. 读取 JPG/PNG 文件大小，详情页可直接显示。
+     *   2. 从上传脚本输出中提取云端 record_id 和 record_no。
+     *   3. 生成当前本地时间作为第一层历史卡片的时间标题。
+     *   4. 调用模型追加并持久化到 `upload_history.json`。
+     *
+     * 参数：
+     *   pair 是本地 JPG/PNG 路径。
+     *   uploadResult 是上传脚本返回的成功或失败状态。
+     *
+     * 返回值：
+     *   无返回值；没有历史模型时只输出日志。
+     */
+    void appendUploadHistoryRecord(const SavedImagePair &pair, const QString &uploadResult)
+    {
+        if (m_historyModel == nullptr) {
+            qWarning() << "upload history model missing, skip append";
+            return;
+        }
+
+        UploadHistoryEntry entry;
+        const QFileInfo jpgInfo(pair.jpgPath);
+        const QFileInfo pngInfo(pair.pngPath);
+
+        entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+        entry.resultText = uploadResult.startsWith(QStringLiteral("上传成功："))
+            ? QStringLiteral("良品")
+            : QStringLiteral("待复核");
+        entry.workflowText = uploadResult.startsWith(QStringLiteral("上传成功："))
+            ? QStringLiteral("云端已归档")
+            : QStringLiteral("本地已保存");
+        entry.jpgPath = pair.jpgPath;
+        entry.pngPath = pair.pngPath;
+        entry.recordId = parseTokenValue(uploadResult, QStringLiteral("record_id"));
+        entry.recordNo = parseTokenValue(uploadResult, QStringLiteral("record_no"));
+        entry.uploadStatus = compactUploadStatus(uploadResult);
+        entry.jpgSizeBytes = jpgInfo.exists() ? jpgInfo.size() : 0;
+        entry.pngSizeBytes = pngInfo.exists() ? pngInfo.size() : 0;
+
+        m_historyModel->appendRecord(entry);
+    }
+
+    /*
+     * appendUploadHistoryRecordFromResult 的作用：
+     *   从后台保存线程返回的完整状态文本中提取 JPG/PNG 路径和上传结果，并在主线程追加历史记录。
+     *
+     * 主要流程：
+     *   1. 只处理以“保存成功：JPG ... PNG ...”开头的结果，保存失败时不产生历史记录。
+     *   2. 复用 parseSavedImagePairFromResult() 抽取本地图片路径。
+     *   3. 把分号后面的上传状态交给 appendUploadHistoryRecord()，保持历史页字段和同步自检一致。
+     *
+     * 参数：
+     *   resultText 是 saveCurrentFrameToSdCard() 返回给 QML 的完整中文状态。
+     *
+     * 返回值：
+     *   无返回值；解析失败只输出日志，不影响界面显示保存结果。
+     */
+    void appendUploadHistoryRecordFromResult(const QString &resultText)
+    {
+        SavedImagePair pair;
+        QString uploadResult;
+        QString errorText;
+
+        if (!resultText.startsWith(QStringLiteral("保存成功：JPG "))) {
+            return;
+        }
+
+        if (!parseSavedImagePairFromResult(resultText, &pair, &uploadResult, &errorText)) {
+            qWarning() << "upload history async result parse failed" << errorText << resultText;
+            return;
+        }
+
+        appendUploadHistoryRecord(pair, uploadResult);
+    }
+
+    /*
+     * parseSavedImagePairFromResult 的作用：
+     *   解析“保存成功：JPG <jpg> PNG <png>；<upload>”格式的控制器结果。
+     *
+     * 参数：
+     *   resultText 是完整保存结果文本。
+     *   pair 用于返回 JPG/PNG 本地路径。
+     *   uploadResult 用于返回 COS 上传结果；没有上传段时使用“本地已保存”。
+     *   errorText 用于返回解析失败原因。
+     *
+     * 返回值：
+     *   解析成功返回 true；格式缺失或路径为空返回 false。
+     */
+    bool parseSavedImagePairFromResult(const QString &resultText,
+                                       SavedImagePair *pair,
+                                       QString *uploadResult,
+                                       QString *errorText) const
+    {
+        const QString prefix = QStringLiteral("保存成功：JPG ");
+        const QString markerPng = QStringLiteral(" PNG ");
+        const int pngMarkerIndex = resultText.indexOf(markerPng, prefix.length());
+
+        if (pngMarkerIndex <= prefix.length()) {
+            if (errorText) {
+                *errorText = QStringLiteral("缺少 PNG 路径标记");
+            }
+            return false;
+        }
+
+        const int uploadMarkerIndex = resultText.indexOf(QStringLiteral("；"), pngMarkerIndex + markerPng.length());
+        const int pngPathEnd = uploadMarkerIndex >= 0 ? uploadMarkerIndex : resultText.length();
+
+        pair->jpgPath = resultText.mid(prefix.length(), pngMarkerIndex - prefix.length()).trimmed();
+        pair->pngPath = resultText.mid(pngMarkerIndex + markerPng.length(), pngPathEnd - pngMarkerIndex - markerPng.length()).trimmed();
+
+        if (pair->jpgPath.isEmpty() || pair->pngPath.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("JPG 或 PNG 路径为空");
+            }
+            return false;
+        }
+
+        if (uploadResult) {
+            *uploadResult = uploadMarkerIndex >= 0
+                ? resultText.mid(uploadMarkerIndex + 1).trimmed()
+                : QStringLiteral("本地已保存");
+        }
+
+        return true;
+    }
+
+    /*
+     * uploadSavedImagesToCos 的作用：
+     *   调用板端 defect-cos-upload 脚本，把本地 JPG/PNG 上传到云端 COS。
+     *
+     * 主要流程：
+     *   1. 优先使用 /root/qt_camera_display/defect-cos-upload，匹配部署脚本路径。
+     *   2. 若绝对路径不存在，则退回 PATH 中的 defect-cos-upload，方便 SSH 调试。
+     *   3. 捕获 stdout/stderr，返回适合界面提示的一行结果。
+     *
+     * 参数：
+     *   pair 保存本次本地落盘成功的 JPG/PNG 路径。
+     *
+     * 返回值：
+     *   上传成功返回“上传成功：...”；失败返回“上传失败：...”。
+     */
+    QString uploadSavedImagesToCos(const SavedImagePair &pair) const
+    {
+        QProcess process;
+        QString scriptPath = QString::fromLatin1(DEFAULT_COS_UPLOAD_SCRIPT);
+        QString stdoutText;
+        QString stderrText;
+        QString usefulLine;
+
+        if (!QFileInfo::exists(scriptPath)) {
+            scriptPath = QStringLiteral("defect-cos-upload");
+        }
+
+        qInfo() << "storage action cos-upload requested"
+                << "script" << scriptPath
+                << "jpg" << pair.jpgPath
+                << "png" << pair.pngPath;
+
+        process.setProgram(scriptPath);
+        process.setArguments(QStringList()
+                             << QStringLiteral("--jpg") << pair.jpgPath
+                             << QStringLiteral("--png") << pair.pngPath);
+        process.start();
+
+        if (!process.waitForStarted(3000)) {
+            return QStringLiteral("上传失败：无法启动 defect-cos-upload");
+        }
+
+        if (!process.waitForFinished(180000)) {
+            process.kill();
+            process.waitForFinished(1000);
+            return QStringLiteral("上传失败：defect-cos-upload 超时");
+        }
+
+        stdoutText = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        stderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
+
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            if (!stderrText.isEmpty()) {
+                usefulLine = firstUsefulLine(stderrText);
+                return usefulLine.startsWith(QStringLiteral("上传失败："))
+                    ? usefulLine
+                    : QStringLiteral("上传失败：") + usefulLine;
+            }
+            if (!stdoutText.isEmpty()) {
+                usefulLine = firstUsefulLine(stdoutText);
+                return usefulLine.startsWith(QStringLiteral("上传失败："))
+                    ? usefulLine
+                    : QStringLiteral("上传失败：") + usefulLine;
+            }
+            return QStringLiteral("上传失败：defect-cos-upload 返回异常");
+        }
+
+        if (!stdoutText.isEmpty()) {
+            usefulLine = firstUsefulLine(stdoutText);
+            return usefulLine.startsWith(QStringLiteral("上传成功："))
+                ? usefulLine
+                : QStringLiteral("上传成功：") + usefulLine;
+        }
+
+        return QStringLiteral("上传成功：JPG/PNG 已上传到 COS");
+    }
+
+    /*
+     * sendOverlayCommand 的作用：
+     *   连接 overlay 控制 socket，发送 SAVE_DUAL 命令并转换为 QML 可显示的中文状态。
+     */
+    QString sendOverlayCommand(const QString &command)
+    {
+        int fd = -1;
+        struct sockaddr_un addr;
+        QString errorText;
+        QString reply;
+        SavedImagePair pair;
+        QByteArray socketPathBytes = m_socketPath.toLocal8Bit();
+        QByteArray commandBytes = command.toLocal8Bit() + '\n';
+
+        if (socketPathBytes.size() >= static_cast<int>(sizeof(addr.sun_path))) {
+            return QStringLiteral("保存失败：控制 socket 路径过长");
+        }
+
+        fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return QStringLiteral("保存失败：创建 socket 失败：")
+                + QString::fromLocal8Bit(strerror(errno));
+        }
+
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, socketPathBytes.constData(), sizeof(addr.sun_path) - 1U);
+
+        if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+            const QString detail = QString::fromLocal8Bit(strerror(errno));
+
+            ::close(fd);
+            return QStringLiteral("保存失败：overlay 控制端未连接：") + detail;
+        }
+
+        if (!writeAllToFd(fd, commandBytes, &errorText)) {
+            ::close(fd);
+            return QStringLiteral("保存失败：发送请求失败：") + errorText;
+        }
+
+        reply = readReplyFromFd(fd, &errorText);
+        ::close(fd);
+
+        if (reply.isEmpty()) {
+            return QStringLiteral("保存失败：overlay 没有返回结果：") + errorText;
+        }
+
+        if (reply.startsWith(QStringLiteral("OK JPG "))) {
+            if (!parseDualSaveReply(reply, &pair, &errorText)) {
+                return QStringLiteral("保存失败：") + errorText;
+            }
+
+            const QString localResult = QStringLiteral("保存成功：JPG ")
+                + pair.jpgPath
+                + QStringLiteral(" PNG ")
+                + pair.pngPath;
+            const QString uploadResult = uploadSavedImagesToCos(pair);
+
+            if (m_appendHistoryInSave) {
+                appendUploadHistoryRecord(pair, uploadResult);
+            }
+
+            qInfo() << "storage action cos-upload result" << uploadResult;
+            return localResult + QStringLiteral("；") + uploadResult;
+        }
+
+        if (reply.startsWith(QStringLiteral("OK "))) {
+            if (command.startsWith(QStringLiteral("VISIBLE "))) {
+                return reply.mid(3);
+            }
+            return QStringLiteral("保存成功：") + reply.mid(3);
+        }
+
+        if (reply.startsWith(QStringLiteral("ERR "))) {
+            if (command.startsWith(QStringLiteral("VISIBLE "))) {
+                return QStringLiteral("视频层切换失败：") + reply.mid(4);
+            }
+            return QStringLiteral("保存失败：") + reply.mid(4);
+        }
+
+        return QStringLiteral("保存失败：未知返回：") + reply;
+    }
+
+    /*
+     * setSaveInProgress 的作用：
+     *   集中更新异步保存忙状态，并在状态变化时通知 QML。
+     *
+     * 参数：
+     *   inProgress 为 true 表示后台保存任务开始；false 表示任务结束或启动失败。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setSaveInProgress(bool inProgress)
+    {
+        if (m_saveInProgress == inProgress) {
+            return;
+        }
+
+        m_saveInProgress = inProgress;
+        emit saveInProgressChanged();
+    }
+
+    QString m_socketPath;  /* m_socketPath 是 overlay 控制 socket 路径。 */
+    QString m_mountPoint;  /* m_mountPoint 是 SD 卡挂载点。 */
+    QString m_imageDir;    /* m_imageDir 是图片保存目录。 */
+    QString m_logDir;      /* m_logDir 是 SD 卡诊断日志目录。 */
+    QString m_alarmSnapshotFile; /* m_alarmSnapshotFile 是告警诊断快照固定文件路径。 */
+    UploadHistoryModel *m_historyModel; /* m_historyModel 指向 QML 使用的上传历史模型，保存成功后会追加记录。 */
+    bool m_appendHistoryInSave; /* m_appendHistoryInSave 控制同步保存函数是否立即追加历史记录。 */
+    bool m_saveInProgress; /* m_saveInProgress 只在 Qt 主线程维护，用于防止保存图片任务重复启动。 */
+};
+
+/*
+ * set_default_environment 的作用：
+ *   设置 Qt Quick 在板端运行时的默认渲染环境。
+ *
+ * 主要流程：
+ *   1. 若用户没有显式设置 TZ，则默认指定 CST-8，让 QML new Date() 显示北京时间。
+ *   2. 调用 tzset() 让 libc/Qt 在进程启动阶段刷新本地时区缓存。
+ *   3. 若用户没有显式设置 QT_OPENGL，则默认指定 es2。
+ *   4. 若用户没有显式设置 QSG_RENDER_LOOP，则默认使用 threaded 渲染循环。
+ *
+ * 关键说明：
+ *   不设置 QT_QUICK_BACKEND。Qt 5.12 在 eglfs 下默认使用 OpenGL scene graph；
+ *   如果强制设置为 opengl，某些构建会尝试寻找名为 opengl 的 scenegraph 插件，
+ *   反而导致 “Could not create scene graph context for backend 'opengl'”。
+ *
+ * 参数：
+ *   无。
+ *
+ * 返回值：
+ *   无返回值；环境变量会在当前进程中生效。
+ */
+static void set_default_environment()
+{
+    /* TZ 必须在 QGuiApplication 创建前设置，否则 QML 顶部时钟可能继续按 UTC 显示。 */
+    if (qEnvironmentVariableIsEmpty("TZ")) {
+        qputenv("TZ", DEFAULT_BOARD_TIME_ZONE);
+    }
+
+    /* qputenv 只改变环境变量；tzset 让当前进程立即按新的 TZ 计算本地时间。 */
+    tzset();
+
+    /* QT_OPENGL=es2 与 STM32MP157 的 Vivante/Nano OpenGL ES 驱动匹配。 */
+    if (qEnvironmentVariableIsEmpty("QT_OPENGL")) {
+        qputenv("QT_OPENGL", "es2");
+    }
+
+    /* threaded 渲染循环让 QML 渲染线程和 UI 线程分离，降低界面卡顿概率。 */
+    if (qEnvironmentVariableIsEmpty("QSG_RENDER_LOOP")) {
+        qputenv("QSG_RENDER_LOOP", "threaded");
+    }
+}
+
+/*
+ * set_surface_format 的作用：
+ *   在创建 QGuiApplication 前声明默认 OpenGL ES surface 格式。
+ *
+ * 主要流程：
+ *   1. 设置 Qt 应用属性 AA_UseOpenGLES，让 Qt 避免选择桌面 OpenGL。
+ *   2. 设置 QSurfaceFormat 为 OpenGLES 2.0，匹配板端 GPU 驱动能力。
+ *
+ * 参数：
+ *   无。
+ *
+ * 返回值：
+ *   无返回值；默认格式影响后续 QQuickView 创建的渲染 surface。
+ */
+static void set_surface_format()
+{
+    /* AA_UseOpenGLES 必须在 QGuiApplication 构造前设置。 */
+    QCoreApplication::setAttribute(Qt::AA_UseOpenGLES);
+
+    /* format 保存默认 surface 的颜色深度、深度缓冲和 OpenGL ES 版本。 */
+    QSurfaceFormat format;
+    format.setRenderableType(QSurfaceFormat::OpenGLES);
+    format.setVersion(2, 0);
+    format.setDepthBufferSize(16);
+    format.setStencilBufferSize(8);
+    QSurfaceFormat::setDefaultFormat(format);
+}
+
+/*
+ * configure_parser 的作用：
+ *   定义本程序支持的命令行参数。
+ *
+ * 参数：
+ *   parser 是待配置的命令行解析器，由 main 创建并传入。
+ *
+ * 返回值：
+ *   无返回值；函数会向 parser 注册 help、version、camera、windowed 选项。
+ */
+static void configure_parser(QCommandLineParser *parser)
+{
+    /* 描述文本用于 --help 输出，方便串口或 SSH 调试时确认程序用途。 */
+    parser->setApplicationDescription(QStringLiteral("STM32MP157 Qt Quick UVC camera display"));
+
+    /* --help 由 Qt 自动生成帮助信息。 */
+    parser->addHelpOption();
+
+    /* --version 输出应用版本，便于确认板端运行的是新程序。 */
+    parser->addVersionOption();
+
+    /* --camera 指定 UVC 摄像头节点，默认 /dev/video0。 */
+    parser->addOption(QCommandLineOption(QStringList() << QStringLiteral("c") << QStringLiteral("camera"),
+                                         QStringLiteral("指定 UVC 摄像头设备节点。"),
+                                         QStringLiteral("device"),
+                                         QString::fromLatin1(DEFAULT_CAMERA_DEVICE)));
+
+    /* --width 指定 V4L2 采集宽度，用于在 CPU 占用和预览清晰度之间取舍。 */
+    parser->addOption(QCommandLineOption(QStringLiteral("width"),
+                                         QStringLiteral("指定 V4L2 采集宽度。"),
+                                         QStringLiteral("pixels"),
+                                         QString::number(DEFAULT_CAPTURE_WIDTH)));
+
+    /* --height 指定 V4L2 采集高度，用于在 CPU 占用和预览清晰度之间取舍。 */
+    parser->addOption(QCommandLineOption(QStringLiteral("height"),
+                                         QStringLiteral("指定 V4L2 采集高度。"),
+                                         QStringLiteral("pixels"),
+                                         QString::number(DEFAULT_CAPTURE_HEIGHT)));
+
+    /* --fps 指定 V4L2 采集帧率，帧率越高，拷贝和纹理上传次数越多。 */
+    parser->addOption(QCommandLineOption(QStringLiteral("fps"),
+                                         QStringLiteral("指定 V4L2 采集帧率。"),
+                                         QStringLiteral("frames"),
+                                         QString::number(DEFAULT_CAPTURE_FPS)));
+
+    /* --video-backend 指定视频显示后端，默认保守走 V4L2VideoItem。 */
+    parser->addOption(QCommandLineOption(QStringLiteral("video-backend"),
+                                         QStringLiteral("指定视频后端：qt-safe、gst-qml 或 kms-overlay。"),
+                                         QStringLiteral("backend"),
+                                         QString::fromLatin1(BACKEND_QT_SAFE)));
+
+    /* --gst-io-mode 指定 gst-qml 后端的 v4l2src 采集模式，便于在 mmap 稳定路线和 dmabuf 攻关路线之间切换。 */
+    parser->addOption(QCommandLineOption(QStringLiteral("gst-io-mode"),
+                                         QStringLiteral("指定 gst-qml 后端的 v4l2src io-mode：mmap 或 dmabuf。"),
+                                         QStringLiteral("mode"),
+                                         QString::fromLatin1(DEFAULT_GST_IO_MODE)));
+
+    /* --windowed 用于桌面调试；板端正式运行默认全屏。 */
+    parser->addOption(QCommandLineOption(QStringLiteral("windowed"),
+                                         QStringLiteral("使用 1024x600 窗口模式而不是全屏。")));
+}
+
+/*
+ * bounded_int_option 的作用：
+ *   从命令行读取整数参数，并限制到安全范围。
+ *
+ * 主要流程：
+ *   1. 使用 parser.value 读取字符串。
+ *   2. 调用 QString::toInt 转成整数。
+ *   3. 转换失败时返回 defaultValue。
+ *   4. 转换成功时限制在 minValue 到 maxValue 之间。
+ *
+ * 参数：
+ *   parser 是已经解析完成的命令行解析器。
+ *   optionName 是参数名，例如 width、height 或 fps。
+ *   defaultValue 是转换失败时使用的默认值。
+ *   minValue/maxValue 是允许范围。
+ *
+ * 返回值：
+ *   返回最终可用于 V4L2 配置的整数值。
+ */
+static int bounded_int_option(const QCommandLineParser &parser,
+                              const QString &optionName,
+                              int defaultValue,
+                              int minValue,
+                              int maxValue)
+{
+    bool ok = false;
+    int value = parser.value(optionName).toInt(&ok);
+
+    if (!ok) {
+        return defaultValue;
+    }
+
+    if (value < minValue) {
+        return minValue;
+    }
+
+    if (value > maxValue) {
+        return maxValue;
+    }
+
+    return value;
+}
+
+/*
+ * normalize_video_backend 的作用：
+ *   把命令行传入的视频后端名称归一化，避免脚本别名导致 QML 判断分叉。
+ *
+ * 参数：
+ *   backendName 是 --video-backend 传入的原始字符串。
+ *
+ * 返回值：
+ *   返回 BACKEND_GST_QML、BACKEND_KMS_OVERLAY 或 BACKEND_QT_SAFE；未知值按安全预览处理。
+ */
+static QString normalize_video_backend(const QString &backendName)
+{
+    /* normalized 保存去空白和小写后的后端名，便于接受脚本中的大小写差异。 */
+    const QString normalized = backendName.trimmed().toLower();
+
+    /* gst-qml 是正式名称；qt-gst、qml-gl、gst-gl-in-qt 是兼容调试别名。 */
+    if (normalized == QStringLiteral("gst-qml")
+            || normalized == QStringLiteral("qt-gst")
+            || normalized == QStringLiteral("qml-gl")
+            || normalized == QStringLiteral("gst-gl-in-qt")) {
+        return QString::fromLatin1(BACKEND_GST_QML);
+    }
+
+    /* kms-overlay 表示视频已经由外部 KMS plane 进程绘制，Qt 不再打开 /dev/video0。 */
+    if (normalized == QStringLiteral("kms-overlay")
+            || normalized == QStringLiteral("kms")
+            || normalized == QStringLiteral("overlay")
+            || normalized == QStringLiteral("drm-overlay")) {
+        return QString::fromLatin1(BACKEND_KMS_OVERLAY);
+    }
+
+    /* 任何未知值都退回 qt-safe，避免现场误输参数后直接黑屏。 */
+    return QString::fromLatin1(BACKEND_QT_SAFE);
+}
+
+/*
+ * normalize_gst_io_mode 的作用：
+ *   归一化 gst-qml 后端的 v4l2src io-mode 参数。
+ *
+ * 主要流程：
+ *   1. 去除首尾空白并转成小写。
+ *   2. 只接受已经用于本项目验证的 mmap 和 dmabuf。
+ *   3. 未知值回退到 mmap，避免现场误传参数后再次走到已知会崩的 DMABUF 嵌入路线。
+ *
+ * 参数：
+ *   ioModeName 是 --gst-io-mode 传入的原始字符串。
+ *
+ * 返回值：
+ *   返回可直接传给 v4l2src io-mode 属性的字符串。
+ */
+static QString normalize_gst_io_mode(const QString &ioModeName)
+{
+    /* normalized 保存规整后的模式名，便于接受脚本或手工命令中的大小写差异。 */
+    const QString normalized = ioModeName.trimmed().toLower();
+
+    /* mmap 是当前 qmlglsink 集成优先稳定路线，dmabuf 保留给零拷贝继续攻关和复现实验。 */
+    if (normalized == QStringLiteral("mmap") || normalized == QStringLiteral("dmabuf")) {
+        return normalized;
+    }
+
+    /* 未知模式回退 mmap，避免误拼写导致 GStreamer 属性解析失败或进入危险路径。 */
+    return QString::fromLatin1(DEFAULT_GST_IO_MODE);
+}
+
+/*
+ * has_raw_argument 的作用：
+ *   在 QGuiApplication 创建前检查是否传入某个调试参数。
+ *
+ * 主要流程：
+ *   1. 遍历 argv 中的原始命令行字符串。
+ *   2. 与目标参数名做精确匹配。
+ *
+ * 参数：
+ *   argc/argv 是 main 收到的原始参数。
+ *   optionName 是要查找的完整参数名，例如 --storage-self-test。
+ *
+ * 返回值：
+ *   找到返回 true；没有找到返回 false。
+ */
+static bool has_raw_argument(int argc, char *argv[], const char *optionName)
+{
+    /* i 从 1 开始跳过程序名，只检查用户传入的参数。 */
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], optionName) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * run_storage_self_test 的作用：
+ *   不启动 QML 界面，直接复用 CameraStorageController 保存当前 overlay 帧。
+ *
+ * 主要流程：
+ *   1. 创建 QCoreApplication，保证 Qt 文本、环境变量和事件基础设施可用。
+ *   2. 调用 saveCurrentFrameToSdCard()，走和 QML 保存按钮相同的 C++ 控制器逻辑。
+ *   3. 把完整返回文本打印到 stdout，便于 SSH 自动化判断。
+ *
+ * 参数：
+ *   argc/argv 是 main 收到的原始参数。
+ *
+ * 返回值：
+ *   返回 EXIT_SUCCESS 表示保存成功；返回 EXIT_FAILURE 表示保存失败。
+ */
+static int run_storage_self_test(int argc, char *argv[])
+{
+    /* SSH 自检也设置默认时区，保证写入历史记录的 upload_time 与屏幕顶部时间一致。 */
+    set_default_environment();
+
+    QCoreApplication app(argc, argv);
+    CameraStorageController storageController;
+    UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
+
+    /* 自检入口也复用同一个历史模型，保证 SSH 保存自检产生的真实上传记录能在历史页中看到。 */
+    storageController.setHistoryModel(&uploadHistory);
+
+    const QString result = storageController.saveCurrentFrameToSdCard();
+    QTextStream(stdout) << result << '\n';
+    return result.startsWith(QStringLiteral("保存成功：")) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/*
+ * run_alarm_snapshot_self_test 的作用：
+ *   不启动 QML 界面，直接复用 CameraStorageController 写一份告警诊断快照。
+ *
+ * 主要流程：
+ *   1. 创建 QCoreApplication，保证 Qt 文本编码、时区和文件接口可用。
+ *   2. 构造一份包含告警码、相机状态、存储状态和历史段落的最小诊断文本。
+ *   3. 调用 saveAlarmSnapshotToSdCard() 写入 /mnt/sdcard/logs/qt_alarm_snapshot.txt。
+ *   4. 把返回结果打印到 stdout，便于 SSH 自动化判断文件落盘是否成功。
+ *
+ * 参数：
+ *   argc/argv 是 main 收到的原始参数。
+ *
+ * 返回值：
+ *   返回 EXIT_SUCCESS 表示诊断快照保存成功；返回 EXIT_FAILURE 表示保存失败。
+ */
+static int run_alarm_snapshot_self_test(int argc, char *argv[])
+{
+    /* 自检入口也设置默认业务时区，保证 snapshot_time 与屏幕顶部北京时间一致。 */
+    set_default_environment();
+
+    QCoreApplication app(argc, argv);
+    CameraStorageController storageController;
+
+    /* snapshotText 保存最小但可判定的诊断内容，字段名与 QML alarmSnapshotText() 保持一致。 */
+    const QString snapshotText =
+        QStringLiteral("STM32MP157 Qt Alarm Snapshot\n")
+        + QStringLiteral("snapshot_time=")
+        + QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+        + QLatin1Char('\n')
+        + QStringLiteral("alarm_code=0x0007\n")
+        + QStringLiteral("alarm_title=SSH self test\n")
+        + QStringLiteral("alarm_level=记录\n")
+        + QStringLiteral("alarm_status=自检\n")
+        + QStringLiteral("camera_status=SSH自检\n")
+        + QStringLiteral("storage_state=alarm-snapshot-self-test\n")
+        + QStringLiteral("[recent_alarm_history]\n")
+        + QStringLiteral("--:--:-- 0x0007 记录 SSH告警诊断快照自检 自检\n");
+
+    const QString result = storageController.saveAlarmSnapshotToSdCard(snapshotText);
+    QTextStream(stdout) << result << '\n';
+    return result.startsWith(QStringLiteral("诊断已保存：")) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/*
+ * create_gst_qml_pipeline 的作用：
+ *   创建 “v4l2src(io-mode) -> capsfilter -> glupload -> qmlglsink” 管线。
+ *
+ * 主要流程：
+ *   1. 创建 pipeline 和每个 element。
+ *   2. 配置 v4l2src 设备节点与指定采集模式。
+ *   3. 用 capsfilter 固定 YUY2、分辨率和帧率，复用已验证的板端输入格式。
+ *   4. mmap 模式先用 videoconvert 转 RGBA，保证 glupload 能协商系统内存帧。
+ *   5. dmabuf 模式在 glupload 后增加 glcolorconvert 和 gleffects_identity，强制 GPU 重新渲染一遍纹理后再交给 Qt。
+ *   6. 把 qmlglsink 返回给调用者，后续绑定 QML 中的 GstGLVideoItem。
+ *
+ * 参数：
+ *   cameraDevice 是 /dev/video0 这类 V4L2 摄像头节点。
+ *   captureWidth/captureHeight/captureFps 是请求的采集格式。
+ *   gstIoMode 是 v4l2src 的 io-mode，mmap 优先保证 Qt 嵌入稳定，dmabuf 用于零拷贝攻关。
+ *   sinkOut 用于返回 qmlglsink 指针；该指针归 pipeline 持有，调用者不能单独 unref。
+ *   errorText 用于返回失败原因，便于 QML 状态和串口日志诊断。
+ *
+ * 返回值：
+ *   成功返回 GstElement* pipeline，调用者负责 gst_object_unref；
+ *   失败返回 nullptr，并写入 errorText。
+ */
+static GstElement *create_gst_qml_pipeline(const QString &cameraDevice,
+                                           int captureWidth,
+                                           int captureHeight,
+                                           int captureFps,
+                                           const QString &gstIoMode,
+                                           GstElement **sinkOut,
+                                           QString *errorText)
+{
+    /* sinkOut 先置空，避免失败路径留下旧指针。 */
+    if (sinkOut) {
+        *sinkOut = nullptr;
+    }
+
+    /* useCpuColorConvert 表示当前是否需要 CPU 颜色转换；mmap 系统内存 YUY2 不能直接进入 glupload。 */
+    const bool useCpuColorConvert = (gstIoMode == QStringLiteral("mmap"));
+
+    /* pipeline 是整条 GStreamer 管线的父对象。 */
+    GstElement *pipeline = gst_pipeline_new("qt-camera-gst-qml-pipeline");
+
+    /* src 从 UVC 摄像头取帧；capsfilter 固定格式；glupload 上传到 GL；sink 交给 QML Item 显示。 */
+    GstElement *src = gst_element_factory_make("v4l2src", "camera-source");
+    GstElement *capsFilter = gst_element_factory_make("capsfilter", "camera-caps");
+    GstElement *preConvert = useCpuColorConvert ? gst_element_factory_make("videoconvert", "camera-videoconvert") : nullptr;
+    GstElement *rgbaCapsFilter = useCpuColorConvert ? gst_element_factory_make("capsfilter", "camera-rgba-caps") : nullptr;
+    GstElement *glupload = gst_element_factory_make("glupload", "camera-glupload");
+    GstElement *glcolorconvert = gst_element_factory_make("glcolorconvert", "camera-glcolorconvert");
+    GstElement *glidentity = gst_element_factory_make("gleffects_identity", "camera-glidentity");
+    GstElement *sink = gst_element_factory_make("qmlglsink", "camera-qmlglsink");
+
+    /* deviceBytes 保存 Qt 字符串转成的本地编码，放在函数顶层避免 goto 跨越对象初始化。 */
+    QByteArray deviceBytes;
+
+    /* ioModeBytes 保存 v4l2src io-mode 字符串，便于传给 GObject 属性解析器。 */
+    QByteArray ioModeBytes;
+
+    /* caps 保存输入 capsfilter 使用的视频格式描述，失败清理时按是否为空判断是否释放。 */
+    GstCaps *caps = nullptr;
+
+    /* rgbaCaps 保存 mmap 路径 videoconvert 输出的 RGBA caps，让 glupload 接收普通 RGBA 系统内存。 */
+    GstCaps *rgbaCaps = nullptr;
+
+    /* elementsAdded 标记 element 是否已经被 pipeline 接管，决定失败时如何释放资源。 */
+    bool elementsAdded = false;
+
+    /* 任一 element 创建失败都说明 rootfs 插件或 GStreamer 安装不完整。 */
+    if (!pipeline || !src || !capsFilter || !glupload || !glcolorconvert || !glidentity || !sink
+            || (useCpuColorConvert && (!preConvert || !rgbaCapsFilter))) {
+        if (errorText) {
+            *errorText = QStringLiteral("GStreamer 元素缺失：需要 v4l2src、capsfilter、videoconvert、glupload、glcolorconvert、gleffects_identity、qmlglsink");
+        }
+        goto fail;
+    }
+
+    /* device 属性指定 UVC 节点；GObject 会复制字符串，因此临时 QByteArray 可以安全释放。 */
+    deviceBytes = cameraDevice.toLocal8Bit();
+    g_object_set(src, "device", deviceBytes.constData(), NULL);
+
+    /* io-mode 使用字符串设置，避免硬编码 enum 数值导致不同 GStreamer 版本不兼容。 */
+    ioModeBytes = gstIoMode.toLatin1();
+    gst_util_set_object_arg(G_OBJECT(src), "io-mode", ioModeBytes.constData());
+
+    /* caps 固定为已验证的 YUY2 格式，保持和独立 gst-gl 管线一致。 */
+    caps = gst_caps_new_simple("video/x-raw",
+                               "format", G_TYPE_STRING, "YUY2",
+                               "width", G_TYPE_INT, captureWidth,
+                               "height", G_TYPE_INT, captureHeight,
+                               "framerate", GST_TYPE_FRACTION, captureFps, 1,
+                               NULL);
+
+    /* capsfilter 持有 caps 后，需要释放本地引用。 */
+    g_object_set(capsFilter, "caps", caps, NULL);
+    gst_caps_unref(caps);
+    caps = nullptr;
+
+    /* mmap 路径把 YUY2 系统内存转成 RGBA，避免 glupload 对 YUY2 系统内存协商失败。 */
+    if (useCpuColorConvert) {
+        rgbaCaps = gst_caps_new_simple("video/x-raw",
+                                       "format", G_TYPE_STRING, "RGBA",
+                                       NULL);
+        g_object_set(rgbaCapsFilter, "caps", rgbaCaps, NULL);
+        gst_caps_unref(rgbaCaps);
+        rgbaCaps = nullptr;
+    }
+
+    /* sync=false 与独立 glimagesink 验证保持一致，避免显示时钟阻塞影响现场观察。 */
+    g_object_set(sink, "sync", FALSE, NULL);
+
+    /* element 加入 pipeline 后，生命周期由 pipeline 统一管理；mmap 路径额外插入 CPU 色彩转换。 */
+    if (useCpuColorConvert) {
+        gst_bin_add_many(GST_BIN(pipeline), src, capsFilter, preConvert, rgbaCapsFilter, glupload, glcolorconvert, glidentity, sink, NULL);
+    } else {
+        gst_bin_add_many(GST_BIN(pipeline), src, capsFilter, glupload, glcolorconvert, glidentity, sink, NULL);
+    }
+    elementsAdded = true;
+
+    /* link 失败通常是 caps、插件能力或 qmlglsink 缺依赖导致。 */
+    if (useCpuColorConvert
+            ? !gst_element_link_many(src, capsFilter, preConvert, rgbaCapsFilter, glupload, glcolorconvert, glidentity, sink, NULL)
+            : !gst_element_link_many(src, capsFilter, glupload, glcolorconvert, glidentity, sink, NULL)) {
+        if (errorText) {
+            *errorText = QStringLiteral("GStreamer 管线连接失败：v4l2src->glupload/glcolorconvert/gleffects_identity->qmlglsink caps 不兼容");
+        }
+        goto fail;
+    }
+
+    /* sinkOut 返回给 main，用于在 QML 加载后设置 widget 属性。 */
+    if (sinkOut) {
+        *sinkOut = sink;
+    }
+
+    /* 成功时返回 pipeline，后续由 main 在退出时置 NULL 并释放。 */
+    return pipeline;
+
+fail:
+    /* 如果 element 已加入 pipeline，释放 pipeline 会递归释放它们。 */
+    if (caps) {
+        gst_caps_unref(caps);
+    }
+
+    /* mmap 路径的 RGBA caps 若在失败前尚未交给 capsfilter，需要在这里释放。 */
+    if (rgbaCaps) {
+        gst_caps_unref(rgbaCaps);
+    }
+
+    /* 如果 element 已加入 pipeline，释放 pipeline 会递归释放它们。 */
+    if (pipeline) {
+        gst_object_unref(pipeline);
+    }
+
+    /* 如果失败发生在加入 pipeline 之前，需要逐个释放已创建的裸 element。 */
+    if (!elementsAdded) {
+        if (src) {
+            gst_object_unref(src);
+        }
+        if (capsFilter) {
+            gst_object_unref(capsFilter);
+        }
+        if (preConvert) {
+            gst_object_unref(preConvert);
+        }
+        if (rgbaCapsFilter) {
+            gst_object_unref(rgbaCapsFilter);
+        }
+        if (glupload) {
+            gst_object_unref(glupload);
+        }
+        if (glcolorconvert) {
+            gst_object_unref(glcolorconvert);
+        }
+        if (glidentity) {
+            gst_object_unref(glidentity);
+        }
+        if (sink) {
+            gst_object_unref(sink);
+        }
+    }
+
+    return nullptr;
+}
+
+/*
+ * main 的作用：
+ *   程序主入口，完成 Qt 图形环境初始化并启动 QML 界面。
+ *
+ * 参数：
+ *   argc 是命令行参数数量。
+ *   argv 是命令行参数内容。
+ *
+ * 返回值：
+ *   QML 加载失败返回 EXIT_FAILURE；正常运行返回 Qt 事件循环退出码。
+ */
+int main(int argc, char *argv[])
+{
+    /* --storage-self-test 用于 SSH 验证保存按钮同一条 C++ 控制路径，不需要启动 Qt Quick/eglfs。 */
+    if (has_raw_argument(argc, argv, "--storage-self-test")) {
+        return run_storage_self_test(argc, argv);
+    }
+
+    /* --alarm-snapshot-self-test 用于 SSH 验证告警维护保存诊断同一条 C++ 落盘路径。 */
+    if (has_raw_argument(argc, argv, "--alarm-snapshot-self-test")) {
+        return run_alarm_snapshot_self_test(argc, argv);
+    }
+
+    /* 先初始化 GStreamer，让 qmlglsink 插件能在 QML 加载前注册 GstGLVideoItem。 */
+    gst_init(&argc, &argv);
+
+    /* 先设置 OpenGL ES 渲染属性，再创建 Qt 应用对象。 */
+    set_surface_format();
+
+    /* 设置缺省环境变量，用户在脚本中显式设置时不会被覆盖。 */
+    set_default_environment();
+
+    /* app 管理 Qt 事件循环、平台插件和图形资源生命周期。 */
+    QGuiApplication app(argc, argv);
+
+    /* 注册 V4L2VideoItem，QML 可通过 import IndustrialCamera 1.0 直接使用它。 */
+    qmlRegisterType<V4L2VideoItem>("IndustrialCamera", 1, 0, "V4L2VideoItem");
+
+    /* 应用元信息用于日志、窗口标题和 --version 输出。 */
+    QCoreApplication::setApplicationName(QStringLiteral("qt_camera_display"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QCoreApplication::setOrganizationName(QStringLiteral("STM32MP157"));
+
+    /* parser 解析 --camera 和 --windowed，Qt 自身参数会先由 QGuiApplication 处理。 */
+    QCommandLineParser parser;
+    configure_parser(&parser);
+    parser.process(app);
+
+    /* cameraDevice 保存传给 QML Camera 的设备 ID；在 Linux/GStreamer 后端通常就是 /dev/video0。 */
+    const QString cameraDevice = parser.value(QStringLiteral("camera"));
+
+    /* captureWidth/captureHeight/captureFps 保存 V4L2 实际请求参数，默认偏低以降低 CPU 占用。 */
+    const int captureWidth = bounded_int_option(parser, QStringLiteral("width"), DEFAULT_CAPTURE_WIDTH, 160, 1920);
+    const int captureHeight = bounded_int_option(parser, QStringLiteral("height"), DEFAULT_CAPTURE_HEIGHT, 120, 1080);
+    const int captureFps = bounded_int_option(parser, QStringLiteral("fps"), DEFAULT_CAPTURE_FPS, 1, 30);
+
+    /* requestedVideoBackend 保存用户请求的后端；actualVideoBackend 在 qmlglsink 缺失时会回退为 qt-safe。 */
+    const QString requestedVideoBackend = normalize_video_backend(parser.value(QStringLiteral("video-backend")));
+    QString actualVideoBackend = requestedVideoBackend;
+
+    /* gstIoMode 保存 gst-qml 后端使用的 V4L2 采集模式，mmap 稳定嵌入，dmabuf 保留给零拷贝验证。 */
+    const QString gstIoMode = normalize_gst_io_mode(parser.value(QStringLiteral("gst-io-mode")));
+
+    /* gstPipeline 是 gst-qml 后端的运行管线；gstSink 是待绑定 QML Item 的 qmlglsink。 */
+    GstElement *gstPipeline = nullptr;
+    GstElement *gstSink = nullptr;
+
+    /* gstStatusText 会暴露给 QML，用于在 GL 后端初始化失败时显示明确原因。 */
+    QString gstStatusText = QStringLiteral("GStreamer GL 未启用");
+
+    /* 请求 gst-qml 时，先创建 qmlglsink，让 QML import 能找到 GstGLVideoItem 类型。 */
+    if (requestedVideoBackend == QString::fromLatin1(BACKEND_GST_QML)) {
+        gstPipeline = create_gst_qml_pipeline(cameraDevice,
+                                              captureWidth,
+                                              captureHeight,
+                                              captureFps,
+                                              gstIoMode,
+                                              &gstSink,
+                                              &gstStatusText);
+
+        /* qmlglsink 创建失败时退回安全预览，避免现场只看到黑屏。 */
+        if (gstPipeline && gstSink) {
+            actualVideoBackend = QString::fromLatin1(BACKEND_GST_QML);
+            gstStatusText = QStringLiteral("GStreamer GL 就绪(") + gstIoMode + QStringLiteral(")");
+        } else {
+            actualVideoBackend = QString::fromLatin1(BACKEND_QT_SAFE);
+            qWarning() << "gst-qml 后端不可用，回退 qt-safe:" << gstStatusText;
+        }
+    }
+
+    /* windowed 记录是否使用窗口模式；没有该参数时按嵌入式全屏界面运行。 */
+    const bool windowed = parser.isSet(QStringLiteral("windowed"));
+
+    /* view 负责加载 QML 根对象，并把它显示到 eglfs/wayland 平台窗口。 */
+    QQuickView view;
+
+    /* storageController 提供 SD 卡保存图片和安全卸载的真实动作入口。 */
+    CameraStorageController storageController;
+
+    /* uploadHistory 保存每次保存/上传动作的本地历史记录，QML 历史页直接读取它。 */
+    UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
+
+    /* 保存控制器拿到历史模型后，保存/上传完成时可以立即追加一条记录。 */
+    storageController.setHistoryModel(&uploadHistory);
+
+    /* SizeRootObjectToView 让 QML 根界面跟随窗口尺寸，适配 1024x600 全屏。 */
+    view.setResizeMode(QQuickView::SizeRootObjectToView);
+
+    /* 把摄像头节点暴露给 QML，QML Camera 会用它选择 UVC 设备。 */
+    view.rootContext()->setContextProperty(QStringLiteral("cameraDeviceId"), cameraDevice);
+
+    /* 把采集参数暴露给 QML，V4L2VideoItem 会按这些参数打开摄像头。 */
+    view.rootContext()->setContextProperty(QStringLiteral("cameraCaptureWidth"), captureWidth);
+    view.rootContext()->setContextProperty(QStringLiteral("cameraCaptureHeight"), captureHeight);
+    view.rootContext()->setContextProperty(QStringLiteral("cameraCaptureFps"), captureFps);
+
+    /* 把实际视频后端暴露给 QML，让界面选择 V4L2VideoItem 或 GstGLVideoItem。 */
+    view.rootContext()->setContextProperty(QStringLiteral("cameraVideoBackend"), actualVideoBackend);
+
+    /* 把 GStreamer 后端状态暴露给 QML，便于界面和日志区显示初始化结果。 */
+    view.rootContext()->setContextProperty(QStringLiteral("cameraGstStatusText"), gstStatusText);
+
+    /* 把版本号暴露给 QML，便于界面底部显示当前程序版本。 */
+    view.rootContext()->setContextProperty(QStringLiteral("appVersion"), QCoreApplication::applicationVersion());
+
+    /* 把 SD 卡动作控制器暴露给 QML，按钮点击时调用真实 C++/overlay/脚本链路。 */
+    view.rootContext()->setContextProperty(QStringLiteral("storageController"), &storageController);
+
+    /* 把上传历史模型暴露给 QML，历史记录页面用它生成横向滑动卡片和详情页。 */
+    view.rootContext()->setContextProperty(QStringLiteral("uploadHistory"), &uploadHistory);
+
+    /* 从 qrc 资源加载主界面，避免板端部署时遗漏单独的 QML 文件。 */
+    view.setSource(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
+
+    /* 如果 QML 语法或模块加载失败，直接返回失败，避免黑屏后误认为程序在运行。 */
+    if (view.status() == QQuickView::Error) {
+        if (gstPipeline) {
+            gst_element_set_state(gstPipeline, GST_STATE_NULL);
+            gst_object_unref(gstPipeline);
+        }
+        gst_deinit();
+        return EXIT_FAILURE;
+    }
+
+    /* 设置窗口标题，窗口模式调试时能明确识别当前程序。 */
+    view.setTitle(QStringLiteral("STM32MP157 工业缺陷检测界面"));
+
+    /* 板端正式运行使用全屏；调试时可通过 --windowed 保持 1024x600 窗口。 */
+    if (windowed) {
+        view.resize(1024, 600);
+        view.show();
+    } else {
+        view.showFullScreen();
+    }
+
+    /* gst-qml 后端需要在窗口 show 之后绑定 qmlglsink，确保 Qt Quick 窗口已进入可曝光状态。 */
+    if (actualVideoBackend == QString::fromLatin1(BACKEND_GST_QML)) {
+        /* rootItem 是 QML 根节点；GstVideoSurface.qml 中 objectName 固定为 gstVideoItem。 */
+        QQuickItem *rootItem = view.rootObject();
+        QQuickItem *videoItem = rootItem ? rootItem->findChild<QQuickItem *>(QStringLiteral("gstVideoItem")) : nullptr;
+
+        /* 找不到视频 Item 说明 QML Loader 没有实例化 GL 表面，继续运行只会黑屏。 */
+        if (!videoItem) {
+            qWarning() << "找不到 QML GstGLVideoItem：gstVideoItem";
+            if (gstPipeline) {
+                gst_element_set_state(gstPipeline, GST_STATE_NULL);
+                gst_object_unref(gstPipeline);
+            }
+            gst_deinit();
+            return EXIT_FAILURE;
+        }
+
+        /* qmlglsink 的 widget 属性接收 QQuickItem 指针，之后视频帧会绘制到该 Item。 */
+        g_object_set(gstSink, "widget", videoItem, NULL);
+
+        /* 按官方示例，在 Qt Quick 渲染同步阶段切到 PLAYING，避免 GL 上下文未就绪。 */
+        view.scheduleRenderJob(new SetGstPipelineStateJob(gstPipeline, GST_STATE_PLAYING),
+                               QQuickWindow::BeforeSynchronizingStage);
+    }
+
+    /* 进入 Qt 事件循环，直到窗口关闭或系统发送退出信号。 */
+    const int ret = app.exec();
+
+    /* 退出时先停止 GStreamer 管线，确保 /dev/video0 和 GL 资源释放干净。 */
+    if (gstPipeline) {
+        gst_element_set_state(gstPipeline, GST_STATE_NULL);
+        gst_object_unref(gstPipeline);
+    }
+
+    /* 对称释放 GStreamer 全局资源，方便后续进程重新扫描插件。 */
+    gst_deinit();
+
+    /* 返回 Qt 事件循环退出码。 */
+    return ret;
+}
+
+#include "main.moc" /* main.cpp 内定义了 CameraStorageController，qmake 需要包含 moc 生成的元对象代码。 */
