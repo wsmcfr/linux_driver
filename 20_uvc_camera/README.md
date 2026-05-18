@@ -12,7 +12,7 @@
 | 板端输出 | RGB LCD framebuffer `/dev/fb0`，后续 Qt 路线还会使用 `/dev/galcore` 和 DRM/KMS。 |
 | 当前稳定路线 | `S90uvc-camera` 默认启动 Qt + KMS overlay；本目录的 `uvc_fb_preview` 保留为 framebuffer 验证和兜底路线。 |
 | 早期静态首帧 | `fb_boot_splash` 在 Qt/GPU 启动前直接写 `/dev/fb0`，显示与 Qt 启动画面第一帧风格一致的静态启动图，减少纯黑屏空窗。 |
-| Qt 保存图片交互 | `保存图片` 在 Qt 控制器后台线程中完成 JPG/PNG 保存和 COS 上传；保存期间只禁止重复保存和安全卸载，左侧页面和其它界面控件仍应可触摸。 |
+| Qt 检测交互 | Qt 首页只保留 `检测` 和 `安全卸载`；`检测` 在后台线程保存当前帧、运行分类模型、运行 UNet、上传 COS 并写历史。分类模型完成后立即显示零件类型和类别，UNet 完成后立即显示双模型耗时，上传完成后才写入云端状态和历史记录。 |
 
 ## 修改文件清单
 
@@ -36,8 +36,8 @@
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/root/qt_camera_display/fb_boot_splash` | 板端实际运行的早期静态启动图绘制器。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S05display-quiet` | 板端早期显示静默入口，开发板重启后由 Buildroot `rcS` 在 S90 前调用。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S90uvc-camera` | 板端开机自启入口，开发板重启后由 Buildroot `rcS` 调用。 |
-| `20_uvc_camera/qt_camera_display/main.cpp` | Qt 保存控制器新增后台保存入口，避免 JPG/PNG 保存和 COS 上传阻塞主界面触摸。 |
-| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 保存图片按钮改为异步请求，保存期间显示 `保存中...`，只临时禁用存储按钮。 |
+| `20_uvc_camera/qt_camera_display/main.cpp` | Qt 控制器保留旧后台保存自检入口，同时正式检测入口在后台完成当前帧保存、分类、UNet、COS 上传和历史记录写入，避免阻塞主界面触摸。 |
+| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 首页不再暴露独立 `保存图片` 按钮；`检测` 按钮改为分阶段刷新结果，分类完成先显示零件/类别，UNet 完成再显示双模型耗时。 |
 | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 增加静态契约，禁止 QML 主线程直接同步调用 `saveCurrentFrameToSdCard()`。 |
 
 ## 使用流程
@@ -66,6 +66,7 @@
 | 2026-05-16 | 新增早期静态首帧 | `fb_boot_splash` 直接写 `/dev/fb0`，`S05display-quiet`、`S90uvc-camera` 和 `run_qt_kms_overlay_display.sh` 在 Qt 启动前调用它，让等待 GPU、摄像头和 Qt 的阶段显示静态启动图而不是纯黑屏。 |
 | 2026-05-16 | 修复 Qt 告警维护保存诊断无文件 | `保存诊断` 不再只显示目标路径，Qt 控制器会真实写入 `/mnt/sdcard/logs/qt_alarm_snapshot.txt` 并 `fsync`；SSH 可用 `test -s`、`wc -c`、`tail` 直接验证。 |
 | 2026-05-16 | 修复保存图片期间界面卡住 | QML 不再同步等待 `saveCurrentFrameToSdCard()`；改为 `requestSaveCurrentFrameToSdCard()` 后台保存，完成后通过信号回填结果。 |
+| 2026-05-18 | 修复检测结果显示被上传阻塞 | Qt 检测链路拆出 `detectClassificationReady` 和 `detectModelsReady` 阶段信号；首页零件类型/类别在第一个分类模型完成后显示，双模型耗时在 UNet 完成后显示，不再等 COS 上传完成。 |
 
 ## 硬件资源
 
@@ -102,7 +103,7 @@
 | GStreamer MJPEG 显示 | 开发板 | `/root/uvc-rootfs/run_gst_fbdev.sh mjpeg /dev/video0 /dev/fb0 640 480` | 摄像头支持 MJPEG 时可显示。 | 若 `jpegdec` 缺失，查 GStreamer 插件部署。 |
 | 开机脚本状态 | 开发板 | `/etc/init.d/S90uvc-camera restart; /etc/init.d/S90uvc-camera status; tail -n 120 /var/log/uvc-camera.log` | 显示预览运行中，日志记录所选后端、video 节点和 PID。 | 若启动后退出，先看日志中的 missing node、galcore required、脚本不可执行。 |
 | Qt + KMS overlay 正式路线 | 开发板 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart; /root/qt_camera_display/run_qt_kms_overlay_display.sh status` | Qt PID 和 `uvc_kms_overlay` PID 同时存在，LCD 显示 UI + 视频。 | 若只剩一个 PID，查 `/tmp/qt_camera_display.log`、`/tmp/uvc_kms_overlay.log` 和 plane 占用。 |
-| 保存期间触摸响应 | 开发板屏幕 | 点击 `保存图片` 后，在按钮显示 `保存中...` 时立即点击左侧 `历史记录`、`统计分析`、`手动控制`、`参数设置` 或 `告警维护` | 页面应立即切换，不能等 COS 上传结束；`保存图片` 和 `安全卸载` 暂时不可点。 | 若页面切换卡住，查 `Main.qml` 是否又直接同步调用 `saveCurrentFrameToSdCard()`；若能重复保存，查 `saveInProgress` 和 `saveImageBusy`。 |
+| 检测阶段显示响应 | 开发板屏幕 | 点击 `检测` 后观察右侧结果面板，同时点击左侧 `历史记录`、`统计分析`、`手动控制`、`参数设置` 或 `告警维护` | 页面应立即响应触摸；分类完成后零件类型/类别先显示，UNet 完成后双模型耗时显示，不能等 COS 上传完成才一起显示；重复 `检测` 和 `安全卸载` 暂时不可点。 | 若页面切换卡住，查 `Main.qml` 是否又直接同步调用检测函数；若零件/类别仍等上传后显示，确认 Qt 二进制包含 `detectClassificationReady` 和 `detectModelsReady`。 |
 | CPU 占用对照 | 开发板 | `top -b -n 2 | grep -E "uvc_fb_preview|uvc_kms_overlay|qt_camera_display"` | 能看到对应进程 CPU 样本，用于对比路线。 | 若没有进程，说明显示链路未运行，先回到 status 和日志。 |
 
 ## 读写/数据路径验证
@@ -114,7 +115,7 @@
 | framebuffer 兜底输出 | `fbset` 或观察 LCD 当前画面 | `/root/uvc_fb_preview ... -f /dev/fb0` | LCD 出现实时画面，程序退出后无崩溃日志。 |
 | GStreamer 显示链路 | `gst-inspect-1.0 v4l2src fbdevsink` | `/root/uvc-rootfs/run_gst_fbdev.sh raw ...` | pipeline 能运行并把视频写到显示设备。 |
 | Qt + KMS overlay | `run_qt_kms_overlay_display.sh status` | `run_qt_kms_overlay_display.sh restart` | Qt UI 进程和 overlay 视频进程同时存在。 |
-| Qt 保存图片 UI 响应 | 屏幕观察 `保存中...` 状态并切换左侧页面 | `保存图片` 调用后台保存任务，完成后通过底部提示条显示结果 | 保存和上传期间主界面仍响应触摸；只有存储按钮临时禁用。 |
+| Qt 检测 UI 响应 | 屏幕观察 `检测中...`、分类结果和双模型耗时并切换左侧页面 | `检测` 调用后台检测任务，分类完成、UNet 完成和上传完成分别通过信号回到 QML | 检测和上传期间主界面仍响应触摸；零件类型/类别不等待上传，双模型耗时不等待上传；只有重复检测和安全卸载临时禁用。 |
 | 图片/日志落盘 | `stat -c %s <file>` 连续两次一致 | 实际拍照/日志程序写入 `/mnt/sdcard/...` 后 `sync` | 文件存在、大小稳定，再执行 `sdcard-safe-remove`。 |
 | 告警诊断快照 | `test -s /mnt/sdcard/logs/qt_alarm_snapshot.txt; tail -n 30 /mnt/sdcard/logs/qt_alarm_snapshot.txt` | Qt 告警维护页点击 `保存诊断`，或执行 `/root/qt_camera_display/qt_camera_display --alarm-snapshot-self-test` | 文件非空，内容包含 `alarm_code=`、`camera_status=` 和 `[recent_alarm_history]`；写入由 Qt 控制器执行 `fsync`。 |
 

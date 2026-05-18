@@ -68,6 +68,18 @@
 /* 默认采集帧率；传入 -r 15 可测试高清 15fps 路线。 */
 #define DEFAULT_FPS 10U
 
+/* 检测模型当前使用中心 300x300 ROI；屏幕观察框必须与 defect-classify 的中心裁剪口径一致。 */
+#define DEFAULT_DETECT_ROI_SIZE 300U
+
+/* ROI 观察框线宽；3 像素在 1024x600 LCD 上足够清楚，同时不会明显遮挡零件边缘。 */
+#define DETECT_ROI_BORDER_THICKNESS 3U
+
+/* ROI 观察框颜色；ARGB8888 数值为不透明绿色，方便在金属和白色背景上观察。 */
+#define DETECT_ROI_COLOR_ARGB8888 0xff35d07fU
+
+/* ROI 观察框 RGB565 颜色；用于实验性 RGB565 输出格式，颜色来源同上面的绿色。 */
+#define DETECT_ROI_COLOR_RGB565 0x368fU
+
 /* V4L2 mmap 缓冲区数量；4 个缓冲区能避免偶发抖动。 */
 #define CAMERA_BUFFER_COUNT 4U
 
@@ -169,11 +181,13 @@ struct control_server {
 
 /*
  * latest_frame 描述已经转换并写入 KMS framebuffer 的最新一帧。
- * 保存按钮读取这个结构，因此保存的是 overlay 正在显示的真实摄像头画面。
+ * yuyv_map 指向当前已从 V4L2 队列取出的原始 YUYV 缓冲，用于点击保存/检测时生成无 ROI 框图片。
  */
 struct latest_frame {
-    const uint8_t *fb_map;
+    uint8_t *fb_map;
     struct kms_device *kms;
+    const uint8_t *yuyv_map;
+    size_t yuyv_size;
     uint32_t pitch;
     unsigned int fb_width;
     unsigned int fb_height;
@@ -771,6 +785,119 @@ static inline uint16_t pack_rgb565_from_yuv(uint8_t y, uint8_t u, uint8_t v)
 }
 
 /*
+ * roi_coordinate_in_border 的作用：
+ *   判断摄像头图像内部的某个坐标是否落在中心 ROI 观察框边线上。
+ *
+ * 主要流程：
+ *   1. 根据 src_width/src_height 计算中心 300x300 ROI 的左上角。
+ *   2. 判断当前 x/y 是否在 ROI 矩形范围内。
+ *   3. 判断该坐标是否属于上、下、左、右任意一条边框。
+ *
+ * 参数：
+ *   x/y 是摄像头图像内部坐标，不包含 KMS framebuffer 居中偏移。
+ *   src_width/src_height 是摄像头图像尺寸。
+ *
+ * 返回值：
+ *   在 ROI 边框上返回 1；不在边框上返回 0。
+ */
+static int roi_coordinate_in_border(unsigned int x,
+                                    unsigned int y,
+                                    unsigned int src_width,
+                                    unsigned int src_height)
+{
+    unsigned int roi_x;
+    unsigned int roi_y;
+    unsigned int roi_right;
+    unsigned int roi_bottom;
+
+    if (src_width < DEFAULT_DETECT_ROI_SIZE || src_height < DEFAULT_DETECT_ROI_SIZE) {
+        return 0;
+    }
+
+    roi_x = (src_width - DEFAULT_DETECT_ROI_SIZE) / 2U;
+    roi_y = (src_height - DEFAULT_DETECT_ROI_SIZE) / 2U;
+    roi_right = roi_x + DEFAULT_DETECT_ROI_SIZE;
+    roi_bottom = roi_y + DEFAULT_DETECT_ROI_SIZE;
+
+    if (x < roi_x || x >= roi_right || y < roi_y || y >= roi_bottom) {
+        return 0;
+    }
+
+    if (x < roi_x + DETECT_ROI_BORDER_THICKNESS ||
+        x >= roi_right - DETECT_ROI_BORDER_THICKNESS ||
+        y < roi_y + DETECT_ROI_BORDER_THICKNESS ||
+        y >= roi_bottom - DETECT_ROI_BORDER_THICKNESS) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * draw_roi_overlay_row_xrgb 的作用：
+ *   在已经完成 YUYV->XRGB8888 转换的一行像素上覆盖 ROI 边框。
+ *
+ * 关键说明：
+ *   这个函数在每一行视频像素转换完成后立即执行，避免上一版“整帧转换后再补画框”
+ *   造成的单 framebuffer 扫描闪烁；它只改一行上属于 ROI 边框的少量像素。
+ *
+ * 参数：
+ *   dst_line 是当前输出行的 XRGB/ARGB 像素数组。
+ *   y 是摄像头图像内部行号。
+ *   src_width/src_height 是摄像头图像尺寸。
+ *
+ * 返回值：
+ *   无返回值，ROI 边框像素直接写入 dst_line。
+ */
+static void draw_roi_overlay_row_xrgb(uint32_t *dst_line,
+                                      unsigned int y,
+                                      unsigned int src_width,
+                                      unsigned int src_height)
+{
+    unsigned int x;
+
+    if (dst_line == NULL) {
+        return;
+    }
+
+    for (x = 0; x < src_width; x++) {
+        if (roi_coordinate_in_border(x, y, src_width, src_height)) {
+            dst_line[x] = DETECT_ROI_COLOR_ARGB8888;
+        }
+    }
+}
+
+/*
+ * draw_roi_overlay_row_rgb565 的作用：
+ *   在已经完成 YUYV->RGB565 转换的一行像素上覆盖 ROI 边框。
+ *
+ * 参数：
+ *   dst_line 是当前输出行的 RGB565 像素数组。
+ *   y 是摄像头图像内部行号。
+ *   src_width/src_height 是摄像头图像尺寸。
+ *
+ * 返回值：
+ *   无返回值，ROI 边框像素直接写入 dst_line。
+ */
+static void draw_roi_overlay_row_rgb565(uint16_t *dst_line,
+                                        unsigned int y,
+                                        unsigned int src_width,
+                                        unsigned int src_height)
+{
+    unsigned int x;
+
+    if (dst_line == NULL) {
+        return;
+    }
+
+    for (x = 0; x < src_width; x++) {
+        if (roi_coordinate_in_border(x, y, src_width, src_height)) {
+            dst_line[x] = DETECT_ROI_COLOR_RGB565;
+        }
+    }
+}
+
+/*
  * convert_yuyv_to_xrgb_center 的作用：
  *   把一帧 YUYV 原始图像转换成居中的 XRGB8888 图像区域。
  *
@@ -835,6 +962,8 @@ static int convert_yuyv_to_xrgb_center(uint8_t *dst,
             dst_line[x] = pack_xrgb_from_yuv(y0, u, v);
             dst_line[x + 1U] = pack_xrgb_from_yuv(y1, u, v);
         }
+
+        draw_roi_overlay_row_xrgb(dst_line, y, src_width, src_height);
     }
 
     return 0;
@@ -905,6 +1034,8 @@ static int convert_yuyv_to_rgb565_center(uint8_t *dst,
             dst_line[x] = pack_rgb565_from_yuv(y0, u, v);
             dst_line[x + 1U] = pack_rgb565_from_yuv(y1, u, v);
         }
+
+        draw_roi_overlay_row_rgb565(dst_line, y, src_width, src_height);
     }
 
     return 0;
@@ -1114,26 +1245,111 @@ static int path_under_sdcard(const char *path)
 }
 
 /*
- * latest_frame_source_offset 的作用：
- *   计算摄像头帧在 KMS framebuffer 中的左上角偏移。
+ * path_under_detect_output 的作用：
+ *   判断检测按钮的图片目录是否位于允许的检测输出根目录下。
+ *
+ * 关键说明：
+ *   旧调试路径允许写 /tmp/qt-defect-detect，方便 SSH 快速验证模型。
+ *   正式界面路径允许写 /mnt/sdcard/images，因为一次检测的 source 和结果图需要进入历史记录。
+ *   其它目录一律拒绝，避免 Qt socket 被误用成任意文件写入口。
  *
  * 参数：
- *   frame 保存 framebuffer 尺寸和摄像头帧尺寸。
- *   x_offset/y_offset 是输出偏移。
+ *   path 是 Qt 传入的检测保存目录。
  *
  * 返回值：
- *   成功返回 0；尺寸不合法返回 -1。
+ *   位于 /tmp/qt-defect-detect、/mnt/sdcard/images 或其子目录时返回 1；其它路径返回 0。
  */
-static int latest_frame_source_offset(const struct latest_frame *frame,
-                                      unsigned int *x_offset,
-                                      unsigned int *y_offset)
+static int path_under_detect_output(const char *path)
 {
-    if (frame->frame_width > frame->fb_width || frame->frame_height > frame->fb_height) {
+    const char *tmp_root = "/tmp/qt-defect-detect";
+    const char *sdcard_root = "/mnt/sdcard/images";
+    const size_t root_len = strlen(tmp_root);
+    const size_t sdcard_root_len = strlen(sdcard_root);
+
+    if (path == NULL) {
+        return 0;
+    }
+
+    if (strcmp(path, tmp_root) == 0) {
+        return 1;
+    }
+
+    if (strncmp(path, tmp_root, root_len) == 0 && path[root_len] == '/') {
+        return 1;
+    }
+
+    if (strcmp(path, sdcard_root) == 0) {
+        return 1;
+    }
+
+    return strncmp(path, sdcard_root, sdcard_root_len) == 0 && path[sdcard_root_len] == '/';
+}
+
+/*
+ * copy_yuyv_frame_to_rgb24 的作用：
+ *   从当前 V4L2 原始 YUYV 缓冲生成一份无 ROI 框的连续 RGB24 图像。
+ *
+ * 主要流程：
+ *   1. 校验 latest_frame 中的 yuyv_map 是否指向当前 dequeue 后的摄像头帧。
+ *   2. 按 YUYV 两像素一组复用 U/V 的规则转换为 RGB24。
+ *   3. 不读取 KMS framebuffer，因此不会把屏幕 ROI 观察框写进检测/保存图片。
+ *
+ * 参数：
+ *   frame 是最新帧描述。
+ *   rgb 是调用者提供的连续 RGB24 输出缓冲。
+ *   rgb_size 是 rgb 缓冲长度，必须至少等于 width * height * 3。
+ *
+ * 返回值：
+ *   成功返回 0；失败返回 -1，并设置 errno。
+ */
+static int copy_yuyv_frame_to_rgb24(const struct latest_frame *frame,
+                                    uint8_t *rgb,
+                                    size_t rgb_size)
+{
+    unsigned int y;
+    size_t need_size;
+    size_t need_yuyv_size;
+
+    if (!frame->has_frame || frame->yuyv_map == NULL || rgb == NULL) {
+        errno = ENODATA;
         return -1;
     }
 
-    *x_offset = (frame->fb_width - frame->frame_width) / 2U;
-    *y_offset = (frame->fb_height - frame->frame_height) / 2U;
+    need_size = (size_t)frame->frame_width * frame->frame_height * 3U;
+    if (rgb_size < need_size) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    need_yuyv_size = (size_t)frame->frame_width * frame->frame_height * 2U;
+    if (frame->yuyv_size < need_yuyv_size) {
+        errno = ENODATA;
+        return -1;
+    }
+
+    for (y = 0; y < frame->frame_height; y++) {
+        const uint8_t *src = frame->yuyv_map + (size_t)y * frame->frame_width * 2U;
+        uint8_t *dst = rgb + (size_t)y * frame->frame_width * 3U;
+        unsigned int x;
+
+        for (x = 0; x + 1U < frame->frame_width; x += 2U) {
+            const uint8_t *p = src + x * 2U;
+            uint8_t y0 = p[0];
+            uint8_t u = p[1];
+            uint8_t y1 = p[2];
+            uint8_t v = p[3];
+            uint32_t pixel0 = pack_xrgb_from_yuv(y0, u, v);
+            uint32_t pixel1 = pack_xrgb_from_yuv(y1, u, v);
+
+            dst[x * 3U + 0U] = (uint8_t)((pixel0 >> 16U) & 0xffU);
+            dst[x * 3U + 1U] = (uint8_t)((pixel0 >> 8U) & 0xffU);
+            dst[x * 3U + 2U] = (uint8_t)(pixel0 & 0xffU);
+            dst[(x + 1U) * 3U + 0U] = (uint8_t)((pixel1 >> 16U) & 0xffU);
+            dst[(x + 1U) * 3U + 1U] = (uint8_t)((pixel1 >> 8U) & 0xffU);
+            dst[(x + 1U) * 3U + 2U] = (uint8_t)(pixel1 & 0xffU);
+        }
+    }
+
     return 0;
 }
 
@@ -1261,12 +1477,12 @@ static int fsync_file_stream(FILE *fp)
 
 /*
  * copy_latest_frame_to_rgb24 的作用：
- *   把当前 KMS framebuffer 中的摄像头矩形复制成连续 RGB24 缓冲。
+ *   把当前摄像头原始 YUYV 帧复制成连续 RGB24 缓冲。
  *
  * 主要流程：
- *   1. 校验 latest_frame 是否已有真实帧，以及当前输出格式是否为 4 字节 BGRA 类格式。
- *   2. 计算摄像头画面在 framebuffer 里的居中偏移。
- *   3. 逐行把 B/G/R/X 字节转换成 R/G/B 字节，供 JPEG 和 PNG 共用同一帧数据。
+ *   1. 为当前帧申请一份 RGB24 输出缓冲。
+ *   2. 调用 copy_yuyv_frame_to_rgb24 从 V4L2 原始帧转换，避开带 ROI 的显示 framebuffer。
+ *   3. 调用者拿到的是 malloc 分配的新缓冲，可以安全用于 JPEG/PNG 编码。
  *
  * 参数：
  *   frame 是最新显示帧。
@@ -1278,23 +1494,10 @@ static int fsync_file_stream(FILE *fp)
 static uint8_t *copy_latest_frame_to_rgb24(const struct latest_frame *frame)
 {
     uint8_t *rgb = NULL;
-    unsigned int x_offset = 0;
-    unsigned int y_offset = 0;
-    unsigned int y;
     size_t rgb_size;
 
     if (!frame->has_frame || frame->fb_map == NULL) {
         errno = ENODATA;
-        return NULL;
-    }
-
-    if (frame->output_format == OUTPUT_FORMAT_RGB565 || frame->bytes_per_pixel != 4U) {
-        errno = ENOTSUP;
-        return NULL;
-    }
-
-    if (latest_frame_source_offset(frame, &x_offset, &y_offset) != 0) {
-        errno = EINVAL;
         return NULL;
     }
 
@@ -1304,18 +1507,9 @@ static uint8_t *copy_latest_frame_to_rgb24(const struct latest_frame *frame)
         return NULL;
     }
 
-    for (y = 0; y < frame->frame_height; y++) {
-        const uint8_t *src = frame->fb_map
-            + (y + y_offset) * frame->pitch
-            + x_offset * frame->bytes_per_pixel;
-        uint8_t *dst = rgb + (size_t)y * frame->frame_width * 3U;
-        unsigned int x;
-
-        for (x = 0; x < frame->frame_width; x++) {
-            dst[x * 3U + 0U] = src[x * 4U + 2U];
-            dst[x * 3U + 1U] = src[x * 4U + 1U];
-            dst[x * 3U + 2U] = src[x * 4U + 0U];
-        }
+    if (copy_yuyv_frame_to_rgb24(frame, rgb, rgb_size) != 0) {
+        free(rgb);
+        return NULL;
     }
 
     return rgb;
@@ -1544,12 +1738,12 @@ out:
 
 /*
  * write_latest_frame_as_ppm 的作用：
- *   把最新 ARGB/XRGB8888 framebuffer 中的摄像头矩形保存为 PPM 图片。
+ *   把最新摄像头矩形保存为 PPM 图片。
  *
  * 主要流程：
  *   1. 先写 P6 PPM 头，格式为 RGB24，避免引入 JPEG/PNG 编码依赖。
- *   2. 按行从 KMS framebuffer 中取 B/G/R/X 字节，并转换成 R/G/B 写入文件。
- *   3. 调用 fsync，确保按钮返回成功前数据已经提交给内核块层。
+ *   2. 使用 copy_latest_frame_to_rgb24 取得无 ROI 框的干净 RGB24 数据。
+ *   3. 写完整个 RGB 缓冲并调用 fsync，确保按钮返回成功前数据已经提交给内核块层。
  *
  * 参数：
  *   frame 是最新显示帧。
@@ -1563,10 +1757,8 @@ static int write_latest_frame_as_ppm(const struct latest_frame *frame, const cha
     int fd = -1;
     char header[64];
     int header_len;
-    uint8_t *row = NULL;
-    unsigned int x_offset = 0;
-    unsigned int y_offset = 0;
-    unsigned int y;
+    uint8_t *rgb = NULL;
+    size_t rgb_size;
     int ret = -1;
 
     if (!frame->has_frame || frame->fb_map == NULL) {
@@ -1574,20 +1766,12 @@ static int write_latest_frame_as_ppm(const struct latest_frame *frame, const cha
         return -1;
     }
 
-    if (frame->output_format == OUTPUT_FORMAT_RGB565 || frame->bytes_per_pixel != 4U) {
-        errno = ENOTSUP;
+    rgb = copy_latest_frame_to_rgb24(frame);
+    if (rgb == NULL) {
         return -1;
     }
 
-    if (latest_frame_source_offset(frame, &x_offset, &y_offset) != 0) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    row = malloc((size_t)frame->frame_width * 3U);
-    if (row == NULL) {
-        return -1;
-    }
+    rgb_size = (size_t)frame->frame_width * frame->frame_height * 3U;
 
     fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
@@ -1608,21 +1792,8 @@ static int write_latest_frame_as_ppm(const struct latest_frame *frame, const cha
         goto out;
     }
 
-    for (y = 0; y < frame->frame_height; y++) {
-        const uint8_t *src = frame->fb_map
-            + (y + y_offset) * frame->pitch
-            + x_offset * frame->bytes_per_pixel;
-        unsigned int x;
-
-        for (x = 0; x < frame->frame_width; x++) {
-            row[x * 3U + 0U] = src[x * 4U + 2U];
-            row[x * 3U + 1U] = src[x * 4U + 1U];
-            row[x * 3U + 2U] = src[x * 4U + 0U];
-        }
-
-        if (write_all(fd, row, (size_t)frame->frame_width * 3U) != 0) {
-            goto out;
-        }
+    if (write_all(fd, rgb, rgb_size) != 0) {
+        goto out;
     }
 
     if (fsync(fd) != 0) {
@@ -1640,7 +1811,7 @@ out:
         unlink(output_path);
     }
 
-    free(row);
+    free(rgb);
     return ret;
 }
 
@@ -1687,6 +1858,47 @@ out:
     if (ret != 0) {
         unlink(jpg_path);
         unlink(png_path);
+    }
+    free(rgb);
+    return ret;
+}
+
+/*
+ * write_latest_frame_as_jpeg 的作用：
+ *   把最新摄像头帧保存成单张 JPG，供首页“检测”按钮临时推理使用。
+ *
+ * 主要流程：
+ *   1. 从 latest_frame 拷贝一份连续 RGB24 缓冲。
+ *   2. 调用 write_rgb24_as_jpeg 写入同目录 .tmp，再 rename 为最终 JPG。
+ *   3. 失败时删除最终路径，避免 Qt 读取半成品图片。
+ *
+ * 参数：
+ *   frame 是最新显示帧。
+ *   jpg_path 是最终 JPG 路径。
+ *
+ * 返回值：
+ *   成功返回 0；失败返回 -1。
+ */
+static int write_latest_frame_as_jpeg(const struct latest_frame *frame,
+                                      const char *jpg_path)
+{
+    uint8_t *rgb;
+    int ret = -1;
+
+    rgb = copy_latest_frame_to_rgb24(frame);
+    if (rgb == NULL) {
+        return -1;
+    }
+
+    if (write_rgb24_as_jpeg(rgb, frame->frame_width, frame->frame_height, jpg_path) != 0) {
+        goto out;
+    }
+
+    ret = 0;
+
+out:
+    if (ret != 0) {
+        unlink(jpg_path);
     }
     free(rgb);
     return ret;
@@ -2057,12 +2269,80 @@ static void handle_save_dual_command(int client_fd,
 }
 
 /*
+ * handle_save_detect_command 的作用：
+ *   执行 SAVE_DETECT 请求，把当前显示帧保存成检测专用 JPG。
+ *
+ * 关键说明：
+ *   SAVE_DETECT 只允许写入 /tmp/qt-defect-detect 或 /mnt/sdcard/images。
+ *   正式 Qt 检测会写 SD 卡历史目录；SSH 临时调试仍可写 /tmp。
+ *
+ * 参数：
+ *   client_fd 是 Qt 客户端连接。
+ *   frame 是最新显示帧。
+ *   output_dir 是 Qt 请求的临时保存目录。
+ *
+ * 返回值：
+ *   无返回值；成功返回 "OK DETECT_JPG <path>"，失败返回 "ERR <原因>"。
+ */
+static void handle_save_detect_command(int client_fd,
+                                       const struct latest_frame *frame,
+                                       const char *output_dir)
+{
+    char base_path[PATH_MAX];
+    char jpg_path[PATH_MAX];
+    char reply[PATH_MAX + 32];
+    int reply_len;
+
+    if (output_dir == NULL || output_dir[0] == '\0') {
+        send_control_reply(client_fd, "ERR", "检测保存目录为空");
+        return;
+    }
+
+    if (!path_under_detect_output(output_dir)) {
+        send_control_reply(client_fd, "ERR", "检测保存目录必须在 /tmp/qt-defect-detect 或 /mnt/sdcard/images 下");
+        return;
+    }
+
+    if (mkdir_p(output_dir) != 0) {
+        char detail[256];
+
+        snprintf(detail, sizeof(detail), "创建检测目录失败: %s", strerror(errno));
+        send_control_reply(client_fd, "ERR", detail);
+        return;
+    }
+
+    if (build_snapshot_base_path(output_dir, frame, base_path, sizeof(base_path)) != 0 ||
+        append_path_suffix(base_path, ".jpg", jpg_path, sizeof(jpg_path)) != 0) {
+        send_control_reply(client_fd, "ERR", "生成检测图片路径失败");
+        return;
+    }
+
+    if (write_latest_frame_as_jpeg(frame, jpg_path) != 0) {
+        char detail[256];
+
+        snprintf(detail, sizeof(detail), "保存检测 JPG 失败: %s", strerror(errno));
+        send_control_reply(client_fd, "ERR", detail);
+        return;
+    }
+
+    reply_len = snprintf(reply, sizeof(reply), "DETECT_JPG %s", jpg_path);
+    if (reply_len < 0 || (size_t)reply_len >= sizeof(reply)) {
+        send_control_reply(client_fd, "ERR", "检测结果路径过长");
+        return;
+    }
+
+    send_control_reply(client_fd, "OK", reply);
+}
+
+/*
  * service_control_client 的作用：
  *   读取并执行一个 Qt 控制命令。
  *
  * 支持命令：
  *   SAVE /mnt/sdcard/images
  *   SAVE_DUAL /mnt/sdcard/images
+ *   SAVE_DETECT /tmp/qt-defect-detect
+ *   SAVE_DETECT /mnt/sdcard/images
  *   VISIBLE 0
  *   VISIBLE 1
  *
@@ -2094,6 +2374,11 @@ static void service_control_client(int client_fd, const struct latest_frame *fra
 
     if (strncmp(command, "SAVE_DUAL ", strlen("SAVE_DUAL ")) == 0) {
         handle_save_dual_command(client_fd, frame, command + strlen("SAVE_DUAL "));
+        return;
+    }
+
+    if (strncmp(command, "SAVE_DETECT ", strlen("SAVE_DETECT ")) == 0) {
+        handle_save_detect_command(client_fd, frame, command + strlen("SAVE_DETECT "));
         return;
     }
 
@@ -2952,6 +3237,9 @@ static int capture_loop(struct camera_device *cam,
             fprintf(stderr, "摄像头返回越界缓冲区索引: %u\n", buf.index);
             goto out;
         }
+
+        latest.yuyv_map = (const uint8_t *)cam->buffers[buf.index].start;
+        latest.yuyv_size = cam->buffers[buf.index].length;
 
         if (output_format == OUTPUT_FORMAT_RGB565) {
             ret = convert_yuyv_to_rgb565_center(use_staging ? staging : kms->fb_map,

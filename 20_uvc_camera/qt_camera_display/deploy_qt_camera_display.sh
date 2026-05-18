@@ -32,14 +32,32 @@ OVERLAY_SRC="$SCRIPT_DIR/$BUILD_DIR/uvc_kms_overlay"
 # FB_SPLASH_SRC 是早期静态启动首帧绘制器，负责在 Qt/GPU 启动前先写 /dev/fb0。
 FB_SPLASH_SRC="$SCRIPT_DIR/$BUILD_DIR/fb_boot_splash"
 
+# DEFECT_CLASSIFY_SRC 是 MobileNetV3-Small INT8 ONNX 独立推理程序。
+DEFECT_CLASSIFY_SRC="$SCRIPT_DIR/$BUILD_DIR/defect-classify"
+
+# DEFECT_SEGMENT_SRC 是 UNet INT8 ONNX 独立分割推理程序。
+DEFECT_SEGMENT_SRC="$SCRIPT_DIR/$BUILD_DIR/defect-segment"
+
 # OVERLAY_RUN_SRC 是板端 start/stop/status 控制脚本。
 OVERLAY_RUN_SRC="$SCRIPT_DIR/run_qt_kms_overlay_display.sh"
 
 # PROBE_SRC 是板端零拷贝/硬件视频链路探测脚本，用于在集成 Qt 前独立验证 GStreamer/KMS 路线。
 PROBE_SRC="$SCRIPT_DIR/probe_zero_copy_video_path.sh"
 
-# COS_UPLOAD_SRC 是保存图片后自动上传 JPG/PNG 到云端 COS 的板端脚本。
+# COS_UPLOAD_SRC 是检测流程自动上传 source/annotated 图片到云端 COS 的板端脚本。
 COS_UPLOAD_SRC="$SCRIPT_DIR/defect-cos-upload"
+
+# DEFECT_MODEL_SRC 是待部署的 INT8 ONNX 模型路径，可通过环境变量覆盖。
+DEFECT_MODEL_SRC="${DEFECT_MODEL_SRC:-/mnt/d/model_picture/checkpoints_classify/defect_classifier_static_mixed_int8.onnx}"
+
+# DEFECT_LABELS_SRC 是待部署的类别映射路径，可通过环境变量覆盖。
+DEFECT_LABELS_SRC="${DEFECT_LABELS_SRC:-/mnt/d/model_picture/checkpoints_classify/defect_classifier_static_mixed_int8_labels.json}"
+
+# DEFECT_UNET_MODEL_SRC 是待部署的 UNet INT8 分割模型路径，可通过环境变量覆盖。
+DEFECT_UNET_MODEL_SRC="${DEFECT_UNET_MODEL_SRC:-/mnt/d/model_picture/checkpoints_unet_test/defect_unet_test_decoder_head_int8.onnx}"
+
+# ORT_ROOT 是可选 ONNX Runtime ARM SDK 根目录；存在 libonnxruntime.so 时部署到板端 lib 目录。
+ORT_ROOT="${ORT_ROOT:-$SCRIPT_DIR/onnxruntime-arm}"
 
 # DISPLAY_QUIET_INIT_SRC 是开机早期显示静默脚本，负责尽早关闭 fbcon 光标。
 DISPLAY_QUIET_INIT_SRC="$SCRIPT_DIR/../S05display-quiet"
@@ -49,6 +67,12 @@ UVC_INIT_SRC="$SCRIPT_DIR/../S90uvc-camera"
 
 # INSTALL_DIR 是开发板启动后可见的持久目录。
 INSTALL_DIR="$ROOTFS/root/qt_camera_display"
+
+# MODEL_INSTALL_DIR 是板端模型与 labels JSON 安装目录。
+MODEL_INSTALL_DIR="$INSTALL_DIR/models"
+
+# LIB_INSTALL_DIR 是板端私有动态库目录，run 脚本通过 LD_LIBRARY_PATH 加载。
+LIB_INSTALL_DIR="$INSTALL_DIR/lib"
 
 # BOARD_COS_UPLOAD_ENV_FILE 是板端运行时 defect-cos-upload 默认读取的私有账号配置路径。
 # 如果部署时设置 CLOUD_UPLOAD_ENV_FILE，则会把该板端绝对路径映射到当前 NFS rootfs 下。
@@ -85,7 +109,7 @@ shell_single_quote()
 write_cos_upload_env_file()
 {
     # write_cos_upload_env_file 的作用：
-    #   部署时可选生成板端私有上传账号配置文件，让保存按钮默认能登录云端。
+    #   部署时可选生成板端私有上传账号配置文件，让检测按钮默认能登录云端。
     # 主要流程：
     #   1. 如果没有提供 CLOUD_ACCOUNT/CLOUD_PASSWORD，则保留现有配置并跳过生成。
     #   2. 如果只提供其中一个变量，则直接报错，避免写出半配置。
@@ -96,7 +120,7 @@ write_cos_upload_env_file()
     #   成功返回 0；配置不完整或安装失败时随 set -e 退出。
     if [ -z "${CLOUD_ACCOUNT:-}" ] && [ -z "${CLOUD_PASSWORD:-}" ]; then
         echo "未设置 CLOUD_ACCOUNT/CLOUD_PASSWORD，跳过生成默认上传账号配置。"
-        echo "如需让保存按钮自动上传，可在部署时设置这两个环境变量后重跑本脚本。"
+        echo "如需让检测按钮自动上传，可在部署时设置这两个环境变量后重跑本脚本。"
         return 0
     fi
 
@@ -163,6 +187,18 @@ if [ ! -f "$FB_SPLASH_SRC" ]; then
     exit 1
 fi
 
+if [ ! -f "$DEFECT_CLASSIFY_SRC" ]; then
+    echo "错误：找不到缺陷分类推理程序：$DEFECT_CLASSIFY_SRC" >&2
+    echo "请先执行：ORT_ROOT=/path/to/onnxruntime-arm ./build_defect_classify.sh" >&2
+    exit 1
+fi
+
+if [ ! -f "$DEFECT_SEGMENT_SRC" ]; then
+    echo "错误：找不到 UNet 分割推理程序：$DEFECT_SEGMENT_SRC" >&2
+    echo "请先执行：ORT_ROOT=/path/to/onnxruntime-arm ./build_defect_segment.sh" >&2
+    exit 1
+fi
+
 if [ ! -f "$OVERLAY_RUN_SRC" ]; then
     echo "错误：找不到 KMS overlay 控制脚本：$OVERLAY_RUN_SRC" >&2
     exit 1
@@ -174,9 +210,27 @@ if [ ! -f "$PROBE_SRC" ]; then
     exit 1
 fi
 
-# 检查 COS 上传脚本是否存在；保存按钮会在本地图片落盘后调用它。
+# 检查 COS 上传脚本是否存在；检测流程会在本地图片落盘后调用它。
 if [ ! -f "$COS_UPLOAD_SRC" ]; then
     echo "错误：找不到 COS 上传脚本：$COS_UPLOAD_SRC" >&2
+    exit 1
+fi
+
+if [ ! -f "$DEFECT_MODEL_SRC" ]; then
+    echo "错误：找不到 INT8 ONNX 模型：$DEFECT_MODEL_SRC" >&2
+    echo "可设置 DEFECT_MODEL_SRC=/path/to/defect_classifier_static_mixed_int8.onnx 后重跑部署。" >&2
+    exit 1
+fi
+
+if [ ! -f "$DEFECT_LABELS_SRC" ]; then
+    echo "错误：找不到 labels JSON：$DEFECT_LABELS_SRC" >&2
+    echo "可设置 DEFECT_LABELS_SRC=/path/to/defect_classifier_static_mixed_int8_labels.json 后重跑部署。" >&2
+    exit 1
+fi
+
+if [ ! -f "$DEFECT_UNET_MODEL_SRC" ]; then
+    echo "错误：找不到 UNet INT8 ONNX 模型：$DEFECT_UNET_MODEL_SRC" >&2
+    echo "可设置 DEFECT_UNET_MODEL_SRC=/path/to/defect_unet_test_decoder_head_int8.onnx 后重跑部署。" >&2
     exit 1
 fi
 
@@ -192,27 +246,53 @@ fi
 
 # 创建安装目录；NFS rootfs 通常需要 sudo 才能写入 root 目录。
 sudo mkdir -p "$INSTALL_DIR"
+sudo mkdir -p "$MODEL_INSTALL_DIR"
+sudo mkdir -p "$LIB_INSTALL_DIR"
 sudo mkdir -p "$ROOTFS/etc/init.d"
 
 # 复制 Qt 可执行程序和运行脚本。
 sudo cp "$APP_SRC" "$INSTALL_DIR/qt_camera_display"
 sudo cp "$OVERLAY_SRC" "$INSTALL_DIR/uvc_kms_overlay"
 sudo cp "$FB_SPLASH_SRC" "$INSTALL_DIR/fb_boot_splash"
+sudo cp "$DEFECT_CLASSIFY_SRC" "$INSTALL_DIR/defect-classify"
+sudo cp "$DEFECT_SEGMENT_SRC" "$INSTALL_DIR/defect-segment"
 sudo cp "$SCRIPT_DIR/run_qt_camera_display.sh" "$INSTALL_DIR/run_qt_camera_display.sh"
 sudo cp "$OVERLAY_RUN_SRC" "$INSTALL_DIR/run_qt_kms_overlay_display.sh"
 sudo cp "$PROBE_SRC" "$INSTALL_DIR/probe_zero_copy_video_path.sh"
 sudo cp "$COS_UPLOAD_SRC" "$INSTALL_DIR/defect-cos-upload"
+sudo cp "$DEFECT_MODEL_SRC" "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8.onnx"
+sudo cp "$DEFECT_LABELS_SRC" "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8_labels.json"
+sudo cp "$DEFECT_UNET_MODEL_SRC" "$MODEL_INSTALL_DIR/defect_unet_test_decoder_head_int8.onnx"
 sudo cp "$DISPLAY_QUIET_INIT_SRC" "$ROOTFS/etc/init.d/S05display-quiet"
 sudo cp "$UVC_INIT_SRC" "$ROOTFS/etc/init.d/S90uvc-camera"
+
+# 如果 ORT_ROOT/lib/libonnxruntime.so 存在，则一起部署到私有 lib 目录；缺失时提示用户手动补运行库。
+if [ -f "$ORT_ROOT/lib/libonnxruntime.so" ]; then
+    ORT_REAL_LIB="$(readlink -f "$ORT_ROOT/lib/libonnxruntime.so")"
+    ORT_REAL_NAME="$(basename "$ORT_REAL_LIB")"
+    sudo cp "$ORT_REAL_LIB" "$LIB_INSTALL_DIR/$ORT_REAL_NAME"
+    sudo ln -sf "$ORT_REAL_NAME" "$LIB_INSTALL_DIR/libonnxruntime.so"
+else
+    echo "提示：未找到 $ORT_ROOT/lib/libonnxruntime.so，未复制 ONNX Runtime 运行库。"
+    echo "      若 rootfs 全局没有 libonnxruntime.so，检测按钮会启动失败。"
+fi
 
 # 设置可执行权限，确保开发板 root 用户可以直接运行。
 sudo chmod 755 "$INSTALL_DIR/qt_camera_display"
 sudo chmod 755 "$INSTALL_DIR/uvc_kms_overlay"
 sudo chmod 755 "$INSTALL_DIR/fb_boot_splash"
+sudo chmod 755 "$INSTALL_DIR/defect-classify"
+sudo chmod 755 "$INSTALL_DIR/defect-segment"
 sudo chmod 755 "$INSTALL_DIR/run_qt_camera_display.sh"
 sudo chmod 755 "$INSTALL_DIR/run_qt_kms_overlay_display.sh"
 sudo chmod 755 "$INSTALL_DIR/probe_zero_copy_video_path.sh"
 sudo chmod 755 "$INSTALL_DIR/defect-cos-upload"
+sudo chmod 644 "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8.onnx"
+sudo chmod 644 "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8_labels.json"
+sudo chmod 644 "$MODEL_INSTALL_DIR/defect_unet_test_decoder_head_int8.onnx"
+if [ -n "${ORT_REAL_NAME:-}" ] && [ -f "$LIB_INSTALL_DIR/$ORT_REAL_NAME" ]; then
+    sudo chmod 755 "$LIB_INSTALL_DIR/$ORT_REAL_NAME"
+fi
 sudo chmod 755 "$ROOTFS/etc/init.d/S05display-quiet"
 sudo chmod 755 "$ROOTFS/etc/init.d/S90uvc-camera"
 
@@ -225,5 +305,9 @@ echo "开发板运行："
 echo "  /root/qt_camera_display/run_qt_camera_display.sh"
 echo "KMS overlay 低 CPU 集成路线："
 echo "  /root/qt_camera_display/run_qt_kms_overlay_display.sh start"
+echo "手动验证当前帧分类程序："
+echo "  LD_LIBRARY_PATH=/root/qt_camera_display/lib:\$LD_LIBRARY_PATH /root/qt_camera_display/defect-classify --image /tmp/test.jpg"
+echo "手动验证当前帧分割程序："
+echo "  LD_LIBRARY_PATH=/root/qt_camera_display/lib:\$LD_LIBRARY_PATH /root/qt_camera_display/defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images"
 echo "零拷贝/硬件视频探测："
 echo "  /root/qt_camera_display/probe_zero_copy_video_path.sh"

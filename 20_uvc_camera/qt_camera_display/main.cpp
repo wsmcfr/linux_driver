@@ -23,6 +23,7 @@
  *   --video-backend kms-overlay  使用外部 DRM/KMS overlay plane 显示视频，Qt 只绘制界面壳。
  *   --gst-io-mode mmap    指定 gst-qml 后端的 v4l2src io-mode，默认 mmap。
  *   --storage-self-test   不启动 QML，只走 Qt 保存控制器保存一张 SD 卡图片，便于 SSH 验证按钮同路径逻辑。
+ *   --detect-self-test    不启动 QML，只走双模型检测链路，便于 SSH 验证分类、UNet、上传和历史记录。
  *   --alarm-snapshot-self-test  不启动 QML，只写一份告警诊断快照，便于 SSH 验证日志落盘逻辑。
  *   --windowed            使用 1024x600 窗口模式，便于桌面或远程调试。
  *
@@ -39,6 +40,7 @@
 #include <QDateTime>            /* QDateTime 用于记录每次上传完成时的本地时间。 */
 #include <QDebug>               /* QDebug/qWarning 用于输出 GStreamer 初始化失败原因。 */
 #include <QDir>                 /* QDir 用于创建 SD 卡图片保存目录和历史记录目录。 */
+#include <QElapsedTimer>        /* QElapsedTimer 用于统计双模型串行检测总耗时。 */
 #include <QFile>                /* QFile 用于读写上传历史 JSON 文件。 */
 #include <QFileInfo>            /* QFileInfo 用于判断 COS 上传脚本、图片文件和历史文件状态。 */
 #include <QGuiApplication>      /* QGuiApplication 是 Qt Quick 图形程序的应用对象。 */
@@ -49,6 +51,8 @@
 #include <QJsonValue>           /* QJsonValue 用于读取历史 JSON 中的字符串或数字字段。 */
 #include <QProcess>             /* QProcess 用于调用现有 sdcard-safe-remove 命令。 */
 #include <QProcessEnvironment>  /* QProcessEnvironment 用于给 sdcard-safe-remove 传入短等待环境变量。 */
+#include <QMetaObject>          /* QMetaObject 用于把后台线程的检测阶段进度安全投递回 Qt 主线程。 */
+#include <QPointer>             /* QPointer 用于后台线程投递进度前判断控制器对象是否仍然存在。 */
 #include <QQmlEngine>           /* qmlRegisterType 需要 Qt QML 类型系统声明。 */
 #include <QQmlContext>          /* QQmlContext 用于把 C++ 变量暴露给 QML。 */
 #include <QQuickItem>           /* QQuickItem 用于在 QML 树中查找 GstGLVideoItem。 */
@@ -56,6 +60,7 @@
 #include <QQuickWindow>         /* QQuickWindow 提供 scheduleRenderJob，用于在渲染线程安全启动管线。 */
 #include <QRunnable>            /* QRunnable 用于把 GStreamer 状态切换安排到 Qt Quick 渲染阶段。 */
 #include <QSharedPointer>       /* QSharedPointer 用于在线程完成信号中安全保存后台任务结果。 */
+#include <QStringList>          /* QStringList 用于保存一次检测中的多张 annotated 结果图路径。 */
 #include <QSurfaceFormat>       /* QSurfaceFormat 用于声明 OpenGL ES 渲染格式。 */
 #include <QTextStream>          /* QTextStream 用于自检入口输出保存结果，也用于写告警诊断文本。 */
 #include <QThread>              /* QThread 用于把图片保存和 COS 上传放到后台线程，避免阻塞 Qt 触摸事件循环。 */
@@ -65,6 +70,7 @@
 #include <QVector>              /* QVector 用于保存内存中的上传历史记录列表。 */
 #include <cstdlib>              /* EXIT_SUCCESS/EXIT_FAILURE 是 main 返回值语义。 */
 #include <ctime>                /* tzset 用于让运行时立刻重新读取 TZ 时区变量。 */
+#include <functional>           /* std::function 用于给检测同步流程注入“分类完成/双模型完成”进度回调。 */
 
 #include <gst/gst.h>            /* GStreamer C API 用于创建 v4l2src->glupload->qmlglsink 管线。 */
 
@@ -117,6 +123,24 @@ static const char *DEFAULT_ALARM_SNAPSHOT_FILE = "/mnt/sdcard/logs/qt_alarm_snap
 
 /* 板端 COS 上传脚本默认部署路径，保存按钮会在本地 JPG/PNG 落盘后调用它。 */
 static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-cos-upload";
+
+/* 板端缺陷分类推理程序默认路径，首页“检测”按钮会通过 QProcess 调用它。 */
+static const char *DEFAULT_DEFECT_CLASSIFY_BIN = "/root/qt_camera_display/defect-classify";
+
+/* 板端 INT8 ONNX 模型默认路径，部署脚本会从 Windows/VM 模型目录复制到这里。 */
+static const char *DEFAULT_DEFECT_CLASSIFY_MODEL =
+    "/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx";
+
+/* 板端标签映射默认路径，类别顺序必须和 ONNX 输出完全一致。 */
+static const char *DEFAULT_DEFECT_CLASSIFY_LABELS =
+    "/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json";
+
+/* 板端 UNet 分割推理程序默认路径，首页“检测”按钮会在分类结束后通过 QProcess 调用它。 */
+static const char *DEFAULT_DEFECT_SEGMENT_BIN = "/root/qt_camera_display/defect-segment";
+
+/* 板端 UNet INT8 ONNX 模型默认路径，必须和部署脚本复制位置一致。 */
+static const char *DEFAULT_DEFECT_SEGMENT_MODEL =
+    "/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx";
 
 /* 上传历史默认文件：放在 SD 卡图片目录内，随图片一起保留，重启 Qt 后仍能恢复历史界面。 */
 static const char *DEFAULT_UPLOAD_HISTORY_FILE = "/mnt/sdcard/images/upload_history.json";
@@ -173,29 +197,39 @@ private:
 
 /*
  * UploadHistoryEntry 的作用：
- *   保存一次“本地 JPG/PNG 落盘 + 云端上传尝试”的历史记录。
+ *   保存一次“双模型串行检测 + 本地结果图落盘 + 云端上传尝试”的历史记录。
  *
  * 字段说明：
- *   uploadTime 是用户第一层历史卡片看到的具体上传时间。
- *   resultText 是本次检测结果摘要，目前沿用占位“良品”，后续可由真实模型覆盖。
- *   workflowText 是上传发生时的流程状态或人工备注，详情页右侧用于补足上下文。
- *   jpgPath/pngPath 分别是 SD 卡上的原图和结果图，本地详情页用它们直接预览。
+ *   uploadTime 是用户第一层历史卡片看到的具体检测时间。
+ *   resultText 是 MobileNetV3-Small 的 GOOD/BAD 汇总，界面显示为“良品/待复核”。
+ *   workflowText 是本次串行检测和上传的流程状态，保留在 JSON 中供日志排查和统计兼容使用。
+ *   sourcePath/sourceSizeBytes 是分类模型使用的当前帧 JPG，云端登记为 source。
+ *   annotatedPaths/annotatedLabels/annotatedSizeBytes 保存 UNet raw/overlay/mask 等结果图，云端统一登记为 annotated。
+ *   classificationResult 保存 defect-classify 的 RESULT 行，便于历史页回看分类概率。
+ *   segmentationResult 保存 defect-segment 的 RESULT_SEG 行，便于历史页回看缺陷像素和结果图路径。
+ *   jpgPath/pngPath/jpgSizeBytes/pngSizeBytes 是旧历史 JSON 兼容字段，新记录会同步写入 source/首张 annotated。
  *   uploadStatus 保存上传脚本返回的一行结果，成功和失败都要保留，便于追查云端问题。
  *   recordId/recordNo 是云端检测记录身份，用于和后台详情页、日志、COS 对象对账。
- *   jpgSizeBytes/pngSizeBytes 是落盘文件大小，用于确认历史记录指向的图片不是空文件。
  */
 struct UploadHistoryEntry
 {
     QString uploadTime;
     QString resultText;
     QString workflowText;
+    QString sourcePath;
+    QStringList annotatedPaths;
+    QStringList annotatedLabels;
+    QVector<qint64> annotatedSizeBytes;
+    QString classificationResult;
+    QString segmentationResult;
     QString jpgPath;
     QString pngPath;
     QString uploadStatus;
     QString recordId;
     QString recordNo;
-    qint64 jpgSizeBytes;
-    qint64 pngSizeBytes;
+    qint64 sourceSizeBytes = 0;
+    qint64 jpgSizeBytes = 0;
+    qint64 pngSizeBytes = 0;
 };
 
 /*
@@ -228,11 +262,14 @@ public:
         WorkflowTextRole,
         JpgPathRole,
         PngPathRole,
+        SourcePathRole,
         UploadStatusRole,
         RecordIdRole,
         RecordNoRole,
         JpgSizeBytesRole,
         PngSizeBytesRole,
+        SourceSizeBytesRole,
+        TotalSizeBytesRole,
         ImageCountRole
     };
 
@@ -300,6 +337,8 @@ public:
             return entry.jpgPath;
         case PngPathRole:
             return entry.pngPath;
+        case SourcePathRole:
+            return normalizedSourcePath(entry);
         case UploadStatusRole:
             return entry.uploadStatus;
         case RecordIdRole:
@@ -310,6 +349,10 @@ public:
             return entry.jpgSizeBytes;
         case PngSizeBytesRole:
             return entry.pngSizeBytes;
+        case SourceSizeBytesRole:
+            return normalizedSourceSizeBytes(entry);
+        case TotalSizeBytesRole:
+            return totalSizeBytesForEntry(entry);
         case ImageCountRole:
             return imageCountForEntry(entry);
         default:
@@ -333,11 +376,14 @@ public:
         roles.insert(WorkflowTextRole, "workflowText");
         roles.insert(JpgPathRole, "jpgPath");
         roles.insert(PngPathRole, "pngPath");
+        roles.insert(SourcePathRole, "sourcePath");
         roles.insert(UploadStatusRole, "uploadStatus");
         roles.insert(RecordIdRole, "recordId");
         roles.insert(RecordNoRole, "recordNo");
         roles.insert(JpgSizeBytesRole, "jpgSizeBytes");
         roles.insert(PngSizeBytesRole, "pngSizeBytes");
+        roles.insert(SourceSizeBytesRole, "sourceSizeBytes");
+        roles.insert(TotalSizeBytesRole, "totalSizeBytes");
         roles.insert(ImageCountRole, "imageCount");
 
         return roles;
@@ -473,6 +519,112 @@ signals:
 
 private:
     /*
+     * normalizedSourcePath 的作用：
+     *   返回历史记录的原始检测图路径，并兼容旧 JSON 中只有 jpgPath 的记录。
+     *
+     * 参数：
+     *   entry 是待读取的历史记录。
+     *
+     * 返回值：
+     *   sourcePath 非空时返回 sourcePath；否则返回旧字段 jpgPath。
+     */
+    QString normalizedSourcePath(const UploadHistoryEntry &entry) const
+    {
+        return !entry.sourcePath.isEmpty() ? entry.sourcePath : entry.jpgPath;
+    }
+
+    /*
+     * normalizedSourceSizeBytes 的作用：
+     *   返回原始检测图文件大小，并兼容旧 JSON 中只有 jpgSizeBytes 的记录。
+     *
+     * 参数：
+     *   entry 是待读取的历史记录。
+     *
+     * 返回值：
+     *   sourceSizeBytes 大于 0 时返回它；否则返回 jpgSizeBytes。
+     */
+    qint64 normalizedSourceSizeBytes(const UploadHistoryEntry &entry) const
+    {
+        return entry.sourceSizeBytes > 0 ? entry.sourceSizeBytes : entry.jpgSizeBytes;
+    }
+
+    /*
+     * normalizedAnnotatedPaths 的作用：
+     *   返回历史记录中所有检测结果图路径，并兼容旧 JSON 中只有 pngPath 的记录。
+     *
+     * 参数：
+     *   entry 是待读取的历史记录。
+     *
+     * 返回值：
+     *   annotatedPaths 非空时返回它；否则用旧字段 pngPath 生成一项列表。
+     */
+    QStringList normalizedAnnotatedPaths(const UploadHistoryEntry &entry) const
+    {
+        if (!entry.annotatedPaths.isEmpty()) {
+            return entry.annotatedPaths;
+        }
+
+        QStringList paths;
+        if (!entry.pngPath.isEmpty()) {
+            paths.append(entry.pngPath);
+        }
+        return paths;
+    }
+
+    /*
+     * normalizedAnnotatedLabels 的作用：
+     *   返回检测结果图标签列表，缺失时根据位置生成默认标签。
+     *
+     * 参数：
+     *   entry 是待读取的历史记录。
+     *   paths 是已经归一化后的结果图路径列表。
+     *
+     * 返回值：
+     *   返回和 paths 等长的标签列表。
+     */
+    QStringList normalizedAnnotatedLabels(const UploadHistoryEntry &entry, const QStringList &paths) const
+    {
+        QStringList labels = entry.annotatedLabels;
+
+        if (labels.isEmpty() && !entry.pngPath.isEmpty() && paths.size() == 1) {
+            labels.append(QStringLiteral("PNG结果图"));
+        }
+
+        while (labels.size() < paths.size()) {
+            labels.append(QStringLiteral("检测结果%1").arg(labels.size() + 1));
+        }
+
+        return labels;
+    }
+
+    /*
+     * normalizedAnnotatedSizeBytes 的作用：
+     *   返回检测结果图大小列表，缺失时兼容旧 pngSizeBytes 或现场读取 QFileInfo。
+     *
+     * 参数：
+     *   entry 是待读取的历史记录。
+     *   paths 是已经归一化后的结果图路径列表。
+     *
+     * 返回值：
+     *   返回和 paths 等长的大小列表。
+     */
+    QVector<qint64> normalizedAnnotatedSizeBytes(const UploadHistoryEntry &entry, const QStringList &paths) const
+    {
+        QVector<qint64> sizes = entry.annotatedSizeBytes;
+
+        if (sizes.isEmpty() && !entry.pngPath.isEmpty() && paths.size() == 1) {
+            sizes.append(entry.pngSizeBytes);
+        }
+
+        while (sizes.size() < paths.size()) {
+            const QFileInfo info(paths.at(sizes.size()));
+            sizes.append(info.exists() ? info.size() : 0);
+        }
+
+        return sizes;
+    }
+
+    /*
      * imageCountForEntry 的作用：
      *   统计一条历史记录中实际有几张可展示图片。
      *
@@ -480,20 +632,41 @@ private:
      *   entry 是待统计的历史记录。
      *
      * 返回值：
-     *   JPG 路径非空加 1，PNG 路径非空加 1。
+     *   原始检测图非空加 1，annotated 结果图每张加 1。
      */
     int imageCountForEntry(const UploadHistoryEntry &entry) const
     {
         int count = 0;
 
-        if (!entry.jpgPath.isEmpty()) {
-            count++;
-        }
-        if (!entry.pngPath.isEmpty()) {
+        if (!normalizedSourcePath(entry).isEmpty()) {
             count++;
         }
 
+        count += normalizedAnnotatedPaths(entry).size();
         return count;
+    }
+
+    /*
+     * totalSizeBytesForEntry 的作用：
+     *   汇总一条历史记录所有本地图片的文件大小。
+     *
+     * 参数：
+     *   entry 是待统计的历史记录。
+     *
+     * 返回值：
+     *   返回 source 和所有 annotated 图片大小之和。
+     */
+    qint64 totalSizeBytesForEntry(const UploadHistoryEntry &entry) const
+    {
+        const QStringList annotatedPaths = normalizedAnnotatedPaths(entry);
+        const QVector<qint64> annotatedSizes = normalizedAnnotatedSizeBytes(entry, annotatedPaths);
+        qint64 total = normalizedSourceSizeBytes(entry);
+
+        for (qint64 size : annotatedSizes) {
+            total += size;
+        }
+
+        return total;
     }
 
     /*
@@ -509,10 +682,18 @@ private:
     QJsonObject entryToJson(const UploadHistoryEntry &entry) const
     {
         QJsonObject object;
+        QJsonArray annotatedImages;
+        const QStringList annotatedPaths = normalizedAnnotatedPaths(entry);
+        const QStringList annotatedLabels = normalizedAnnotatedLabels(entry, annotatedPaths);
+        const QVector<qint64> annotatedSizes = normalizedAnnotatedSizeBytes(entry, annotatedPaths);
 
         object.insert(QStringLiteral("upload_time"), entry.uploadTime);
         object.insert(QStringLiteral("result_text"), entry.resultText);
         object.insert(QStringLiteral("workflow_text"), entry.workflowText);
+        object.insert(QStringLiteral("source_path"), normalizedSourcePath(entry));
+        object.insert(QStringLiteral("source_size_bytes"), QString::number(normalizedSourceSizeBytes(entry)));
+        object.insert(QStringLiteral("classification_result"), entry.classificationResult);
+        object.insert(QStringLiteral("segmentation_result"), entry.segmentationResult);
         object.insert(QStringLiteral("jpg_path"), entry.jpgPath);
         object.insert(QStringLiteral("png_path"), entry.pngPath);
         object.insert(QStringLiteral("upload_status"), entry.uploadStatus);
@@ -520,6 +701,17 @@ private:
         object.insert(QStringLiteral("record_no"), entry.recordNo);
         object.insert(QStringLiteral("jpg_size_bytes"), QString::number(entry.jpgSizeBytes));
         object.insert(QStringLiteral("png_size_bytes"), QString::number(entry.pngSizeBytes));
+
+        for (int i = 0; i < annotatedPaths.size(); i++) {
+            QJsonObject imageObject;
+
+            imageObject.insert(QStringLiteral("label"), annotatedLabels.value(i, QStringLiteral("检测结果%1").arg(i + 1)));
+            imageObject.insert(QStringLiteral("path"), annotatedPaths.at(i));
+            imageObject.insert(QStringLiteral("size_bytes"), QString::number(annotatedSizes.value(i, 0)));
+            annotatedImages.append(imageObject);
+        }
+
+        object.insert(QStringLiteral("annotated_images"), annotatedImages);
 
         return object;
     }
@@ -537,10 +729,15 @@ private:
     UploadHistoryEntry entryFromJson(const QJsonObject &object) const
     {
         UploadHistoryEntry entry;
+        const QJsonArray annotatedImages = object.value(QStringLiteral("annotated_images")).toArray();
 
         entry.uploadTime = object.value(QStringLiteral("upload_time")).toString();
         entry.resultText = object.value(QStringLiteral("result_text")).toString();
         entry.workflowText = object.value(QStringLiteral("workflow_text")).toString();
+        entry.sourcePath = object.value(QStringLiteral("source_path")).toString();
+        entry.sourceSizeBytes = jsonIntegerString(object, QStringLiteral("source_size_bytes"));
+        entry.classificationResult = object.value(QStringLiteral("classification_result")).toString();
+        entry.segmentationResult = object.value(QStringLiteral("segmentation_result")).toString();
         entry.jpgPath = object.value(QStringLiteral("jpg_path")).toString();
         entry.pngPath = object.value(QStringLiteral("png_path")).toString();
         entry.uploadStatus = object.value(QStringLiteral("upload_status")).toString();
@@ -548,6 +745,30 @@ private:
         entry.recordNo = object.value(QStringLiteral("record_no")).toString();
         entry.jpgSizeBytes = jsonIntegerString(object, QStringLiteral("jpg_size_bytes"));
         entry.pngSizeBytes = jsonIntegerString(object, QStringLiteral("png_size_bytes"));
+
+        for (const QJsonValue &value : annotatedImages) {
+            if (!value.isObject()) {
+                continue;
+            }
+
+            const QJsonObject imageObject = value.toObject();
+            const QString path = imageObject.value(QStringLiteral("path")).toString();
+
+            if (path.isEmpty()) {
+                continue;
+            }
+
+            entry.annotatedPaths.append(path);
+            entry.annotatedLabels.append(imageObject.value(QStringLiteral("label")).toString(QStringLiteral("检测结果")));
+            entry.annotatedSizeBytes.append(jsonIntegerString(imageObject, QStringLiteral("size_bytes")));
+        }
+
+        if (entry.sourcePath.isEmpty()) {
+            entry.sourcePath = entry.jpgPath;
+        }
+        if (entry.sourceSizeBytes <= 0) {
+            entry.sourceSizeBytes = entry.jpgSizeBytes;
+        }
 
         return entry;
     }
@@ -566,35 +787,45 @@ private:
     {
         QVariantMap map;
         QVariantList images;
+        const QString sourcePath = normalizedSourcePath(entry);
+        const qint64 sourceSizeBytes = normalizedSourceSizeBytes(entry);
+        const QStringList annotatedPaths = normalizedAnnotatedPaths(entry);
+        const QStringList annotatedLabels = normalizedAnnotatedLabels(entry, annotatedPaths);
+        const QVector<qint64> annotatedSizes = normalizedAnnotatedSizeBytes(entry, annotatedPaths);
 
-        if (!entry.jpgPath.isEmpty()) {
+        if (!sourcePath.isEmpty()) {
             QVariantMap jpgImage;
 
-            jpgImage.insert(QStringLiteral("label"), QStringLiteral("JPG原图"));
-            jpgImage.insert(QStringLiteral("path"), entry.jpgPath);
-            jpgImage.insert(QStringLiteral("sizeBytes"), entry.jpgSizeBytes);
+            jpgImage.insert(QStringLiteral("label"), QStringLiteral("原始图片"));
+            jpgImage.insert(QStringLiteral("path"), sourcePath);
+            jpgImage.insert(QStringLiteral("sizeBytes"), sourceSizeBytes);
             images.append(jpgImage);
         }
 
-        if (!entry.pngPath.isEmpty()) {
-            QVariantMap pngImage;
+        for (int i = 0; i < annotatedPaths.size(); i++) {
+            QVariantMap annotatedImage;
 
-            pngImage.insert(QStringLiteral("label"), QStringLiteral("PNG结果图"));
-            pngImage.insert(QStringLiteral("path"), entry.pngPath);
-            pngImage.insert(QStringLiteral("sizeBytes"), entry.pngSizeBytes);
-            images.append(pngImage);
+            annotatedImage.insert(QStringLiteral("label"), annotatedLabels.value(i, QStringLiteral("检测结果%1").arg(i + 1)));
+            annotatedImage.insert(QStringLiteral("path"), annotatedPaths.at(i));
+            annotatedImage.insert(QStringLiteral("sizeBytes"), annotatedSizes.value(i, 0));
+            images.append(annotatedImage);
         }
 
         map.insert(QStringLiteral("uploadTime"), entry.uploadTime);
         map.insert(QStringLiteral("resultText"), entry.resultText);
         map.insert(QStringLiteral("workflowText"), entry.workflowText);
-        map.insert(QStringLiteral("jpgPath"), entry.jpgPath);
+        map.insert(QStringLiteral("sourcePath"), sourcePath);
+        map.insert(QStringLiteral("jpgPath"), entry.jpgPath.isEmpty() ? sourcePath : entry.jpgPath);
         map.insert(QStringLiteral("pngPath"), entry.pngPath);
+        map.insert(QStringLiteral("classificationResult"), entry.classificationResult);
+        map.insert(QStringLiteral("segmentationResult"), entry.segmentationResult);
         map.insert(QStringLiteral("uploadStatus"), entry.uploadStatus);
         map.insert(QStringLiteral("recordId"), entry.recordId);
         map.insert(QStringLiteral("recordNo"), entry.recordNo);
-        map.insert(QStringLiteral("jpgSizeBytes"), entry.jpgSizeBytes);
+        map.insert(QStringLiteral("sourceSizeBytes"), sourceSizeBytes);
+        map.insert(QStringLiteral("jpgSizeBytes"), entry.jpgSizeBytes > 0 ? entry.jpgSizeBytes : sourceSizeBytes);
         map.insert(QStringLiteral("pngSizeBytes"), entry.pngSizeBytes);
+        map.insert(QStringLiteral("totalSizeBytes"), totalSizeBytesForEntry(entry));
         map.insert(QStringLiteral("imageCount"), images.size());
         map.insert(QStringLiteral("images"), images);
 
@@ -632,10 +863,10 @@ private:
 
     /*
      * removeHistoryImageFiles 的作用：
-     *   删除单条历史记录中保存的 JPG 和 PNG 图片实体文件。
+     *   删除单条历史记录中保存的 source 和 annotated 图片实体文件。
      *
      * 主要流程：
-     *   1. 分别处理 jpgPath 和 pngPath，路径为空时跳过。
+     *   1. 先处理原始检测图，再逐个处理 annotated 检测结果图，路径为空时跳过。
      *   2. 每个路径必须位于历史 JSON 所在目录下，避免损坏 JSON 时误删其他目录文件。
      *   3. 已经不存在的图片视为可接受状态，因为记录已经没有可展示实体文件。
      *   4. 删除失败只通过返回文本和日志提示，不再恢复历史记录，避免 JSON 与界面反复抖动。
@@ -651,9 +882,13 @@ private:
         int deletedCount = 0;
         int missingCount = 0;
         int failedCount = 0;
+        const QString sourcePath = normalizedSourcePath(entry);
+        const QStringList annotatedPaths = normalizedAnnotatedPaths(entry);
 
-        removeOneHistoryImageFile(entry.jpgPath, &deletedCount, &missingCount, &failedCount);
-        removeOneHistoryImageFile(entry.pngPath, &deletedCount, &missingCount, &failedCount);
+        removeOneHistoryImageFile(sourcePath, &deletedCount, &missingCount, &failedCount);
+        for (const QString &path : annotatedPaths) {
+            removeOneHistoryImageFile(path, &deletedCount, &missingCount, &failedCount);
+        }
 
         if (failedCount > 0) {
             return QStringLiteral("删除完成：记录已删除，%1 张图片删除失败").arg(failedCount);
@@ -781,7 +1016,9 @@ private:
             }
 
             const UploadHistoryEntry entry = entryFromJson(value.toObject());
-            if (!entry.uploadTime.isEmpty() || !entry.jpgPath.isEmpty() || !entry.pngPath.isEmpty()) {
+            if (!entry.uploadTime.isEmpty()
+                    || !normalizedSourcePath(entry).isEmpty()
+                    || !normalizedAnnotatedPaths(entry).isEmpty()) {
                 m_entries.append(entry);
             }
         }
@@ -874,6 +1111,7 @@ class CameraStorageController : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool saveInProgress READ saveInProgress NOTIFY saveInProgressChanged)
+    Q_PROPERTY(bool detectInProgress READ detectInProgress NOTIFY detectInProgressChanged)
 
 public:
     explicit CameraStorageController(QObject *parent = nullptr)
@@ -885,7 +1123,8 @@ public:
           m_alarmSnapshotFile(QString::fromLatin1(DEFAULT_ALARM_SNAPSHOT_FILE)),
           m_historyModel(nullptr),
           m_appendHistoryInSave(true),
-          m_saveInProgress(false)
+          m_saveInProgress(false),
+          m_detectInProgress(false)
     {
     }
 
@@ -904,6 +1143,23 @@ public:
     bool saveInProgress() const
     {
         return m_saveInProgress;
+    }
+
+    /*
+     * detectInProgress 的作用：
+     *   告诉 QML 当前是否已有检测后台任务正在运行。
+     *
+     * 主要流程：
+     *   直接返回主线程维护的 m_detectInProgress 标志；后台线程只能通过 queued signal
+     *   回到主线程后改变它，避免跨线程直接写 QObject 状态。
+     *
+     * 返回值：
+     *   true 表示当前帧保存和 defect-classify 推理尚未结束；
+     *   false 表示检测按钮可以再次点击。
+     */
+    bool detectInProgress() const
+    {
+        return m_detectInProgress;
     }
 
     /*
@@ -1115,6 +1371,172 @@ public:
     }
 
     /*
+     * requestDetectCurrentFrame 的作用：
+     *   给 QML 首页“检测”按钮使用的异步检测入口。
+     *
+     * 主要流程：
+     *   1. 防止重复点击，先把检测忙标志置位。
+     *   2. 复制 overlay socket、临时目录、模型路径和标签路径，交给后台线程使用。
+     *   3. 后台线程让 overlay 执行 SAVE_DETECT，只保存一张 JPG 到 /tmp。
+     *   4. 后台线程调用 defect-classify 独立程序完成 ONNX Runtime 推理。
+     *   5. 任务结束后回到主线程清除忙标志，并把 RESULT 行传给 QML 解析显示。
+     *
+     * 返回值：
+     *   无直接返回值；QML 通过 detectCurrentFrameFinished(resultText) 获取最终结果。
+     */
+    Q_INVOKABLE void requestDetectCurrentFrame()
+    {
+        if (m_detectInProgress) {
+            qWarning() << "detect action ignored because previous detect is still running";
+            return;
+        }
+
+        /* 先置位忙状态，让 QML 立即把按钮切到“检测中”。 */
+        setDetectInProgress(true);
+
+        /* socketPath 保存 overlay 控制端点，后台线程通过它请求当前帧 JPG。 */
+        const QString socketPath = m_socketPath;
+
+        /* imageDir 保存检测图片目录；正式检测结果写入 SD 卡，才能进入历史记录并重启后继续预览。 */
+        const QString imageDir = m_imageDir;
+
+        /* mountPoint 保存 SD 卡挂载点，检测历史图写入前必须确认真实挂载。 */
+        const QString mountPoint = m_mountPoint;
+
+        /* classifyBin 保存独立推理程序路径，部署后默认在 /root/qt_camera_display 下。 */
+        const QString classifyBin = QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_BIN);
+
+        /* classifyModelPath 保存分类 INT8 ONNX 模型路径，必须和部署脚本复制位置一致。 */
+        const QString classifyModelPath = QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_MODEL);
+
+        /* labelsPath 保存类别映射路径，保证板端输出类别顺序不靠硬编码猜测。 */
+        const QString labelsPath = QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_LABELS);
+
+        /* segmentBin 保存 UNet 分割推理程序路径，分类结束后再启动它。 */
+        const QString segmentBin = QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_BIN);
+
+        /* segmentModelPath 保存 UNet INT8 ONNX 模型路径，必须和部署脚本复制位置一致。 */
+        const QString segmentModelPath = QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_MODEL);
+
+        /* workerResult 保存后台线程最终结果，线程结束后由主线程读取并通知 QML。 */
+        const QSharedPointer<QString> workerResult(new QString(QStringLiteral("检测失败：后台检测线程没有返回结果")));
+
+        /* workerBundle 保存后台线程产出的图片路径和模型输出，线程结束后由主线程追加历史。 */
+        const QSharedPointer<DetectResultBundle> workerBundle(new DetectResultBundle);
+
+        /* controllerPtr 是安全指针；如果界面关闭导致控制器销毁，后台线程不会再投递进度信号。 */
+        const QPointer<CameraStorageController> controllerPtr(this);
+
+        /* workerThread 承载保存当前帧和模型推理两个耗时动作，避免阻塞触摸事件循环。 */
+        QThread *workerThread = QThread::create([socketPath,
+                                                 mountPoint,
+                                                 imageDir,
+                                                 classifyBin,
+                                                 classifyModelPath,
+                                                 labelsPath,
+                                                 segmentBin,
+                                                 segmentModelPath,
+                                                 controllerPtr,
+                                                 workerBundle,
+                                                 workerResult]() {
+            CameraStorageController workerController;
+            const auto emitClassificationReady = [controllerPtr](const QString &classificationResult) {
+                /* 分类模型结束后立即把零件类型、类别和 GOOD/BAD 结果送回 QML；不等待 UNet 或上传。 */
+                if (controllerPtr.isNull()) {
+                    return;
+                }
+
+                QMetaObject::invokeMethod(controllerPtr.data(),
+                                          "detectClassificationReady",
+                                          Qt::QueuedConnection,
+                                          Q_ARG(QString, classificationResult));
+            };
+            const auto emitModelsReady = [controllerPtr](const QString &modelResult) {
+                /* 两个模型都结束后立即把 total_time_ms 送回 QML；后续 COS 上传继续在后台执行。 */
+                if (controllerPtr.isNull()) {
+                    return;
+                }
+
+                QMetaObject::invokeMethod(controllerPtr.data(),
+                                          "detectModelsReady",
+                                          Qt::QueuedConnection,
+                                          Q_ARG(QString, modelResult));
+            };
+
+            workerController.setStoragePaths(socketPath,
+                                             mountPoint,
+                                             imageDir,
+                                             QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR),
+                                             QString::fromLatin1(DEFAULT_ALARM_SNAPSHOT_FILE));
+            workerController.setAppendHistoryInSave(false);
+
+            *workerResult = workerController.detectCurrentFrameOnce(mountPoint,
+                                                                    imageDir,
+                                                                    classifyBin,
+                                                                    classifyModelPath,
+                                                                    labelsPath,
+                                                                    segmentBin,
+                                                                    segmentModelPath,
+                                                                    workerBundle.data(),
+                                                                    emitClassificationReady,
+                                                                    emitModelsReady);
+        });
+
+        if (workerThread == nullptr) {
+            setDetectInProgress(false);
+            emit detectCurrentFrameFinished(QStringLiteral("检测失败：无法创建后台检测线程"));
+            return;
+        }
+
+        connect(workerThread, &QThread::finished, this, [this, workerResult, workerBundle]() {
+            if (workerResult->startsWith(QStringLiteral("RESULT "))
+                    && !workerBundle->sourcePath.isEmpty()) {
+                appendDetectHistoryRecord(*workerBundle);
+            }
+
+            setDetectInProgress(false);
+            emit detectCurrentFrameFinished(*workerResult);
+        }, Qt::QueuedConnection);
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+
+        workerThread->start();
+    }
+
+    /*
+     * detectCurrentFrameForSelfTest 的作用：
+     *   给 SSH `--detect-self-test` 使用的同步双模型检测入口。
+     *
+     * 主要流程：
+     *   1. 直接复用 detectCurrentFrameOnce()，执行 SAVE_DETECT、分类、UNet、上传。
+     *   2. 检测成功时在当前线程追加历史记录，保证 SSH 自检和屏幕点击写同一种 JSON。
+     *   3. 返回 RESULT 或“检测失败”，由命令行入口打印到 stdout。
+     *
+     * 返回值：
+     *   成功返回 RESULT 行；失败返回“检测失败：...”。
+     */
+    QString detectCurrentFrameForSelfTest()
+    {
+        DetectResultBundle bundle;
+        const QString result = detectCurrentFrameOnce(
+            m_mountPoint,
+            m_imageDir,
+            QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_BIN),
+            QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_MODEL),
+            QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_LABELS),
+            QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_BIN),
+            QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_MODEL),
+            &bundle);
+
+        if (result.startsWith(QStringLiteral("RESULT "))
+                && !bundle.sourcePath.isEmpty()) {
+            appendDetectHistoryRecord(bundle);
+        }
+
+        return result;
+    }
+
+    /*
      * safeRemoveSdCard 的作用：
      *   响应 QML 的“安全卸载”按钮，执行现有 sdcard-safe-remove 命令。
      *
@@ -1268,8 +1690,20 @@ signals:
     /* saveInProgressChanged 在后台保存开始或结束时通知 QML 刷新按钮状态。 */
     void saveInProgressChanged();
 
+    /* detectInProgressChanged 在后台检测开始或结束时通知 QML 刷新按钮状态。 */
+    void detectInProgressChanged();
+
     /* saveCurrentFrameFinished 在异步保存任务结束后发送完整中文结果，QML 用它更新提示条。 */
     void saveCurrentFrameFinished(const QString &resultText);
+
+    /* detectClassificationReady 在第一个分类模型结束后立即发送 RESULT，QML 用它提前显示零件和类别。 */
+    void detectClassificationReady(const QString &resultText);
+
+    /* detectModelsReady 在分类和 UNet 都结束后立即发送 RESULT，QML 用它提前显示双模型总耗时。 */
+    void detectModelsReady(const QString &resultText);
+
+    /* detectCurrentFrameFinished 在异步检测任务结束后发送 RESULT 或错误文本，QML 用它更新当前结果。 */
+    void detectCurrentFrameFinished(const QString &resultText);
 
 private:
     /*
@@ -1285,6 +1719,40 @@ private:
         QString jpgPath;
         QString pngPath;
     };
+
+    /*
+     * DetectResultBundle 的作用：
+     *   保存一次点击“检测”后两个模型串行输出的全部本地结果。
+     *
+     * 字段说明：
+     *   sourcePath 是 overlay 保存的当前帧 JPG，MobileNetV3-Small 和 UNet 都基于它推理。
+     *   annotatedPaths 保存 UNet raw/overlay/mask 等检测结果图，云端统一通过 --annotated 上传。
+     *   annotatedLabels 保存每张结果图在历史页图片轮播上的显示名称。
+     *   classificationResult 是 defect-classify 输出的 RESULT 行。
+     *   segmentationResult 是 defect-segment 输出的 RESULT_SEG 行。
+     *   uploadResult 是 defect-cos-upload 返回的上传状态。
+     */
+    struct DetectResultBundle
+    {
+        QString sourcePath;
+        QStringList annotatedPaths;
+        QStringList annotatedLabels;
+        QString classificationResult;
+        QString segmentationResult;
+        QString uploadResult;
+    };
+
+    /*
+     * DetectProgressCallback 的作用：
+     *   让同步检测流程在关键阶段向异步 UI 汇报进度。
+     *
+     * 参数：
+     *   QString 是该阶段可被 QML 复用解析的 RESULT 文本。
+     *
+     * 返回值：
+     *   无返回值；同步 SSH 自检路径传空回调即可保持原行为。
+     */
+    using DetectProgressCallback = std::function<void(const QString &)>;
 
     /*
      * firstUsefulLine 的作用：
@@ -1458,6 +1926,43 @@ private:
     }
 
     /*
+     * parseDetectSaveReply 的作用：
+     *   解析 overlay 返回的 "OK DETECT_JPG <path>" 检测临时图片路径。
+     *
+     * 参数：
+     *   reply 是 overlay 返回的一行文本。
+     *   imagePath 用于返回当前帧 JPG 路径。
+     *   errorText 用于返回解析失败原因。
+     *
+     * 返回值：
+     *   解析成功返回 true；格式错误或路径为空返回 false。
+     */
+    bool parseDetectSaveReply(const QString &reply, QString *imagePath, QString *errorText) const
+    {
+        const QString marker = QStringLiteral("OK DETECT_JPG ");
+
+        if (!reply.startsWith(marker)) {
+            if (errorText) {
+                *errorText = QStringLiteral("overlay 返回格式不是检测图片路径");
+            }
+            return false;
+        }
+
+        if (imagePath) {
+            *imagePath = reply.mid(marker.length()).trimmed();
+        }
+
+        if (imagePath == nullptr || imagePath->isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("overlay 返回的检测图片路径为空");
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    /*
      * parseTokenValue 的作用：
      *   从脚本返回行中提取 `key=value` 形式的短字段。
      *
@@ -1487,6 +1992,111 @@ private:
         }
 
         return text.mid(valueStart, valueEnd - valueStart).trimmed();
+    }
+
+    /*
+     * resultStatusIsBad 的作用：
+     *   判断 defect-classify 的 RESULT 行是否判定当前样本为 BAD。
+     *
+     * 参数：
+     *   classificationResult 是 defect-classify 输出的一行 RESULT。
+     *
+     * 返回值：
+     *   status=BAD 时返回 true；其它情况返回 false。
+     */
+    bool resultStatusIsBad(const QString &classificationResult) const
+    {
+        return parseTokenValue(classificationResult, QStringLiteral("status")) == QStringLiteral("BAD");
+    }
+
+    /*
+     * buildDetectModelResultLine 的作用：
+     *   把分类 RESULT 和 UNet RESULT_SEG 合成 QML 首页可解析的一行双模型结果。
+     *
+     * 主要流程：
+     *   1. 保留分类 RESULT 原有字段，继续让 QML 读取 status/class/confidence/good_total/bad_total。
+     *   2. 追加 UNet 状态、缺陷像素、分割耗时和双模型总耗时。
+     *   3. 追加 source_path，方便最终结果和日志仍能对齐本次检测原图。
+     *
+     * 参数：
+     *   classificationResult 是 defect-classify 输出的 RESULT 行。
+     *   segmentationResult 是 defect-segment 输出的 RESULT_SEG 行。
+     *   totalModelTimeMs 是分类和 UNet 两个模型串行耗时，单位毫秒。
+     *   sourcePath 是 overlay 保存的本次检测原图。
+     *
+     * 返回值：
+     *   返回以 RESULT 开头的一行文本；不包含 upload_status，表示上传尚未完成。
+     */
+    QString buildDetectModelResultLine(const QString &classificationResult,
+                                       const QString &segmentationResult,
+                                       qint64 totalModelTimeMs,
+                                       const QString &sourcePath) const
+    {
+        return classificationResult
+            + QStringLiteral(" segment_status=")
+            + parseTokenValue(segmentationResult, QStringLiteral("status"))
+            + QStringLiteral(" defect_pixels=")
+            + parseTokenValue(segmentationResult, QStringLiteral("defect_pixels"))
+            + QStringLiteral(" segment_time_ms=")
+            + parseTokenValue(segmentationResult, QStringLiteral("time_ms"))
+            + QStringLiteral(" total_time_ms=")
+            + QString::number(totalModelTimeMs)
+            + QStringLiteral(" source_path=")
+            + sourcePath;
+    }
+
+    /*
+     * segmentationHasDefect 的作用：
+     *   判断 defect-segment 的 RESULT_SEG 行是否输出了非背景缺陷像素。
+     *
+     * 参数：
+     *   segmentationResult 是 defect-segment 输出的一行 RESULT_SEG。
+     *
+     * 返回值：
+     *   defect_pixels 大于 0 或 status=NG 时返回 true；否则返回 false。
+     */
+    bool segmentationHasDefect(const QString &segmentationResult) const
+    {
+        const QString status = parseTokenValue(segmentationResult, QStringLiteral("status"));
+        const QString defectPixelsText = parseTokenValue(segmentationResult, QStringLiteral("defect_pixels"));
+        bool ok = false;
+        const int defectPixels = defectPixelsText.toInt(&ok);
+
+        if (status == QStringLiteral("NG")) {
+            return true;
+        }
+
+        return ok && defectPixels > 0;
+    }
+
+    /*
+     * cloudResultFromClassificationResult 的作用：
+     *   把分类模型 RESULT 行转换成云端记录接口使用的 result 字段。
+     *
+     * 主要流程：
+     *   1. 读取 RESULT 中的 status 字段。
+     *   2. status=BAD 明确上传 bad，status=GOOD 明确上传 good。
+     *   3. 其它异常或未知状态统一上传 review，避免脚本静默退回默认 good。
+     *
+     * 参数：
+     *   classificationResult 是 defect-classify 输出的 RESULT 行。
+     *
+     * 返回值：
+     *   返回云端接口接受的小写结果：good、bad 或 review。
+     */
+    QString cloudResultFromClassificationResult(const QString &classificationResult) const
+    {
+        const QString status = parseTokenValue(classificationResult, QStringLiteral("status"));
+
+        if (status == QStringLiteral("BAD")) {
+            return QStringLiteral("bad");
+        }
+
+        if (status == QStringLiteral("GOOD")) {
+            return QStringLiteral("good");
+        }
+
+        return QStringLiteral("review");
     }
 
     /*
@@ -1567,11 +2177,78 @@ private:
             : QStringLiteral("本地已保存");
         entry.jpgPath = pair.jpgPath;
         entry.pngPath = pair.pngPath;
+        entry.sourcePath = pair.jpgPath;
+        entry.annotatedPaths.append(pair.pngPath);
+        entry.annotatedLabels.append(QStringLiteral("PNG结果图"));
         entry.recordId = parseTokenValue(uploadResult, QStringLiteral("record_id"));
         entry.recordNo = parseTokenValue(uploadResult, QStringLiteral("record_no"));
         entry.uploadStatus = compactUploadStatus(uploadResult);
+        entry.sourceSizeBytes = jpgInfo.exists() ? jpgInfo.size() : 0;
+        entry.annotatedSizeBytes.append(pngInfo.exists() ? pngInfo.size() : 0);
         entry.jpgSizeBytes = jpgInfo.exists() ? jpgInfo.size() : 0;
         entry.pngSizeBytes = pngInfo.exists() ? pngInfo.size() : 0;
+
+        m_historyModel->appendRecord(entry);
+    }
+
+    /*
+     * appendDetectHistoryRecord 的作用：
+     *   把一次完整双模型检测结果追加到本地历史记录。
+     *
+     * 主要流程：
+     *   1. 读取 source 和所有 annotated 图片大小，详情页可直接显示。
+     *   2. 从上传脚本输出中提取云端 record_id 和 record_no。
+     *   3. 根据分类模型 GOOD/BAD 和 UNet 缺陷像素生成本次历史主结果。
+     *   4. 保存两个模型原始 RESULT 行，方便后续排查阈值和图片对应关系。
+     *
+     * 参数：
+     *   bundle 保存本次检测图片、两个模型输出和上传状态。
+     *
+     * 返回值：
+     *   无返回值；没有历史模型时只输出日志。
+     */
+    void appendDetectHistoryRecord(const DetectResultBundle &bundle)
+    {
+        if (m_historyModel == nullptr) {
+            qWarning() << "detect history model missing, skip append";
+            return;
+        }
+
+        UploadHistoryEntry entry;
+        const QFileInfo sourceInfo(bundle.sourcePath);
+        const bool classifyBad = resultStatusIsBad(bundle.classificationResult);
+        const bool segmentBad = segmentationHasDefect(bundle.segmentationResult);
+
+        entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+        entry.resultText = classifyBad ? QStringLiteral("待复核") : QStringLiteral("良品");
+        entry.workflowText = QStringLiteral("分类%1；UNet%2；%3")
+            .arg(classifyBad ? QStringLiteral("BAD") : QStringLiteral("GOOD"))
+            .arg(segmentBad ? QStringLiteral("发现缺陷") : QStringLiteral("未见缺陷"))
+            .arg(bundle.uploadResult.startsWith(QStringLiteral("上传成功："))
+                 ? QStringLiteral("云端已归档")
+                 : QStringLiteral("本地已保存"));
+        entry.sourcePath = bundle.sourcePath;
+        entry.annotatedPaths = bundle.annotatedPaths;
+        entry.annotatedLabels = bundle.annotatedLabels;
+        entry.classificationResult = bundle.classificationResult;
+        entry.segmentationResult = bundle.segmentationResult;
+        entry.jpgPath = bundle.sourcePath;
+        entry.pngPath = bundle.annotatedPaths.isEmpty() ? QString() : bundle.annotatedPaths.constFirst();
+        entry.recordId = parseTokenValue(bundle.uploadResult, QStringLiteral("record_id"));
+        entry.recordNo = parseTokenValue(bundle.uploadResult, QStringLiteral("record_no"));
+        entry.uploadStatus = compactUploadStatus(bundle.uploadResult);
+        entry.sourceSizeBytes = sourceInfo.exists() ? sourceInfo.size() : 0;
+        entry.jpgSizeBytes = entry.sourceSizeBytes;
+
+        for (const QString &path : bundle.annotatedPaths) {
+            const QFileInfo info(path);
+            const qint64 sizeBytes = info.exists() ? info.size() : 0;
+
+            entry.annotatedSizeBytes.append(sizeBytes);
+            if (entry.pngPath == path) {
+                entry.pngSizeBytes = sizeBytes;
+            }
+        }
 
         m_historyModel->appendRecord(entry);
     }
@@ -1677,25 +2354,68 @@ private:
      */
     QString uploadSavedImagesToCos(const SavedImagePair &pair) const
     {
+        QStringList annotatedPaths;
+
+        annotatedPaths.append(pair.pngPath);
+        return uploadDetectImagesToCos(pair.jpgPath, annotatedPaths);
+    }
+
+    /*
+     * uploadDetectImagesToCos 的作用：
+     *   调用板端 defect-cos-upload 脚本，把一次检测的 source 原图和多张 annotated 结果图上传到云端 COS。
+     *
+     * 主要流程：
+     *   1. 优先使用 /root/qt_camera_display/defect-cos-upload，匹配部署脚本路径。
+     *   2. 传入 --jpg <source> 和多次 --annotated <result>。
+     *   3. 通过 CLOUD_RESULT 把本次模型 GOOD/BAD/REVIEW 显式传给上传脚本。
+     *   4. 捕获 stdout/stderr，返回适合界面提示和历史记录的一行结果。
+     *
+     * 参数：
+     *   sourcePath 是云端 file_kind=source 的原始检测图。
+     *   annotatedPaths 是云端 file_kind=annotated 的所有模型结果图。
+     *   cloudResult 是云端记录 result 字段，只允许 good、bad 或 review。
+     *
+     * 返回值：
+     *   上传成功返回“上传成功：...”；失败返回“上传失败：...”。
+     */
+    QString uploadDetectImagesToCos(const QString &sourcePath,
+                                    const QStringList &annotatedPaths,
+                                    const QString &cloudResult = QStringLiteral("review")) const
+    {
         QProcess process;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
         QString scriptPath = QString::fromLatin1(DEFAULT_COS_UPLOAD_SCRIPT);
         QString stdoutText;
         QString stderrText;
         QString usefulLine;
+        QStringList arguments;
+        const QString normalizedCloudResult = (cloudResult == QStringLiteral("good")
+                                               || cloudResult == QStringLiteral("bad")
+                                               || cloudResult == QStringLiteral("review"))
+            ? cloudResult
+            : QStringLiteral("review");
 
         if (!QFileInfo::exists(scriptPath)) {
             scriptPath = QStringLiteral("defect-cos-upload");
         }
 
+        arguments << QStringLiteral("--jpg") << sourcePath;
+        for (const QString &path : annotatedPaths) {
+            if (!path.isEmpty()) {
+                arguments << QStringLiteral("--annotated") << path;
+            }
+        }
+
         qInfo() << "storage action cos-upload requested"
                 << "script" << scriptPath
-                << "jpg" << pair.jpgPath
-                << "png" << pair.pngPath;
+                << "source" << sourcePath
+                << "annotated" << annotatedPaths
+                << "cloudResult" << normalizedCloudResult;
 
+        env.insert(QStringLiteral("CLOUD_RESULT"), normalizedCloudResult);
+        process.setProcessEnvironment(env);
         process.setProgram(scriptPath);
-        process.setArguments(QStringList()
-                             << QStringLiteral("--jpg") << pair.jpgPath
-                             << QStringLiteral("--png") << pair.pngPath);
+        process.setArguments(arguments);
         process.start();
 
         if (!process.waitForStarted(3000)) {
@@ -1738,27 +2458,373 @@ private:
     }
 
     /*
+     * detectCurrentFrameOnce 的作用：
+     *   在后台线程中完成“一次当前帧保存 + 分类模型推理 + UNet 分割推理 + 云端上传”。
+     *
+     * 主要流程：
+     *   1. 确认 /mnt/sdcard 已挂载，并创建图片历史目录。
+     *   2. 发送 SAVE_DETECT 命令，让 overlay 保存当前帧 JPG 作为 source。
+     *   3. 调用 defect-classify，得到 MobileNetV3-Small GOOD/BAD 结果。
+     *   4. 调用 defect-segment，得到 UNet raw/overlay/mask 结果图和缺陷像素。
+     *   5. 把 source 和所有结果图上传到 COS，并把 bundle 交给主线程写历史记录。
+     *
+     * 参数：
+     *   mountPoint 是 SD 卡挂载点。
+     *   imageDir 是检测图片输出目录。
+     *   classifyBin 是独立推理程序路径。
+     *   modelPath 是分类 INT8 ONNX 模型路径。
+     *   labelsPath 是标签 JSON 路径。
+     *   segmentBin 是 UNet 分割推理程序路径。
+     *   segmentModelPath 是 UNet INT8 ONNX 模型路径。
+     *   bundle 用于返回本次检测图片路径、两个模型输出和上传状态。
+     *
+     * 返回值：
+     *   成功返回 "RESULT status=... segment_status=... ..."；
+     *   失败返回 "检测失败：<原因>"，供 QML 原样显示。
+     */
+    QString detectCurrentFrameOnce(const QString &mountPoint,
+                                   const QString &imageDir,
+                                   const QString &classifyBin,
+                                   const QString &modelPath,
+                                   const QString &labelsPath,
+                                   const QString &segmentBin,
+                                   const QString &segmentModelPath,
+                                   DetectResultBundle *bundle,
+                                   const DetectProgressCallback &classificationReadyCallback = DetectProgressCallback(),
+                                   const DetectProgressCallback &modelsReadyCallback = DetectProgressCallback())
+    {
+        QString detectImagePath;
+        QString errorText;
+        QString reply;
+        QString classificationResult;
+        QString segmentationResult;
+        QString modelResult;
+        QString uploadResult;
+        QString cloudResult;
+        qint64 totalModelTimeMs = 0;
+        QElapsedTimer totalDetectTimer;
+
+        qInfo() << "detect action requested"
+                << "imageDir" << imageDir
+                << "classifyBin" << classifyBin
+                << "classifyModel" << modelPath
+                << "labels" << labelsPath
+                << "segmentBin" << segmentBin
+                << "segmentModel" << segmentModelPath;
+
+        if (bundle == nullptr) {
+            return QStringLiteral("检测失败：内部结果缓存为空");
+        }
+
+        if (!isMountPointMounted(mountPoint, &errorText)) {
+            return QStringLiteral("检测失败：") + errorText;
+        }
+
+        if (!QDir().mkpath(imageDir)) {
+            return QStringLiteral("检测失败：无法创建检测图片目录 ") + imageDir;
+        }
+
+        reply = sendRawOverlayCommand(QStringLiteral("SAVE_DETECT ") + imageDir);
+        if (reply.isEmpty()) {
+            return QStringLiteral("检测失败：overlay 没有返回结果");
+        }
+
+        if (reply.startsWith(QStringLiteral("ERR "))) {
+            return QStringLiteral("检测失败：") + reply.mid(4);
+        }
+
+        if (!parseDetectSaveReply(reply, &detectImagePath, &errorText)) {
+            return QStringLiteral("检测失败：") + errorText;
+        }
+
+        QFileInfo imageInfo(detectImagePath);
+        if (!imageInfo.exists() || imageInfo.size() <= 0) {
+            return QStringLiteral("检测失败：当前帧 JPG 不存在或为空：") + detectImagePath;
+        }
+
+        /* totalDetectTimer 只覆盖两个模型本身，避免把拍照、文件校验和网络上传算进“检测耗时”。 */
+        totalDetectTimer.start();
+
+        classificationResult = runDefectClassify(classifyBin, modelPath, labelsPath, detectImagePath);
+        if (!classificationResult.startsWith(QStringLiteral("RESULT "))) {
+            return classificationResult;
+        }
+        if (classificationReadyCallback) {
+            classificationReadyCallback(classificationResult);
+        }
+
+        segmentationResult = runDefectSegment(segmentBin,
+                                              segmentModelPath,
+                                              detectImagePath,
+                                              imageDir,
+                                              bundle);
+        if (!segmentationResult.startsWith(QStringLiteral("RESULT_SEG "))) {
+            return segmentationResult;
+        }
+        totalModelTimeMs = totalDetectTimer.elapsed();
+
+        bundle->sourcePath = detectImagePath;
+        bundle->classificationResult = classificationResult;
+        bundle->segmentationResult = segmentationResult;
+        modelResult = buildDetectModelResultLine(classificationResult,
+                                                 segmentationResult,
+                                                 totalModelTimeMs,
+                                                 bundle->sourcePath);
+        if (modelsReadyCallback) {
+            modelsReadyCallback(modelResult);
+        }
+        cloudResult = cloudResultFromClassificationResult(classificationResult);
+        uploadResult = uploadDetectImagesToCos(bundle->sourcePath, bundle->annotatedPaths, cloudResult);
+        bundle->uploadResult = uploadResult;
+
+        return modelResult
+            + QStringLiteral(" upload_status=")
+            + (uploadResult.startsWith(QStringLiteral("上传成功：")) ? QStringLiteral("OK") : QStringLiteral("FAIL"));
+    }
+
+    /*
+     * runDefectClassify 的作用：
+     *   调用独立 defect-classify 程序，并把输出压缩成 QML 可解析的一行。
+     *
+     * 主要流程：
+     *   1. 校验程序、模型、标签和图片文件是否存在。
+     *   2. 传入 --image/--model/--labels/--roi 300，保持板端预处理与训练采集一致。
+     *   3. 等待进程结束，成功时返回 stdout 中第一行 RESULT，失败时返回 stderr/stdout 中的首行错误。
+     *
+     * 参数：
+     *   classifyBin/modelPath/labelsPath/imagePath 分别是推理程序、模型、标签和图片路径。
+     *
+     * 返回值：
+     *   成功返回 RESULT 行；失败返回“检测失败：...”。
+     */
+    QString runDefectClassify(const QString &classifyBin,
+                              const QString &modelPath,
+                              const QString &labelsPath,
+                              const QString &imagePath) const
+    {
+        QProcess process;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        QString stdoutText;
+        QString stderrText;
+        QString usefulLine;
+
+        if (!QFileInfo::exists(classifyBin)) {
+            return QStringLiteral("检测失败：找不到推理程序 ") + classifyBin;
+        }
+
+        if (!QFileInfo::exists(modelPath)) {
+            return QStringLiteral("检测失败：找不到模型 ") + modelPath;
+        }
+
+        if (!QFileInfo::exists(labelsPath)) {
+            return QStringLiteral("检测失败：找不到标签 ") + labelsPath;
+        }
+
+        if (!QFileInfo::exists(imagePath)) {
+            return QStringLiteral("检测失败：找不到当前帧图片 ") + imagePath;
+        }
+
+        env.insert(QStringLiteral("LD_LIBRARY_PATH"),
+                   QStringLiteral("/root/qt_camera_display/lib:")
+                   + env.value(QStringLiteral("LD_LIBRARY_PATH")));
+        process.setProcessEnvironment(env);
+        process.setProgram(classifyBin);
+        process.setArguments(QStringList()
+                             << QStringLiteral("--image") << imagePath
+                             << QStringLiteral("--model") << modelPath
+                             << QStringLiteral("--labels") << labelsPath
+                             << QStringLiteral("--roi") << QStringLiteral("300"));
+        process.start();
+
+        if (!process.waitForStarted(3000)) {
+            return QStringLiteral("检测失败：无法启动 defect-classify");
+        }
+
+        if (!process.waitForFinished(120000)) {
+            process.kill();
+            process.waitForFinished(1000);
+            return QStringLiteral("检测失败：defect-classify 超时");
+        }
+
+        stdoutText = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        stderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
+
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            if (!stderrText.isEmpty()) {
+                usefulLine = firstUsefulLine(stderrText);
+                return usefulLine.startsWith(QStringLiteral("检测失败："))
+                    ? usefulLine
+                    : QStringLiteral("检测失败：") + usefulLine;
+            }
+            if (!stdoutText.isEmpty()) {
+                usefulLine = firstUsefulLine(stdoutText);
+                return usefulLine.startsWith(QStringLiteral("检测失败："))
+                    ? usefulLine
+                    : QStringLiteral("检测失败：") + usefulLine;
+            }
+            return QStringLiteral("检测失败：defect-classify 返回异常");
+        }
+
+        if (!stdoutText.isEmpty()) {
+            usefulLine = firstUsefulLine(stdoutText);
+            return usefulLine.startsWith(QStringLiteral("RESULT "))
+                ? usefulLine
+                : QStringLiteral("检测失败：推理输出缺少 RESULT：") + usefulLine.left(120);
+        }
+
+        return QStringLiteral("检测失败：defect-classify 没有输出");
+    }
+
+    /*
+     * runDefectSegment 的作用：
+     *   调用独立 defect-segment 程序，并把输出路径写入 DetectResultBundle。
+     *
+     * 主要流程：
+     *   1. 校验程序、UNet 模型、输入图片和输出目录是否存在或可用。
+     *   2. 传入 --image/--model/--output-dir/--roi/--alpha，保持板端预处理与 PC 端测试一致。
+     *   3. 等待进程结束，成功时解析 RESULT_SEG 中的 raw_path/overlay_path/mask_path。
+     *   4. 把 raw/overlay/mask 三张图都放入 annotatedPaths，后续统一作为 --annotated 上传。
+     *
+     * 参数：
+     *   segmentBin/modelPath/imagePath/outputDir 分别是推理程序、模型、输入图和输出目录。
+     *   bundle 用于保存分割结果图路径和标签。
+     *
+     * 返回值：
+     *   成功返回 RESULT_SEG 行；失败返回“检测失败：...”。
+     */
+    QString runDefectSegment(const QString &segmentBin,
+                             const QString &modelPath,
+                             const QString &imagePath,
+                             const QString &outputDir,
+                             DetectResultBundle *bundle) const
+    {
+        QProcess process;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        QString stdoutText;
+        QString stderrText;
+        QString usefulLine;
+        QString rawPath;
+        QString overlayPath;
+        QString maskPath;
+
+        if (bundle == nullptr) {
+            return QStringLiteral("检测失败：UNet 结果缓存为空");
+        }
+
+        if (!QFileInfo::exists(segmentBin)) {
+            return QStringLiteral("检测失败：找不到 UNet 推理程序 ") + segmentBin;
+        }
+
+        if (!QFileInfo::exists(modelPath)) {
+            return QStringLiteral("检测失败：找不到 UNet 模型 ") + modelPath;
+        }
+
+        if (!QFileInfo::exists(imagePath)) {
+            return QStringLiteral("检测失败：找不到 UNet 输入图片 ") + imagePath;
+        }
+
+        if (!QDir().mkpath(outputDir)) {
+            return QStringLiteral("检测失败：无法创建 UNet 输出目录 ") + outputDir;
+        }
+
+        env.insert(QStringLiteral("LD_LIBRARY_PATH"),
+                   QStringLiteral("/root/qt_camera_display/lib:")
+                   + env.value(QStringLiteral("LD_LIBRARY_PATH")));
+        process.setProcessEnvironment(env);
+        process.setProgram(segmentBin);
+        process.setArguments(QStringList()
+                             << QStringLiteral("--image") << imagePath
+                             << QStringLiteral("--model") << modelPath
+                             << QStringLiteral("--output-dir") << outputDir
+                             << QStringLiteral("--roi") << QStringLiteral("300")
+                             << QStringLiteral("--alpha") << QStringLiteral("0.45"));
+        process.start();
+
+        if (!process.waitForStarted(3000)) {
+            return QStringLiteral("检测失败：无法启动 defect-segment");
+        }
+
+        if (!process.waitForFinished(180000)) {
+            process.kill();
+            process.waitForFinished(1000);
+            return QStringLiteral("检测失败：defect-segment 超时");
+        }
+
+        stdoutText = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        stderrText = QString::fromUtf8(process.readAllStandardError()).trimmed();
+
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            if (!stderrText.isEmpty()) {
+                usefulLine = firstUsefulLine(stderrText);
+                return usefulLine.startsWith(QStringLiteral("检测失败："))
+                    ? usefulLine
+                    : QStringLiteral("检测失败：") + usefulLine;
+            }
+            if (!stdoutText.isEmpty()) {
+                usefulLine = firstUsefulLine(stdoutText);
+                return usefulLine.startsWith(QStringLiteral("检测失败："))
+                    ? usefulLine
+                    : QStringLiteral("检测失败：") + usefulLine;
+            }
+            return QStringLiteral("检测失败：defect-segment 返回异常");
+        }
+
+        if (stdoutText.isEmpty()) {
+            return QStringLiteral("检测失败：defect-segment 没有输出");
+        }
+
+        usefulLine = firstUsefulLine(stdoutText);
+        if (!usefulLine.startsWith(QStringLiteral("RESULT_SEG "))) {
+            return QStringLiteral("检测失败：UNet 输出缺少 RESULT_SEG：") + usefulLine.left(120);
+        }
+
+        rawPath = parseTokenValue(usefulLine, QStringLiteral("raw_path"));
+        overlayPath = parseTokenValue(usefulLine, QStringLiteral("overlay_path"));
+        maskPath = parseTokenValue(usefulLine, QStringLiteral("mask_path"));
+
+        if (rawPath.isEmpty() || overlayPath.isEmpty() || maskPath.isEmpty()) {
+            return QStringLiteral("检测失败：UNet 输出缺少 raw/overlay/mask 路径");
+        }
+
+        const QStringList paths = QStringList() << rawPath << overlayPath << maskPath;
+        for (const QString &path : paths) {
+            const QFileInfo info(path);
+
+            if (!info.exists() || info.size() <= 0) {
+                return QStringLiteral("检测失败：UNet 结果图不存在或为空：") + path;
+            }
+        }
+
+        bundle->annotatedPaths.clear();
+        bundle->annotatedLabels.clear();
+        bundle->annotatedPaths << rawPath << overlayPath << maskPath;
+        bundle->annotatedLabels << QStringLiteral("UNet原图")
+                                << QStringLiteral("UNet叠加图")
+                                << QStringLiteral("UNet掩膜图");
+
+        return usefulLine;
+    }
+
+    /*
      * sendOverlayCommand 的作用：
      *   连接 overlay 控制 socket，发送 SAVE_DUAL 命令并转换为 QML 可显示的中文状态。
      */
-    QString sendOverlayCommand(const QString &command)
+    QString sendRawOverlayCommand(const QString &command)
     {
         int fd = -1;
         struct sockaddr_un addr;
         QString errorText;
         QString reply;
-        SavedImagePair pair;
         QByteArray socketPathBytes = m_socketPath.toLocal8Bit();
         QByteArray commandBytes = command.toLocal8Bit() + '\n';
 
         if (socketPathBytes.size() >= static_cast<int>(sizeof(addr.sun_path))) {
-            return QStringLiteral("保存失败：控制 socket 路径过长");
+            return QStringLiteral("ERR 控制 socket 路径过长");
         }
 
         fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
-            return QStringLiteral("保存失败：创建 socket 失败：")
-                + QString::fromLocal8Bit(strerror(errno));
+            return QStringLiteral("ERR 创建 socket 失败：") + QString::fromLocal8Bit(strerror(errno));
         }
 
         std::memset(&addr, 0, sizeof(addr));
@@ -1769,20 +2835,41 @@ private:
             const QString detail = QString::fromLocal8Bit(strerror(errno));
 
             ::close(fd);
-            return QStringLiteral("保存失败：overlay 控制端未连接：") + detail;
+            return QStringLiteral("ERR overlay 控制端未连接：") + detail;
         }
 
         if (!writeAllToFd(fd, commandBytes, &errorText)) {
             ::close(fd);
-            return QStringLiteral("保存失败：发送请求失败：") + errorText;
+            return QStringLiteral("ERR 发送请求失败：") + errorText;
         }
 
         reply = readReplyFromFd(fd, &errorText);
         ::close(fd);
 
         if (reply.isEmpty()) {
-            return QStringLiteral("保存失败：overlay 没有返回结果：") + errorText;
+            return QStringLiteral("ERR overlay 没有返回结果：") + errorText;
         }
+
+        return reply;
+    }
+
+    /*
+     * sendOverlayCommand 的作用：
+     *   连接 overlay 控制 socket，发送 SAVE_DUAL/VISIBLE 命令并转换为 QML 可显示的中文状态。
+     *
+     * 参数：
+     *   command 是发给 overlay 的一行命令。
+     *
+     * 返回值：
+     *   保存类命令返回“保存成功/保存失败”；VISIBLE 命令返回视频层切换状态。
+     */
+    QString sendOverlayCommand(const QString &command)
+    {
+        QString errorText;
+        QString reply;
+        SavedImagePair pair;
+
+        reply = sendRawOverlayCommand(command);
 
         if (reply.startsWith(QStringLiteral("OK JPG "))) {
             if (!parseDualSaveReply(reply, &pair, &errorText)) {
@@ -1840,6 +2927,26 @@ private:
         emit saveInProgressChanged();
     }
 
+    /*
+     * setDetectInProgress 的作用：
+     *   集中更新异步检测忙状态，并在状态变化时通知 QML。
+     *
+     * 参数：
+     *   inProgress 为 true 表示后台检测任务开始；false 表示任务结束或启动失败。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setDetectInProgress(bool inProgress)
+    {
+        if (m_detectInProgress == inProgress) {
+            return;
+        }
+
+        m_detectInProgress = inProgress;
+        emit detectInProgressChanged();
+    }
+
     QString m_socketPath;  /* m_socketPath 是 overlay 控制 socket 路径。 */
     QString m_mountPoint;  /* m_mountPoint 是 SD 卡挂载点。 */
     QString m_imageDir;    /* m_imageDir 是图片保存目录。 */
@@ -1848,6 +2955,7 @@ private:
     UploadHistoryModel *m_historyModel; /* m_historyModel 指向 QML 使用的上传历史模型，保存成功后会追加记录。 */
     bool m_appendHistoryInSave; /* m_appendHistoryInSave 控制同步保存函数是否立即追加历史记录。 */
     bool m_saveInProgress; /* m_saveInProgress 只在 Qt 主线程维护，用于防止保存图片任务重复启动。 */
+    bool m_detectInProgress; /* m_detectInProgress 只在 Qt 主线程维护，用于防止检测任务重复启动。 */
 };
 
 /*
@@ -2149,6 +3257,39 @@ static int run_storage_self_test(int argc, char *argv[])
 }
 
 /*
+ * run_detect_self_test 的作用：
+ *   不启动 QML 界面，直接复用 CameraStorageController 的双模型检测链路。
+ *
+ * 主要流程：
+ *   1. 创建 QCoreApplication，保证 Qt 文本、环境变量、QProcess 和文件接口可用。
+ *   2. 创建 UploadHistoryModel，检测成功后和屏幕点击一样追加 upload_history.json。
+ *   3. 调用 detectCurrentFrameOnce()，串行执行 SAVE_DETECT、defect-classify、defect-segment 和 COS 上传。
+ *   4. 把最终 RESULT 或失败原因打印到 stdout，便于 SSH 自动化判断。
+ *
+ * 参数：
+ *   argc/argv 是 main 收到的原始参数。
+ *
+ * 返回值：
+ *   返回 EXIT_SUCCESS 表示双模型检测主链路跑通；返回 EXIT_FAILURE 表示任一步失败。
+ */
+static int run_detect_self_test(int argc, char *argv[])
+{
+    /* 自检入口也设置默认时区，保证历史记录 upload_time 与屏幕顶部时间一致。 */
+    set_default_environment();
+
+    QCoreApplication app(argc, argv);
+    CameraStorageController storageController;
+    UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
+
+    /* 自检入口复用同一个历史模型，保证 SSH 检测成功后屏幕历史页能看到这条记录。 */
+    storageController.setHistoryModel(&uploadHistory);
+
+    const QString result = storageController.detectCurrentFrameForSelfTest();
+    QTextStream(stdout) << result << '\n';
+    return result.startsWith(QStringLiteral("RESULT ")) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/*
  * run_alarm_snapshot_self_test 的作用：
  *   不启动 QML 界面，直接复用 CameraStorageController 写一份告警诊断快照。
  *
@@ -2391,6 +3532,11 @@ int main(int argc, char *argv[])
     /* --storage-self-test 用于 SSH 验证保存按钮同一条 C++ 控制路径，不需要启动 Qt Quick/eglfs。 */
     if (has_raw_argument(argc, argv, "--storage-self-test")) {
         return run_storage_self_test(argc, argv);
+    }
+
+    /* --detect-self-test 用于 SSH 验证双模型串行检测链路，不需要启动 Qt Quick/eglfs。 */
+    if (has_raw_argument(argc, argv, "--detect-self-test")) {
+        return run_detect_self_test(argc, argv);
     }
 
     /* --alarm-snapshot-self-test 用于 SSH 验证告警维护保存诊断同一条 C++ 落盘路径。 */

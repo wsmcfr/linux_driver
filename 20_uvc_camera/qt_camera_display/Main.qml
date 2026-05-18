@@ -43,8 +43,38 @@ Rectangle {
     /* workflowState 表示当前产线状态；按钮会改变该文本，后续可接真实状态机。 */
     property string workflowState: "定位预览"
 
-    /* storageState 表示 SD 卡保存图片和安全卸载按钮的最近一次执行结果。 */
+    /* storageState 表示检测流程、SD 卡安全卸载和告警快照的最近一次执行结果。 */
     property string storageState: "SD卡就绪"
+
+    /* saveImageBusy 保留给旧 SSH 保存自检状态同步；首页已经不再暴露独立保存图片按钮。 */
+    property bool saveImageBusy: false
+
+    /* detectImageBusy 表示当前帧检测后台任务正在执行，用于禁止重复检测和提示按钮状态。 */
+    property bool detectImageBusy: false
+
+    /* detectState 保存检测按钮最近一次结果摘要；初始为等待用户手动触发。 */
+    property string detectState: "等待检测"
+
+    /* detectStatus 保存模型输出 GOOD/BAD/WAIT/ERROR 状态，决定结果色和主结果文案。 */
+    property string detectStatus: "WAIT"
+
+    /* detectClassName 保存模型输出的具体类别名，例如 washer_good 或 gasket_bad。 */
+    property string detectClassName: "未检测"
+
+    /* detectConfidenceText 保存模型输出置信度的千分比显示文本。 */
+    property string detectConfidenceText: "--/1000"
+
+    /* detectConfidenceRatio 保存 0~1 置信度比例，用于进度条宽度。 */
+    property real detectConfidenceRatio: 0.0
+
+    /* detectBadTotalText 保存 bad 类别总概率，辅助现场判断低置信度坏品趋势。 */
+    property string detectBadTotalText: "坏品 --/1000"
+
+    /* detectGoodTotalText 保存 good 类别总概率，辅助现场判断低置信度良品趋势。 */
+    property string detectGoodTotalText: "良品 --/1000"
+
+    /* detectTimeText 保存 defect-classify 返回的单次推理耗时。 */
+    property string detectTimeText: "耗时 -- ms"
 
     /* storageToastVisible 表示底部 SD 卡操作提示是否显示；Timer 到时后自动隐藏。 */
     property bool storageToastVisible: false
@@ -127,7 +157,7 @@ Rectangle {
     /* settingsSortTimeoutMs 保存分拣动作超时时间，超时后应进入告警维护流程。 */
     property int settingsSortTimeoutMs: 1500
 
-    /* settingsAutoUpload 表示保存图片后是否自动触发 COS 上传，当前只作为界面配置状态。 */
+    /* settingsAutoUpload 表示检测结果是否自动触发 COS 上传，当前只作为界面配置状态。 */
     property bool settingsAutoUpload: true
 
     /* settingsLastActionText 保存参数页最近一次应用、保存或恢复默认的结果提示。 */
@@ -151,7 +181,7 @@ Rectangle {
     /* alarmCleared 表示当前模拟告警是否已清除；真实接入后以 F4 状态帧为准。 */
     property bool alarmCleared: false
 
-    /* historyDetailVisible 表示历史页是否进入“查看详情”二级页面；false 时只显示第一层上传记录列表。 */
+    /* historyDetailVisible 表示历史页是否进入“查看详情”二级页面；false 时只显示第一层检测记录列表。 */
     property bool historyDetailVisible: false
 
     /* selectedHistoryIndex 保存当前正在查看的历史记录索引；-1 表示尚未选择记录。 */
@@ -499,27 +529,27 @@ Rectangle {
 
     /*
      * handleStorageAction 的作用：
-     *   统一处理“保存图片”和“安全卸载”两个真实 SD 卡按钮。
+     *   统一处理“安全卸载”等真实 SD 卡按钮。
      *
      * 主要流程：
-     *   1. 保存图片时调用 C++ 控制器，控制器再请求 overlay 保存当前显示帧。
-     *   2. 安全卸载时调用 C++ 控制器执行 sdcard-safe-remove。
-     *   3. 把返回结果写入 storageState，让现场测试者能立即看到成功路径或失败原因。
+     *   1. 首页已经不再提供独立保存图片，检测按钮会自动保存两种模型的结果图。
+     *   2. 安全卸载仍调用同步脚本，但检测或旧保存自检进行中禁止安全卸载，避免写文件时卸载 SD 卡。
      *
      * 参数：
-     *   action 是 save-image 或 safe-remove。
+     *   action 是 safe-remove。
      *
      * 返回值：
      *   无返回值；函数会更新 storageState，并短暂显示底部提示条。
      */
     function handleStorageAction(action) {
-        if (action === "save-image") {
-            storageState = storageController.saveCurrentFrameToSdCard()
-            showStorageToast()
-            return
-        }
-
         if (action === "safe-remove") {
+            if (detectImageBusy || storageController.detectInProgress
+                    || saveImageBusy || storageController.saveInProgress) {
+                storageState = "检测图片写入中，暂不能安全卸载"
+                showStorageToast()
+                return
+            }
+
             storageState = storageController.safeRemoveSdCard()
             showStorageToast()
             return
@@ -527,6 +557,170 @@ Rectangle {
 
         storageState = "未知SD卡操作"
         showStorageToast()
+    }
+
+    /*
+     * handleDetectAction 的作用：
+     *   处理首页“检测”按钮点击，异步请求 C++ 保存当前帧并串行调用分类和 UNet。
+     *
+     * 主要流程：
+     *   1. 如果检测线程已经在运行，直接提示等待，避免重复启动多个 ONNX Runtime 进程。
+     *   2. 设置检测中状态，让结果面板和按钮立即给出反馈。
+     *   3. 调用 storageController.requestDetectCurrentFrame()，实际保存和推理都在 C++ 后台线程完成。
+     *
+     * 返回值：
+     *   无返回值；检测完成后由 onDetectCurrentFrameFinished 更新界面。
+     */
+    function handleDetectAction() {
+        if (detectImageBusy || storageController.detectInProgress) {
+            storageState = "正在检测当前帧，请等待完成"
+            showStorageToast()
+            return
+        }
+
+        detectImageBusy = true
+        detectStatus = "WAIT"
+        detectState = "检测中..."
+        detectClassName = "当前帧"
+        detectConfidenceText = "--/1000"
+        detectConfidenceRatio = 0.0
+        detectBadTotalText = "坏品 --/1000"
+        detectGoodTotalText = "良品 --/1000"
+        detectTimeText = "耗时 -- ms"
+        storageState = "正在检测当前帧..."
+        storageController.requestDetectCurrentFrame()
+        showStorageToast()
+    }
+
+    /*
+     * resultTokenValue 的作用：
+     *   从 defect-classify 输出的 RESULT 行中提取 key=value 字段。
+     *
+     * 参数：
+     *   text 是完整 RESULT 行。
+     *   key 是字段名，例如 status、class、confidence。
+     *
+     * 返回值：
+     *   找到时返回 value；找不到时返回空字符串。
+     */
+    function resultTokenValue(text, key) {
+        var marker = key + "="
+        var markerIndex = text.indexOf(marker)
+        if (markerIndex < 0) {
+            return ""
+        }
+
+        var valueStart = markerIndex + marker.length
+        var valueEnd = valueStart
+        while (valueEnd < text.length
+               && text.charAt(valueEnd) !== " "
+               && text.charAt(valueEnd) !== ";") {
+            valueEnd += 1
+        }
+
+        return text.substring(valueStart, valueEnd)
+    }
+
+    /*
+     * probabilityToText 的作用：
+     *   把 0~1 概率转换成界面使用的千分比文本。
+     *
+     * 参数：
+     *   valueText 是 RESULT 行里的小数文本。
+     *   prefix 是可选中文前缀，例如“坏品”。
+     *
+     * 返回值：
+     *   返回 “962/1000” 或 “坏品 962/1000”。
+     */
+    function probabilityToText(valueText, prefix) {
+        var value = Number(valueText)
+        if (isNaN(value)) {
+            return prefix.length > 0 ? prefix + " --/1000" : "--/1000"
+        }
+
+        var score = Math.max(0, Math.min(1000, Math.round(value * 1000)))
+        return prefix.length > 0 ? prefix + " " + score + "/1000" : score + "/1000"
+    }
+
+    /*
+     * probabilityToRatio 的作用：
+     *   把 RESULT 概率文本转换成 0~1 进度条比例。
+     *
+     * 参数：
+     *   valueText 是 RESULT 行里的小数文本。
+     *
+     * 返回值：
+     *   返回 0~1 数值；解析失败返回 0。
+     */
+    function probabilityToRatio(valueText) {
+        var value = Number(valueText)
+        if (isNaN(value)) {
+            return 0.0
+        }
+        return Math.max(0.0, Math.min(1.0, value))
+    }
+
+    /*
+     * formatDetectTime 的作用：
+     *   把 defect-classify 输出的毫秒耗时整理成短文本。
+     *
+     * 参数：
+     *   timeText 是 RESULT 行里的 time_ms 文本。
+     *
+     * 返回值：
+     *   成功返回 “耗时 12 ms”；失败返回 “耗时 -- ms”。
+     */
+    function formatDetectTime(timeText) {
+        var value = Number(timeText)
+        if (isNaN(value)) {
+            return "耗时 -- ms"
+        }
+        return "耗时 " + Math.round(value) + " ms"
+    }
+
+    /*
+     * handleDetectResultText 的作用：
+     *   解析 C++ 返回的检测结果，并刷新首页结果面板。
+     *
+     * 主要流程：
+     *   1. 失败文本以“检测失败”开头时进入 ERROR 状态。
+     *   2. 成功 RESULT 行提取 status/class/confidence/bad_total/good_total/time_ms。
+     *   3. 根据 GOOD/BAD 更新主结果色、类别名、概率条和状态提示。
+     *
+     * 参数：
+     *   resultText 是 detectCurrentFrameFinished 信号传来的文本。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 root 的检测属性。
+     */
+    function handleDetectResultText(resultText) {
+        if (resultText.indexOf("RESULT ") !== 0) {
+            detectStatus = "ERROR"
+            detectState = resultText
+            detectClassName = "检测失败"
+            detectConfidenceText = "--/1000"
+            detectConfidenceRatio = 0.0
+            detectBadTotalText = "坏品 --/1000"
+            detectGoodTotalText = "良品 --/1000"
+            detectTimeText = "耗时 -- ms"
+            return
+        }
+
+        var statusText = resultTokenValue(resultText, "status")
+        var classText = resultTokenValue(resultText, "class")
+        var confidenceText = resultTokenValue(resultText, "confidence")
+        var badTotalText = resultTokenValue(resultText, "bad_total")
+        var goodTotalText = resultTokenValue(resultText, "good_total")
+        var timeText = resultTokenValue(resultText, "time_ms")
+
+        detectStatus = statusText.length > 0 ? statusText : "WAIT"
+        detectClassName = classText.length > 0 ? classText : "未知类别"
+        detectConfidenceText = probabilityToText(confidenceText, "")
+        detectConfidenceRatio = probabilityToRatio(confidenceText)
+        detectBadTotalText = probabilityToText(badTotalText, "坏品")
+        detectGoodTotalText = probabilityToText(goodTotalText, "良品")
+        detectTimeText = formatDetectTime(timeText)
+        detectState = detectStatus === "BAD" ? "模型判定坏品" : "模型判定良品"
     }
 
     /*
@@ -581,7 +775,7 @@ Rectangle {
      *   集中判断某个手动动作当前是否允许执行，让按钮置灰条件和点击保护分支使用同一套安全规则。
      *
      * 主要流程：
-     *   1. 保存当前帧、刷新状态、进入手动、停止和清故障属于安全动作，可以在未进入手动模式时执行。
+     *   1. 检测当前帧、刷新状态、进入手动、停止和清故障属于安全动作，可以在未进入手动模式时执行。
      *   2. 其它运动或执行器动作必须先进入手动模式。
      *   3. 急停状态下只允许停止、刷新状态和清故障。
      *   4. 抓取和放置类动作要求机械臂已经回零。
@@ -593,7 +787,7 @@ Rectangle {
      *   返回 true 表示按钮可以执行；返回 false 表示界面应置灰或点击时给出禁止原因。
      */
     function manualActionAllowed(action) {
-        if (action === "enter-manual" || action === "stop" || action === "save-frame"
+        if (action === "enter-manual" || action === "stop" || action === "detect-frame"
                 || action === "refresh" || action === "clear-alarm" || action === "emergency-toggle") {
             return true
         }
@@ -619,11 +813,11 @@ Rectangle {
      *
      * 主要流程：
      *   1. 先执行手动模式、急停和回零等安全保护判断。
-     *   2. 保存当前帧动作复用现有 storageController 链路，避免重复实现图片保存。
+     *   2. 检测当前帧动作复用首页双模型检测链路，避免只保存无检测结果的图片。
      *   3. 其它动作只改变模拟状态和命令日志，后续会在这里替换为 motionController.sendManualCommand(action)。
      *
      * 参数：
-     *   action 是动作标识，例如 belt-forward、arm-home、save-frame。
+     *   action 是动作标识，例如 belt-forward、arm-home、detect-frame。
      *   label 是界面显示的按钮文字，用于日志和提示。
      *
      * 返回值：
@@ -631,7 +825,7 @@ Rectangle {
      */
     function handleManualAction(action, label) {
         if (!manualMode && action !== "enter-manual" && action !== "stop"
-                && action !== "save-frame" && action !== "refresh"
+                && action !== "detect-frame" && action !== "refresh"
                 && action !== "clear-alarm" && action !== "emergency-toggle") {
             manualLastAckText = "请先进入手动模式"
             storageState = manualLastAckText
@@ -657,9 +851,9 @@ Rectangle {
             return
         }
 
-        if (action === "save-frame") {
-            handleStorageAction("save-image")
-            manualLastAckText = "已请求保存当前帧"
+        if (action === "detect-frame") {
+            handleDetectAction()
+            manualLastAckText = "已请求双模型检测当前帧"
             appendManualCommandLog(label, "检测辅助", manualLastAckText)
             return
         }
@@ -1027,7 +1221,7 @@ Rectangle {
      *
      * 主要流程：
      *   1. 更新 activePage，让对应页面的 QML 内容显示。
-     *   2. 第一次进入历史页时，如果已有上传记录，默认选中最新一条。
+     *   2. 第一次进入历史页时，如果已有检测记录，默认选中最新一条。
      *   3. KMS overlay 模式下，非首页需要隐藏视频 plane，返回首页再恢复。
      *
      * 参数：
@@ -1080,7 +1274,7 @@ Rectangle {
 
     /*
      * deleteHistoryRecord 的作用：
-     *   响应历史卡片中的“删除”按钮，删除这条历史记录和它对应的 JPG/PNG 图片文件。
+     *   响应历史卡片中的“删除”按钮，删除这条历史记录和它对应的 source/annotated 图片文件。
      *
      * 主要流程：
      *   1. 先校验 index，避免列表滑动时误传已经失效的记录编号。
@@ -1137,7 +1331,7 @@ Rectangle {
 
     /*
      * backToHistoryList 的作用：
-     *   从某条上传记录详情页返回历史列表页。
+     *   从某条检测记录详情页返回历史列表页。
      *
      * 主要流程：
      *   只关闭 historyDetailVisible，不改变 selectedHistoryIndex，这样用户回到列表时仍能看到刚才查看的卡片高亮。
@@ -1313,17 +1507,17 @@ Rectangle {
      *   为首页底部最近记录区域生成一行历史摘要。
      *
      * 返回值：
-     *   有历史时显示最新上传时间和云端记录号；无历史时显示暂无上传。
+     *   有历史时显示最新检测时间和云端记录号；无历史时显示暂无检测。
      */
     function latestHistoryText() {
         if (uploadHistory.count <= 0) {
-            return "最近记录：暂无上传记录"
+            return "最近记录：暂无检测记录"
         }
 
         var record = uploadHistory.latestEntry()
         var recordName = record.recordNo && record.recordNo.length > 0 ? record.recordNo : "本地记录"
 
-        return "最近上传：" + record.uploadTime + "  |  " + record.resultText + "  |  " + recordName
+        return "最近检测：" + record.uploadTime + "  |  " + record.resultText + "  |  " + recordName
     }
 
     /*
@@ -1367,6 +1561,30 @@ Rectangle {
     }
 
     /*
+     * historyRecordBytes 的作用：
+     *   返回一条历史记录所有图片的总字节数，兼容旧记录只有 jpg/png 两个大小字段的格式。
+     *
+     * 参数：
+     *   record 是 uploadHistory.entryAt() 返回的历史记录对象。
+     *
+     * 返回值：
+     *   返回 source 和所有 annotated 图片大小之和。
+     */
+    function historyRecordBytes(record) {
+        if (!record) {
+            return 0
+        }
+
+        if (record.totalSizeBytes && record.totalSizeBytes > 0) {
+            return record.totalSizeBytes
+        }
+
+        var jpgBytes = record.jpgSizeBytes ? record.jpgSizeBytes : 0
+        var pngBytes = record.pngSizeBytes ? record.pngSizeBytes : 0
+        return jpgBytes + pngBytes
+    }
+
+    /*
      * percentText 的作用：
      *   把分子和分母格式化成百分比文本，避免多个统计卡重复写除零判断。
      *
@@ -1387,7 +1605,7 @@ Rectangle {
 
     /*
      * statsSummary 的作用：
-     *   汇总上传历史中的核心生产统计，供 KPI 卡、分布条和云端状态区复用。
+     *   汇总检测历史中的核心生产统计，供 KPI 卡、分布条和云端状态区复用。
      *
      * 主要流程：
      *   1. 遍历 uploadHistory 的每条记录。
@@ -1414,9 +1632,7 @@ Rectangle {
 
         for (var i = 0; i < uploadHistory.count; ++i) {
             var record = uploadHistory.entryAt(i)
-            var jpgBytes = record.jpgSizeBytes ? record.jpgSizeBytes : 0
-            var pngBytes = record.pngSizeBytes ? record.pngSizeBytes : 0
-            var recordBytes = jpgBytes + pngBytes
+            var recordBytes = historyRecordBytes(record)
 
             if (isGoodRecord(record)) {
                 summary.good += 1
@@ -1658,7 +1874,7 @@ Rectangle {
 
         /*
          * countChanged 的作用：
-         *   当 C++ 保存控制器追加上传历史后，让历史页默认跟到最新记录。
+         *   当 C++ 检测控制器追加检测历史后，让历史页默认跟到最新记录。
          */
         onCountChanged: {
             if (uploadHistory.count > 0) {
@@ -1666,6 +1882,47 @@ Rectangle {
                 selectedHistoryImageIndex = 0
                 selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
             }
+        }
+    }
+
+    Connections {
+        target: storageController
+
+        /*
+         * onSaveInProgressChanged 的作用：
+         *   同步 C++ 后台保存忙状态，让按钮文案和置灰状态准确反映真实线程生命周期。
+         */
+        onSaveInProgressChanged: {
+            saveImageBusy = storageController.saveInProgress
+        }
+
+        /*
+         * onDetectInProgressChanged 的作用：
+         *   同步 C++ 后台检测忙状态，让检测按钮和状态文案反映真实线程生命周期。
+         */
+        onDetectInProgressChanged: {
+            detectImageBusy = storageController.detectInProgress
+        }
+
+        /*
+         * onSaveCurrentFrameFinished 的作用：
+         *   接收旧 SSH 保存自检任务最终结果，并恢复兼容状态标志。
+         */
+        onSaveCurrentFrameFinished: {
+            saveImageBusy = false
+            storageState = resultText
+            showStorageToast()
+        }
+
+        /*
+         * onDetectCurrentFrameFinished 的作用：
+         *   接收 C++ 后台检测任务最终结果，解析模型 RESULT 并刷新首页检测面板。
+         */
+        onDetectCurrentFrameFinished: {
+            detectImageBusy = false
+            handleDetectResultText(resultText)
+            storageState = resultText
+            showStorageToast()
         }
     }
 
@@ -1969,28 +2226,28 @@ Rectangle {
             x: root.usingKmsOverlay ? 12 : 16
             y: 52
             width: parent.width - (root.usingKmsOverlay ? 24 : 32)
-            spacing: root.usingKmsOverlay ? 9 : 13
+            spacing: root.usingKmsOverlay ? 6 : 8
 
             Repeater {
                 model: root.usingKmsOverlay ? [
                     {"name": "零件", "value": "平垫圈 A"},
                     {"name": "状态", "value": root.workflowState},
                     {"name": "偏差", "value": (root.dxPixels >= 0 ? "+" : "") + root.dxPixels + " px"},
-                    {"name": "表面", "value": "正常"},
-                    {"name": "背光", "value": "孔位正常"},
-                    {"name": "涡流", "value": "待接入"}
+                    {"name": "类别", "value": root.detectClassName},
+                    {"name": "模型", "value": root.detectState},
+                    {"name": "耗时", "value": root.detectTimeText}
                 ] : [
                     {"name": "当前零件", "value": "平垫圈 A"},
                     {"name": "流程状态", "value": root.workflowState},
                     {"name": "视觉偏差", "value": (root.dxPixels >= 0 ? "+" : "") + root.dxPixels + " px"},
-                    {"name": "表面结果", "value": "正常"},
-                    {"name": "背光结果", "value": "孔位正常"},
-                    {"name": "涡流结果", "value": "待接入"}
+                    {"name": "模型类别", "value": root.detectClassName},
+                    {"name": "检测状态", "value": root.detectState},
+                    {"name": "推理耗时", "value": root.detectTimeText}
                 ]
 
                 Row {
                     width: parent.width
-                    height: 24
+                    height: root.usingKmsOverlay ? 22 : 22
 
                     Text {
                         width: root.usingKmsOverlay ? 48 : 86
@@ -2003,7 +2260,8 @@ Rectangle {
                     Text {
                         width: parent.width - (root.usingKmsOverlay ? 48 : 86)
                         text: modelData.value
-                        color: modelData.value === "待接入" ? root.accentAmber : "#edf2f3"
+                        color: modelData.value === "待接入" || modelData.value === "等待检测"
+                               || modelData.value === "检测中..." ? root.accentAmber : "#edf2f3"
                         font.pixelSize: root.usingKmsOverlay ? 13 : 15
                         font.bold: true
                         elide: Text.ElideRight
@@ -2014,17 +2272,23 @@ Rectangle {
 
         Rectangle {
             x: root.usingKmsOverlay ? 12 : 16
-            y: root.usingKmsOverlay ? 258 : 242
+            y: root.usingKmsOverlay ? 224 : 228
             width: parent.width - (root.usingKmsOverlay ? 24 : 32)
-            height: root.usingKmsOverlay ? 40 : 54
+            height: root.usingKmsOverlay ? 38 : 46
             radius: 8
-            color: "#173524"
-            border.color: root.accentGreen
+            color: root.detectStatus === "BAD" ? "#3a1b1f"
+                   : root.detectStatus === "ERROR" ? "#33251a"
+                   : root.detectStatus === "WAIT" ? "#252a2e" : "#173524"
+            border.color: root.detectStatus === "BAD" ? root.accentRed
+                          : root.detectStatus === "ERROR" || root.detectStatus === "WAIT"
+                            ? root.accentAmber : root.accentGreen
             border.width: 1
 
             Text {
                 anchors.centerIn: parent
-                text: root.usingKmsOverlay ? "融合：良品" : "融合结果：良品"
+                text: root.detectStatus === "BAD" ? (root.usingKmsOverlay ? "检测：坏品" : "模型检测：坏品")
+                      : root.detectStatus === "GOOD" ? (root.usingKmsOverlay ? "检测：良品" : "模型检测：良品")
+                      : root.detectStatus === "ERROR" ? "检测失败" : "等待检测"
                 color: "#ffffff"
                 font.pixelSize: root.usingKmsOverlay ? 17 : 22
                 font.bold: true
@@ -2033,7 +2297,7 @@ Rectangle {
 
         Row {
             x: 16
-            y: 304
+            y: 286
             width: parent.width - 32
             height: 18
             spacing: 10
@@ -2053,15 +2317,17 @@ Rectangle {
                 color: "#2a3034"
 
                 Rectangle {
-                    width: parent.width * 0.962
+                    width: parent.width * root.detectConfidenceRatio
                     height: parent.height
                     radius: 4
-                    color: root.accentGreen
+                    color: root.detectStatus === "BAD" ? root.accentRed
+                           : root.detectStatus === "ERROR" || root.detectStatus === "WAIT"
+                             ? root.accentAmber : root.accentGreen
                 }
             }
 
             Text {
-                text: "962/1000"
+                text: root.detectConfidenceText
                 color: "#dfe5e7"
                 font.pixelSize: 13
             }
@@ -2069,14 +2335,14 @@ Rectangle {
 
         Column {
             x: 12
-            y: 306
+            y: 270
             width: parent.width - 24
-            spacing: 6
+            spacing: 4
             visible: root.usingKmsOverlay
 
             Text {
                 width: parent.width
-                text: "置信度  962/1000"
+                text: "置信度  " + root.detectConfidenceText
                 color: "#dfe5e7"
                 font.pixelSize: 13
                 font.bold: true
@@ -2090,40 +2356,58 @@ Rectangle {
                 color: "#2a3034"
 
                 Rectangle {
-                    width: parent.width * 0.962
+                    width: parent.width * root.detectConfidenceRatio
                     height: parent.height
                     radius: 4
-                    color: root.accentGreen
+                    color: root.detectStatus === "BAD" ? root.accentRed
+                           : root.detectStatus === "ERROR" || root.detectStatus === "WAIT"
+                             ? root.accentAmber : root.accentGreen
                 }
+            }
+
+            Text {
+                width: parent.width
+                text: root.detectBadTotalText + "  " + root.detectGoodTotalText
+                color: "#aeb7bc"
+                font.pixelSize: 11
+                elide: Text.ElideRight
             }
         }
 
-        /* storageControls 是真实 SD 卡操作区，保存图片和安全卸载都通过 C++/overlay/脚本链路执行。 */
+        /* storageControls 是真实操作区，检测会自动保存两种模型的图片和结果，安全卸载仍走脚本链路。 */
         Column {
             id: storageControls
             x: 12
-            y: parent.height - 126
+            y: parent.height - 134
             width: parent.width - 24
-            spacing: 6
+            spacing: 8
             visible: root.usingKmsOverlay
 
             Repeater {
                 model: [
-                    {"text": "保存图片", "action": "save-image", "color": root.accentGreen},
+                    {"text": "检测", "action": "detect", "color": root.detectStatus === "BAD" ? root.accentRed : root.accentGreen},
                     {"text": "安全卸载", "action": "safe-remove", "color": root.accentAmber}
                 ]
 
                 Rectangle {
+                    property bool storageActionBusy: root.saveImageBusy || storageController.saveInProgress
+                    property bool detectActionBusy: root.detectImageBusy || storageController.detectInProgress
+                    property bool actionEnabled: modelData.action === "detect"
+                                                 ? !detectActionBusy
+                                                 : !detectActionBusy && !storageActionBusy
+
                     width: storageControls.width
-                    height: 27
+                    height: 34
                     radius: 6
-                    color: storageButtonMouse.pressed ? "#2d3338" : "#22272b"
-                    border.color: modelData.color
+                    color: actionEnabled ? (storageButtonMouse.pressed ? "#2d3338" : "#22272b") : "#171b1e"
+                    border.color: actionEnabled ? modelData.color : "#3a4147"
                     border.width: 1
+                    opacity: actionEnabled ? 1.0 : 0.55
 
                     Text {
                         anchors.centerIn: parent
-                        text: modelData.text
+                        text: modelData.action === "detect" && detectActionBusy ? "检测中..."
+                              : modelData.text
                         color: "#ffffff"
                         font.pixelSize: 13
                         font.bold: true
@@ -2132,9 +2416,14 @@ Rectangle {
                     MouseArea {
                         id: storageButtonMouse
                         anchors.fill: parent
+                        enabled: parent.actionEnabled
 
                         onClicked: {
-                            root.handleStorageAction(modelData.action)
+                            if (modelData.action === "detect") {
+                                root.handleDetectAction()
+                            } else {
+                                root.handleStorageAction(modelData.action)
+                            }
                         }
                     }
                 }
@@ -2225,7 +2514,7 @@ Rectangle {
         }
     }
 
-    /* historyPage 是上传历史记录界面：默认只显示上传记录列表，点击“查看”后进入单条记录详情。 */
+    /* historyPage 是检测历史记录界面：默认只显示检测记录列表，点击“查看”后进入单条记录详情。 */
     Rectangle {
         id: historyPage
         x: 176
@@ -2250,7 +2539,7 @@ Rectangle {
             Text {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.historyDetailVisible ? "记录详情" : "上传历史"
+                text: root.historyDetailVisible ? "记录详情" : "检测历史"
                 color: "#f1f4f5"
                 font.pixelSize: 20
                 font.bold: true
@@ -2348,7 +2637,7 @@ Rectangle {
             Text {
                 x: 18
                 y: 16
-                text: "每次上传按时间独立保存，左右滑动查看更多记录"
+                text: "每次检测按时间独立保存，左右滑动查看更多记录"
                 color: "#aeb9bf"
                 font.pixelSize: 14
                 font.bold: true
@@ -2423,7 +2712,7 @@ Rectangle {
                             x: 10
                             y: 28
                             width: parent.width - 20
-                            text: recordNo && recordNo.length > 0 ? recordNo : "本地上传记录"
+                            text: recordNo && recordNo.length > 0 ? recordNo : "本地检测记录"
                             color: "#eef3f4"
                             font.pixelSize: 13
                             font.bold: true
@@ -2587,7 +2876,7 @@ Rectangle {
 
                     Text {
                         anchors.centerIn: parent
-                        text: "暂无上传记录"
+                        text: "暂无检测记录"
                         color: "#909aa0"
                         font.pixelSize: 20
                         font.bold: true
@@ -2739,8 +3028,8 @@ Rectangle {
                             {"name": "上传时间", "value": root.selectedHistoryRecord.uploadTime},
                             {"name": "记录ID", "value": root.selectedHistoryRecord.recordId && root.selectedHistoryRecord.recordId.length > 0 ? root.selectedHistoryRecord.recordId : "本地"},
                             {"name": "图片数量", "value": root.selectedHistoryRecord.imageCount + " 张"},
-                            {"name": "JPG大小", "value": root.formatBytes(root.selectedHistoryRecord.jpgSizeBytes)},
-                            {"name": "PNG大小", "value": root.formatBytes(root.selectedHistoryRecord.pngSizeBytes)},
+                            {"name": "分类图", "value": root.formatBytes(root.selectedHistoryRecord.sourceSizeBytes)},
+                            {"name": "检测图总量", "value": root.formatBytes(root.selectedHistoryRecord.totalSizeBytes)},
                             {"name": "流程状态", "value": root.selectedHistoryRecord.workflowText}
                         ]
 
@@ -2828,18 +3117,26 @@ Rectangle {
 
                         Text {
                             width: parent.width
-                            text: "表面：正常    背光：孔位正常"
+                            text: root.selectedHistoryRecord.classificationResult
+                                  && root.selectedHistoryRecord.classificationResult.length > 0
+                                  ? root.selectedHistoryRecord.classificationResult
+                                  : "分类结果：暂无"
                             color: "#c9d1d5"
                             font.pixelSize: 12
                             wrapMode: Text.Wrap
+                            elide: Text.ElideRight
                         }
 
                         Text {
                             width: parent.width
-                            text: "涡流：待接入    置信度：962/1000"
+                            text: root.selectedHistoryRecord.segmentationResult
+                                  && root.selectedHistoryRecord.segmentationResult.length > 0
+                                  ? root.selectedHistoryRecord.segmentationResult
+                                  : "UNet结果：暂无"
                             color: "#c9d1d5"
                             font.pixelSize: 12
                             wrapMode: Text.Wrap
+                            elide: Text.ElideRight
                         }
                     }
                 }
@@ -2855,7 +3152,7 @@ Rectangle {
                     Text {
                         x: 12
                         y: 7
-                        text: "本地文件"
+                        text: "分类原图"
                         color: "#8f9aa1"
                         font.pixelSize: 11
                     }
@@ -2864,7 +3161,10 @@ Rectangle {
                         x: 12
                         y: 25
                         width: parent.width - 24
-                        text: root.selectedHistoryRecord.jpgPath
+                        text: root.selectedHistoryRecord.sourcePath
+                              && root.selectedHistoryRecord.sourcePath.length > 0
+                              ? root.selectedHistoryRecord.sourcePath
+                              : root.selectedHistoryRecord.jpgPath
                         color: "#c4ccd1"
                         font.pixelSize: 11
                         elide: Text.ElideMiddle
@@ -2874,7 +3174,7 @@ Rectangle {
         }
     }
 
-    /* statsPage 是统计分析界面：基于本地上传历史汇总生产、云端和文件保存状态。 */
+    /* statsPage 是统计分析界面：基于本地检测历史汇总生产、云端和文件状态。 */
     Rectangle {
         id: statsPage
         x: 176
@@ -2956,11 +3256,11 @@ Rectangle {
             }
         }
 
-        /* statsEmptyText 在没有上传历史时给出明确空状态，避免用户误以为图表未加载。 */
+        /* statsEmptyText 在没有检测历史时给出明确空状态，避免用户误以为图表未加载。 */
         Text {
             id: statsEmptyText
             anchors.centerIn: parent
-            text: "暂无统计数据\n点击首页“保存图片”后会生成本地历史与云端上传统计"
+            text: "暂无统计数据\n点击首页“检测”后会生成双模型历史与云端上传统计"
             color: "#aeb9bf"
             font.pixelSize: 18
             font.bold: true
@@ -3039,7 +3339,7 @@ Rectangle {
                 }
             }
 
-            /* statsTrendPanel 用轻量柱状图展示最近保存记录，颜色区分上传成功和待排查。 */
+            /* statsTrendPanel 用轻量柱状图展示最近检测记录，颜色区分上传成功和待排查。 */
             Rectangle {
                 id: statsTrendPanel
                 x: 0
@@ -3055,7 +3355,7 @@ Rectangle {
                 Text {
                     x: 14
                     y: 12
-                    text: "最近保存趋势"
+                    text: "最近检测趋势"
                     color: "#f1f4f5"
                     font.pixelSize: 17
                     font.bold: true
@@ -3119,7 +3419,7 @@ Rectangle {
                 Text {
                     x: 18
                     y: 140
-                    text: "绿色代表已登记云端，黄色代表本地保存后仍需排查上传链路"
+                    text: "绿色代表已登记云端，黄色代表本地检测后仍需排查上传链路"
                     color: "#7f898f"
                     font.pixelSize: 12
                 }
@@ -3390,7 +3690,7 @@ Rectangle {
                         anchors.centerIn: parent
                         text: root.statsSummary().uploadFailed > 0
                               ? "存在 " + root.statsSummary().uploadFailed + " 条上传待排查"
-                              : "保存与上传记录正常"
+                              : "检测与上传记录正常"
                         color: "#ffffff"
                         font.pixelSize: 13
                         font.bold: true
@@ -3706,7 +4006,7 @@ Rectangle {
             }
         }
 
-        /* manualLightPanel 负责显示背光常亮状态、补光和检测辅助动作，保存当前帧复用现有 SD 卡保存链路。 */
+        /* manualLightPanel 负责显示背光常亮状态、补光和检测辅助动作，当前帧检测复用首页双模型链路。 */
         Rectangle {
             id: manualLightPanel
             x: 592
@@ -3752,7 +4052,7 @@ Rectangle {
                         {"text": "亮度低", "action": "light-low", "color": "#9aa6ad"},
                         {"text": "亮度中", "action": "light-mid", "color": root.accentAmber},
                         {"text": "亮度高", "action": "light-high", "color": root.accentGreen},
-                        {"text": "保存当前帧", "action": "save-frame", "color": root.accentGreen},
+                        {"text": "检测当前帧", "action": "detect-frame", "color": root.accentGreen},
                         {"text": "背光常亮", "action": "refresh", "color": root.accentGreen}
                     ]
 

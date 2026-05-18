@@ -1,13 +1,13 @@
 #!/bin/sh
 #
 # 作用：
-#   把 Qt 保存按钮生成的 JPG 和 PNG 图片上传到云端 COS，并登记到同一条检测记录。
+#   把 Qt 检测任务生成的原图和检测结果图片上传到云端 COS，并登记到同一条检测记录。
 #
 # 主要流程：
-#   1. 校验 --jpg 和 --png 指向的本地文件已经存在且非空。
+#   1. 校验 --jpg 原图和一个或多个 --annotated 结果图已经存在且非空。
 #   2. 先读取板端本地默认账号配置，再使用后端登录 Cookie 调用云端 API；
 #      Cookie 缺失时可用 CLOUD_ACCOUNT/CLOUD_PASSWORD 登录。
-#   3. 创建检测记录，再分别为 JPG(source) 和 PNG(annotated) 申请 COS 预签名上传地址。
+#   3. 创建检测记录，再为 JPG(source) 和每张结果图(annotated) 申请 COS 预签名上传地址。
 #   4. 使用 curl PUT 上传到 COS，并把 ETag、对象路径和文件大小登记回检测记录。
 #
 # 返回值：
@@ -35,14 +35,18 @@ CLOUD_TIME_NOW_CMD_OVERRIDE="${CLOUD_TIME_NOW_CMD:-}"
 SOURCE_HEADERS_OVERRIDE="${SOURCE_HEADERS:-}"
 ANNOTATED_HEADERS_OVERRIDE="${ANNOTATED_HEADERS:-}"
 
-# jpg_file/png_file 分别保存命令行传入的两种图片路径。
+# jpg_file 保存命令行传入的原始检测图路径，云端登记为 source。
 jpg_file=""
-png_file=""
+
+# ANNOTATED_FILES 保存命令行传入的一组检测结果图路径，云端统一登记为 annotated。
+# 这里使用换行分隔，避免后续 UNet overlay/mask 等路径列表互相覆盖。
+ANNOTATED_FILES=""
 
 show_usage()
 {
-    echo "用法：$0 --jpg /mnt/sdcard/images/a.jpg --png /mnt/sdcard/images/a.png" >&2
-    echo "自检：$0 --self-test-json-parser" >&2
+    echo "用法：$0 --jpg /mnt/sdcard/images/raw.jpg --annotated /mnt/sdcard/images/overlay.jpg [--annotated /mnt/sdcard/images/mask.png]" >&2
+    echo "兼容：$0 --jpg /mnt/sdcard/images/raw.jpg --png /mnt/sdcard/images/old-result.png" >&2
+    echo "自检：$0 --self-test-json-parser | --self-test-args" >&2
 }
 
 fail()
@@ -54,7 +58,7 @@ fail()
 load_upload_env_file()
 {
     # 读取板端本地默认上传账号配置。
-    # 这样保存按钮不需要每次通过命令行传入账号密码，源码中也不会硬编码真实凭据。
+    # 这样检测按钮不需要每次通过命令行传入账号密码，源码中也不会硬编码真实凭据。
     if [ ! -e "$CLOUD_UPLOAD_ENV_FILE" ]; then
         return 0
     fi
@@ -257,6 +261,141 @@ run_time_format_self_test()
     fi
 }
 
+add_annotated_file()
+{
+    # add_annotated_file 的作用：
+    #   把一张检测结果图加入待上传列表。
+    # 主要流程：
+    #   1. 检查参数不能为空，避免生成空行导致后续 validate_file 报错不直观。
+    #   2. 使用换行追加路径，保留调用方传入的顺序。
+    # 参数：
+    #   $1：检测结果图路径，可以是 jpg/jpeg/png。
+    # 返回值：
+    #   成功时只更新 ANNOTATED_FILES；参数为空时终止脚本。
+    path="$1"
+
+    if [ -z "$path" ]; then
+        fail "--annotated 路径为空"
+    fi
+
+    if [ -z "$ANNOTATED_FILES" ]; then
+        ANNOTATED_FILES="$path"
+    else
+        ANNOTATED_FILES="${ANNOTATED_FILES}
+$path"
+    fi
+}
+
+detect_content_type()
+{
+    # detect_content_type 的作用：
+    #   根据本地图片扩展名推断 COS Content-Type。
+    # 主要流程：
+    #   1. 只接受 jpg/jpeg/png 三类浏览器可预览图片。
+    #   2. jpg/jpeg 返回 image/jpeg，png 返回 image/png。
+    # 参数：
+    #   $1：本地图片路径。
+    # 返回值：
+    #   stdout 输出 MIME 类型；扩展名不支持时终止脚本。
+    path="$1"
+
+    case "$path" in
+        *.[Jj][Pp][Gg]|*.[Jj][Pp][Ee][Gg])
+            printf '%s\n' "image/jpeg"
+            ;;
+        *.[Pp][Nn][Gg])
+            printf '%s\n' "image/png"
+            ;;
+        *)
+            fail "不支持的图片格式：$path，只允许 jpg/jpeg/png"
+            ;;
+    esac
+}
+
+annotated_header_path()
+{
+    # annotated_header_path 的作用：
+    #   为第 N 张 annotated 图片生成独立 COS 响应头保存路径。
+    # 主要流程：
+    #   1. 如果 ANNOTATED_HEADERS 带扩展名，就把序号插入到扩展名前。
+    #   2. 如果没有扩展名，就直接追加 -N，避免生成包含斜杠的异常路径。
+    # 参数：
+    #   $1：annotated 图片序号，从 1 开始。
+    # 返回值：
+    #   stdout 输出响应头文件路径。
+    index="$1"
+    header_dir="$(dirname "$ANNOTATED_HEADERS")"
+    header_name="$(basename "$ANNOTATED_HEADERS")"
+
+    case "$header_name" in
+        *.*)
+            printf '%s/%s-%s.%s\n' "$header_dir" "${header_name%.*}" "$index" "${header_name##*.}"
+            ;;
+        *)
+            printf '%s/%s-%s\n' "$header_dir" "$header_name" "$index"
+            ;;
+    esac
+}
+
+run_arg_parser_self_test()
+{
+    # run_arg_parser_self_test 的作用：
+    #   在不访问网络的情况下验证新上传参数契约。
+    # 主要流程：
+    #   1. 校验 JPG/JPEG/PNG 能推断正确 Content-Type。
+    #   2. 校验 add_annotated_file 能保留两张 annotated 结果图。
+    # 参数：
+    #   无。
+    # 返回值：
+    #   解析契约正确返回 0；任何断言失败返回非 0。
+    old_annotated_files="$ANNOTATED_FILES"
+
+    ANNOTATED_FILES=""
+    add_annotated_file "/tmp/unet_overlay.jpg"
+    add_annotated_file "/tmp/unet_mask.png"
+
+    annotated_count=$(printf '%s\n' "$ANNOTATED_FILES" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ "$annotated_count" != "2" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：期望 2 张 annotated，实际 $annotated_count"
+    fi
+
+    if [ "$(detect_content_type "/tmp/unet_overlay.jpg")" != "image/jpeg" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：jpg 未识别为 image/jpeg"
+    fi
+
+    if [ "$(detect_content_type "/tmp/unet_overlay.JPEG")" != "image/jpeg" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：jpeg 未识别为 image/jpeg"
+    fi
+
+    if [ "$(detect_content_type "/tmp/unet_mask.png")" != "image/png" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：png 未识别为 image/png"
+    fi
+
+    ANNOTATED_HEADERS="/tmp/annotated_upload_headers.txt"
+    if [ "$(annotated_header_path 2)" != "/tmp/annotated_upload_headers-2.txt" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：带扩展名 header 路径生成错误"
+    fi
+
+    ANNOTATED_HEADERS="/tmp/annotated_upload_headers"
+    if [ "$(annotated_header_path 2)" != "/tmp/annotated_upload_headers-2" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：无扩展名 header 路径生成错误"
+    fi
+
+    ANNOTATED_HEADERS="/tmp/dir.with.dot/annotated_upload_headers"
+    if [ "$(annotated_header_path 2)" != "/tmp/dir.with.dot/annotated_upload_headers-2" ]; then
+        ANNOTATED_FILES="$old_annotated_files"
+        fail "参数解析自检失败：目录带点时 header 路径生成错误"
+    fi
+
+    ANNOTATED_FILES="$old_annotated_files"
+}
+
 http_json()
 {
     # 统一发送 JSON 请求；调用者通过返回文件读取响应体，HTTP 非 2xx 时 curl 会返回失败。
@@ -332,8 +471,9 @@ CLOUD_PASSWORD="${CLOUD_PASSWORD:-}"
 CLOUD_DEVICE_ID="${CLOUD_DEVICE_ID:-}"
 CLOUD_PART_ID="${CLOUD_PART_ID:-}"
 
-# CLOUD_RESULT 是这次最小闭环使用的检测结果，占位阶段默认 good，后续可由真实检测服务覆盖。
-CLOUD_RESULT="${CLOUD_RESULT:-good}"
+# CLOUD_RESULT 是本次模型检测结果，Qt 检测链路会显式传入 good、bad 或 review。
+# 默认 review 是保守值，避免没有模型结果时把云端记录静默写成良品。
+CLOUD_RESULT="${CLOUD_RESULT:-review}"
 
 # CLOUD_HEALTH_URL 默认访问后端 /health，验证 HTTP 服务是否在线。
 CLOUD_HEALTH_URL="${CLOUD_HEALTH_URL:-$CLOUD_BASE_URL/health}"
@@ -345,7 +485,7 @@ CLOUD_TIME_TZ="${CLOUD_TIME_TZ:-CST-8}"
 CLOUD_TIME_OFFSET="${CLOUD_TIME_OFFSET:-+08:00}"
 CLOUD_TIME_ZONE="${CLOUD_TIME_ZONE:-CST-8}"
 
-# 导出北京时间时区，保证保存图片上传时读取的是业务本地墙钟。
+# 导出北京时间时区，保证检测图片上传时读取的是业务本地墙钟。
 # 板端校时后系统 UTC 是正确的，但 BusyBox/登录环境不一定自动读取 /etc/TZ；
 # 如果这里不显式导出，date 可能输出 UTC 小时，最终 captured_at/uploaded_at 会少 8 小时。
 export TZ="$CLOUD_TIME_ZONE"
@@ -403,7 +543,7 @@ resolve_cloud_ids()
 
 validate_file()
 {
-    # 保存按钮返回成功后仍在上传前做一次文件非空检查，避免网络流程上传空文件。
+    # 检测流程返回成功后仍在上传前做一次文件非空检查，避免网络流程上传空文件。
     path="$1"
     label="$2"
 
@@ -414,6 +554,27 @@ validate_file()
     if [ ! -s "$path" ]; then
         fail "$label 文件为空：$path"
     fi
+}
+
+validate_cloud_result()
+{
+    # validate_cloud_result 的作用：
+    #   校验即将写入云端检测记录的 result 字段，防止调用方遗漏模型结果时误写固定良品。
+    # 主要流程：
+    #   1. 只接受后端约定的 good、bad、review 三种短值。
+    #   2. 其它值直接终止脚本，让 Qt/SSH 日志暴露配置错误。
+    # 参数：
+    #   $1：准备写入云端 records.result 的检测结果。
+    # 返回值：
+    #   合法返回 0；非法时调用 fail 退出。
+    case "$1" in
+        good|bad|review)
+            return 0
+            ;;
+        *)
+            fail "非法 CLOUD_RESULT：$1，只允许 good、bad、review"
+            ;;
+    esac
 }
 
 create_record()
@@ -474,16 +635,19 @@ prepare_upload()
     # 参数：
     #   $1 record_id：创建记录返回的新记录 id。
     #   $2 record_no：创建记录返回的新记录编号。
-    #   $3 file_kind：source 或 annotated。
-    #   $4 file_path：本地 JPG/PNG 路径。
-    #   $5 content_type：image/jpeg 或 image/png。
+    #   $3 file_kind：云端文件类型，source 或 annotated。
+    #   $4 local_tag：本地临时文件标签，用于区分多张 annotated 图片。
+    #   $5 file_path：本地 JPG/PNG 路径。
+    #   $6 content_type：image/jpeg 或 image/png。
     # 返回值：
-    #   成功时生成 /tmp/defect-cos-prepare-<kind>.json；失败时终止脚本。
+    #   成功时生成 /tmp/defect-cos-prepare-<local_tag>.json；失败时终止脚本。
     record_id="$1"
     record_no="$2"
     file_kind="$3"
-    file_path="$4"
-    content_type="$5"
+    local_tag="$4"
+    file_path="$5"
+    content_type="$6"
+    prepare_file="/tmp/defect-cos-prepare-$local_tag.json"
     file_name="$(basename "$file_path")"
     file_name_json=$(json_escape "$file_name")
 
@@ -498,18 +662,18 @@ prepare_upload()
 \"content_type\":\"$content_type\"
 }"
 
-    http_json "POST" "$CLOUD_BASE_URL/api/v1/uploads/cos/prepare" "$prepare_body" "/tmp/defect-cos-prepare-$file_kind.json" \
-        || fail "COS prepare 失败：$file_kind"
+    http_json "POST" "$CLOUD_BASE_URL/api/v1/uploads/cos/prepare" "$prepare_body" "$prepare_file" \
+        || fail "COS prepare 失败：$local_tag"
 
-    enabled=$(sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "/tmp/defect-cos-prepare-$file_kind.json" | head -n 1)
+    enabled=$(sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$prepare_file" | head -n 1)
     if [ "$enabled" != "true" ]; then
-        message=$(extract_json_string "message" "/tmp/defect-cos-prepare-$file_kind.json")
-        fail "COS prepare 未启用：$file_kind ${message:-unknown}"
+        message=$(extract_json_string "message" "$prepare_file")
+        fail "COS prepare 未启用：$local_tag ${message:-unknown}"
     fi
 
-    object_key=$(extract_json_string "object_key" "/tmp/defect-cos-prepare-$file_kind.json")
+    object_key=$(extract_json_string "object_key" "$prepare_file")
     if [ -z "$object_key" ]; then
-        fail "prepare 响应缺少 object_key：$file_kind"
+        fail "prepare 响应缺少 object_key：$local_tag"
     fi
 
     case "$object_key" in
@@ -521,21 +685,22 @@ prepare_upload()
     esac
 
     log_upload_step "prepare_file_kind=$file_kind prepare_record_id=$record_id"
+    log_upload_step "prepare_local_tag=$local_tag"
     log_upload_step "prepare_object_key=$object_key"
 }
 
 put_to_cos()
 {
     # COS 预签名 URL 要求 PUT 时 Content-Type 和 prepare 请求保持一致。
-    file_kind="$1"
+    local_tag="$1"
     file_path="$2"
     content_type="$3"
     header_file="$4"
-    prepare_file="/tmp/defect-cos-prepare-$file_kind.json"
+    prepare_file="/tmp/defect-cos-prepare-$local_tag.json"
     upload_url=$(extract_json_string "upload_url" "$prepare_file")
 
     if [ -z "$upload_url" ]; then
-        fail "prepare 响应缺少 upload_url：$file_kind"
+        fail "prepare 响应缺少 upload_url：$local_tag"
     fi
 
     http_code=$(curl -sS \
@@ -547,12 +712,12 @@ put_to_cos()
         -T "$file_path")
 
     if [ "$http_code" != "200" ]; then
-        fail "COS PUT 失败：$file_kind HTTP_CODE=$http_code"
+        fail "COS PUT 失败：$local_tag HTTP_CODE=$http_code"
     fi
 
     etag=$(extract_etag_header "$header_file")
     if [ -z "$etag" ]; then
-        fail "COS PUT 成功但响应头缺少 ETag：$file_kind"
+        fail "COS PUT 成功但响应头缺少 ETag：$local_tag"
     fi
 }
 
@@ -567,18 +732,20 @@ register_file()
     #   4. uploaded_at 使用带本地时区的时间，短期规避后端 UTC fallback 显示偏移。
     # 参数：
     #   $1 record_id：创建记录返回的新记录 id。
-    #   $2 file_kind：source 或 annotated。
-    #   $3 file_path：本地 JPG/PNG 路径。
-    #   $4 content_type：image/jpeg 或 image/png。
-    #   $5 header_file：COS PUT 响应头文件。
+    #   $2 file_kind：云端文件类型，source 或 annotated。
+    #   $3 local_tag：本地临时文件标签，用于读取对应 prepare 响应。
+    #   $4 file_path：本地 JPG/PNG 路径。
+    #   $5 content_type：image/jpeg 或 image/png。
+    #   $6 header_file：COS PUT 响应头文件。
     # 返回值：
-    #   成功时生成 /tmp/defect-cos-register-<kind>.json；失败时终止脚本。
+    #   成功时生成 /tmp/defect-cos-register-<local_tag>.json；失败时终止脚本。
     record_id="$1"
     file_kind="$2"
-    file_path="$3"
-    content_type="$4"
-    header_file="$5"
-    prepare_file="/tmp/defect-cos-prepare-$file_kind.json"
+    local_tag="$3"
+    file_path="$4"
+    content_type="$5"
+    header_file="$6"
+    prepare_file="/tmp/defect-cos-prepare-$local_tag.json"
 
     if ! is_positive_number "$record_id"; then
         fail "登记文件收到非法 record_id：$record_id"
@@ -597,7 +764,7 @@ register_file()
     uploaded_at_json=$(json_escape "$uploaded_at")
 
     if [ -z "$bucket_name" ] || [ -z "$region" ] || [ -z "$object_key" ]; then
-        fail "prepare 响应缺少对象元数据：$file_kind"
+        fail "prepare 响应缺少对象元数据：$local_tag"
     fi
 
     register_body="{
@@ -614,27 +781,34 @@ register_file()
 
     log_upload_step "register_url=/api/v1/records/$record_id/files"
     log_upload_step "register_file_kind=$file_kind"
+    log_upload_step "register_local_tag=$local_tag"
 
-    http_json "POST" "$CLOUD_BASE_URL/api/v1/records/$record_id/files" "$register_body" "/tmp/defect-cos-register-$file_kind.json" \
-        || fail "登记文件对象失败：$file_kind"
+    http_json "POST" "$CLOUD_BASE_URL/api/v1/records/$record_id/files" "$register_body" "/tmp/defect-cos-register-$local_tag.json" \
+        || fail "登记文件对象失败：$local_tag"
 }
 
 verify_record_detail()
 {
     # verify_record_detail 的作用：
-    #   上传完成后回查本次新记录，确认详情里至少能看到 source 和 annotated 两类文件。
+    #   上传完成后回查本次新记录，确认详情里能看到 source 和所有 annotated 结果图。
     # 主要流程：
     #   1. GET /api/v1/records/{record_id} 保存到 /tmp/defect-cos-record-detail.json。
-    #   2. 检查详情响应包含 source 与 annotated，避免只登记了一张图还误报成功。
-    #   3. 粗略统计 file_kind 数量；若不是 2，直接失败，避免界面把记录隔离异常显示成上传成功。
+    #   2. 检查详情响应包含 source 与 annotated，避免只登记了一类图还误报成功。
+    #   3. 粗略统计 file_kind 数量；若不是期望数量，直接失败。
     # 参数：
     #   $1 record_id：创建记录返回的新记录 id。
+    #   $2 expected_file_count：期望文件总数，等于 1 张 source + N 张 annotated。
     # 返回值：
     #   两类文件都存在返回 0；缺失或回查失败时终止脚本。
     record_id="$1"
+    expected_file_count="$2"
 
     if ! is_positive_number "$record_id"; then
         fail "回查检测记录收到非法 record_id：$record_id"
+    fi
+
+    if ! is_positive_number "$expected_file_count"; then
+        fail "回查检测记录收到非法期望文件数量：$expected_file_count"
     fi
 
     curl -fsS -b "$CLOUD_COOKIE_FILE" "$CLOUD_BASE_URL/api/v1/records/$record_id" -o /tmp/defect-cos-record-detail.json \
@@ -652,8 +826,8 @@ verify_record_detail()
         | sed -n 's/^[[:space:]]*"file_kind"[[:space:]]*:.*/x/p' \
         | wc -l \
         | tr -d ' ')
-    if [ "$file_count" != "2" ]; then
-        fail "记录详情文件数量异常：record_id=$record_id expected=2 actual=$file_count"
+    if [ "$file_count" != "$expected_file_count" ]; then
+        fail "记录详情文件数量异常：record_id=$record_id expected=$expected_file_count actual=$file_count"
     fi
 }
 
@@ -664,9 +838,14 @@ while [ "$#" -gt 0 ]; do
             jpg_file="$2"
             shift 2
             ;;
+        --annotated)
+            [ "$#" -ge 2 ] || fail "--annotated 缺少路径"
+            add_annotated_file "$2"
+            shift 2
+            ;;
         --png)
             [ "$#" -ge 2 ] || fail "--png 缺少路径"
-            png_file="$2"
+            add_annotated_file "$2"
             shift 2
             ;;
         -h|--help)
@@ -678,6 +857,10 @@ while [ "$#" -gt 0 ]; do
             run_time_format_self_test
             exit 0
             ;;
+        --self-test-args)
+            run_arg_parser_self_test
+            exit 0
+            ;;
         *)
             show_usage
             fail "未知参数：$1"
@@ -686,14 +869,27 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$jpg_file" ] || fail "缺少 --jpg"
-[ -n "$png_file" ] || fail "缺少 --png"
+[ -n "$ANNOTATED_FILES" ] || fail "缺少 --annotated"
 
-validate_file "$jpg_file" "JPG"
-validate_file "$png_file" "PNG"
+source_content_type=$(detect_content_type "$jpg_file")
+annotated_count=$(printf '%s\n' "$ANNOTATED_FILES" | sed '/^$/d' | wc -l | tr -d ' ')
+
+if [ "$source_content_type" != "image/jpeg" ]; then
+    fail "--jpg 只能传入 jpg/jpeg 原图：$jpg_file"
+fi
+
+validate_file "$jpg_file" "source"
+
+printf '%s\n' "$ANNOTATED_FILES" | while IFS= read -r annotated_file; do
+    [ -n "$annotated_file" ] || continue
+    annotated_content_type=$(detect_content_type "$annotated_file")
+    validate_file "$annotated_file" "annotated($annotated_content_type)"
+done
 
 curl -fsS "$CLOUD_HEALTH_URL" -o /tmp/defect-cos-health.json \
     || fail "云端 health 检查失败：$CLOUD_HEALTH_URL"
 
+validate_cloud_result "$CLOUD_RESULT"
 ensure_cloud_session
 resolve_cloud_ids
 record_id=$(create_record)
@@ -703,14 +899,23 @@ if [ -z "$created_record_no" ]; then
     fail "创建检测记录后无法读取 record_no"
 fi
 
-prepare_upload "$record_id" "$created_record_no" "source" "$jpg_file" "image/jpeg"
-put_to_cos "source" "$jpg_file" "image/jpeg" "$SOURCE_HEADERS"
-register_file "$record_id" "source" "$jpg_file" "image/jpeg" "$SOURCE_HEADERS"
+prepare_upload "$record_id" "$created_record_no" "source" "source" "$jpg_file" "$source_content_type"
+put_to_cos "source" "$jpg_file" "$source_content_type" "$SOURCE_HEADERS"
+register_file "$record_id" "source" "source" "$jpg_file" "$source_content_type" "$SOURCE_HEADERS"
 
-prepare_upload "$record_id" "$created_record_no" "annotated" "$png_file" "image/png"
-put_to_cos "annotated" "$png_file" "image/png" "$ANNOTATED_HEADERS"
-register_file "$record_id" "annotated" "$png_file" "image/png" "$ANNOTATED_HEADERS"
+annotated_index=0
+printf '%s\n' "$ANNOTATED_FILES" | while IFS= read -r annotated_file; do
+    [ -n "$annotated_file" ] || continue
+    annotated_index=$((annotated_index + 1))
+    annotated_tag="annotated-$annotated_index"
+    annotated_header_file=$(annotated_header_path "$annotated_index")
+    annotated_content_type=$(detect_content_type "$annotated_file")
 
-verify_record_detail "$record_id"
+    prepare_upload "$record_id" "$created_record_no" "annotated" "$annotated_tag" "$annotated_file" "$annotated_content_type"
+    put_to_cos "$annotated_tag" "$annotated_file" "$annotated_content_type" "$annotated_header_file"
+    register_file "$record_id" "annotated" "$annotated_tag" "$annotated_file" "$annotated_content_type" "$annotated_header_file"
+done
 
-echo "上传成功：record_id=$record_id record_no=$created_record_no jpg_kind=source png_kind=annotated"
+verify_record_detail "$record_id" "$((1 + annotated_count))"
+
+echo "上传成功：record_id=$record_id record_no=$created_record_no source_kind=source annotated_count=$annotated_count"
