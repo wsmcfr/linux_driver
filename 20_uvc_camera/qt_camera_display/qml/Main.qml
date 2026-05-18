@@ -231,6 +231,9 @@ Rectangle {
     /* splashFadingOut 表示启动覆盖层正在淡出，淡出期间仍保持 visible，避免主界面提前闪出来。 */
     property bool splashFadingOut: false
 
+    /* bootOverlayRestoreFinished 表示 Qt 启动遮罩是否已经完成淡出并进入主界面；相机在线回调必须等它为 true 后才能显示 KMS 视频层。 */
+    property bool bootOverlayRestoreFinished: false
+
     /* bootOverlayRestoreAttempts 记录启动结束后恢复 KMS 视频层的重试次数，避免 overlay socket 晚于 Qt splash 就绪。 */
     property int bootOverlayRestoreAttempts: 0
 
@@ -268,7 +271,7 @@ Rectangle {
             return gstVideoLoader.status === Loader.Ready
         }
         if (usingKmsOverlay) {
-            return true
+            return deviceHealth.cameraStatusText === "在线"
         }
         return cameraView.active
     }
@@ -292,7 +295,7 @@ Rectangle {
         }
 
         if (usingKmsOverlay) {
-            return "Overlay在线"
+            return deviceHealth.cameraStatusText
         }
 
         if (cameraView.active) {
@@ -319,6 +322,10 @@ Rectangle {
      *   在线返回绿色，错误返回红色，其它等待状态返回黄色。
      */
     function cameraDotColor() {
+        if (usingKmsOverlay) {
+            return deviceHealth.cameraStatusColor
+        }
+
         if (cameraIsActive()) {
             return accentGreen
         }
@@ -443,6 +450,7 @@ Rectangle {
             return
         }
 
+        root.bootOverlayRestoreFinished = true
         root.bootOverlayRestoreAttempts = 0
         var result = root.setBootOverlayVisible(true)
         if (root.overlayRestoreNeedsRetry(result)) {
@@ -1302,6 +1310,7 @@ Rectangle {
             manualEmergencyStop = false
             resultText = "清故障：等待 F4 复核"
         } else if (action === "refresh") {
+            deviceHealth.refreshAllStatus()
             resultText = "已刷新设备健康状态"
         } else if (action === "snapshot") {
             resultText = storageController.saveAlarmSnapshotToSdCard(alarmSnapshotText())
@@ -1332,7 +1341,7 @@ Rectangle {
      * 主要流程：
      *   1. 更新 activePage，让对应页面的 QML 内容显示。
      *   2. 第一次进入历史页时，如果已有检测记录，默认选中最新一条。
-     *   3. KMS overlay 模式下，非首页需要隐藏视频 plane，返回首页再恢复。
+     *   3. KMS overlay 模式下，非首页需要隐藏视频 plane，返回首页时也必须等 Qt 启动遮罩结束后再恢复。
      *
      * 参数：
      *   pageName 是目标页面名称，目前支持 home、history、stats、manual、settings 和 alarm。
@@ -1357,7 +1366,9 @@ Rectangle {
         selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
 
         if (root.usingKmsOverlay) {
-            storageController.setOverlayVisible(pageName === "home")
+            storageController.setOverlayVisible(pageName === "home"
+                                                && root.bootOverlayRestoreFinished
+                                                && !root.splashOverlayVisible)
         }
     }
 
@@ -2106,6 +2117,26 @@ Rectangle {
     }
 
     Connections {
+        target: deviceHealth
+
+        /*
+         * onCameraStatusChanged 的作用：
+         *   USB 摄像头热拔插后，overlay 进程可能被后台 restart-overlay 重新初始化。
+         *   当健康检测确认相机重新在线时，必须等 Qt 启动遮罩完全结束后才能发送 VISIBLE 1 恢复画面；
+         *   如果当前在历史、统计、手动、参数或告警页，则保持视频层隐藏，避免覆盖功能页面。
+         */
+        onCameraStatusChanged: {
+            if (!root.usingKmsOverlay || deviceHealth.cameraStatusText !== "在线") {
+                return
+            }
+
+            if (root.bootOverlayRestoreFinished && !root.splashOverlayVisible && root.activePage === "home") {
+                root.setBootOverlayVisible(true)
+            }
+        }
+    }
+
+    Connections {
         target: storageController
 
         /*
@@ -2208,12 +2239,12 @@ Rectangle {
 
             Repeater {
                 model: [
-                    {"name": "网络", "value": "在线", "dot": root.accentGreen},
+                    {"name": "网络", "value": deviceHealth.networkStatusText, "dot": deviceHealth.networkStatusColor},
                     {"name": "相机", "value": root.cameraStatusText(), "dot": root.cameraDotColor()},
-                    {"name": "F4", "value": "待接入", "dot": root.accentAmber},
+                    {"name": "F4", "value": deviceHealth.f4StatusText, "dot": deviceHealth.f4StatusColor},
                     {"name": "机械臂", "value": "待命", "dot": root.accentGreen},
                     {"name": "背光", "value": "常亮", "dot": root.accentGreen},
-                    {"name": "云端", "value": "已连接", "dot": root.accentGreen}
+                    {"name": "云端", "value": deviceHealth.cloudStatusText, "dot": deviceHealth.cloudStatusColor}
                 ]
 
                 Row {
@@ -4366,7 +4397,7 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"name": "F4控制器", "value": "待接入", "color": root.accentAmber},
+                        {"name": "F4控制器", "value": deviceHealth.f4StatusText, "color": deviceHealth.f4StatusColor},
                         {"name": "手动模式", "value": root.manualMode ? "允许" : "未进入", "color": root.manualMode ? root.accentAmber : root.accentGreen},
                         {"name": "急停", "value": root.manualEmergencyStop ? "已按下" : "释放", "color": root.manualEmergencyStop ? root.accentRed : root.accentGreen},
                         {"name": "限位", "value": "未触发", "color": root.accentGreen},
@@ -5586,12 +5617,12 @@ Rectangle {
                 Repeater {
                     model: [
                         {"name": "相机", "value": root.cameraStatusText(), "color": root.cameraDotColor()},
-                        {"name": "F4心跳", "value": "待接入", "color": root.accentAmber},
+                        {"name": "F4心跳", "value": deviceHealth.f4StatusText, "color": deviceHealth.f4StatusColor},
                         {"name": "机械臂", "value": root.manualArmHomeOk ? "已回零" : "未回零", "color": root.manualArmHomeOk ? root.accentGreen : root.accentAmber},
                         {"name": "急停", "value": root.manualEmergencyStop || !root.alarmCleared ? "需检查" : "释放", "color": root.manualEmergencyStop || !root.alarmCleared ? root.accentRed : root.accentGreen},
-                        {"name": "SD卡", "value": root.storageState, "color": root.storageState.indexOf("失败") >= 0 ? root.accentAmber : root.accentGreen},
-                        {"name": "云端", "value": root.statsSummary().uploadFailed > 0 ? "有失败" : "正常", "color": root.statsSummary().uploadFailed > 0 ? root.accentAmber : root.accentGreen},
-                        {"name": "KMS视频", "value": root.usingKmsOverlay ? "Overlay在线" : "预览/桥接", "color": root.usingKmsOverlay ? root.accentGreen : root.accentAmber},
+                        {"name": "SD卡", "value": deviceHealth.sdcardStatusText, "color": deviceHealth.sdcardStatusColor},
+                        {"name": "云端", "value": deviceHealth.cloudStatusText, "color": deviceHealth.cloudStatusColor},
+                        {"name": "KMS视频", "value": root.usingKmsOverlay ? deviceHealth.cameraStatusText : "预览/桥接", "color": root.usingKmsOverlay ? deviceHealth.cameraStatusColor : root.accentAmber},
                         {"name": "背光", "value": "常亮", "color": root.accentGreen},
                         {"name": "配置", "value": root.settingsPartType, "color": "#5aa7ff"}
                     ]

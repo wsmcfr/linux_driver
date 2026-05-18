@@ -250,6 +250,249 @@ ssh root@192.168.1.250 'chmod 755 /root/qt_camera_display/qt_camera_display && /
 
 ---
 
+## Qt Boot Display And Early Framebuffer Splash Contract
+
+Use this convention when changing the STM32MP157 Qt boot display chain, the SysV init scripts that start it, or any helper that draws before Qt/eglfs is ready.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/S05display-quiet`, `20_uvc_camera/S90uvc-camera`, `20_uvc_camera/qt_camera_display/run_qt_kms_overlay_display.sh`, `20_uvc_camera/qt_camera_display/fb_boot_splash.c`, or the QML `splashOverlay`.
+- Goal: the LCD should show a static first-frame style image as soon as `/dev/fb0` is writable, then QML `splashOverlay`, then the home page with KMS overlay video restored.
+- Boundary: early framebuffer splash must not depend on Qt, OpenGL, DRM/KMS, UVC camera nodes, image codecs, or `/dev/galcore`.
+
+### 2. Signatures
+
+| Operation | Signature |
+|---|---|
+| Early splash build | `./build_fb_boot_splash.sh` |
+| Early splash binary | `/root/qt_camera_display/fb_boot_splash` |
+| Early splash command | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q` |
+| Build compiler override | `SPLASH_CC=/path/to/arm-gcc ./build_fb_boot_splash.sh` |
+| Init helper env | `FB_BOOT_SPLASH_BIN=/root/qt_camera_display/fb_boot_splash` |
+| Init framebuffer env | `FB_DEV=/dev/fb0` |
+| Disable switch | `FB_BOOT_SPLASH_ENABLE=0` |
+| Startup scripts | `S05display-quiet`, `S90uvc-camera`, `run_qt_kms_overlay_display.sh` call `show_boot_splash()` |
+| Static contract | `./test_qt_kms_overlay_assets.sh` checks `fb_boot_splash.c`, `build_fb_boot_splash.sh`, `FB_BOOT_SPLASH_BIN`, `show_boot_splash`, `/dev/fb0`, `FBIOGET_VSCREENINFO`, `mmap`, `draw_splash`, and `msync` |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Dependency boundary | `fb_boot_splash` must use Linux framebuffer ioctls and `mmap` only. It must not require Qt runtime, PNG/JPEG decoders, DRM resources, UVC camera nodes, or GPU initialization. |
+| Pixel support | The helper must support the framebuffer formats used on the board, at minimum 16 bpp RGB565 and common 24/32 bpp RGB layouts through framebuffer bitfields. Unsupported formats must return non-zero with a clear error. |
+| Script behavior | `show_boot_splash()` is visual fallback only. Missing binary, missing `/dev/fb0`, or draw failure must not block Qt startup. |
+| Startup order | Draw early static splash after `/dev/fb0` exists and before long waits for camera, GPU, overlay socket, or Qt QML load. |
+| Overlay order | KMS overlay video must still start hidden with `-V 0`; QML restores it with `VISIBLE 1` only after the QML splash fades out. |
+| Build isolation | `build_fb_boot_splash.sh` must use `SPLASH_CC`, not inherited `CC`, because the ST Qt SDK exports `CC` as a compiler command plus flags. |
+| Deployment | `deploy_qt_camera_display.sh` must require and install `build-mp157/fb_boot_splash` with mode `755` beside the Qt binary and overlay helper. |
+| Documentation | `20_uvc_camera/README.md` and `20_uvc_camera/qt_camera_display/README.md` must document the file list, build command, deploy path, board test command, and failure triage. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning |
+|---|---|---|
+| Static contract | `./test_qt_kms_overlay_assets.sh` prints `PASS: Qt KMS overlay assets contract` | One of the boot display chain markers drifted or a required file is missing |
+| Early helper build | `./build_fb_boot_splash.sh` outputs an ARM ELF at `build-mp157/fb_boot_splash` | Buildroot compiler/sysroot path is wrong, or the helper picked up a bad compiler environment |
+| Board helper smoke | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q && echo fb_splash_rc=0` prints `fb_splash_rc=0` | `/dev/fb0` is missing, the pixel format is unsupported, or the binary is not executable for the board |
+| Board fb facts | `cat /sys/class/graphics/fb0/bits_per_pixel; cat /sys/class/graphics/fb0/virtual_size` matches expected screen facts | The board display path changed; revisit helper format support and layout scaling |
+| Startup logs | `run_qt_kms_overlay_display.sh restart` logs `early static splash drawn on /dev/fb0` before Qt/overlay status | The script did not call the early helper or `/dev/fb0` was not ready |
+| Runtime status | `run_qt_kms_overlay_display.sh status` shows both `qt_camera_display` and `uvc_kms_overlay` PIDs | Early splash or startup script changes broke the formal display stack |
+
+### 5. Good / Base / Bad Cases
+
+```sh
+# Good: build the early framebuffer helper with its own compiler variable.
+SPLASH_CC=/home/cfr/linux/buildroot/buildroot-2020.02.6/output-uvc/host/bin/arm-none-linux-gnueabihf-gcc ./build_fb_boot_splash.sh
+```
+
+```sh
+# Good: the init script treats early splash as optional visual fallback.
+if [ -x "$FB_BOOT_SPLASH_BIN" ] && [ -e "$FB_DEV" ]; then
+    "$FB_BOOT_SPLASH_BIN" -f "$FB_DEV" -q >/dev/null 2>&1 || true
+fi
+```
+
+```sh
+# Bad: blocking boot because the optional early splash binary is absent.
+[ -x "$FB_BOOT_SPLASH_BIN" ] || exit 1
+```
+
+```sh
+# Bad: compiling the helper with inherited CC after sourcing the Qt SDK.
+CC="${CC:-$BR_OUTPUT/host/bin/arm-none-linux-gnueabihf-gcc}"
+```
+
+```text
+Base: If the LCD driver registers `/dev/fb0` late, `S05display-quiet` may skip the helper and `S90uvc-camera` should draw it after `wait_for_node "$FB_DEV"` succeeds.
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing early splash code, boot display scripts, deploy scripts, or QML `splashOverlay`.
+- Run `sh -n` on `S05display-quiet`, `S90uvc-camera`, `build_fb_boot_splash.sh`, `run_qt_kms_overlay_display.sh`, and `deploy_qt_camera_display.sh`.
+- Cross-build `fb_boot_splash` and confirm `file build-mp157/fb_boot_splash` reports an ARM 32-bit EABI executable.
+- Deploy the helper and scripts to the board or NFS rootfs, then assert `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q && echo fb_splash_rc=0`.
+- Restart the formal display stack and assert logs include `early static splash drawn on /dev/fb0` and status shows both Qt and overlay PIDs.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The black gap happens before Qt starts, but the fix only changes QML splash timing.
+```
+
+#### Correct
+
+```text
+Draw a static first-frame style image directly to `/dev/fb0` before Qt/GPU/camera startup, then let QML `splashOverlay` continue the animated boot sequence.
+```
+
+---
+
+## Scenario: Qt Real Device Health Refresh And KMS Overlay Visibility
+
+Use this convention when the STM32MP157 Qt camera UI shows real 4G, camera, F4, cloud, or SD-card health, or when QML controls the KMS overlay video plane during boot and USB camera hotplug recovery.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp`, `20_uvc_camera/qt_camera_display/qml/Main.qml`, `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`, or `20_uvc_camera/qt_camera_display/run_qt_kms_overlay_display.sh` for health status, camera hotplug, cloud probing, serial probing, or overlay visibility.
+- Trigger: fixing flicker where network/cloud repeatedly alternates between `检测中` and `在线` / `已连接`.
+- Trigger: fixing startup ordering where the external KMS camera plane appears before the Qt splash or home UI is ready.
+- Goal: health labels must represent the last proven real device state without blocking QML, and the camera plane must be visible only after Qt has completed its boot display handoff.
+- Boundary: QML binds and displays state only. Real socket, shell, serial, and filesystem probes belong in C++ controllers or helper scripts using asynchronous processes or worker threads.
+
+### 2. Signatures
+
+| Operation | Signature |
+|---|---|
+| Health controller | `class DeviceHealthController : public QObject` |
+| Periodic refresh | `m_healthTimer.setInterval(8000)` or slower unless a task explicitly requires faster diagnostics |
+| Network probe | `startNetworkProbe()` asynchronously starts `4g-ppp test` |
+| Cloud probe | `startCloudProbe()` asynchronously starts `curl -fsS --max-time 2 http://119.91.65.122/health` |
+| Process completion | `handleNetworkProcessFinished(...)`, `handleCloudProcessFinished(...)` update final state |
+| Process errors | `handleNetworkProcessError(...)`, `handleCloudProcessError(...)` update a failure state |
+| Probe timeout | `handleNetworkProbeTimeout()`, `handleCloudProbeTimeout()` kill the probe and set timeout/failure state |
+| Overlay startup | `uvc_kms_overlay` starts hidden through `-V 0` |
+| Overlay restore gate | `root.bootOverlayRestoreFinished && !root.splashOverlayVisible && root.activePage === "home"` |
+| QML camera recovery | `onCameraStatusChanged` may call `storageController.setOverlayVisible(true)` only behind the restore gate |
+| Page navigation recovery | `switchPage("home")` may restore overlay only behind the same restore gate |
+| Static regression test | `./test_qt_kms_overlay_assets.sh` checks health refresh markers and QML overlay restore gates |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Stable refresh semantics | Only the first unknown state may show `检测中`. Later periodic refreshes must keep the last stable label while probes run in the background, then update only on success, failure, timeout, or explicit device absence. |
+| Network truth source | 4G/network status may show `在线` only when the real test command exits successfully. A missing `4g-ppp`, non-zero exit, timeout, or process error must not display online. |
+| Cloud truth source | Cloud status may show `已连接` only when the configured health URL succeeds within the timeout. DNS, TCP, HTTP, command, or timeout failure must show a non-connected state. |
+| No flicker writes | `startNetworkProbe()` must not call `setNetworkStatus(QStringLiteral("检测中"), ...)` on every cycle. `startCloudProbe()` must not call `setCloudStatus(QStringLiteral("检测中"), ...)` on every cycle. |
+| UI responsiveness | `DeviceHealthController` must not call `waitForStarted()`, `waitForFinished()`, blocking shell commands, blocking serial reads, or sleeps on the Qt/UI thread. Use Qt signals, timeouts, and worker threads. |
+| Camera truth source | Camera status may show online only after the overlay `STATUS` path proves frames are present and progressing. USB unplug or a stopped serial/frame counter must become offline and may trigger `restart-overlay` without killing Qt. |
+| F4 truth source | F4 may show `接入` only after a configured serial handshake returns an accepted response such as `ACK`, `OK`, `F4`, or `READY`. Missing TTY, open failure, timeout, or unrecognized response is `待接入` / offline. |
+| Overlay initial visibility | The KMS video plane must start hidden with `-V 0`; early camera initialization is allowed, but early camera display is not. |
+| QML boot handoff | QML may send `VISIBLE 1` only after `splashOverlayVisible` is false, `bootOverlayRestoreFinished` is true, and the active page is `home`. |
+| Page ownership | Non-home pages keep overlay hidden. Returning to home does not bypass the boot handoff gate, even if camera status already says online. |
+| Build deployment proof | Because QML is compiled through `qml.qrc`, QML changes require proving `rcc -name qml` reran and the deployed board binary contains the expected markers. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning |
+|---|---|---|
+| Static health contract | `./test_qt_kms_overlay_assets.sh` passes checks for `m_healthTimer.setInterval(8000)`, no `waitForStarted`, and no repeated `检测中` writes inside network/cloud probe starters | Health refresh may flicker or block the UI thread |
+| Static overlay contract | The same test finds `bootOverlayRestoreFinished` and restore conditions containing `bootOverlayRestoreFinished`, `!splashOverlayVisible`, and `activePage === "home"` in both camera-status and page-return paths | Camera video can appear before Qt splash/home is ready |
+| 4G board check | `4g-ppp test; echo "exit=$?"` exits `0`, and Qt shows `在线` only after that success | UI is showing a guessed state instead of a real network probe |
+| Cloud board check | `curl -fsS --max-time 2 http://119.91.65.122/health; echo "exit=$?"` succeeds, and Qt shows `已连接` only after that success | UI is showing cloud connectivity without a live backend check |
+| Camera unplug check | Unplugging the USB camera changes Qt camera status to offline and does not freeze navigation | Camera state is cached, overlay polling is blocked, or hotplug recovery is not isolated |
+| Camera replug check | Replugging the USB camera lets `restart-overlay` recover frames while the Qt PID stays unchanged; the video becomes visible only on home after the boot gate | Recovery killed Qt, or QML restored overlay from the wrong page/state |
+| F4 serial check | Only a successful `/dev/ttySTM2` handshake changes F4 from `待接入` to `接入` | F4 status is hard-coded or not tied to serial communication |
+| Startup ordering check | `/tmp/uvc-kms-overlay.log` contains `initial-visible=0`; the LCD shows early splash, then QML splash, then home with video | Overlay was launched visible or QML restored it too early |
+| Deployment check | Board-side `strings /root/qt_camera_display/qt_camera_display \| grep -E 'bootOverlayRestoreFinished|DeviceHealthController'` finds the markers after deploy | Board is still running an old binary or stale embedded QML |
+
+### 5. Good / Base / Bad Cases
+
+```cpp
+/* Good: 周期刷新只启动异步探测，不把稳定的在线状态先改回“检测中”。 */
+void startNetworkProbe()
+{
+    m_networkProbe.start(QStringLiteral("4g-ppp"), QStringList() << QStringLiteral("test"));
+    m_networkTimeout.start();
+}
+```
+
+```cpp
+/* Bad: 每 8 秒先写“检测中”，再写“在线”，用户会看到顶部网络状态循环闪烁。 */
+void startNetworkProbe()
+{
+    setNetworkStatus(QStringLiteral("检测中"), QStringLiteral("#f4b942"));
+    m_networkProbe.start(QStringLiteral("4g-ppp"), QStringList() << QStringLiteral("test"));
+}
+```
+
+```cpp
+/* Bad: 在 Qt 主线程等待进程启动或结束，会让触摸、动画和页面切换短暂停顿。 */
+m_networkProbe.start(QStringLiteral("4g-ppp"), QStringList() << QStringLiteral("test"));
+m_networkProbe.waitForStarted(1000);
+```
+
+```qml
+// Good: camera recovery can show the external video plane only after Qt has completed the boot handoff.
+if (root.bootOverlayRestoreFinished && !root.splashOverlayVisible && root.activePage === "home") {
+    storageController.setOverlayVisible(true)
+}
+```
+
+```qml
+// Bad: camera status changes before the splash ends, so the KMS plane appears above the Qt boot UI.
+onCameraStatusChanged: {
+    if (deviceHealth.cameraStatus === "在线") {
+        storageController.setOverlayVisible(true)
+    }
+}
+```
+
+```text
+Base: On cold boot the overlay helper may initialize and collect frames before QML is visible, but it must remain hidden until QML explicitly sends `VISIBLE 1` after the splash fade has completed.
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing health status, cloud/network probing, camera hotplug handling, QML splash logic, page navigation, overlay visibility, or deployment scripts.
+- The static test must assert that `DeviceHealthController` does not contain `waitForStarted` and that `startNetworkProbe()` / `startCloudProbe()` do not reset labels to `检测中` during every periodic probe.
+- The static test must assert that QML contains `bootOverlayRestoreFinished`, that `onCameraStatusChanged` uses the full restore gate, and that `switchPage("home")` uses the same gate before sending `VISIBLE 1`.
+- On board, verify 4G and cloud with the exact shell commands used by the controller and compare the UI labels with command exit codes.
+- On board, unplug and replug the USB camera. Confirm Qt remains responsive, the Qt PID does not change during `restart-overlay`, camera status becomes offline then online, and video is restored only on the home page.
+- On board, verify F4 status with a real serial handshake. Do not accept a screenshot or hard-coded QML label as proof.
+- After QML changes, rebuild and deploy the Qt binary, then prove the board binary contains the expected QML/C++ markers before accepting visual behavior.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+Periodic health refresh writes `检测中` immediately, then writes `在线` or `已连接` after each successful probe.
+```
+
+#### Correct
+
+```text
+Periodic health refresh runs silently in the background and leaves the previous stable label visible until a real success, failure, timeout, or unplug event changes the state.
+```
+
+#### Wrong
+
+```text
+Camera online status directly sends `VISIBLE 1`, so a hotplug or early frame can display video before the Qt splash has disappeared.
+```
+
+#### Correct
+
+```text
+Camera online status and `switchPage("home")` both use the same boot/page gate: `bootOverlayRestoreFinished && !splashOverlayVisible && activePage === "home"`.
+```
+
+---
+
 ## Qt And Procfs Runtime Checks
 
 Use this convention when a Qt or user-space helper on the STM32MP157 board must read kernel-generated procfs files such as `/proc/mounts`, `/proc/bus/input/devices`, `/proc/<pid>/fd`, or `/proc/<pid>/status`.
@@ -453,6 +696,372 @@ This ignores the browser/cloud preview requirement and can leave the detail page
 
 ```text
 The board saved a JPG/PNG pair from the same overlay frame, registered JPG as source and PNG as annotated, and the cloud record detail returns preview_url for both.
+```
+
+---
+
+## Qt Detection Result Payload Contract
+
+Use this convention when the STM32MP157 Qt defect screen runs the model detection chain, renders the latest result on the home page, writes local history, or sends a detection record to the defect cloud backend.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp`, `20_uvc_camera/qt_camera_display/qml/Main.qml`, `20_uvc_camera/qt_camera_display/defect-cos-upload`, history JSON parsing/writing, README acceptance text, or cloud record payload mapping for a detection action.
+- Trigger: touching any nearby save/upload code that already contains placeholder values, fixed result strings, fixed part labels, fixed IDs, or old display scaling. When a file is already being modified in this area, remove obsolete fixed fields in the same change instead of leaving them for a later pass.
+- Transaction boundary: one `检测` action captures one source frame, runs the classifier first, runs the segmentation model second, computes the total model time after both models finish, stores one local history entry, and sends one cloud record payload with the actual model result.
+
+### 2. Signatures
+
+| Operation | Signature |
+|---|---|
+| Board self-test | `/root/qt_camera_display/qt_camera_display --detect-self-test` |
+| Detection result line | `RESULT status=<GOOD|BAD|REVIEW> class=<model_class> ... segment_time_ms=<ms> total_time_ms=<ms> upload_status=<OK|FAIL>` |
+| First-model UI signal | `void detectClassificationReady(const QString &resultText)` |
+| All-models UI signal | `void detectModelsReady(const QString &resultText)` |
+| QML first-model handler | `onDetectClassificationReady: updateDetectClassificationFields(resultText)` |
+| QML all-models handler | `onDetectModelsReady: updateDetectClassificationFields(resultText); updateDetectModelTimeFields(resultText)` |
+| Classifier-to-cloud mapping | `cloudResultFromClassificationResult(const QString &classificationResult) -> good|bad|review` |
+| Upload environment field | `CLOUD_RESULT=good|bad|review` |
+| Upload result validator | `validate_cloud_result "$CLOUD_RESULT"` |
+| Cloud create-record field | JSON payload field `"result":"good|bad|review"` |
+| Local history fields | `classification_result`, `segmentation_result`, `total_time_ms`, `source_path`, `annotated_images` |
+| Home-page display fields | model-derived part name, percent confidence on a 0-100 scale, and `total_time_ms` when present |
+| Cloud detail verification | `GET /api/v1/records/{record_id}` must return `result` and `effective_result` matching the model outcome |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Result source of truth | `records.result` must come from the classifier result for the same detection transaction. Map model `BAD` to cloud `bad`, model `GOOD` to cloud `good`, and uncertain/no-model local diagnostics to `review`. Never default a model-backed detection to `good`. |
+| Upload default | `defect-cos-upload` may use `review` as the conservative default for manual diagnostics without a model result. It must not use `good` as a fallback default, because that turns missing data into a false pass. |
+| Result validation | The upload helper must reject any `CLOUD_RESULT` outside `good`, `bad`, and `review` before create-record. Invalid values should fail locally and not create a misleading cloud record. |
+| Placeholder cleanup | When editing the detection/upload/history/QML chain, search the touched files for fixed payload values such as hard-coded `good`, `待接入`, demo IDs, fixed part names, fixed result text, and old confidence scaling. Replace them with model-derived or explicitly conservative values. |
+| Part display | The home page part name must be derived from the model class or backend part field for the current record. For class names such as `washer_bad` or `gasket_good`, strip only the quality suffix and display the remaining part token. Do not keep a fixed part label. |
+| Confidence display | The home page confidence must be rendered as a 0-100 percentage. Do not divide confidence by `1000` or show a permille-style value unless the upstream model contract explicitly changes. |
+| Progressive result display | The home page must show each model stage as soon as that stage has a complete result. After the first classifier returns `RESULT`, QML must immediately refresh part name, class name, GOOD/BAD state, confidence, and good/bad totals. It must not wait for segmentation, COS upload, or history append. |
+| Progressive time display | `total_time_ms` must appear when the last model in the local model chain finishes. For the current classifier + UNet chain, emit `detectModelsReady` after UNet returns and before COS upload starts. Do not wait for `upload_status=OK/FAIL` to show the model elapsed time. |
+| Final completion boundary | `detectCurrentFrameFinished` means the whole detect transaction finished, including upload attempt and history append eligibility. It should restore busy state and show final upload status, but it must not be the first moment when model result fields become visible. |
+| Total detection time | `total_time_ms` is measured from classifier start through segmentation completion. It must include both model runtimes and exclude COS upload time unless the field name is changed to an upload-inclusive metric. |
+| History/cloud parity | Local history and the cloud record must describe the same source frame, model class, status, annotated evidence, and total model time. UI success is incomplete until cloud detail round-trip confirms the same result fields. |
+| Legacy save paths | Old manual save or diagnostic paths that do not run the models may upload evidence only as `review` or mark it as local-only. They must not create a cloud `good` record just because image upload succeeded. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning |
+|---|---|---|
+| Static model-to-cloud markers | `./test_qt_kms_overlay_assets.sh` finds `cloudResultFromClassificationResult`, `CLOUD_RESULT`, `validate_cloud_result`, and `total_time_ms` | Result mapping, validation, or total-time propagation can drift silently |
+| Fixed result search | `rg -n 'CLOUD_RESULT=.*good|"result":"good"|result=good|待接入|固定|/1000' main.cpp qml/Main.qml defect-cos-upload README.md` has no unreviewed detection payload defaults | A touched path may still send placeholder content or old confidence scaling |
+| Upload helper validation | `CLOUD_RESULT=bad sh defect-cos-upload ...` creates a `bad` payload; `CLOUD_RESULT=badness sh defect-cos-upload ...` fails before create-record | Invalid or missing result values can become cloud records |
+| Board self-test BAD case | `--detect-self-test` can produce `status=BAD ... total_time_ms=<nonzero> upload_status=OK` | The classifier result, segmentation result, timing, or upload path is not wired together |
+| Cloud detail BAD round-trip | For the returned `record_id`, detail JSON contains `"result":"bad"` and `"effective_result":"bad"` | The board sent a fixed/default good payload or the backend interpreted it incorrectly |
+| Home part display | A class such as `washer_bad` displays part `washer` on the home page | The UI still shows a fixed part name or exposes quality suffix as part identity |
+| Home confidence display | A confidence value renders on a 0-100 percent scale and no QML `/1000` scaling remains | The UI still uses the old permille contract |
+| First-model display timing | Board binary contains `detectClassificationReady`; on the LCD, part/class/GOOD-BAD/confidence update immediately after classifier completion while UNet or upload can still be running | The UI is tied to final upload completion or all-model completion instead of the first model result |
+| All-model time display timing | Board binary contains `detectModelsReady`; on the LCD, `total_time_ms` updates after UNet completion before COS upload returns | The elapsed-time UI is tied to `detectCurrentFrameFinished` and waits for the network |
+| Total time display | Home page prefers `total_time_ms` over the first model's elapsed time | The operator sees only classifier latency instead of the complete detection latency |
+
+### 5. Good / Base / Bad Cases
+
+```cpp
+/* Good: the cloud payload is derived from the model status for this detection transaction. */
+const QString cloudResult = cloudResultFromClassificationResult(classificationResult);
+env.insert(QStringLiteral("CLOUD_RESULT"), cloudResult);
+```
+
+```sh
+# Base: manual diagnostics without a classifier result are conservative review records, not pass records.
+CLOUD_RESULT="${CLOUD_RESULT:-review}"
+validate_cloud_result "$CLOUD_RESULT"
+```
+
+```qml
+// Good: display the model-derived part token and percent confidence from the current result.
+text: displayPartNameFromClass(root.detectClassName)
+```
+
+```qml
+// Good: first-stage model fields update when the classifier emits RESULT, before upload finishes.
+onDetectClassificationReady: {
+    updateDetectClassificationFields(resultText)
+}
+```
+
+```qml
+// Good: total model time updates after the local model chain finishes, before COS upload returns.
+onDetectModelsReady: {
+    updateDetectClassificationFields(resultText)
+    updateDetectModelTimeFields(resultText)
+}
+```
+
+```text
+Bad: the classifier reports BAD, but the upload helper creates `"result":"good"` because the script has a fixed default.
+```
+
+```text
+Bad: the home page says the detection took only the classifier time even though the segmentation model is still running afterward.
+```
+
+```text
+Bad: the classifier result is already known, but the home page still shows "当前帧" or "检测中..." for part/class until COS upload returns.
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing detection, result display, history, upload, or README contracts.
+- Run `sh -n defect-cos-upload` after changing the upload helper, then test at least one accepted `CLOUD_RESULT` and one rejected value.
+- Search touched files for old fixed payload/display markers: `CLOUD_RESULT`, hard-coded `good`, fixed part names, fixed IDs, placeholder text such as `待接入`, and confidence `/1000`.
+- Cross-build `qt_camera_display` in `cfr-vm` and confirm the ARM binary contains the expected detection markers such as `cloudResultFromClassificationResult`, `CLOUD_RESULT`, `total_time_ms`, `detectClassificationReady`, and `detectModelsReady`.
+- On the board, run `--detect-self-test` and assert the result line includes `classification_result`, `segmentation_result`, nonzero `total_time_ms`, and `upload_status=OK` when network credentials are available.
+- For at least one BAD detection acceptance test, query the returned cloud detail and assert both `result` and `effective_result` are `bad`. Do not accept the feature based only on upload stdout.
+- On the LCD, verify the home page shows the model-derived part name, 0-100 percent confidence, and total two-model detection time without overlapping controls.
+- On the LCD, verify timing explicitly: part/class/GOOD-BAD/confidence appear after the first classifier finishes; `total_time_ms` appears after the final local model finishes; upload completion only changes final status/history.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The upload succeeded, so sending the helper's default `"result":"good"` is acceptable even when the model classified the part as BAD.
+```
+
+#### Correct
+
+```text
+The classifier result is mapped to `CLOUD_RESULT=bad`, the helper validates that value, create-record sends `"result":"bad"`, and cloud detail returns `result/effective_result=bad` for the same `record_id`.
+```
+
+#### Wrong
+
+```text
+Only fix the QML display bug and leave nearby fixed cloud payload fields untouched because they were pre-existing.
+```
+
+#### Correct
+
+```text
+When editing the detection/upload/history files, search and remove stale placeholder fields in the touched path so UI, history, and cloud all report the same model-backed result.
+```
+
+#### Wrong
+
+```text
+The final `detectCurrentFrameFinished` signal already contains every field, so it is fine to update the home page only after COS upload returns.
+```
+
+#### Correct
+
+```text
+Emit `detectClassificationReady` after the first model returns and update part/class/confidence immediately; emit `detectModelsReady` after the last local model returns and update `total_time_ms`; reserve `detectCurrentFrameFinished` for final upload status and busy-state reset.
+```
+
+---
+
+## Qt Long-Running Action Responsiveness Contract
+
+Use this convention when a STM32MP157 Qt Quick screen starts a slow board operation such as `保存图片`, COS upload, SD-card sync, diagnostics export, log dump, or safe-remove preparation.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp`, `20_uvc_camera/qt_camera_display/qml/Main.qml`, or any QML handler that calls C++ code which can touch `/mnt/sdcard`, sockets, network helpers, `sync`, image encoding, or upload scripts.
+- Trigger: a visible button starts an operation that can take more than one event-loop tick, especially SD-card image save plus cloud upload.
+- User contract: while the operation is running, the operator must still be able to tap other pages such as `历史记录`, `统计分析`, `手动控制`, `参数设置`, and `告警维护`.
+- Boundary: the running action may lock only its own conflicting commands, such as `保存图片` and `安全卸载`. It must not block the global QML event loop or disable unrelated navigation.
+
+### 2. Signatures
+
+| Operation | Signature |
+|---|---|
+| QML save action | `storageController.requestSaveCurrentFrameToSdCard()` |
+| C++ async save API | `Q_INVOKABLE void requestSaveCurrentFrameToSdCard()` |
+| C++ sync save API | `Q_INVOKABLE QString saveCurrentFrameToSdCard()` kept for CLI/self-test paths only |
+| QML busy flag | `property bool saveInProgress` |
+| C++ completion signal | `saveCurrentFrameFinished(const QString &message)` |
+| QML completion handler | `Connections { target: storageController; function onSaveCurrentFrameFinished(message) { ... } }` |
+| Button busy text | `保存中...` |
+| SSH save-path self-test | `/root/qt_camera_display/qt_camera_display --storage-self-test` |
+| Static contract | `./test_qt_kms_overlay_assets.sh` rejects QML direct calls to `saveCurrentFrameToSdCard()` and requires async markers |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Main-thread boundary | QML click handlers must return quickly. Do not call a synchronous C++ method from QML when that method waits for SD-card writes, overlay socket replies, upload helpers, or `sync`. |
+| Async entry | Use a QML-facing async wrapper such as `requestSaveCurrentFrameToSdCard()` for the screen button. It owns the worker dispatch and emits a completion signal back to the GUI thread. |
+| Sync self-test retention | Keep `saveCurrentFrameToSdCard()` available for `--storage-self-test` and direct SSH validation, because it gives a deterministic exit code and output. QML must not use it for the interactive button. |
+| Busy scope | `saveInProgress` may disable only commands that conflict with the same storage transaction, currently `保存图片` and `安全卸载`. It must not disable left navigation or unrelated controls. |
+| Duplicate-click guard | A second `保存图片` tap while `saveInProgress == true` must be ignored or reported as already running. It must not launch a second overlapping save/upload. |
+| Completion signal | The worker must reset `saveInProgress` only through the GUI-thread completion path and must surface the same success/failure message that the synchronous save path would have returned. |
+| Navigation during save | Page switches are UI state changes and must remain local to QML. They must not wait for image encoding, SD-card flush, upload, or overlay socket completion. |
+| Error propagation | Save/upload failures should update the status text after completion, but an error must not leave `saveInProgress` stuck true or permanently disable storage buttons. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning |
+|---|---|---|
+| Static QML contract | `./test_qt_kms_overlay_assets.sh` finds `requestSaveCurrentFrameToSdCard`, `saveCurrentFrameFinished`, `saveInProgress`, and rejects QML `saveCurrentFrameToSdCard()` calls | The interactive UI can regress to a blocking save path |
+| VM Qt build | `./build_qt_camera_display.sh` outputs an ARM ELF and `strings build-mp157/qt_camera_display` contains `requestSaveCurrentFrameToSdCard` and `saveCurrentFrameFinished` | The async API, signal, or QML resource packaging was not compiled into the deployed binary |
+| Board deployment proof | Board `strings /root/qt_camera_display/qt_camera_display` contains the async markers and `run_qt_kms_overlay_display.sh status` reports Qt and overlay PIDs | The board is still running an old binary or the display stack did not restart |
+| Save-path proof | `--storage-self-test` creates a new JPG/PNG pair under `/mnt/sdcard/images` and `sync` completes | The lower storage path is broken independently of UI responsiveness |
+| Human touch proof | Tap `保存图片`; while the button shows `保存中...`, immediately tap another left navigation page and it changes pages without waiting for the save result | The GUI thread is still blocked or global navigation is disabled |
+| Conflict-button proof | During `保存中...`, `保存图片` and `安全卸载` cannot start conflicting storage operations | The app can overlap two writes or unmount while a save is in progress |
+| Completion proof | After save/upload completes, status text shows the result and both storage buttons become usable again | The completion signal did not reach QML or busy-state reset is missing |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: interactive QML starts the async request, marks only the storage action busy, and returns to the event loop.
+root.saveInProgress = true
+storageController.requestSaveCurrentFrameToSdCard()
+```
+
+```qml
+// Good: unrelated page navigation remains a local QML state change during the save.
+activePage = "history"
+storageController.setOverlayVisible(false)
+```
+
+```qml
+// Good: completion resets the busy state on the GUI side and shows the real controller result.
+function onSaveCurrentFrameFinished(message) {
+    root.saveInProgress = false
+    root.storageStatusText = message
+}
+```
+
+```cpp
+/* Good: 同步保存路径保留给命令行自检，QML 按钮改走异步入口，避免阻塞 Qt GUI 主线程。 */
+Q_INVOKABLE void requestSaveCurrentFrameToSdCard();
+Q_INVOKABLE QString saveCurrentFrameToSdCard();
+```
+
+```qml
+// Bad: this blocks the QML event loop while the C++ path waits for SD card, overlay socket, upload, or sync.
+root.storageStatusText = storageController.saveCurrentFrameToSdCard()
+```
+
+```qml
+// Bad: a single busy flag disables the whole shell, so other pages cannot be clicked during a save.
+navigationPanel.enabled = !root.saveInProgress
+```
+
+```text
+Base: SSH `--storage-self-test` may still run synchronously because it is not an interactive touch workflow. Do not use that as proof that the screen remains responsive.
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing storage buttons, QML navigation, `CameraStorageController`, save/upload code, or README acceptance text.
+- Cross-build `qt_camera_display` in the VM and confirm `file build-mp157/qt_camera_display` reports an ARM ELF.
+- Confirm the VM ARM binary and the board binary contain `requestSaveCurrentFrameToSdCard`, `saveCurrentFrameFinished`, and `保存中`.
+- Deploy to the NFS rootfs or directly to the board, restart `/root/qt_camera_display/run_qt_kms_overlay_display.sh`, and verify Qt plus overlay PIDs.
+- On the board, run `--storage-self-test`, list the newest JPG/PNG pair under `/mnt/sdcard/images`, and execute `sync` to prove the save path still works.
+- On the LCD, tap `保存图片`, then while `保存中...` is visible tap `历史记录`, `统计分析`, `手动控制`, `参数设置`, and `告警维护`; each page switch must respond without waiting for the save result.
+- On the LCD, confirm `保存图片` and `安全卸载` are temporarily disabled during the running save and become usable again after `saveCurrentFrameFinished`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The save path writes files correctly, so it is acceptable if the whole Qt UI cannot be tapped until the save finishes.
+```
+
+#### Correct
+
+```text
+The save path still writes and syncs files, but the screen button starts it through an async controller entry. Only conflicting storage commands are busy; unrelated navigation remains clickable during `保存中...`.
+```
+
+---
+
+## Qt Alarm Snapshot And SD-Card Diagnostic File Contract
+
+Use this convention when the STM32MP157 Qt alarm maintenance page saves a diagnostic snapshot to `/mnt/sdcard/logs/qt_alarm_snapshot.txt`.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp`, `qml/Main.qml`, the alarm maintenance save action, or the static contract test that guards alarm snapshot behavior.
+- Goal: the `保存诊断` button must create a real UTF-8 text file on the SD card, not only show a target path in the UI.
+- Boundary: QML may assemble the human-readable diagnostic text, but C++ must own mount checking, directory creation, file overwrite, flush, and `fsync`.
+
+### 2. Signatures
+
+| Operation | Signature |
+|---|---|
+| QML snapshot text builder | `alarmSnapshotText()` |
+| QML save action | `storageController.saveAlarmSnapshotToSdCard(alarmSnapshotText())` |
+| C++ save API | `Q_INVOKABLE QString saveAlarmSnapshotToSdCard(const QString &snapshotText)` |
+| Default log directory | `/mnt/sdcard/logs` |
+| Default snapshot file | `/mnt/sdcard/logs/qt_alarm_snapshot.txt` |
+| SSH self-test | `/root/qt_camera_display/qt_camera_display --alarm-snapshot-self-test` |
+| Static contract | `./test_qt_kms_overlay_assets.sh` checks `saveAlarmSnapshotToSdCard`, `DEFAULT_SDCARD_LOG_DIR`, `DEFAULT_ALARM_SNAPSHOT_FILE`, `alarm-snapshot-self-test`, and `fsync` |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| UI contract | The alarm page may show a short status string, but the save path must be backed by an actual file write. Do not leave the button in a "path only" state. |
+| Mount contract | `saveAlarmSnapshotToSdCard()` must check that `/mnt/sdcard` is mounted before writing. If the mount check fails, return `诊断保存失败：...` and do not create a file under the rootfs by mistake. |
+| Directory contract | The controller must create `/mnt/sdcard/logs` before opening the file, so SSH users can enter the directory and see the snapshot file directly. |
+| Write contract | The snapshot file is overwritten on each save. This keeps the latest diagnostic state in a fixed, easy-to-check path. |
+| Flush contract | The controller must call `flush` and then `fsync` before reporting success, so the result is durable on removable media. |
+| Text contract | `alarmSnapshotText()` should include the alarm code, alarm status, camera status, storage state, and recent alarm history. The text must remain UTF-8 and end with a trailing newline. |
+| Self-test contract | `--alarm-snapshot-self-test` must exercise the same C++ save path as the UI button, so SSH validation proves the real button path. |
+| Error contract | Any failure should preserve the specific reason from the failing boundary, such as mount, directory creation, file open, flush, or `fsync`. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning |
+|---|---|---|
+| UI button save | Clicking `保存诊断` shows `诊断已保存：/mnt/sdcard/logs/qt_alarm_snapshot.txt` | The UI still only formats a path or the controller did not write the file |
+| SSH self-test | `/root/qt_camera_display/qt_camera_display --alarm-snapshot-self-test` exits `0` | The same C++ save path cannot write the diagnostic file |
+| File existence | `test -s /mnt/sdcard/logs/qt_alarm_snapshot.txt` succeeds | The file was not created or is empty |
+| Content proof | `wc -c /mnt/sdcard/logs/qt_alarm_snapshot.txt` is non-zero and `tail -n 30` shows `alarm_code=`, `camera_status=`, and `[recent_alarm_history]` | The file exists but does not contain the expected diagnostic payload |
+| Mount proof | `mount | grep ' /mnt/sdcard '` shows the SD card mount | The save path may be writing to the wrong filesystem or the card is not mounted |
+| Static contract | `./test_qt_kms_overlay_assets.sh` passes | The code-spec and implementation drifted |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: QML only builds the diagnostic text, then hands it to the C++ controller for the real file write.
+resultText = storageController.saveAlarmSnapshotToSdCard(alarmSnapshotText())
+```
+
+```cpp
+/* Good: the controller creates the log directory, writes the snapshot, flushes it, and fsyncs before success. */
+if (!QDir().mkpath(m_logDir)) {
+    return QStringLiteral("诊断保存失败：无法创建 ") + m_logDir;
+}
+```
+
+```text
+Base: the snapshot text can be simple, but it must still include a time stamp, the alarm code, and recent history so SSH can confirm the file is real.
+```
+
+```text
+Bad: `快照目标：/mnt/sdcard/logs/qt_alarm_snapshot.txt` only tells the operator where a file should have been written.
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing the alarm save flow, the QML text builder, the C++ controller, or the alarm README contract.
+- Cross-build `qt_camera_display` and confirm the generated ARM binary contains `--alarm-snapshot-self-test` and `/mnt/sdcard/logs/qt_alarm_snapshot.txt`.
+- On the board, run `mount | grep ' /mnt/sdcard '`, `/root/qt_camera_display/qt_camera_display --alarm-snapshot-self-test`, `test -s /mnt/sdcard/logs/qt_alarm_snapshot.txt`, `wc -c /mnt/sdcard/logs/qt_alarm_snapshot.txt`, and `tail -n 30 /mnt/sdcard/logs/qt_alarm_snapshot.txt`.
+- Verify the screen button and SSH self-test use the same save path by comparing their success messages and file contents.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The alarm page shows a snapshot target path, so the diagnostic file must exist.
+```
+
+#### Correct
+
+```text
+The alarm page calls the C++ save controller, the controller writes and fsyncs /mnt/sdcard/logs/qt_alarm_snapshot.txt, and SSH can prove the file exists with test -s and tail.
 ```
 
 ---

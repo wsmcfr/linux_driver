@@ -45,6 +45,7 @@
 #include <QFileInfo>            /* QFileInfo 用于判断 COS 上传脚本、图片文件和历史文件状态。 */
 #include <QGuiApplication>      /* QGuiApplication 是 Qt Quick 图形程序的应用对象。 */
 #include <QHash>                /* QHash 用于声明 QML 模型角色名映射。 */
+#include <QTimer>               /* QTimer 用于周期性异步刷新设备真实健康状态。 */
 #include <QJsonArray>           /* QJsonArray 用于把历史记录数组保存到 JSON。 */
 #include <QJsonDocument>        /* QJsonDocument 用于解析和生成上传历史 JSON 文档。 */
 #include <QJsonObject>          /* QJsonObject 用于保存单条上传历史记录字段。 */
@@ -77,9 +78,12 @@
 #include <cerrno>               /* errno 保存 Unix socket 调用失败原因。 */
 #include <cstdio>               /* fopen/fscanf/fclose 用于可靠读取 procfs；stdout 用于自检入口输出保存结果。 */
 #include <cstring>              /* strerror 用于把 errno 转成人可读文本。 */
+#include <fcntl.h>              /* open/O_NOCTTY 用于后台 F4 串口握手检测。 */
+#include <termios.h>            /* termios 用于配置 F4 串口 115200 8N1 原始模式。 */
 
 #include <sys/socket.h>         /* socket/connect 负责与 overlay 控制端点通信。 */
 #include <sys/un.h>             /* sockaddr_un 描述 Unix domain socket 地址。 */
+#include <sys/select.h>         /* select 用于给 F4 串口握手设置短超时，避免线程长时间阻塞。 */
 #include <unistd.h>             /* close/read/write 处理 socket 文件描述符。 */
 
 /* 默认摄像头设备节点：当前 UVC 摄像头已经验证通常枚举为 /dev/video0。 */
@@ -109,6 +113,9 @@ static const char *DEFAULT_GST_IO_MODE = "mmap";
 /* overlay 控制 socket 默认路径，需要与 uvc_kms_overlay.c 保持一致。 */
 static const char *DEFAULT_OVERLAY_CONTROL_SOCKET = "/tmp/uvc-kms-overlay-control.sock";
 
+/* 默认 overlay 启动控制脚本；相机热拔插恢复时只后台重启 overlay 进程，不重启 Qt 界面。 */
+static const char *DEFAULT_OVERLAY_RESTART_SCRIPT = "/root/qt_camera_display/run_qt_kms_overlay_display.sh";
+
 /* SD 卡默认挂载点，保存按钮只允许写入这个挂载点下的 images 目录。 */
 static const char *DEFAULT_SDCARD_MOUNT_POINT = "/mnt/sdcard";
 
@@ -123,6 +130,21 @@ static const char *DEFAULT_ALARM_SNAPSHOT_FILE = "/mnt/sdcard/logs/qt_alarm_snap
 
 /* 板端 COS 上传脚本默认部署路径，保存按钮会在本地 JPG/PNG 落盘后调用它。 */
 static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-cos-upload";
+
+/* 默认 4G PPP 管理脚本；健康检测只调用 test，不在界面线程里执行 start/restart。 */
+static const char *DEFAULT_4G_PPP_SCRIPT = "4g-ppp";
+
+/* 默认云端健康地址；与 defect-cos-upload 的默认后端保持一致。 */
+static const char *DEFAULT_CLOUD_HEALTH_URL = "http://119.91.65.122/health";
+
+/* 默认 F4 串口节点；真实接入时只有握手成功才显示接入。 */
+static const char *DEFAULT_F4_SERIAL_DEVICE = "/dev/ttySTM2";
+
+/* 默认 F4 串口波特率；当前项目串口测试工具和文档均使用 115200 8N1。 */
+static const int DEFAULT_F4_SERIAL_BAUD = 115200;
+
+/* 默认 F4 握手命令；用户已确认没有现成协议时先按 STATUS 查询实现。 */
+static const char *DEFAULT_F4_HEALTH_QUERY = "STATUS\r\n";
 
 /* 板端缺陷分类推理程序默认路径，首页“检测”按钮会通过 QProcess 调用它。 */
 static const char *DEFAULT_DEFECT_CLASSIFY_BIN = "/root/qt_camera_display/defect-classify";
@@ -2959,6 +2981,988 @@ private:
 };
 
 /*
+ * DeviceHealthController 的作用：
+ *   统一管理 Qt 页面顶部状态栏和告警页里的真实设备在线状态。
+ *
+ * 主要流程：
+ *   1. 周期性异步检测 4G 网络、KMS overlay 相机、F4 串口和云端 health。
+ *   2. 每个检测都有忙标志和短超时，避免检测任务堆积或阻塞 Qt 主线程。
+ *   3. QML 只读取 status/color/detail 属性，不直接执行 shell、串口或 socket 操作。
+ *   4. 相机连续离线时尝试后台重启 overlay 控制脚本，让 USB 摄像头重新插入后能恢复画面。
+ *
+ * 关键说明：
+ *   这个控制器只做“健康探测”，不接管保存、检测和 overlay 可见性控制，避免和 CameraStorageController
+ *   的业务动作互相影响。
+ */
+class DeviceHealthController : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString networkStatusText READ networkStatusText NOTIFY networkStatusChanged)
+    Q_PROPERTY(QString networkStatusColor READ networkStatusColor NOTIFY networkStatusChanged)
+    Q_PROPERTY(QString cameraStatusText READ cameraStatusText NOTIFY cameraStatusChanged)
+    Q_PROPERTY(QString cameraStatusColor READ cameraStatusColor NOTIFY cameraStatusChanged)
+    Q_PROPERTY(QString f4StatusText READ f4StatusText NOTIFY f4StatusChanged)
+    Q_PROPERTY(QString f4StatusColor READ f4StatusColor NOTIFY f4StatusChanged)
+    Q_PROPERTY(QString cloudStatusText READ cloudStatusText NOTIFY cloudStatusChanged)
+    Q_PROPERTY(QString cloudStatusColor READ cloudStatusColor NOTIFY cloudStatusChanged)
+    Q_PROPERTY(QString sdcardStatusText READ sdcardStatusText NOTIFY sdcardStatusChanged)
+    Q_PROPERTY(QString sdcardStatusColor READ sdcardStatusColor NOTIFY sdcardStatusChanged)
+    Q_PROPERTY(QString detailText READ detailText NOTIFY detailTextChanged)
+
+public:
+    /*
+     * 构造函数的作用：
+     *   初始化状态文本、探测路径和定时器间隔。
+     *
+     * 参数：
+     *   videoBackend 是当前 Qt 视频后端；kms-overlay 时相机状态以 overlay STATUS 为准。
+     *   cameraDevice 是摄像头设备节点，用于 qt-safe/qt-gst 或离线提示。
+     *   parent 是 Qt 对象树父对象。
+     */
+    explicit DeviceHealthController(const QString &videoBackend,
+                                    const QString &cameraDevice,
+                                    QObject *parent = nullptr)
+        : QObject(parent),
+          m_videoBackend(videoBackend),
+          m_cameraDevice(cameraDevice),
+          m_overlaySocket(QString::fromLatin1(DEFAULT_OVERLAY_CONTROL_SOCKET)),
+          m_overlayRestartScript(QString::fromLatin1(DEFAULT_OVERLAY_RESTART_SCRIPT)),
+          m_networkScript(QString::fromLatin1(DEFAULT_4G_PPP_SCRIPT)),
+          m_cloudHealthUrl(QString::fromLatin1(DEFAULT_CLOUD_HEALTH_URL)),
+          m_sdcardMount(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
+          m_f4Device(QString::fromLatin1(DEFAULT_F4_SERIAL_DEVICE)),
+          m_f4Query(QString::fromLatin1(DEFAULT_F4_HEALTH_QUERY)),
+          m_f4Baud(DEFAULT_F4_SERIAL_BAUD),
+          m_networkStatusText(QStringLiteral("检测中")),
+          m_networkStatusColor(QStringLiteral("#f4b942")),
+          m_cameraStatusText(QStringLiteral("检测中")),
+          m_cameraStatusColor(QStringLiteral("#f4b942")),
+          m_f4StatusText(QStringLiteral("待接入")),
+          m_f4StatusColor(QStringLiteral("#f4b942")),
+          m_cloudStatusText(QStringLiteral("检测中")),
+          m_cloudStatusColor(QStringLiteral("#f4b942")),
+          m_sdcardStatusText(QStringLiteral("检测中")),
+          m_sdcardStatusColor(QStringLiteral("#f4b942")),
+          m_detailText(QStringLiteral("设备健康检测启动")),
+          m_lastOverlaySerial(0),
+          m_cameraOfflineCount(0),
+          m_overlayRestartCooldown(0),
+          m_networkProbeRunning(false),
+          m_cloudProbeRunning(false),
+          m_f4ProbeRunning(false),
+          m_overlayProbeRunning(false),
+          m_networkProbeTimedOut(false),
+          m_cloudProbeTimedOut(false)
+    {
+        /* 主健康定时器只调度后台刷新，间隔放慢到 8 秒，避免顶部状态频繁跳动或频繁跑外设测试。 */
+        m_healthTimer.setInterval(8000);
+        m_healthTimer.setSingleShot(false);
+        connect(&m_healthTimer, &QTimer::timeout, this, &DeviceHealthController::refreshAllStatus);
+
+        /* 网络和云端探测独立使用 QProcess；finished/timeout 都回到主线程更新状态。 */
+        m_networkProcess.setProcessChannelMode(QProcess::MergedChannels);
+        connect(&m_networkProcess,
+                static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this,
+                &DeviceHealthController::handleNetworkProcessFinished);
+        connect(&m_networkProcess,
+                static_cast<void (QProcess::*)(QProcess::ProcessError)>(&QProcess::errorOccurred),
+                this,
+                &DeviceHealthController::handleNetworkProcessError);
+        connect(&m_networkTimeout, &QTimer::timeout, this, &DeviceHealthController::handleNetworkProbeTimeout);
+        m_networkTimeout.setSingleShot(true);
+
+        m_cloudProcess.setProcessChannelMode(QProcess::MergedChannels);
+        connect(&m_cloudProcess,
+                static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this,
+                &DeviceHealthController::handleCloudProcessFinished);
+        connect(&m_cloudProcess,
+                static_cast<void (QProcess::*)(QProcess::ProcessError)>(&QProcess::errorOccurred),
+                this,
+                &DeviceHealthController::handleCloudProcessError);
+        connect(&m_cloudTimeout, &QTimer::timeout, this, &DeviceHealthController::handleCloudProbeTimeout);
+        m_cloudTimeout.setSingleShot(true);
+    }
+
+    /* networkStatusText 返回 4G 网络状态文本，QML 顶部状态栏直接显示它。 */
+    QString networkStatusText() const { return m_networkStatusText; }
+
+    /* networkStatusColor 返回 4G 网络状态颜色，绿色在线、黄色等待、红色离线。 */
+    QString networkStatusColor() const { return m_networkStatusColor; }
+
+    /* cameraStatusText 返回摄像头状态文本，kms-overlay 下来自 overlay STATUS。 */
+    QString cameraStatusText() const { return m_cameraStatusText; }
+
+    /* cameraStatusColor 返回摄像头状态颜色。 */
+    QString cameraStatusColor() const { return m_cameraStatusColor; }
+
+    /* f4StatusText 返回 F4 串口握手状态文本。 */
+    QString f4StatusText() const { return m_f4StatusText; }
+
+    /* f4StatusColor 返回 F4 串口握手状态颜色。 */
+    QString f4StatusColor() const { return m_f4StatusColor; }
+
+    /* cloudStatusText 返回云端 health 状态文本。 */
+    QString cloudStatusText() const { return m_cloudStatusText; }
+
+    /* cloudStatusColor 返回云端 health 状态颜色。 */
+    QString cloudStatusColor() const { return m_cloudStatusColor; }
+
+    /* sdcardStatusText 返回 SD 卡挂载状态文本。 */
+    QString sdcardStatusText() const { return m_sdcardStatusText; }
+
+    /* sdcardStatusColor 返回 SD 卡挂载状态颜色。 */
+    QString sdcardStatusColor() const { return m_sdcardStatusColor; }
+
+    /* detailText 返回最近一次健康检测详情，用于告警页和日志排查。 */
+    QString detailText() const { return m_detailText; }
+
+    /*
+     * start 的作用：
+     *   启动周期性健康检测，并立即跑第一轮，避免开机后长时间显示旧占位状态。
+     */
+    Q_INVOKABLE void start()
+    {
+        refreshAllStatus();
+        m_healthTimer.start();
+    }
+
+    /*
+     * refreshAllStatus 的作用：
+     *   调度一轮设备健康检测。
+     *
+     * 返回值：
+     *   无返回值；每个子检测完成后通过属性通知 QML。
+     */
+    Q_INVOKABLE void refreshAllStatus()
+    {
+        refreshSdcardStatus();
+        refreshOverlayCameraStatus();
+        startNetworkProbe();
+        startCloudProbe();
+        startF4Probe();
+    }
+
+signals:
+    /* networkStatusChanged 通知 QML 网络状态和颜色已更新。 */
+    void networkStatusChanged();
+
+    /* cameraStatusChanged 通知 QML 摄像头状态和颜色已更新。 */
+    void cameraStatusChanged();
+
+    /* f4StatusChanged 通知 QML F4 接入状态和颜色已更新。 */
+    void f4StatusChanged();
+
+    /* cloudStatusChanged 通知 QML 云端状态和颜色已更新。 */
+    void cloudStatusChanged();
+
+    /* sdcardStatusChanged 通知 QML SD 卡状态和颜色已更新。 */
+    void sdcardStatusChanged();
+
+    /* detailTextChanged 通知 QML 最近检测详情已更新。 */
+    void detailTextChanged();
+
+private slots:
+    /*
+     * handleNetworkProcessFinished 的作用：
+     *   接收 `4g-ppp test` 的异步结果，只有返回 0 才认为网络在线。
+     */
+    void handleNetworkProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+    {
+        const QString output = QString::fromUtf8(m_networkProcess.readAll()).trimmed();
+
+        m_networkTimeout.stop();
+        m_networkProbeRunning = false;
+
+        if (m_networkProbeTimedOut) {
+            m_networkProbeTimedOut = false;
+            return;
+        }
+
+        if (exitStatus == QProcess::NormalExit && exitCode == 0) {
+            setNetworkStatus(QStringLiteral("在线"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("4G 联网测试通过"));
+        } else {
+            setNetworkStatus(QStringLiteral("离线"), QStringLiteral("#ef5b5b"));
+            setDetailText(QStringLiteral("4G 测试未通过：") + compactText(output, 96));
+        }
+    }
+
+    /*
+     * handleNetworkProbeTimeout 的作用：
+     *   网络测试超过短超时后主动结束进程，避免 4G 命令长时间占用资源。
+     */
+    void handleNetworkProbeTimeout()
+    {
+        if (m_networkProcess.state() != QProcess::NotRunning) {
+            m_networkProbeTimedOut = true;
+            m_networkProcess.kill();
+        } else {
+            m_networkProbeRunning = false;
+        }
+        setNetworkStatus(QStringLiteral("超时"), QStringLiteral("#ef5b5b"));
+        setDetailText(QStringLiteral("4G 联网测试超时"));
+    }
+
+    /*
+     * handleNetworkProcessError 的作用：
+     *   异步接收 4G 测试进程启动失败等错误。
+     *
+     * 关键说明：
+     *   不在 startNetworkProbe() 中等待进程启动，避免健康检测定时器让 QML 主线程短暂停顿；
+     *   Qt 后续通过该信号告诉我们启动失败，再更新界面状态。
+     */
+    void handleNetworkProcessError(QProcess::ProcessError error)
+    {
+        if (error != QProcess::FailedToStart) {
+            return;
+        }
+
+        m_networkTimeout.stop();
+        m_networkProbeRunning = false;
+        m_networkProbeTimedOut = false;
+        setNetworkStatus(QStringLiteral("未安装"), QStringLiteral("#f4b942"));
+        setDetailText(QStringLiteral("无法启动 4G 测试命令：") + m_networkProcess.errorString());
+    }
+
+    /*
+     * handleCloudProcessFinished 的作用：
+     *   接收云端 health curl 结果，只有 HTTP 请求返回成功才显示已连接。
+     */
+    void handleCloudProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+    {
+        const QString output = QString::fromUtf8(m_cloudProcess.readAll()).trimmed();
+
+        m_cloudTimeout.stop();
+        m_cloudProbeRunning = false;
+
+        if (m_cloudProbeTimedOut) {
+            m_cloudProbeTimedOut = false;
+            return;
+        }
+
+        if (exitStatus == QProcess::NormalExit && exitCode == 0) {
+            setCloudStatus(QStringLiteral("已连接"), QStringLiteral("#35d07f"));
+        } else {
+            setCloudStatus(QStringLiteral("离线"), QStringLiteral("#f4b942"));
+            setDetailText(QStringLiteral("云端 health 未通过：") + compactText(output, 96));
+        }
+    }
+
+    /*
+     * handleCloudProbeTimeout 的作用：
+     *   云端 health 超时后主动结束 curl，避免弱网时卡住状态刷新。
+     */
+    void handleCloudProbeTimeout()
+    {
+        if (m_cloudProcess.state() != QProcess::NotRunning) {
+            m_cloudProbeTimedOut = true;
+            m_cloudProcess.kill();
+        } else {
+            m_cloudProbeRunning = false;
+        }
+        setCloudStatus(QStringLiteral("超时"), QStringLiteral("#f4b942"));
+    }
+
+    /*
+     * handleCloudProcessError 的作用：
+     *   异步接收 curl 启动失败错误。
+     *
+     * 关键说明：
+     *   云端 health 探测不能因为 curl 不存在或启动异常阻塞界面，所以启动失败只通过信号回写状态。
+     */
+    void handleCloudProcessError(QProcess::ProcessError error)
+    {
+        if (error != QProcess::FailedToStart) {
+            return;
+        }
+
+        m_cloudTimeout.stop();
+        m_cloudProbeRunning = false;
+        m_cloudProbeTimedOut = false;
+        setCloudStatus(QStringLiteral("待确认"), QStringLiteral("#f4b942"));
+        setDetailText(QStringLiteral("无法启动云端 health 命令：") + m_cloudProcess.errorString());
+    }
+
+    /*
+     * handleOverlayProbeFinished 的作用：
+     *   接收后台 overlay STATUS 查询结果，并在 Qt 主线程更新相机状态。
+     *
+     * 参数：
+     *   reply 是后台线程读取到的 `OK STATUS ...` 或 `ERR ...` 文本。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void handleOverlayProbeFinished(const QString &reply)
+    {
+        m_overlayProbeRunning = false;
+        applyOverlayStatusReply(reply);
+    }
+
+    /*
+     * handleF4ProbeFinished 的作用：
+     *   接收后台 F4 串口握手结果，并在 Qt 主线程更新 F4 接入状态。
+     *
+     * 参数：
+     *   ok 为 true 表示收到 ACK/OK/F4/READY 之一。
+     *   detail 保存失败原因或辅助说明。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void handleF4ProbeFinished(bool ok, const QString &detail)
+    {
+        m_f4ProbeRunning = false;
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4 串口握手成功"));
+        } else {
+            setF4Status(QStringLiteral("待接入"), QStringLiteral("#f4b942"));
+            setDetailText(QStringLiteral("F4 待接入：") + detail);
+        }
+    }
+
+private:
+    /*
+     * compactText 的作用：
+     *   把外部命令输出压缩成适合界面显示的一行。
+     */
+    QString compactText(const QString &text, int maxLen) const
+    {
+        QString compact = text;
+
+        compact.replace(QLatin1Char('\n'), QLatin1Char(' '));
+        compact.replace(QLatin1Char('\r'), QLatin1Char(' '));
+        compact = compact.simplified();
+        if (compact.length() > maxLen) {
+            compact = compact.left(maxLen);
+        }
+        return compact;
+    }
+
+    /*
+     * startNetworkProbe 的作用：
+     *   异步启动 4G 联网测试，忙时跳过本轮，防止弱网下任务堆积。
+     *
+     * 关键说明：
+     *   周期刷新不能每轮把界面改成“检测中”，否则网络正常时会在“检测中/在线”之间闪烁。
+     *   初始状态已经是“检测中”，后续后台静默刷新，只在成功、失败或超时时更新稳定状态。
+     */
+    void startNetworkProbe()
+    {
+        if (m_networkProbeRunning) {
+            return;
+        }
+
+        m_networkProbeRunning = true;
+        m_networkProbeTimedOut = false;
+        m_networkProcess.start(m_networkScript, QStringList() << QStringLiteral("test"));
+        if (m_networkProbeRunning) {
+            m_networkTimeout.start(7000);
+        }
+    }
+
+    /*
+     * startCloudProbe 的作用：
+     *   异步访问云端 health；如果没有 curl，则状态显示待确认，不影响其它设备检测。
+     *
+     * 关键说明：
+     *   周期刷新时保留上一轮“已连接/离线/超时”等稳定结果，不再每轮显示“检测中”。
+     */
+    void startCloudProbe()
+    {
+        if (m_cloudProbeRunning) {
+            return;
+        }
+
+        m_cloudProbeRunning = true;
+        m_cloudProbeTimedOut = false;
+        m_cloudProcess.start(QStringLiteral("curl"),
+                             QStringList()
+                             << QStringLiteral("-fsS")
+                             << QStringLiteral("--max-time")
+                             << QStringLiteral("2")
+                             << m_cloudHealthUrl);
+        if (m_cloudProbeRunning) {
+            m_cloudTimeout.start(4000);
+        }
+    }
+
+    /*
+     * refreshOverlayCameraStatus 的作用：
+     *   调度摄像头真实状态检测；kms-overlay 不再直接假定在线。
+     *
+     * 主要流程：
+     *   1. 非 kms-overlay 后端只检查设备节点是否存在，避免影响旧兜底路线。
+     *   2. kms-overlay 后端把 Unix socket STATUS 查询放到后台线程，避免 overlay 异常时主界面卡顿。
+     *   3. 后台线程只返回一行状态文本，最终解析和属性更新仍回到 Qt 主线程执行。
+     *
+     * 返回值：
+     *   无返回值；检测结果通过 cameraStatusChanged 通知 QML。
+     */
+    void refreshOverlayCameraStatus()
+    {
+        if (m_overlayProbeRunning) {
+            return;
+        }
+
+        if (m_videoBackend != QString::fromLatin1(BACKEND_KMS_OVERLAY)) {
+            const QFileInfo deviceInfo(m_cameraDevice);
+            if (deviceInfo.exists()) {
+                setCameraStatus(QStringLiteral("待出帧"), QStringLiteral("#f4b942"));
+            } else {
+                setCameraStatus(QStringLiteral("离线"), QStringLiteral("#ef5b5b"));
+            }
+            return;
+        }
+
+        m_overlayProbeRunning = true;
+
+        /* self 用于后台线程结束后判断控制器是否还存在，避免窗口关闭时访问悬空对象。 */
+        QPointer<DeviceHealthController> self(this);
+
+        /* socketPath 复制当前 overlay 控制端点，后台线程只读副本，不读写 QObject 成员。 */
+        const QString socketPath = m_overlaySocket;
+
+        /* workerThread 承载 socket connect/read 的短超时等待，确保 QML 主线程只负责调度和显示。 */
+        QThread *workerThread = QThread::create([self, socketPath]() {
+            const QString reply = queryOverlayStatus(socketPath);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleOverlayProbeFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, reply));
+        });
+
+        if (workerThread == nullptr) {
+            m_overlayProbeRunning = false;
+            handleCameraOffline(QStringLiteral("相机检测线程创建失败"));
+            return;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+    }
+
+    /*
+     * applyOverlayStatusReply 的作用：
+     *   在 Qt 主线程解析 overlay STATUS 回复，并更新摄像头状态。
+     *
+     * 参数：
+     *   reply 是后台线程通过 overlay 控制 socket 读取到的一行状态文本。
+     *
+     * 返回值：
+     *   无返回值；成功时显示“在线”，失败时进入离线处理和重启冷却逻辑。
+     */
+    void applyOverlayStatusReply(const QString &reply)
+    {
+        if (!reply.startsWith(QStringLiteral("OK STATUS "))) {
+            handleCameraOffline(QStringLiteral("Overlay未连接"));
+            return;
+        }
+
+        const bool hasFrame = tokenValue(reply, QStringLiteral("has_frame")) == QStringLiteral("1");
+        const unsigned int serial = tokenValue(reply, QStringLiteral("serial")).toUInt();
+        if (!hasFrame || serial == 0U) {
+            handleCameraOffline(QStringLiteral("相机未出帧"));
+            return;
+        }
+
+        if (m_lastOverlaySerial != 0U && serial == m_lastOverlaySerial) {
+            handleCameraOffline(QStringLiteral("相机画面停滞"));
+            return;
+        }
+
+        m_cameraOfflineCount = 0;
+        m_lastOverlaySerial = serial;
+        setCameraStatus(QStringLiteral("在线"), QStringLiteral("#35d07f"));
+    }
+
+    /*
+     * handleCameraOffline 的作用：
+     *   更新相机离线状态，并在连续失败后尝试重启 overlay 链路。
+     */
+    void handleCameraOffline(const QString &reason)
+    {
+        m_cameraOfflineCount++;
+        setCameraStatus(reason, QStringLiteral("#ef5b5b"));
+        setDetailText(QStringLiteral("相机离线：") + reason);
+
+        if (m_overlayRestartCooldown > 0) {
+            m_overlayRestartCooldown--;
+            return;
+        }
+
+        if (m_cameraOfflineCount >= 2) {
+            startDetachedOverlay();
+            m_lastOverlaySerial = 0U;
+            m_overlayRestartCooldown = 2;
+            m_cameraOfflineCount = 0;
+        }
+    }
+
+    /*
+     * startDetachedOverlay 的作用：
+     *   在相机离线后后台重启 KMS overlay 视频进程。
+     *
+     * 关键说明：
+     *   使用 restart-overlay 而不是 restart，只重新初始化 UVC/DRM 视频进程，不杀 Qt 主界面。
+     *   使用 startDetached，不等待脚本执行完成，避免摄像头热拔插恢复时卡住 Qt 事件循环。
+     */
+    void startDetachedOverlay()
+    {
+        const QFileInfo scriptInfo(m_overlayRestartScript);
+
+        if (!scriptInfo.exists() || !scriptInfo.isExecutable()) {
+            setDetailText(QStringLiteral("相机 overlay 重启脚本不可执行"));
+            return;
+        }
+
+        if (QProcess::startDetached(m_overlayRestartScript, QStringList() << QStringLiteral("restart-overlay"))) {
+            setDetailText(QStringLiteral("已请求重启相机 overlay 进程"));
+        } else {
+            setDetailText(QStringLiteral("相机 overlay 重启命令启动失败"));
+        }
+    }
+
+    /*
+     * startF4Probe 的作用：
+     *   在后台线程里执行 F4 串口握手，避免串口等待阻塞 QML。
+     */
+    void startF4Probe()
+    {
+        if (m_f4ProbeRunning) {
+            return;
+        }
+
+        m_f4ProbeRunning = true;
+        QPointer<DeviceHealthController> self(this);
+        const QString dev = m_f4Device;
+        const QString query = m_f4Query;
+        const int baud = m_f4Baud;
+
+        QThread *workerThread = QThread::create([self, dev, query, baud]() {
+            QString detail;
+            const bool ok = probeF4Serial(dev, query, baud, &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4ProbeFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4ProbeRunning = false;
+            setF4Status(QStringLiteral("待接入"), QStringLiteral("#f4b942"));
+            setDetailText(QStringLiteral("F4 检测线程创建失败"));
+            return;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+    }
+
+    /*
+     * refreshSdcardStatus 的作用：
+     *   读取 /proc/mounts 判断 SD 卡挂载状态；这是轻量本地读取，可以同步执行。
+     */
+    void refreshSdcardStatus()
+    {
+        FILE *mounts = std::fopen("/proc/mounts", "r");
+        QByteArray expected = m_sdcardMount.toLocal8Bit();
+        char device[256];
+        char path[4096];
+        bool mounted = false;
+
+        if (mounts != nullptr) {
+            while (std::fscanf(mounts, "%255s %4095s %*s %*s %*d %*d\n", device, path) == 2) {
+                if (std::strcmp(path, expected.constData()) == 0) {
+                    mounted = true;
+                    break;
+                }
+            }
+            std::fclose(mounts);
+        }
+
+        if (mounted) {
+            setSdcardStatus(QStringLiteral("已挂载"), QStringLiteral("#35d07f"));
+        } else {
+            setSdcardStatus(QStringLiteral("未挂载"), QStringLiteral("#f4b942"));
+        }
+    }
+
+    /*
+     * tokenValue 的作用：
+     *   从 `key=value` 状态文本中提取字段值。
+     */
+    QString tokenValue(const QString &text, const QString &key) const
+    {
+        const QString prefix = key + QLatin1Char('=');
+        const QStringList parts = text.split(QLatin1Char(' '), QString::SkipEmptyParts);
+
+        for (const QString &part : parts) {
+            if (part.startsWith(prefix)) {
+                return part.mid(prefix.length());
+            }
+        }
+        return QString();
+    }
+
+    /*
+     * queryOverlayStatus 的作用：
+     *   发送 overlay `STATUS` 查询并读取回复。
+     *
+     * 参数：
+     *   socketPath 是 overlay 控制 socket 路径。
+     *
+     * 返回值：
+     *   成功返回 `OK STATUS ...`；失败返回 `ERR ...`，由主线程统一转为离线状态。
+     */
+    static QString queryOverlayStatus(const QString &socketPath)
+    {
+        int fd = -1;
+        struct sockaddr_un addr;
+        QByteArray socketPathBytes = socketPath.toLocal8Bit();
+        QByteArray commandBytes = QByteArrayLiteral("STATUS\n");
+        char buffer[256];
+        QByteArray reply;
+        fd_set wfds;
+        fd_set rfds;
+        struct timeval tv;
+        int optError = 0;
+        socklen_t optLen = sizeof(optError);
+
+        if (socketPathBytes.size() >= static_cast<int>(sizeof(addr.sun_path))) {
+            return QStringLiteral("ERR socket路径过长");
+        }
+
+        fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return QStringLiteral("ERR 创建socket失败");
+        }
+
+        /* 设置非阻塞，避免 overlay 进程异常时 connect/read 长时间等待。 */
+        const int oldFlags = fcntl(fd, F_GETFL, 0);
+        if (oldFlags >= 0) {
+            fcntl(fd, F_SETFL, oldFlags | O_NONBLOCK);
+        }
+
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, socketPathBytes.constData(), sizeof(addr.sun_path) - 1U);
+
+        if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+            if (errno != EINPROGRESS) {
+                ::close(fd);
+                return QStringLiteral("ERR overlay未连接");
+            }
+
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 150000;
+            if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                ::close(fd);
+                return QStringLiteral("ERR overlay连接超时");
+            }
+
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &optError, &optLen) != 0 || optError != 0) {
+                ::close(fd);
+                return QStringLiteral("ERR overlay连接失败");
+            }
+        }
+
+        if (oldFlags >= 0) {
+            fcntl(fd, F_SETFL, oldFlags);
+        }
+
+        if (!writeAllToFd(fd, commandBytes)) {
+            ::close(fd);
+            return QStringLiteral("ERR 发送失败");
+        }
+
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 150000;
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            ::close(fd);
+            return QStringLiteral("ERR overlay回复超时");
+        }
+
+        const ssize_t nread = ::read(fd, buffer, sizeof(buffer) - 1U);
+        ::close(fd);
+        if (nread <= 0) {
+            return QStringLiteral("ERR 无回复");
+        }
+
+        buffer[nread] = '\0';
+        reply = QByteArray(buffer, static_cast<int>(nread)).trimmed();
+        return QString::fromLocal8Bit(reply);
+    }
+
+    /*
+     * baudToSpeed 的作用：
+     *   把整数波特率转换成 termios 常量。
+     */
+    static speed_t baudToSpeed(int baud)
+    {
+        switch (baud) {
+        case 9600:
+            return B9600;
+        case 19200:
+            return B19200;
+        case 38400:
+            return B38400;
+        case 57600:
+            return B57600;
+        case 115200:
+            return B115200;
+        default:
+            return B115200;
+        }
+    }
+
+    /*
+     * probeF4Serial 的作用：
+     *   打开串口、发送 STATUS 查询并等待短回复，判断 F4 是否真实接入。
+     */
+    static bool probeF4Serial(const QString &device, const QString &query, int baud, QString *detail)
+    {
+        const QByteArray devBytes = device.toLocal8Bit();
+        const QByteArray queryBytes = query.toLocal8Bit();
+        int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        struct termios tio;
+        fd_set rfds;
+        struct timeval tv;
+        char buffer[128];
+        QByteArray reply;
+
+        if (fd < 0) {
+            if (detail) {
+                *detail = QStringLiteral("无法打开 ") + device;
+            }
+            return false;
+        }
+
+        if (tcgetattr(fd, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("读取串口属性失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        cfmakeraw(&tio);
+        cfsetispeed(&tio, baudToSpeed(baud));
+        cfsetospeed(&tio, baudToSpeed(baud));
+        tio.c_cflag |= CLOCAL | CREAD;
+#ifdef CRTSCTS
+        tio.c_cflag &= ~CRTSCTS;
+#endif
+        tio.c_cc[VMIN] = 0;
+        tio.c_cc[VTIME] = 0;
+
+        if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("配置串口失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        tcflush(fd, TCIOFLUSH);
+        if (!writeAllToFd(fd, queryBytes)) {
+            if (detail) {
+                *detail = QStringLiteral("写入 STATUS 查询失败");
+            }
+            ::close(fd);
+            return false;
+        }
+        tcdrain(fd);
+
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 250000;
+
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            if (detail) {
+                *detail = QStringLiteral("未收到 STATUS 回复");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
+        ::close(fd);
+        if (nread <= 0) {
+            if (detail) {
+                *detail = QStringLiteral("串口回复为空");
+            }
+            return false;
+        }
+
+        reply = QByteArray(buffer, static_cast<int>(nread)).toUpper();
+        if (reply.contains("ACK") || reply.contains("OK") || reply.contains("F4") || reply.contains("READY")) {
+            return true;
+        }
+
+        if (detail) {
+            *detail = QStringLiteral("回复不匹配：") + QString::fromLocal8Bit(reply.left(48));
+        }
+        return false;
+    }
+
+    /*
+     * writeAllToFd 的作用：
+     *   对短 socket/串口命令执行完整写入，避免 write 短写导致 overlay 或 F4 收到半条命令。
+     *
+     * 参数：
+     *   fd 是已经打开的文件描述符。
+     *   data 是需要写入的一整条命令。
+     *
+     * 返回值：
+     *   全部写入返回 true；遇到不可恢复错误返回 false。
+     */
+    static bool writeAllToFd(int fd, const QByteArray &data)
+    {
+        const char *cursor = data.constData();
+        ssize_t remaining = static_cast<ssize_t>(data.size());
+
+        while (remaining > 0) {
+            const ssize_t written = ::write(fd, cursor, static_cast<size_t>(remaining));
+
+            if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+
+            if (written == 0) {
+                return false;
+            }
+
+            cursor += written;
+            remaining -= written;
+        }
+
+        return true;
+    }
+
+    /*
+     * setXxxStatus 系列函数的作用：
+     *   集中更新状态属性，只有变化时才发信号，减少 QML 无意义重绘。
+     */
+    void setNetworkStatus(const QString &text, const QString &color)
+    {
+        if (m_networkStatusText == text && m_networkStatusColor == color) {
+            return;
+        }
+        m_networkStatusText = text;
+        m_networkStatusColor = color;
+        emit networkStatusChanged();
+    }
+
+    void setCameraStatus(const QString &text, const QString &color)
+    {
+        if (m_cameraStatusText == text && m_cameraStatusColor == color) {
+            return;
+        }
+        m_cameraStatusText = text;
+        m_cameraStatusColor = color;
+        emit cameraStatusChanged();
+    }
+
+    void setF4Status(const QString &text, const QString &color)
+    {
+        if (m_f4StatusText == text && m_f4StatusColor == color) {
+            return;
+        }
+        m_f4StatusText = text;
+        m_f4StatusColor = color;
+        emit f4StatusChanged();
+    }
+
+    void setCloudStatus(const QString &text, const QString &color)
+    {
+        if (m_cloudStatusText == text && m_cloudStatusColor == color) {
+            return;
+        }
+        m_cloudStatusText = text;
+        m_cloudStatusColor = color;
+        emit cloudStatusChanged();
+    }
+
+    void setSdcardStatus(const QString &text, const QString &color)
+    {
+        if (m_sdcardStatusText == text && m_sdcardStatusColor == color) {
+            return;
+        }
+        m_sdcardStatusText = text;
+        m_sdcardStatusColor = color;
+        emit sdcardStatusChanged();
+    }
+
+    void setDetailText(const QString &text)
+    {
+        if (m_detailText == text) {
+            return;
+        }
+        m_detailText = text;
+        emit detailTextChanged();
+    }
+
+    QString m_videoBackend;             /* m_videoBackend 保存当前视频后端，用于决定相机状态判定来源。 */
+    QString m_cameraDevice;             /* m_cameraDevice 保存摄像头节点路径。 */
+    QString m_overlaySocket;            /* m_overlaySocket 保存 overlay 控制 socket 路径。 */
+    QString m_overlayRestartScript;     /* m_overlayRestartScript 保存相机重连时要后台执行的控制脚本。 */
+    QString m_networkScript;            /* m_networkScript 保存 4G PPP 管理命令。 */
+    QString m_cloudHealthUrl;           /* m_cloudHealthUrl 保存云端 health 地址。 */
+    QString m_sdcardMount;              /* m_sdcardMount 保存 SD 卡挂载点。 */
+    QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
+    QString m_f4Query;                  /* m_f4Query 保存发给 F4 的握手查询。 */
+    int m_f4Baud;                       /* m_f4Baud 保存 F4 串口波特率。 */
+    QString m_networkStatusText;        /* m_networkStatusText 保存网络状态文本。 */
+    QString m_networkStatusColor;       /* m_networkStatusColor 保存网络状态颜色。 */
+    QString m_cameraStatusText;         /* m_cameraStatusText 保存摄像头状态文本。 */
+    QString m_cameraStatusColor;        /* m_cameraStatusColor 保存摄像头状态颜色。 */
+    QString m_f4StatusText;             /* m_f4StatusText 保存 F4 状态文本。 */
+    QString m_f4StatusColor;            /* m_f4StatusColor 保存 F4 状态颜色。 */
+    QString m_cloudStatusText;          /* m_cloudStatusText 保存云端状态文本。 */
+    QString m_cloudStatusColor;         /* m_cloudStatusColor 保存云端状态颜色。 */
+    QString m_sdcardStatusText;         /* m_sdcardStatusText 保存 SD 卡状态文本。 */
+    QString m_sdcardStatusColor;        /* m_sdcardStatusColor 保存 SD 卡状态颜色。 */
+    QString m_detailText;               /* m_detailText 保存最近一次健康检测详情。 */
+    unsigned int m_lastOverlaySerial;   /* m_lastOverlaySerial 保存上一次 overlay 帧序号，后续可用于卡帧判断。 */
+    int m_cameraOfflineCount;           /* m_cameraOfflineCount 记录相机连续离线次数。 */
+    int m_overlayRestartCooldown;       /* m_overlayRestartCooldown 防止相机离线时反复高频重启 overlay。 */
+    bool m_networkProbeRunning;         /* m_networkProbeRunning 防止网络检测任务堆积。 */
+    bool m_cloudProbeRunning;           /* m_cloudProbeRunning 防止云端检测任务堆积。 */
+    bool m_f4ProbeRunning;              /* m_f4ProbeRunning 防止串口检测线程堆积。 */
+    bool m_overlayProbeRunning;         /* m_overlayProbeRunning 防止 overlay socket 查询重入。 */
+    bool m_networkProbeTimedOut;        /* m_networkProbeTimedOut 标记当前 4G 进程已超时，finished 时不再覆盖超时状态。 */
+    bool m_cloudProbeTimedOut;          /* m_cloudProbeTimedOut 标记当前云端进程已超时，finished 时不再覆盖超时状态。 */
+    QTimer m_healthTimer;               /* m_healthTimer 周期性调度整轮健康检测。 */
+    QTimer m_networkTimeout;            /* m_networkTimeout 是 4G 测试短超时。 */
+    QTimer m_cloudTimeout;              /* m_cloudTimeout 是云端测试短超时。 */
+    QProcess m_networkProcess;          /* m_networkProcess 异步执行 4g-ppp test。 */
+    QProcess m_cloudProcess;            /* m_cloudProcess 异步执行 curl health。 */
+};
+
+/*
  * set_default_environment 的作用：
  *   设置 Qt Quick 在板端运行时的默认渲染环境。
  *
@@ -3620,6 +4624,9 @@ int main(int argc, char *argv[])
     /* storageController 提供 SD 卡保存图片和安全卸载的真实动作入口。 */
     CameraStorageController storageController;
 
+    /* deviceHealth 负责异步探测 4G、相机、F4、云端和 SD 卡真实状态。 */
+    DeviceHealthController deviceHealth(actualVideoBackend, cameraDevice);
+
     /* uploadHistory 保存每次保存/上传动作的本地历史记录，QML 历史页直接读取它。 */
     UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
 
@@ -3649,6 +4656,9 @@ int main(int argc, char *argv[])
     /* 把 SD 卡动作控制器暴露给 QML，按钮点击时调用真实 C++/overlay/脚本链路。 */
     view.rootContext()->setContextProperty(QStringLiteral("storageController"), &storageController);
 
+    /* 把真实设备健康控制器暴露给 QML，顶部状态栏不再显示固定在线文案。 */
+    view.rootContext()->setContextProperty(QStringLiteral("deviceHealth"), &deviceHealth);
+
     /* 把上传历史模型暴露给 QML，历史记录页面用它生成横向滑动卡片和详情页。 */
     view.rootContext()->setContextProperty(QStringLiteral("uploadHistory"), &uploadHistory);
 
@@ -3675,6 +4685,9 @@ int main(int argc, char *argv[])
     } else {
         view.showFullScreen();
     }
+
+    /* 窗口显示后启动第一轮设备健康检测；所有耗时探测均异步执行，不阻塞界面触摸。 */
+    deviceHealth.start();
 
     /* gst-qml 后端需要在窗口 show 之后绑定 qmlglsink，确保 Qt Quick 窗口已进入可曝光状态。 */
     if (actualVideoBackend == QString::fromLatin1(BACKEND_GST_QML)) {

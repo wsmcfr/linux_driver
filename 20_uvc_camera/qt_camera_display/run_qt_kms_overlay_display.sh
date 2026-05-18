@@ -10,6 +10,7 @@
 #   stop    ：优雅停止 Qt 和 overlay 进程，让 overlay 进程释放 DRM plane。
 #   status  ：输出当前进程、日志路径和 plane 参数，便于 SSH 快速确认现场状态。
 #   restart ：先 stop 再 start。
+#   restart-overlay：只重启 overlay 视频进程，不重启 Qt 界面，用于 USB 摄像头热拔插恢复。
 #   restore-fallback：停止当前链路后恢复已验证的 GStreamer drop6 可见线。
 #
 # 返回值：
@@ -370,6 +371,20 @@ start_stack()
     status_stack
 }
 
+restart_overlay_only()
+{
+    # 只重启 overlay 进程，不触碰 qt_camera_display，避免摄像头热拔插恢复时打断触摸界面。
+    # 新 overlay 仍以 -V 0 隐藏启动；是否显示视频层交给 QML 按当前页面决定。
+    stop_processes_by_name "$OVERLAY_PID_NAME"
+    if ! start_overlay; then
+        log_msg "错误：overlay 单独重启失败，Qt 界面保持运行"
+        status_stack
+        return 1
+    fi
+    log_msg "overlay 已单独重启并保持隐藏，等待 Qt 首页状态同步后再显示视频层"
+    status_stack
+}
+
 stop_stack()
 {
     stop_processes_by_name "$QT_PID_NAME" "$OVERLAY_PID_NAME"
@@ -397,7 +412,7 @@ status_stack()
 
 usage()
 {
-    echo "用法：$0 {start|stop|restart|status|restore-fallback}"
+    echo "用法：$0 {start|stop|restart|restart-overlay|status|restore-fallback}"
 }
 
 case "${1:-start}" in
@@ -410,6 +425,9 @@ case "${1:-start}" in
     restart)
         stop_stack
         start_stack
+        ;;
+    restart-overlay)
+        restart_overlay_only
         ;;
     status)
         status_stack

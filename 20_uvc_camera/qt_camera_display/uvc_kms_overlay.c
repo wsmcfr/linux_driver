@@ -2141,6 +2141,43 @@ static void handle_visible_command(int client_fd,
 }
 
 /*
+ * handle_status_command 的作用：
+ *   把 overlay 进程当前掌握的摄像头和视频层状态返回给 Qt。
+ *
+ * 主要流程：
+ *   1. 只读取 latest_frame 里的缓存字段，不重新访问 V4L2 或 DRM，避免状态查询拖慢采集主循环。
+ *   2. has_frame 表示是否已经成功取到至少一帧真实摄像头数据。
+ *   3. serial 表示最新帧序号，Qt 可以用它判断画面是否还在更新。
+ *   4. visible 表示 KMS overlay plane 当前是否处于显示状态。
+ *
+ * 参数：
+ *   client_fd 是 Qt 客户端连接。
+ *   frame 是最新显示帧。
+ *
+ * 返回值：
+ *   无返回值；通过 socket 回复 `OK STATUS ...`。
+ */
+static void handle_status_command(int client_fd, const struct latest_frame *frame)
+{
+    char detail[256];
+    const int has_frame = (frame != NULL && frame->has_frame) ? 1 : 0;
+    const unsigned int serial = frame != NULL ? frame->serial : 0U;
+    const unsigned int width = frame != NULL ? frame->frame_width : 0U;
+    const unsigned int height = frame != NULL ? frame->frame_height : 0U;
+    const int visible = (frame != NULL && frame->kms != NULL) ? frame->kms->plane_visible : 0;
+
+    snprintf(detail,
+             sizeof(detail),
+             "STATUS has_frame=%d serial=%u visible=%d width=%u height=%u",
+             has_frame,
+             serial,
+             visible,
+             width,
+             height);
+    send_control_reply(client_fd, "OK", detail);
+}
+
+/*
  * handle_save_command 的作用：
  *   执行 SAVE 请求，把当前显示帧保存到 SD 卡目录。
  *
@@ -2345,6 +2382,7 @@ static void handle_save_detect_command(int client_fd,
  *   SAVE_DETECT /mnt/sdcard/images
  *   VISIBLE 0
  *   VISIBLE 1
+ *   STATUS
  *
  * 参数：
  *   client_fd 是客户端连接。
@@ -2384,6 +2422,11 @@ static void service_control_client(int client_fd, const struct latest_frame *fra
 
     if (strncmp(command, "VISIBLE ", strlen("VISIBLE ")) == 0) {
         handle_visible_command(client_fd, frame, command + strlen("VISIBLE "));
+        return;
+    }
+
+    if (strcmp(command, "STATUS") == 0) {
+        handle_status_command(client_fd, frame);
         return;
     }
 
