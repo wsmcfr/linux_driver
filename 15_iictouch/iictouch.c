@@ -1,13 +1,17 @@
+#include <linux/atomic.h>             /* 提供 atomic_t 和 atomic_cmpxchg()，用于恢复工作项的防重复排队。 */
 #include <linux/delay.h>              /* 提供 msleep()，用于 Goodix 触摸 IC 的复位和上电等待。 */
 #include <linux/gpio.h>               /* 提供 legacy GPIO 接口，用于课程设备树中的 reset-gpios 和 irq-gpios。 */
 #include <linux/i2c.h>                /* 提供 I2C client、i2c_transfer() 等接口，GT911/GT9147 通过 I2C 通信。 */
 #include <linux/input.h>              /* 提供 input 子系统接口，触摸坐标最终通过 input 事件上报。 */
 #include <linux/input/mt.h>           /* 提供多点触摸 slot 接口，用于上报 ABS_MT_POSITION_X/Y。 */
 #include <linux/interrupt.h>          /* 提供线程化中断接口，I2C 读写必须放在线程中执行。 */
+#include <linux/jiffies.h>            /* 提供 jiffies 和 time_before()，用于限制自动恢复的触发频率。 */
 #include <linux/module.h>             /* 提供内核模块宏，例如 module_i2c_driver() 和 MODULE_LICENSE。 */
+#include <linux/mutex.h>              /* 提供 mutex，保护恢复流程，避免多个上下文同时复位触摸 IC。 */
 #include <linux/of.h>                 /* 提供设备树通用读取接口，用于读取 touchscreen-size-x/y。 */
 #include <linux/of_gpio.h>            /* 提供 of_get_named_gpio()，用于读取设备树 GPIO。 */
 #include <linux/slab.h>               /* 提供 devm_kzalloc()，用于分配驱动私有数据。 */
+#include <linux/workqueue.h>          /* 提供 work_struct，把耗时复位流程放到普通进程上下文执行。 */
 
 #define GOODIX_CTRL_REG		0x8040 /* Goodix 控制寄存器，官方例程用于软件复位，本驱动只读取触摸数据。 */
 #define GOODIX_CFG_REG		0x8047 /* Goodix 配置起始寄存器，可读取配置版本，但不自动覆盖芯片配置。 */
@@ -26,6 +30,8 @@
 #define GOODIX_RESET_LOW_MS	20 /* RESET 拉低保持时间，保证触摸 IC 进入复位状态。 */
 #define GOODIX_RESET_HIGH_MS	80 /* RESET 拉高后的等待时间，保证触摸 IC 固件启动完成。 */
 #define GOODIX_INT_READY_MS	50 /* INT 由输出切到输入后的等待时间，保证中断脚状态稳定。 */
+#define GOODIX_RECOVERY_FAIL_THRESHOLD	1 /* I2C 读写失败 1 次就触发恢复，真正限频由 GOODIX_RECOVERY_COOLDOWN_MS 控制。 */
+#define GOODIX_RECOVERY_COOLDOWN_MS	3000 /* 两次恢复之间至少间隔 3 秒，避免硬件离线时反复复位刷屏。 */
 
 /*
  * struct goodix_ts_data - GT911/GT9147 触摸驱动私有数据。
@@ -37,6 +43,12 @@
  * @irq_gpio: 设备树 irq-gpios 或 interrupt-gpios 对应的 GPIO 编号，用于触摸中断。
  * @irq: 最终申请到的 Linux IRQ 编号，可能来自 client->irq，也可能来自 gpio_to_irq()。
  * @slot_active: 记录每个 slot 是否已经按下，用于触点消失或 I2C 出错时补发抬起事件。
+ * @recover_lock: 保护恢复流程，确保同一时间只有一个复位/重新识别流程运行。
+ * @recover_work: I2C 连续失败后调度的恢复任务，普通工作队列上下文可以安全睡眠。
+ * @recover_pending: 标记恢复任务已经排队或正在执行，避免中断线程重复排队。
+ * @stopping: 标记驱动正在移除，阻止 IRQ 线程继续排队新的恢复任务。
+ * @i2c_fail_count: 记录连续 I2C 失败次数，成功读写后清零。
+ * @next_recover_jiffies: 下一次允许触发恢复的时间点，用于故障状态下限频。
  */
 struct goodix_ts_data {
 	struct i2c_client *client;                         /* 保存 I2C client，所有寄存器读写都依赖它。 */
@@ -47,7 +59,71 @@ struct goodix_ts_data {
 	int irq_gpio;                                      /* 保存中断 GPIO 编号，GPIO 无效时为负数。 */
 	int irq;                                           /* 保存最终使用的 Linux IRQ 编号。 */
 	bool slot_active[GOODIX_MAX_POINTS];               /* 保存每个触摸 slot 当前是否处于按下状态。 */
+	struct mutex recover_lock;                         /* 恢复流程互斥锁，防止并发复位和并发访问恢复状态。 */
+	struct work_struct recover_work;                   /* 恢复工作项，用于异步执行硬件复位和重新识别。 */
+	atomic_t recover_pending;                          /* 恢复工作排队标志，1 表示已有恢复任务在等待或运行。 */
+	bool stopping;                                     /* 驱动移除标志，true 表示不再接受新的恢复任务。 */
+	unsigned int i2c_fail_count;                       /* 连续 I2C 通信失败次数，读触摸数据成功后清零。 */
+	unsigned long next_recover_jiffies;                /* 下一次允许恢复的 jiffies 时间，节流恢复日志和复位动作。 */
 };
+
+static int goodix_identify(struct goodix_ts_data *ts);       /* 前向声明产品识别函数，恢复工作中需要复用 probe 的识别逻辑。 */
+
+/*
+ * goodix_reset_sequence - 对已经申请好的 RESET/INT GPIO 执行 Goodix 复位时序。
+ * @ts: 驱动私有数据，函数使用 ts->reset_gpio 和 ts->irq_gpio 控制硬件引脚。
+ *
+ * 主要流程：
+ * 1. 把 RESET 拉低，让 Goodix 进入硬件复位状态。
+ * 2. 把 INT 配成输出低电平，让芯片在释放 RESET 时选择 0x5d 地址。
+ * 3. 拉高 RESET，等待芯片固件重新启动。
+ * 4. 把 INT 切回输入，让触摸 IC 继续用该脚产生触摸中断。
+ *
+ * 返回值：
+ * 0 表示复位时序完成；负数表示 GPIO 方向切换失败或 GPIO 资源无效。
+ */
+static int goodix_reset_sequence(struct goodix_ts_data *ts)
+{
+	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印 GPIO 相关错误。 */
+	int ret;                                             /* 保存 GPIO 方向切换返回值。 */
+
+	if (!gpio_is_valid(ts->reset_gpio)) {                /* 如果复位 GPIO 无效，运行中无法恢复硬件。 */
+		dev_err(dev, "invalid reset gpio %d\n", ts->reset_gpio); /* 打印无效 GPIO 编号，便于检查设备树。 */
+		return -ENODEV;                                  /* 返回设备不可用，表示恢复无法继续。 */
+	}
+
+	if (!gpio_is_valid(ts->irq_gpio)) {                  /* 如果中断 GPIO 无效，就无法完成 Goodix 地址选择。 */
+		dev_err(dev, "invalid irq gpio %d\n", ts->irq_gpio); /* 打印无效 GPIO 编号，便于检查设备树。 */
+		return -ENODEV;                                  /* 返回设备不可用，表示恢复无法继续。 */
+	}
+
+	ret = gpio_direction_output(ts->reset_gpio, 0);       /* 把 RESET 配成输出低电平，强制触摸 IC 进入复位。 */
+	if (ret) {                                            /* 如果 RESET 方向切换失败。 */
+		dev_err(dev, "set reset gpio output low failed: %d\n", ret); /* 打印失败原因。 */
+		return ret;                                      /* 返回底层错误码，停止复位流程。 */
+	}
+
+	msleep(GOODIX_RESET_LOW_MS);                          /* 保持复位低电平，确保芯片内部状态完全清空。 */
+
+	ret = gpio_direction_output(ts->irq_gpio, 0);         /* 把 INT 配成输出低电平，让释放 RESET 时选择 0x5d 地址。 */
+	if (ret) {                                            /* 如果 INT 方向切换失败。 */
+		dev_err(dev, "set irq gpio output low failed: %d\n", ret); /* 打印失败原因。 */
+		return ret;                                      /* 返回底层错误码，停止复位流程。 */
+	}
+
+	gpio_set_value_cansleep(ts->reset_gpio, 1);           /* 拉高 RESET，释放触摸 IC 复位。 */
+	msleep(GOODIX_RESET_HIGH_MS);                         /* 等待 Goodix 内部固件启动并准备响应 I2C。 */
+	gpio_set_value_cansleep(ts->irq_gpio, 0);             /* 复位完成后保持 INT 短暂低电平，贴近官方 GT9147 时序。 */
+	msleep(GOODIX_INT_READY_MS);                          /* 等待 INT 引脚电平和芯片中断状态稳定。 */
+
+	ret = gpio_direction_input(ts->irq_gpio);             /* 把 INT 切回输入，后续由触摸 IC 驱动触摸中断。 */
+	if (ret) {                                            /* 如果 INT 方向切回输入失败。 */
+		dev_err(dev, "set irq gpio input failed: %d\n", ret); /* 打印方向切换失败错误码。 */
+		return ret;                                      /* 返回底层错误码，提示恢复未完成。 */
+	}
+
+	return 0;                                             /* 返回 0，表示硬件复位时序完成。 */
+}
 
 /*
  * goodix_read_regs - 从 Goodix 触摸 IC 连续读取寄存器。
@@ -186,6 +262,44 @@ static void goodix_release_all_slots(struct goodix_ts_data *ts)
 }
 
 /*
+ * goodix_schedule_recovery - 在连续 I2C 失败后调度一次异步恢复。
+ * @ts: 驱动私有数据，里面保存失败计数、恢复工作项和节流时间。
+ * @err: 本次 I2C 失败的错误码，用于日志定位底层失败来源。
+ *
+ * 主要流程：
+ * 1. 递增连续失败次数。
+ * 2. 未达到阈值时只记录失败，不复位硬件。
+ * 3. 达到阈值后检查恢复冷却时间，避免触摸 IC 离线时频繁复位。
+ * 4. 使用 atomic_cmpxchg() 确保同一时间只排队一个恢复工作项。
+ *
+ * 返回值：
+ * 无。恢复工作异步执行，调用方仍然按 IRQ_HANDLED 结束当前中断线程。
+ */
+static void goodix_schedule_recovery(struct goodix_ts_data *ts, int err)
+{
+	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印恢复调度日志。 */
+	unsigned long now = jiffies;                         /* 保存当前 jiffies，用于和冷却时间比较。 */
+
+	if (ts->stopping)                                    /* 如果驱动正在卸载或解绑。 */
+		return;                                        /* 不再排队恢复任务，避免卸载后访问旧资源。 */
+
+	ts->i2c_fail_count++;                                /* 连续失败计数加 1，成功读触摸数据后会清零。 */
+	if (ts->i2c_fail_count < GOODIX_RECOVERY_FAIL_THRESHOLD) /* 如果还没达到恢复阈值。 */
+		return;                                        /* 暂不复位，避免偶发 I2C 毛刺导致触摸 IC 重启。 */
+
+	if (time_before(now, ts->next_recover_jiffies))       /* 如果距离上一次恢复还没超过冷却时间。 */
+		return;                                        /* 直接返回，避免硬件持续异常时重复复位刷屏。 */
+
+	if (atomic_cmpxchg(&ts->recover_pending, 0, 1) != 0)  /* 如果已经有恢复任务排队或正在执行。 */
+		return;                                        /* 不重复排队，避免多个 work 同时操作 GPIO。 */
+
+	ts->next_recover_jiffies = now + msecs_to_jiffies(GOODIX_RECOVERY_COOLDOWN_MS); /* 更新下一次允许恢复的时间。 */
+	dev_warn(dev, "schedule touch recovery after %u I2C failures, last error %d\n",
+		 ts->i2c_fail_count, err);                      /* 打印一次恢复调度日志，说明连续失败次数和最后错误码。 */
+	schedule_work(&ts->recover_work);                     /* 把耗时复位动作交给系统工作队列异步执行。 */
+}
+
+/*
  * goodix_report_events - 解析一帧 Goodix 触摸数据并上报 input 事件。
  * @ts: 驱动私有数据，包含 input 设备、坐标范围和 slot 状态。
  * @buf: 从 GOODIX_STATUS_REG 开始读出的原始数据，buf[0] 是状态寄存器。
@@ -267,21 +381,28 @@ static irqreturn_t goodix_irq_thread(int irq, void *dev_id)
 	u8 clear = 0;                                        /* 写 0 到状态寄存器，用于通知 Goodix 本帧已处理。 */
 	int ret;                                             /* 保存 I2C 读写返回值。 */
 
+	if (ts->stopping)                                    /* 如果驱动正在卸载或解绑。 */
+		return IRQ_HANDLED;                              /* 不再访问 I2C/GPIO，避免 remove 阶段的并发访问。 */
+
 	ret = goodix_read_regs(ts, GOODIX_STATUS_REG, buf, sizeof(buf)); /* 一次读取状态和触点数据。 */
 	if (ret) {                                           /* 如果 I2C 读取失败。 */
 		dev_err_ratelimited(&ts->client->dev,            /* 限速打印错误，避免中断风暴刷屏。 */
 				    "read touch data failed: %d\n", ret); /* 打印 I2C 错误码。 */
 		goodix_release_all_slots(ts);                    /* 释放旧触点，避免应用层触摸卡住。 */
+		goodix_schedule_recovery(ts, ret);               /* 连续失败达到阈值后异步复位并重新识别触摸 IC。 */
 		return IRQ_HANDLED;                              /* 中断已经处理，返回 HANDLED。 */
 	}
 
+	ts->i2c_fail_count = 0;                               /* 触摸数据读取成功，说明 I2C 已恢复，清零连续失败计数。 */
 	goodix_report_events(ts, buf);                        /* 解析触摸数据并上报 input 事件。 */
 
 	if (buf[0] & GOODIX_STATUS_READY) {                    /* 只有处理了新数据时才清状态寄存器。 */
 		ret = goodix_write_regs(ts, GOODIX_STATUS_REG, &clear, 1); /* 写 0 清除 Goodix 数据就绪标志。 */
-		if (ret)                                         /* 如果清除状态失败，下一次可能重复收到同一帧。 */
+		if (ret) {                                       /* 如果清除状态失败，下一次可能重复收到同一帧。 */
 			dev_err_ratelimited(&ts->client->dev,        /* 限速打印状态清除失败。 */
 					    "clear touch status failed: %d\n", ret); /* 打印 I2C 错误码。 */
+			goodix_schedule_recovery(ts, ret);           /* 清状态也属于 I2C 写失败，连续失败时同样触发恢复。 */
+		}
 	}
 
 	return IRQ_HANDLED;                                   /* 返回 IRQ_HANDLED，表示中断线程处理完成。 */
@@ -335,20 +456,7 @@ static int goodix_hw_reset(struct goodix_ts_data *ts)
 		return ret;                                      /* 返回错误码，中止 probe。 */
 	}
 
-	gpio_set_value_cansleep(ts->reset_gpio, 0);            /* 拉低 RESET，让 Goodix 进入硬件复位。 */
-	msleep(GOODIX_RESET_LOW_MS);                           /* 保持复位一段时间，保证芯片真正复位。 */
-	gpio_set_value_cansleep(ts->irq_gpio, 0);              /* 复位释放前保持 INT 低电平，用于选择当前硬件扫到的 0x5d 地址。 */
-	gpio_set_value_cansleep(ts->reset_gpio, 1);            /* 拉高 RESET，释放硬件复位。 */
-	msleep(GOODIX_RESET_HIGH_MS);                          /* 等待芯片内部固件启动完成。 */
-	gpio_set_value_cansleep(ts->irq_gpio, 0);              /* 复位完成后短暂拉低 INT，贴近官方 GT9147 例程时序。 */
-	msleep(GOODIX_INT_READY_MS);                           /* 等待 INT 状态稳定。 */
-	ret = gpio_direction_input(ts->irq_gpio);              /* 把 INT 切换为输入，后续由触摸 IC 驱动中断电平。 */
-	if (ret) {                                            /* 如果 GPIO 方向切换失败。 */
-		dev_err(dev, "set irq gpio input failed: %d\n", ret); /* 打印方向切换失败错误码。 */
-		return ret;                                      /* 返回错误码，中止 probe。 */
-	}
-
-	return 0;                                             /* Goodix 复位和地址选择流程完成。 */
+	return goodix_reset_sequence(ts);                     /* 复用统一复位时序，完成地址选择和 INT 输入恢复。 */
 }
 
 /*
@@ -452,6 +560,60 @@ static int goodix_identify(struct goodix_ts_data *ts)
 }
 
 /*
+ * goodix_recover_work - Goodix 触摸 IC 运行中 I2C 掉线后的恢复工作。
+ * @work: 内核工作队列传入的 work_struct 指针，可反推出 goodix_ts_data。
+ *
+ * 主要流程：
+ * 1. 禁用触摸 IRQ，阻止恢复期间继续进入中断线程。
+ * 2. 释放所有已按下 slot，避免 UI 保持“手指未抬起”的错误状态。
+ * 3. 按上电时序重新复位 Goodix，并保持 INT 低电平选择 0x5d 地址。
+ * 4. 重新读取产品 ID 验证 I2C 是否恢复。
+ * 5. 清理失败计数、恢复排队标志，并重新打开 IRQ。
+ *
+ * 这个函数不重新注册 input 设备，也不重新申请 GPIO/IRQ，因为这些资源仍然归当前驱动实例持有。
+ */
+static void goodix_recover_work(struct work_struct *work)
+{
+	struct goodix_ts_data *ts = container_of(work, struct goodix_ts_data, recover_work); /* 从 work 指针反推出驱动私有数据。 */
+	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印恢复过程日志。 */
+	bool irq_disabled = false;                           /* 标记本函数是否已经禁用 IRQ，用于退出时成对恢复。 */
+	int ret;                                             /* 保存复位和重新识别返回值。 */
+
+	mutex_lock(&ts->recover_lock);                        /* 加锁，防止极端情况下多个恢复流程同时操作 GPIO/I2C。 */
+	if (ts->stopping) {                                   /* 如果模块正在卸载，恢复动作已经没有意义。 */
+		atomic_set(&ts->recover_pending, 0);              /* 清除恢复排队标志，保证状态收尾干净。 */
+		mutex_unlock(&ts->recover_lock);                  /* 释放互斥锁，避免 remove 等待时死锁。 */
+		return;                                          /* 直接退出，不再操作 IRQ、GPIO 或 I2C。 */
+	}
+
+	disable_irq(ts->irq);                                /* 禁用触摸中断，避免复位期间中断线程继续读取 I2C。 */
+	irq_disabled = true;                                 /* 记录 IRQ 已由本函数禁用，后续退出路径需要成对 enable。 */
+	goodix_release_all_slots(ts);                         /* 复位前释放所有触摸点，避免用户界面卡在按下状态。 */
+
+	dev_warn(dev, "start touch recovery: reset controller and re-read product id\n"); /* 打印恢复开始日志。 */
+	ret = goodix_reset_sequence(ts);                      /* 执行硬件复位和地址选择时序。 */
+	if (ret) {                                            /* 如果 GPIO 复位流程失败。 */
+		dev_err(dev, "touch recovery reset failed: %d\n", ret); /* 打印复位失败错误码。 */
+		goto out_enable_irq;                             /* 仍然需要恢复 IRQ 状态并清理 pending 标志。 */
+	}
+
+	ret = goodix_identify(ts);                            /* 复位后重新读取 PID，验证 I2C 是否重新有应答。 */
+	if (ret) {                                            /* 如果 PID 仍然读取失败。 */
+		dev_err(dev, "touch recovery identify failed: %d\n", ret); /* 打印识别失败错误码，提示硬件仍未恢复。 */
+		goto out_enable_irq;                             /* 跳到统一出口，避免 IRQ 长期关闭。 */
+	}
+
+	ts->i2c_fail_count = 0;                               /* 恢复成功后清零连续失败计数。 */
+	dev_info(dev, "touch recovery completed\n");          /* 打印恢复成功日志，便于现场确认恢复发生过。 */
+
+out_enable_irq:
+	atomic_set(&ts->recover_pending, 0);                  /* 清除恢复排队标志，允许后续新故障重新调度恢复。 */
+	if (irq_disabled)                                     /* 如果本函数曾经成功禁用 IRQ。 */
+		enable_irq(ts->irq);                              /* 重新启用触摸中断，让正常触摸事件继续上报。 */
+	mutex_unlock(&ts->recover_lock);                      /* 释放恢复互斥锁，恢复流程结束。 */
+}
+
+/*
  * goodix_probe - Goodix I2C 驱动探测函数。
  * @client: 内核根据设备树 I2C 节点创建的设备对象。
  * @id: I2C ID 表匹配项，设备树匹配时通常不使用。
@@ -482,6 +644,12 @@ static int goodix_probe(struct i2c_client *client, const struct i2c_device_id *i
 	ts->reset_gpio = -EINVAL;                             /* 初始化复位 GPIO 为无效状态。 */
 	ts->irq_gpio = -EINVAL;                               /* 初始化中断 GPIO 为无效状态。 */
 	ts->irq = -EINVAL;                                    /* 初始化 IRQ 为无效状态。 */
+	mutex_init(&ts->recover_lock);                        /* 初始化恢复互斥锁，后续 workqueue 会用它串行化复位流程。 */
+	INIT_WORK(&ts->recover_work, goodix_recover_work);    /* 初始化恢复工作项，连续 I2C 失败后由中断线程调度。 */
+	atomic_set(&ts->recover_pending, 0);                  /* 初始没有恢复任务排队或运行。 */
+	ts->stopping = false;                                 /* probe 阶段驱动处于运行状态，允许后续故障恢复。 */
+	ts->i2c_fail_count = 0;                               /* 初始连续 I2C 失败次数为 0。 */
+	ts->next_recover_jiffies = 0;                         /* 初始不限制第一次恢复触发时间。 */
 	i2c_set_clientdata(client, ts);                        /* 把私有数据保存到 client，便于 remove 或调试取回。 */
 
 	of_property_read_u32(client->dev.of_node, "touchscreen-size-x", &ts->max_x); /* 从设备树读取 X 分辨率。 */
@@ -533,6 +701,12 @@ static int goodix_probe(struct i2c_client *client, const struct i2c_device_id *i
  */
 static int goodix_remove(struct i2c_client *client)
 {
+	struct goodix_ts_data *ts = i2c_get_clientdata(client); /* 取回 probe 保存的驱动私有数据，用于取消恢复工作。 */
+
+	ts->stopping = true;                                  /* 标记驱动正在移除，阻止 IRQ 线程继续调度恢复工作。 */
+	cancel_work_sync(&ts->recover_work);                  /* 等待可能正在运行的恢复工作结束，避免卸载后继续访问已释放资源。 */
+	devm_free_irq(&client->dev, ts->irq, ts);             /* 主动释放 devm IRQ，确保 input 注销前不会再进入中断线程。 */
+	goodix_release_all_slots(ts);                         /* 卸载前释放所有触摸 slot，避免用户空间残留按下状态。 */
 	return 0;                                             /* 没有额外手工资源需要释放，直接返回成功。 */
 }
 
