@@ -535,6 +535,166 @@ public:
         return removeHistoryImageFiles(removedEntry);
     }
 
+    /*
+     * retryPayloadAt 的作用：
+     *   给“重新发送”按钮读取一条历史记录的本地图片上传载荷。
+     *
+     * 主要流程：
+     *   1. 校验 row，避免 QML 传入已经删除的历史索引。
+     *   2. 归一化 source 原图路径，兼容旧 JSON 里的 jpg_path。
+     *   3. 归一化 annotated 结果图路径，兼容旧 JSON 里的 png_path。
+     *   4. 返回 classification_result 和 segmentation_result，上传时据此恢复综合 good/bad/review 判定。
+     *
+     * 参数：
+     *   row 是历史记录索引。
+     *   sourcePath 用于返回云端 file_kind=source 的原始图路径。
+     *   annotatedPaths 用于返回云端 file_kind=annotated 的结果图路径列表。
+     *   classificationResult 用于返回分类模型 RESULT 行，可为空。
+     *   segmentationResult 用于返回 UNet 分割模型 RESULT_SEG 行，可为空。
+     *   errorText 用于返回中文失败原因。
+     *
+     * 返回值：
+     *   载荷完整返回 true；记录不存在或图片路径不足返回 false。
+     */
+    bool retryPayloadAt(int row,
+                        QString *sourcePath,
+                        QStringList *annotatedPaths,
+                        QString *classificationResult,
+                        QString *segmentationResult,
+                        QString *errorText) const
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            if (errorText) {
+                *errorText = QStringLiteral("记录不存在");
+            }
+            return false;
+        }
+
+        const UploadHistoryEntry &entry = m_entries.at(row);
+        const QString normalizedSource = normalizedSourcePath(entry);
+        const QStringList normalizedAnnotated = normalizedAnnotatedPaths(entry);
+
+        if (normalizedSource.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("缺少原始图片路径");
+            }
+            return false;
+        }
+
+        if (normalizedAnnotated.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("缺少检测结果图片路径");
+            }
+            return false;
+        }
+
+        if (sourcePath) {
+            *sourcePath = normalizedSource;
+        }
+        if (annotatedPaths) {
+            *annotatedPaths = normalizedAnnotated;
+        }
+        if (classificationResult) {
+            *classificationResult = entry.classificationResult;
+        }
+        if (segmentationResult) {
+            *segmentationResult = entry.segmentationResult;
+        }
+
+        return true;
+    }
+
+    /*
+     * updateRecordUploadResult 的作用：
+     *   在“重新发送”结束后原地更新同一条历史记录的云端状态。
+     *
+     * 主要流程：
+     *   1. 校验 row，避免后台上传期间用户删除记录后越界写入。
+     *   2. 备份旧记录，先更新内存中的 upload_status、record_id、record_no 和流程状态。
+     *   3. 如果重发上传成功，把本地 upload_time 改成本次重发完成时间，并移动到历史末尾。
+     *   4. 写回 upload_history.json；若写入失败，回滚旧记录并通知 QML 刷新。
+     *   5. 写入成功后发送 dataChanged，让列表卡片和详情页都能读到最新云端状态。
+     *
+     * 参数：
+     *   row 是需要更新的历史记录索引。
+     *   uploadStatus 是压缩后的上传状态文本。
+     *   recordId/recordNo 是上传脚本返回的新云端记录身份，失败时可为空；为空时保留旧值。
+     *   errorText 用于返回中文失败原因。
+     *
+     * 返回值：
+     *   历史文件成功保存返回 true；索引非法或写盘失败返回 false。
+     */
+    bool updateRecordUploadResult(int row,
+                                  const QString &uploadStatus,
+                                  const QString &recordId,
+                                  const QString &recordNo,
+                                  QString *errorText)
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            if (errorText) {
+                *errorText = QStringLiteral("记录不存在");
+            }
+            return false;
+        }
+
+        const UploadHistoryEntry oldEntry = m_entries.at(row);
+        const QVector<UploadHistoryEntry> oldEntries = m_entries;
+        const bool uploadSucceeded = uploadStatus.startsWith(QStringLiteral("上传成功"));
+        const QString refreshedUploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+
+        m_entries[row].uploadStatus = uploadStatus;
+        if (!recordId.isEmpty()) {
+            m_entries[row].recordId = recordId;
+        }
+        if (!recordNo.isEmpty()) {
+            m_entries[row].recordNo = recordNo;
+        }
+        m_entries[row].workflowText = uploadStatus.startsWith(QStringLiteral("上传成功"))
+            ? QStringLiteral("云端已归档")
+            : QStringLiteral("本地已保存，等待重新发送");
+
+        if (uploadSucceeded) {
+            const int lastRow = m_entries.size() - 1;
+
+            /*
+             * 重发成功代表云端重新创建了一条“当前时间”的记录。
+             * 本地历史仍复用同一组 source/annotated 图片，但时间和排序要跟本次云端记录对齐。
+             * 先把记录移动到数组末尾，再对末尾记录刷新 upload_time，可以让“当前显示的最新记录”
+             * 和写入 JSON 的最后一条记录严格对应，避免界面继续显示旧失败时间。
+             */
+            if (row != lastRow) {
+                beginMoveRows(QModelIndex(), row, row, QModelIndex(), m_entries.size());
+                m_entries.move(row, lastRow);
+                endMoveRows();
+            }
+            m_entries[lastRow].uploadTime = refreshedUploadTime;
+        }
+
+        if (!saveToDisk()) {
+            if (uploadSucceeded && row != m_entries.size() - 1) {
+                beginResetModel();
+                m_entries = oldEntries;
+                endResetModel();
+            } else {
+                m_entries[row] = oldEntry;
+                emit dataChanged(index(row, 0), index(row, 0));
+            }
+            if (errorText) {
+                *errorText = QStringLiteral("历史文件写入失败");
+            }
+            return false;
+        }
+
+        const int changedRow = uploadSucceeded ? m_entries.size() - 1 : row;
+        emit dataChanged(index(changedRow, 0), index(changedRow, 0),
+                         QVector<int>() << UploadTimeRole
+                                        << WorkflowTextRole
+                                        << UploadStatusRole
+                                        << RecordIdRole
+                                        << RecordNoRole);
+        return true;
+    }
+
 signals:
     /* countChanged 在历史记录数量变化时发出，QML 可用它刷新空状态和统计卡。 */
     void countChanged();
@@ -1134,6 +1294,28 @@ class CameraStorageController : public QObject
     Q_OBJECT
     Q_PROPERTY(bool saveInProgress READ saveInProgress NOTIFY saveInProgressChanged)
     Q_PROPERTY(bool detectInProgress READ detectInProgress NOTIFY detectInProgressChanged)
+    Q_PROPERTY(bool retryUploadInProgress READ retryUploadInProgress NOTIFY retryUploadInProgressChanged)
+
+    /*
+     * FusedDetectResult 的作用：
+     *   保存分类模型和 UNet 分割模型综合后的最终判定。
+     *
+     * 字段说明：
+     *   cloudResult 是云端 records.result 使用的小写结果，取值 good/bad/review。
+     *   historyText 是本地历史列表展示的中文主结果，良品表示两个模型均未发现缺陷。
+     *   uiStatus 是 QML 首页结果卡片使用的状态，取值 GOOD/BAD/REVIEW。
+     *   reason 是不带空格的中文短原因，会追加到 RESULT 行供 QML 和日志读取。
+     *   classifyBad/segmentBad 保存两个模型各自是否发现缺陷，便于工作流文案说明冲突来源。
+     */
+    struct FusedDetectResult
+    {
+        QString cloudResult;
+        QString historyText;
+        QString uiStatus;
+        QString reason;
+        bool classifyBad = false;
+        bool segmentBad = false;
+    };
 
 public:
     explicit CameraStorageController(QObject *parent = nullptr)
@@ -1146,7 +1328,8 @@ public:
           m_historyModel(nullptr),
           m_appendHistoryInSave(true),
           m_saveInProgress(false),
-          m_detectInProgress(false)
+          m_detectInProgress(false),
+          m_retryUploadInProgress(false)
     {
     }
 
@@ -1182,6 +1365,22 @@ public:
     bool detectInProgress() const
     {
         return m_detectInProgress;
+    }
+
+    /*
+     * retryUploadInProgress 的作用：
+     *   告诉 QML 当前是否已有历史图片重新发送任务正在运行。
+     *
+     * 主要流程：
+     *   直接返回主线程维护的 m_retryUploadInProgress；后台线程结束后必须通过
+     *   Qt queued connection 回到主线程清除该标志。
+     *
+     * 返回值：
+     *   true 表示正在重发某条失败历史记录；false 表示可以点击“重新发送”。
+     */
+    bool retryUploadInProgress() const
+    {
+        return m_retryUploadInProgress;
     }
 
     /*
@@ -1708,12 +1907,126 @@ public:
         return result;
     }
 
+    /*
+     * retryUploadRecord 的作用：
+     *   响应历史详情页“重新发送”按钮，把已保存的本地 source/annotated 图片重新上传到云端。
+     *
+     * 主要流程：
+     *   1. 校验历史模型和 row，读取该记录原始图片、结果图和分类结果。
+     *   2. 根据分类 RESULT 恢复云端 good/bad/review 判定；旧记录缺少模型结果时保守使用 review。
+     *   3. 后台线程复用 defect-cos-upload 执行网络上传，避免阻塞 Qt 主线程。
+     *   4. 上传结束后回到主线程原地更新同一条历史记录的 upload_status、record_id 和 record_no。
+     *
+     * 参数：
+     *   row 是 QML 当前详情页对应的历史记录索引。
+     *
+     * 返回值：
+     *   无直接返回值；QML 通过 retryUploadFinished(row, resultText) 显示最终结果。
+     */
+    Q_INVOKABLE void retryUploadRecord(int row)
+    {
+        QString sourcePath;
+        QStringList annotatedPaths;
+        QString classificationResult;
+        QString segmentationResult;
+        QString errorText;
+
+        if (m_retryUploadInProgress) {
+            qWarning() << "history retry upload ignored because previous retry is still running";
+            emit retryUploadFinished(row, QStringLiteral("重新发送失败：已有图片正在重新发送"));
+            return;
+        }
+
+        if (m_historyModel == nullptr) {
+            emit retryUploadFinished(row, QStringLiteral("重新发送失败：历史模型未初始化"));
+            return;
+        }
+
+        if (!m_historyModel->retryPayloadAt(row,
+                                            &sourcePath,
+                                            &annotatedPaths,
+                                            &classificationResult,
+                                            &segmentationResult,
+                                            &errorText)) {
+            emit retryUploadFinished(row, QStringLiteral("重新发送失败：") + errorText);
+            return;
+        }
+
+        /*
+         * fusedResult 保存分类模型和 UNet 分割模型共同生成的最终判定。
+         * 旧历史缺少任一模型结果时会落到 review，避免重新发送时把证据不完整的记录误写成良品。
+         */
+        const FusedDetectResult fusedResult = fusedResultFromModelResults(classificationResult, segmentationResult);
+
+        /* cloudResult 保存云端 records.result 字段，必须来自综合判定而不是单个分类模型。 */
+        const QString cloudResult = cloudResultFromFusedResult(fusedResult);
+
+        /* workerResult 保存后台上传脚本返回的完整中文状态，线程结束后主线程读取并更新历史记录。 */
+        const QSharedPointer<QString> workerResult(new QString(QStringLiteral("上传失败：后台重新发送线程没有返回结果")));
+
+        setRetryUploadInProgress(true);
+
+        QThread *workerThread = QThread::create([sourcePath,
+                                                 annotatedPaths,
+                                                 cloudResult,
+                                                 workerResult]() {
+            CameraStorageController workerController;
+
+            workerController.setAppendHistoryInSave(false);
+            *workerResult = workerController.uploadDetectImagesToCos(sourcePath,
+                                                                     annotatedPaths,
+                                                                     cloudResult);
+        });
+
+        if (workerThread == nullptr) {
+            setRetryUploadInProgress(false);
+            emit retryUploadFinished(row, QStringLiteral("重新发送失败：无法创建后台上传线程"));
+            return;
+        }
+
+        connect(workerThread, &QThread::finished, this, [this, row, workerResult]() {
+            QString errorText;
+            const QString recordId = parseTokenValue(*workerResult, QStringLiteral("record_id"));
+            const QString recordNo = parseTokenValue(*workerResult, QStringLiteral("record_no"));
+            const QString compactStatus = compactUploadStatus(*workerResult);
+            QString resultText;
+
+            if (m_historyModel == nullptr) {
+                resultText = QStringLiteral("重新发送失败：历史模型已释放");
+            } else if (!m_historyModel->updateRecordUploadResult(row,
+                                                                 compactStatus,
+                                                                 recordId,
+                                                                 recordNo,
+                                                                 &errorText)) {
+                resultText = QStringLiteral("重新发送失败：") + errorText;
+            } else if (workerResult->startsWith(QStringLiteral("上传成功："))) {
+                resultText = QStringLiteral("重新发送成功：") + compactStatus;
+            } else {
+                const QString failureDetail = workerResult->startsWith(QStringLiteral("上传失败："))
+                    ? workerResult->mid(QStringLiteral("上传失败：").length())
+                    : *workerResult;
+
+                resultText = QStringLiteral("重新发送失败：") + failureDetail.left(80);
+            }
+
+            setRetryUploadInProgress(false);
+            emit retryUploadFinished(row, resultText);
+        }, Qt::QueuedConnection);
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+
+        workerThread->start();
+    }
+
 signals:
     /* saveInProgressChanged 在后台保存开始或结束时通知 QML 刷新按钮状态。 */
     void saveInProgressChanged();
 
     /* detectInProgressChanged 在后台检测开始或结束时通知 QML 刷新按钮状态。 */
     void detectInProgressChanged();
+
+    /* retryUploadInProgressChanged 在历史图片重新发送开始或结束时通知 QML 刷新按钮状态。 */
+    void retryUploadInProgressChanged();
 
     /* saveCurrentFrameFinished 在异步保存任务结束后发送完整中文结果，QML 用它更新提示条。 */
     void saveCurrentFrameFinished(const QString &resultText);
@@ -1726,6 +2039,9 @@ signals:
 
     /* detectCurrentFrameFinished 在异步检测任务结束后发送 RESULT 或错误文本，QML 用它更新当前结果。 */
     void detectCurrentFrameFinished(const QString &resultText);
+
+    /* retryUploadFinished 在历史图片重新发送结束后发送 row 和结果文本，QML 用它刷新当前详情页。 */
+    void retryUploadFinished(int row, const QString &resultText);
 
 private:
     /*
@@ -2017,32 +2333,19 @@ private:
     }
 
     /*
-     * resultStatusIsBad 的作用：
-     *   判断 defect-classify 的 RESULT 行是否判定当前样本为 BAD。
-     *
-     * 参数：
-     *   classificationResult 是 defect-classify 输出的一行 RESULT。
-     *
-     * 返回值：
-     *   status=BAD 时返回 true；其它情况返回 false。
-     */
-    bool resultStatusIsBad(const QString &classificationResult) const
-    {
-        return parseTokenValue(classificationResult, QStringLiteral("status")) == QStringLiteral("BAD");
-    }
-
-    /*
      * buildDetectModelResultLine 的作用：
      *   把分类 RESULT 和 UNet RESULT_SEG 合成 QML 首页可解析的一行双模型结果。
      *
      * 主要流程：
      *   1. 保留分类 RESULT 原有字段，继续让 QML 读取 status/class/confidence/good_total/bad_total。
      *   2. 追加 UNet 状态、缺陷像素、分割耗时和双模型总耗时。
-     *   3. 追加 source_path，方便最终结果和日志仍能对齐本次检测原图。
+     *   3. 追加综合判定字段，让首页、历史和云端看到同一个最终结论。
+     *   4. 追加 source_path，方便最终结果和日志仍能对齐本次检测原图。
      *
      * 参数：
      *   classificationResult 是 defect-classify 输出的 RESULT 行。
      *   segmentationResult 是 defect-segment 输出的 RESULT_SEG 行。
+     *   fusedResult 是分类和 UNet 分割的综合判定。
      *   totalModelTimeMs 是分类和 UNet 两个模型串行耗时，单位毫秒。
      *   sourcePath 是 overlay 保存的本次检测原图。
      *
@@ -2051,6 +2354,7 @@ private:
      */
     QString buildDetectModelResultLine(const QString &classificationResult,
                                        const QString &segmentationResult,
+                                       const FusedDetectResult &fusedResult,
                                        qint64 totalModelTimeMs,
                                        const QString &sourcePath) const
     {
@@ -2063,6 +2367,12 @@ private:
             + parseTokenValue(segmentationResult, QStringLiteral("time_ms"))
             + QStringLiteral(" total_time_ms=")
             + QString::number(totalModelTimeMs)
+            + QStringLiteral(" fused_status=")
+            + uiStatusFromFusedResult(fusedResult)
+            + QStringLiteral(" fused_result=")
+            + cloudResultFromFusedResult(fusedResult)
+            + QStringLiteral(" fused_reason=")
+            + fusedResult.reason
             + QStringLiteral(" source_path=")
             + sourcePath;
     }
@@ -2092,33 +2402,114 @@ private:
     }
 
     /*
-     * cloudResultFromClassificationResult 的作用：
-     *   把分类模型 RESULT 行转换成云端记录接口使用的 result 字段。
+     * fusedResultFromModelResults 的作用：
+     *   综合分类模型和 UNet 分割模型的详细输出，生成唯一最终判定。
      *
      * 主要流程：
-     *   1. 读取 RESULT 中的 status 字段。
-     *   2. status=BAD 明确上传 bad，status=GOOD 明确上传 good。
-     *   3. 其它异常或未知状态统一上传 review，避免脚本静默退回默认 good。
+     *   1. 先读取分类 RESULT 的 status，只有 GOOD/BAD 属于可信输入。
+     *   2. 再读取 UNet RESULT_SEG 的 status 和 defect_pixels，NG 或缺陷像素大于 0 都视为发现缺陷。
+     *   3. 任一模型发现缺陷时最终判为 bad/待复核，禁止把 UNet 检出划痕的样本放进良品流。
+     *   4. 任一模型结果缺失或状态未知时最终判为 review，避免证据不完整时默认 good。
      *
      * 参数：
-     *   classificationResult 是 defect-classify 输出的 RESULT 行。
+     *   classificationResult 是 defect-classify 输出的一行 RESULT。
+     *   segmentationResult 是 defect-segment 输出的一行 RESULT_SEG。
      *
      * 返回值：
-     *   返回云端接口接受的小写结果：good、bad 或 review。
+     *   返回 FusedDetectResult，供云端上传、历史记录和 QML 首页共用。
      */
-    QString cloudResultFromClassificationResult(const QString &classificationResult) const
+    FusedDetectResult fusedResultFromModelResults(const QString &classificationResult,
+                                                  const QString &segmentationResult) const
     {
-        const QString status = parseTokenValue(classificationResult, QStringLiteral("status"));
+        FusedDetectResult result;
+        const QString classifyStatus = parseTokenValue(classificationResult, QStringLiteral("status"));
+        const QString segmentStatus = parseTokenValue(segmentationResult, QStringLiteral("status"));
+        const bool classifyKnown = classifyStatus == QStringLiteral("GOOD") || classifyStatus == QStringLiteral("BAD");
+        const bool segmentKnown = segmentStatus == QStringLiteral("OK") || segmentStatus == QStringLiteral("NG");
 
-        if (status == QStringLiteral("BAD")) {
-            return QStringLiteral("bad");
+        result.cloudResult = QStringLiteral("review");
+        result.historyText = QStringLiteral("待复核");
+        result.uiStatus = QStringLiteral("REVIEW");
+        result.reason = QStringLiteral("模型结果待复核");
+        result.classifyBad = classifyStatus == QStringLiteral("BAD");
+        result.segmentBad = segmentationHasDefect(segmentationResult);
+
+        if (!classifyKnown || !segmentKnown) {
+            result.reason = QStringLiteral("模型结果不完整");
+            return result;
         }
 
-        if (status == QStringLiteral("GOOD")) {
-            return QStringLiteral("good");
+        if (result.classifyBad && result.segmentBad) {
+            result.cloudResult = QStringLiteral("bad");
+            result.uiStatus = QStringLiteral("BAD");
+            result.reason = QStringLiteral("分类和UNet均发现缺陷");
+            return result;
         }
 
-        return QStringLiteral("review");
+        if (result.classifyBad) {
+            result.cloudResult = QStringLiteral("bad");
+            result.uiStatus = QStringLiteral("BAD");
+            result.reason = QStringLiteral("分类模型判定坏品");
+            return result;
+        }
+
+        if (result.segmentBad) {
+            result.cloudResult = QStringLiteral("bad");
+            result.uiStatus = QStringLiteral("BAD");
+            result.reason = QStringLiteral("UNet发现疑似缺陷");
+            return result;
+        }
+
+        result.cloudResult = QStringLiteral("good");
+        result.historyText = QStringLiteral("良品");
+        result.uiStatus = QStringLiteral("GOOD");
+        result.reason = QStringLiteral("双模型均未发现缺陷");
+        return result;
+    }
+
+    /*
+     * cloudResultFromFusedResult 的作用：
+     *   把综合判定转换为云端 records.result 字段。
+     *
+     * 参数：
+     *   fusedResult 是 fusedResultFromModelResults() 的返回值。
+     *
+     * 返回值：
+     *   返回 good、bad 或 review。
+     */
+    QString cloudResultFromFusedResult(const FusedDetectResult &fusedResult) const
+    {
+        return fusedResult.cloudResult.isEmpty() ? QStringLiteral("review") : fusedResult.cloudResult;
+    }
+
+    /*
+     * historyTextFromFusedResult 的作用：
+     *   把综合判定转换成本地历史列表展示的中文主结果。
+     *
+     * 参数：
+     *   fusedResult 是 fusedResultFromModelResults() 的返回值。
+     *
+     * 返回值：
+     *   返回“良品”或“待复核”；当前坏品也先进入待复核，避免未接自动分拣前直接下最终人工结论。
+     */
+    QString historyTextFromFusedResult(const FusedDetectResult &fusedResult) const
+    {
+        return fusedResult.historyText.isEmpty() ? QStringLiteral("待复核") : fusedResult.historyText;
+    }
+
+    /*
+     * uiStatusFromFusedResult 的作用：
+     *   把综合判定转换成 QML 首页可直接使用的状态值。
+     *
+     * 参数：
+     *   fusedResult 是 fusedResultFromModelResults() 的返回值。
+     *
+     * 返回值：
+     *   返回 GOOD、BAD 或 REVIEW。
+     */
+    QString uiStatusFromFusedResult(const FusedDetectResult &fusedResult) const
+    {
+        return fusedResult.uiStatus.isEmpty() ? QStringLiteral("REVIEW") : fusedResult.uiStatus;
     }
 
     /*
@@ -2238,14 +2629,15 @@ private:
 
         UploadHistoryEntry entry;
         const QFileInfo sourceInfo(bundle.sourcePath);
-        const bool classifyBad = resultStatusIsBad(bundle.classificationResult);
-        const bool segmentBad = segmentationHasDefect(bundle.segmentationResult);
+        const FusedDetectResult fusedResult =
+            fusedResultFromModelResults(bundle.classificationResult, bundle.segmentationResult);
 
         entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
-        entry.resultText = classifyBad ? QStringLiteral("待复核") : QStringLiteral("良品");
-        entry.workflowText = QStringLiteral("分类%1；UNet%2；%3")
-            .arg(classifyBad ? QStringLiteral("BAD") : QStringLiteral("GOOD"))
-            .arg(segmentBad ? QStringLiteral("发现缺陷") : QStringLiteral("未见缺陷"))
+        entry.resultText = historyTextFromFusedResult(fusedResult);
+        entry.workflowText = QStringLiteral("综合%1；分类%2；UNet%3；%4")
+            .arg(fusedResult.reason)
+            .arg(fusedResult.classifyBad ? QStringLiteral("BAD") : QStringLiteral("GOOD"))
+            .arg(fusedResult.segmentBad ? QStringLiteral("发现缺陷") : QStringLiteral("未见缺陷"))
             .arg(bundle.uploadResult.startsWith(QStringLiteral("上传成功："))
                  ? QStringLiteral("云端已归档")
                  : QStringLiteral("本地已保存"));
@@ -2523,6 +2915,7 @@ private:
         QString modelResult;
         QString uploadResult;
         QString cloudResult;
+        FusedDetectResult fusedResult;
         qint64 totalModelTimeMs = 0;
         QElapsedTimer totalDetectTimer;
 
@@ -2588,14 +2981,16 @@ private:
         bundle->sourcePath = detectImagePath;
         bundle->classificationResult = classificationResult;
         bundle->segmentationResult = segmentationResult;
+        fusedResult = fusedResultFromModelResults(classificationResult, segmentationResult);
         modelResult = buildDetectModelResultLine(classificationResult,
                                                  segmentationResult,
+                                                 fusedResult,
                                                  totalModelTimeMs,
                                                  bundle->sourcePath);
         if (modelsReadyCallback) {
             modelsReadyCallback(modelResult);
         }
-        cloudResult = cloudResultFromClassificationResult(classificationResult);
+        cloudResult = cloudResultFromFusedResult(fusedResult);
         uploadResult = uploadDetectImagesToCos(bundle->sourcePath, bundle->annotatedPaths, cloudResult);
         bundle->uploadResult = uploadResult;
 
@@ -2969,6 +3364,26 @@ private:
         emit detectInProgressChanged();
     }
 
+    /*
+     * setRetryUploadInProgress 的作用：
+     *   集中更新历史图片重新发送忙状态，并通知 QML 刷新按钮文案和置灰状态。
+     *
+     * 参数：
+     *   inProgress 为 true 表示重新发送任务开始；false 表示任务结束或启动失败。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setRetryUploadInProgress(bool inProgress)
+    {
+        if (m_retryUploadInProgress == inProgress) {
+            return;
+        }
+
+        m_retryUploadInProgress = inProgress;
+        emit retryUploadInProgressChanged();
+    }
+
     QString m_socketPath;  /* m_socketPath 是 overlay 控制 socket 路径。 */
     QString m_mountPoint;  /* m_mountPoint 是 SD 卡挂载点。 */
     QString m_imageDir;    /* m_imageDir 是图片保存目录。 */
@@ -2978,6 +3393,7 @@ private:
     bool m_appendHistoryInSave; /* m_appendHistoryInSave 控制同步保存函数是否立即追加历史记录。 */
     bool m_saveInProgress; /* m_saveInProgress 只在 Qt 主线程维护，用于防止保存图片任务重复启动。 */
     bool m_detectInProgress; /* m_detectInProgress 只在 Qt 主线程维护，用于防止检测任务重复启动。 */
+    bool m_retryUploadInProgress; /* m_retryUploadInProgress 只在 Qt 主线程维护，用于防止历史重发任务重复启动。 */
 };
 
 /*

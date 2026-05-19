@@ -256,35 +256,45 @@ Use this convention when changing the STM32MP157 Qt boot display chain, the SysV
 
 ### 1. Scope / Trigger
 
-- Trigger: changing `20_uvc_camera/S05display-quiet`, `20_uvc_camera/S90uvc-camera`, `20_uvc_camera/qt_camera_display/run_qt_kms_overlay_display.sh`, `20_uvc_camera/qt_camera_display/fb_boot_splash.c`, or the QML `splashOverlay`.
+- Trigger: changing `20_uvc_camera/S05display-quiet`, `20_uvc_camera/S90uvc-camera`, `20_uvc_camera/qt_camera_display/run_qt_kms_overlay_display.sh`, `20_uvc_camera/qt_camera_display/fb_boot_splash.c`, `20_uvc_camera/qt_camera_display/ai_boot_splash_preview.html`, `20_uvc_camera/qt_camera_display/generate_boot_splash_asset.py`, generated splash assets, or the QML `splashOverlay`.
 - Goal: the LCD should show a static first-frame style image as soon as `/dev/fb0` is writable, then QML `splashOverlay`, then the home page with KMS overlay video restored.
 - Boundary: early framebuffer splash must not depend on Qt, OpenGL, DRM/KMS, UVC camera nodes, image codecs, or `/dev/galcore`.
+- Design source rule: high-fidelity early splash visuals with Chinese text, glows, transparent layers, chip logos, and precise typography must be designed in HTML/CSS first, rendered into PNG/RGB565 during build/deploy preparation, and then blitted by `fb_boot_splash`. Do not hand-rebuild complex UI artwork in C except as a low-fidelity resource-missing fallback.
 
 ### 2. Signatures
 
 | Operation | Signature |
 |---|---|
+| HTML splash design source | `20_uvc_camera/qt_camera_display/ai_boot_splash_preview.html` |
+| Splash asset generator | `python3 generate_boot_splash_asset.py` |
+| Generated PNG preview | `20_uvc_camera/qt_camera_display/boot_splash.png` |
+| Generated raw asset | `20_uvc_camera/qt_camera_display/boot_splash.rgb565` |
+| Raw asset byte contract | `1024 * 600 * 2 = 1228800` bytes |
 | Early splash build | `./build_fb_boot_splash.sh` |
 | Early splash binary | `/root/qt_camera_display/fb_boot_splash` |
 | Early splash command | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q` |
+| Early splash asset override | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -a /root/qt_camera_display/boot_splash.rgb565` |
 | Build compiler override | `SPLASH_CC=/path/to/arm-gcc ./build_fb_boot_splash.sh` |
 | Init helper env | `FB_BOOT_SPLASH_BIN=/root/qt_camera_display/fb_boot_splash` |
 | Init framebuffer env | `FB_DEV=/dev/fb0` |
 | Disable switch | `FB_BOOT_SPLASH_ENABLE=0` |
 | Startup scripts | `S05display-quiet`, `S90uvc-camera`, `run_qt_kms_overlay_display.sh` call `show_boot_splash()` |
-| Static contract | `./test_qt_kms_overlay_assets.sh` checks `fb_boot_splash.c`, `build_fb_boot_splash.sh`, `FB_BOOT_SPLASH_BIN`, `show_boot_splash`, `/dev/fb0`, `FBIOGET_VSCREENINFO`, `mmap`, `draw_splash`, and `msync` |
+| Static contract | `./test_qt_kms_overlay_assets.sh` checks `generate_boot_splash_asset.py`, `boot_splash.png`, `boot_splash.rgb565`, `fb_boot_splash.c`, `build_fb_boot_splash.sh`, `FB_BOOT_SPLASH_BIN`, `show_boot_splash`, `/dev/fb0`, `FBIOGET_VSCREENINFO`, `mmap`, `draw_splash_asset`, `draw_splash_fallback`, and `msync` |
 
 ### 3. Contracts
 
 | Area | Contract |
 |---|---|
 | Dependency boundary | `fb_boot_splash` must use Linux framebuffer ioctls and `mmap` only. It must not require Qt runtime, PNG/JPEG decoders, DRM resources, UVC camera nodes, or GPU initialization. |
+| Design-to-asset pipeline | `ai_boot_splash_preview.html` is the visual source of truth. `generate_boot_splash_asset.py` renders it to `boot_splash.png`, converts that image to little-endian RGB565 raw pixels, and writes `boot_splash.rgb565`. The board runtime must not execute a browser, HTML renderer, PNG decoder, or Pillow. |
+| Asset-first rendering | `fb_boot_splash` must try the RGB565 asset first through `DEFAULT_SPLASH_ASSET` or `-a`. Only if the asset is missing, unreadable, or has an invalid byte count may it draw `draw_splash_fallback`. A successful resource path should log `asset: /root/qt_camera_display/boot_splash.rgb565` or equivalent. |
+| Canvas and crop | The HTML artboard and generated asset are fixed at `1024x600`. The generator must capture the actual splash artboard, not the browser window, body margin, or a decorative preview frame. Borders, shadows, or dark page chrome around a desktop preview must not be baked into `boot_splash.rgb565` unless the final board design intentionally includes them. |
 | Pixel support | The helper must support the framebuffer formats used on the board, at minimum 16 bpp RGB565 and common 24/32 bpp RGB layouts through framebuffer bitfields. Unsupported formats must return non-zero with a clear error. |
 | Script behavior | `show_boot_splash()` is visual fallback only. Missing binary, missing `/dev/fb0`, or draw failure must not block Qt startup. |
 | Startup order | Draw early static splash after `/dev/fb0` exists and before long waits for camera, GPU, overlay socket, or Qt QML load. |
 | Overlay order | KMS overlay video must still start hidden with `-V 0`; QML restores it with `VISIBLE 1` only after the QML splash fades out. |
 | Build isolation | `build_fb_boot_splash.sh` must use `SPLASH_CC`, not inherited `CC`, because the ST Qt SDK exports `CC` as a compiler command plus flags. |
-| Deployment | `deploy_qt_camera_display.sh` must require and install `build-mp157/fb_boot_splash` with mode `755` beside the Qt binary and overlay helper. |
+| Deployment | `deploy_qt_camera_display.sh` must require and install `build-mp157/fb_boot_splash` with mode `755` and `boot_splash.rgb565` with mode `644` beside the Qt binary and overlay helper. |
 | Documentation | `20_uvc_camera/README.md` and `20_uvc_camera/qt_camera_display/README.md` must document the file list, build command, deploy path, board test command, and failure triage. |
 
 ### 4. Validation & Error Matrix
@@ -292,13 +302,26 @@ Use this convention when changing the STM32MP157 Qt boot display chain, the SysV
 | Check | Good Result | Failure Meaning |
 |---|---|---|
 | Static contract | `./test_qt_kms_overlay_assets.sh` prints `PASS: Qt KMS overlay assets contract` | One of the boot display chain markers drifted or a required file is missing |
+| Asset generation | `python3 generate_boot_splash_asset.py` writes `boot_splash.png` and `boot_splash.rgb565` | Chromium/Edge, Playwright/Selenium glue, Pillow, the HTML source, or the crop selector is broken |
+| Raw asset size | `stat -c %s boot_splash.rgb565` prints `1228800` | The output size no longer matches the 1024x600 RGB565 framebuffer contract |
+| PNG visual review | `boot_splash.png` visually matches the HTML artboard with no unintended black border | The generator captured the preview wrapper, body background, browser margin, or an old HTML frame/shadow |
 | Early helper build | `./build_fb_boot_splash.sh` outputs an ARM ELF at `build-mp157/fb_boot_splash` | Buildroot compiler/sysroot path is wrong, or the helper picked up a bad compiler environment |
-| Board helper smoke | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q && echo fb_splash_rc=0` prints `fb_splash_rc=0` | `/dev/fb0` is missing, the pixel format is unsupported, or the binary is not executable for the board |
+| Board helper smoke | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q && echo fb_splash_rc=0` prints `fb_splash_rc=0` and logs/use confirms the asset path | `/dev/fb0` is missing, the raw asset is absent or the wrong size, the pixel format is unsupported, or the binary is not executable for the board |
 | Board fb facts | `cat /sys/class/graphics/fb0/bits_per_pixel; cat /sys/class/graphics/fb0/virtual_size` matches expected screen facts | The board display path changed; revisit helper format support and layout scaling |
 | Startup logs | `run_qt_kms_overlay_display.sh restart` logs `early static splash drawn on /dev/fb0` before Qt/overlay status | The script did not call the early helper or `/dev/fb0` was not ready |
 | Runtime status | `run_qt_kms_overlay_display.sh status` shows both `qt_camera_display` and `uvc_kms_overlay` PIDs | Early splash or startup script changes broke the formal display stack |
 
 ### 5. Good / Base / Bad Cases
+
+```sh
+# Good: edit the visual source first, then regenerate the exact board asset.
+python3 generate_boot_splash_asset.py
+stat -c %s boot_splash.rgb565
+```
+
+```text
+Good: `stat` prints `1228800`, and `boot_splash.png` is the expected 1024x600 artboard without desktop preview borders.
+```
 
 ```sh
 # Good: build the early framebuffer helper with its own compiler variable.
@@ -310,6 +333,21 @@ SPLASH_CC=/home/cfr/linux/buildroot/buildroot-2020.02.6/output-uvc/host/bin/arm-
 if [ -x "$FB_BOOT_SPLASH_BIN" ] && [ -e "$FB_DEV" ]; then
     "$FB_BOOT_SPLASH_BIN" -f "$FB_DEV" -q >/dev/null 2>&1 || true
 fi
+```
+
+```c
+/* Good: runtime code blits the generated resource first and keeps C drawing as fallback only. */
+used_asset = (draw_splash_asset(&fb, cfg.asset_path) == 0);
+if (!used_asset) {
+    draw_splash_fallback(&fb);
+}
+```
+
+```c
+/* Bad: manually redrawing the full HTML visual in C and expecting pixel-level fidelity. */
+draw_complex_chinese_title_with_many_rectangles();
+draw_css_like_glows_with_integer_loops();
+draw_transparent_cards_by_hand();
 ```
 
 ```sh
@@ -326,12 +364,17 @@ CC="${CC:-$BR_OUTPUT/host/bin/arm-none-linux-gnueabihf-gcc}"
 Base: If the LCD driver registers `/dev/fb0` late, `S05display-quiet` may skip the helper and `S90uvc-camera` should draw it after `wait_for_node "$FB_DEV"` succeeds.
 ```
 
+```text
+Base: If `boot_splash.rgb565` is missing on a test board, `fb_boot_splash` may use `draw_splash_fallback`, but that fallback is not the design source and must not be used to judge final visual fidelity.
+```
+
 ### 6. Tests Required
 
+- After any visual change, regenerate assets with `python3 generate_boot_splash_asset.py`; assert `boot_splash.rgb565` is exactly `1228800` bytes and visually inspect `boot_splash.png`.
 - Run `./test_qt_kms_overlay_assets.sh` after changing early splash code, boot display scripts, deploy scripts, or QML `splashOverlay`.
 - Run `sh -n` on `S05display-quiet`, `S90uvc-camera`, `build_fb_boot_splash.sh`, `run_qt_kms_overlay_display.sh`, and `deploy_qt_camera_display.sh`.
 - Cross-build `fb_boot_splash` and confirm `file build-mp157/fb_boot_splash` reports an ARM 32-bit EABI executable.
-- Deploy the helper and scripts to the board or NFS rootfs, then assert `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q && echo fb_splash_rc=0`.
+- Deploy the helper, `boot_splash.rgb565`, and scripts to the board or NFS rootfs, then assert `/root/qt_camera_display/fb_boot_splash -f /dev/fb0 -q && echo fb_splash_rc=0`; if possible, run once without `-q` and confirm the log says the `asset` path was used rather than fallback.
 - Restart the formal display stack and assert logs include `early static splash drawn on /dev/fb0` and status shows both Qt and overlay PIDs.
 
 ### 7. Wrong vs Correct
@@ -342,10 +385,26 @@ Base: If the LCD driver registers `/dev/fb0` late, `S05display-quiet` may skip t
 The black gap happens before Qt starts, but the fix only changes QML splash timing.
 ```
 
+```text
+The HTML preview looks right, so manually reimplementing the same layout in C should be close enough for the board.
+```
+
+```text
+The generator screenshots a desktop preview wrapper that includes a border, box-shadow, or body background, then the board shows an unintended black edge.
+```
+
 #### Correct
 
 ```text
 Draw a static first-frame style image directly to `/dev/fb0` before Qt/GPU/camera startup, then let QML `splashOverlay` continue the animated boot sequence.
+```
+
+```text
+Treat HTML/CSS as the source of truth, regenerate `boot_splash.png` and `boot_splash.rgb565`, deploy the raw RGB565 asset, and let `fb_boot_splash` blit that asset before Qt starts.
+```
+
+```text
+Capture only the 1024x600 splash artboard and remove preview-only frames, shadows, margins, or backgrounds before generating `boot_splash.rgb565`.
 ```
 
 ---
@@ -715,12 +774,14 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 | Operation | Signature |
 |---|---|
 | Board self-test | `/root/qt_camera_display/qt_camera_display --detect-self-test` |
-| Detection result line | `RESULT status=<GOOD|BAD|REVIEW> class=<model_class> ... segment_time_ms=<ms> total_time_ms=<ms> upload_status=<OK|FAIL>` |
+| Detection result line | `RESULT status=<GOOD|BAD> class=<model_class> ... segment_status=<OK|NG> defect_pixels=<n> fused_status=<GOOD|BAD|REVIEW> fused_result=<good|bad|review> fused_reason=<text> segment_time_ms=<ms> total_time_ms=<ms> upload_status=<OK|FAIL>` |
 | First-model UI signal | `void detectClassificationReady(const QString &resultText)` |
 | All-models UI signal | `void detectModelsReady(const QString &resultText)` |
 | QML first-model handler | `onDetectClassificationReady: updateDetectClassificationFields(resultText)` |
-| QML all-models handler | `onDetectModelsReady: updateDetectClassificationFields(resultText); updateDetectModelTimeFields(resultText)` |
-| Classifier-to-cloud mapping | `cloudResultFromClassificationResult(const QString &classificationResult) -> good|bad|review` |
+| QML all-models handler | `onDetectModelsReady: updateDetectClassificationFields(resultText); updateDetectFusedFields(resultText); updateDetectModelTimeFields(resultText)` |
+| Model-fusion function | `fusedResultFromModelResults(const QString &classificationResult, const QString &segmentationResult) -> FusedDetectResult` |
+| Fused-to-cloud mapping | `cloudResultFromFusedResult(const FusedDetectResult &fusedResult) -> good|bad|review` |
+| Fused-to-history mapping | `historyTextFromFusedResult(const FusedDetectResult &fusedResult) -> 良品|待复核` |
 | Upload environment field | `CLOUD_RESULT=good|bad|review` |
 | Upload result validator | `validate_cloud_result "$CLOUD_RESULT"` |
 | Cloud create-record field | JSON payload field `"result":"good|bad|review"` |
@@ -732,13 +793,14 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 
 | Area | Contract |
 |---|---|
-| Result source of truth | `records.result` must come from the classifier result for the same detection transaction. Map model `BAD` to cloud `bad`, model `GOOD` to cloud `good`, and uncertain/no-model local diagnostics to `review`. Never default a model-backed detection to `good`. |
+| Result source of truth | `records.result` must come from the fused classifier + UNet result for the same detection transaction. Map classifier `BAD` or UNet `NG/defect_pixels>0` to cloud `bad`; map `good` only when the classifier is `GOOD` and UNet reports no defect; map incomplete or unknown model evidence to `review`. Never default a model-backed detection to `good`. |
 | Upload default | `defect-cos-upload` may use `review` as the conservative default for manual diagnostics without a model result. It must not use `good` as a fallback default, because that turns missing data into a false pass. |
 | Result validation | The upload helper must reject any `CLOUD_RESULT` outside `good`, `bad`, and `review` before create-record. Invalid values should fail locally and not create a misleading cloud record. |
 | Placeholder cleanup | When editing the detection/upload/history/QML chain, search the touched files for fixed payload values such as hard-coded `good`, `待接入`, demo IDs, fixed part names, fixed result text, and old confidence scaling. Replace them with model-derived or explicitly conservative values. |
 | Part display | The home page part name must be derived from the model class or backend part field for the current record. For class names such as `washer_bad` or `gasket_good`, strip only the quality suffix and display the remaining part token. Do not keep a fixed part label. |
 | Confidence display | The home page confidence must be rendered as a 0-100 percentage. Do not divide confidence by `1000` or show a permille-style value unless the upstream model contract explicitly changes. |
-| Progressive result display | The home page must show each model stage as soon as that stage has a complete result. After the first classifier returns `RESULT`, QML must immediately refresh part name, class name, GOOD/BAD state, confidence, and good/bad totals. It must not wait for segmentation, COS upload, or history append. |
+| Progressive result display | The home page must show each model stage as soon as that stage has a complete result. After the first classifier returns `RESULT`, QML must immediately refresh part name, class name, classifier tendency, confidence, and good/bad totals, but the main pass/fail banner must stay in a waiting/review style until fusion finishes. It must not wait for segmentation, COS upload, or history append to show classifier details. |
+| Final fused display | After the last local model returns, QML must apply `fused_status/fused_reason` over the first classifier status. If the classifier says `GOOD` but UNet reports `NG` or a positive `defect_pixels`, the home page must show a bad/review-style final state, not a good state. |
 | Progressive time display | `total_time_ms` must appear when the last model in the local model chain finishes. For the current classifier + UNet chain, emit `detectModelsReady` after UNet returns and before COS upload starts. Do not wait for `upload_status=OK/FAIL` to show the model elapsed time. |
 | Final completion boundary | `detectCurrentFrameFinished` means the whole detect transaction finished, including upload attempt and history append eligibility. It should restore busy state and show final upload status, but it must not be the first moment when model result fields become visible. |
 | Total detection time | `total_time_ms` is measured from classifier start through segmentation completion. It must include both model runtimes and exclude COS upload time unless the field name is changed to an upload-inclusive metric. |
@@ -749,22 +811,23 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 
 | Check | Good Result | Failure Meaning |
 |---|---|---|
-| Static model-to-cloud markers | `./test_qt_kms_overlay_assets.sh` finds `cloudResultFromClassificationResult`, `CLOUD_RESULT`, `validate_cloud_result`, and `total_time_ms` | Result mapping, validation, or total-time propagation can drift silently |
+| Static model-to-cloud markers | `./test_qt_kms_overlay_assets.sh` finds `fusedResultFromModelResults`, `cloudResultFromFusedResult`, `historyTextFromFusedResult`, `CLOUD_RESULT`, `validate_cloud_result`, `fused_status`, and `total_time_ms` | Result mapping, validation, or total-time propagation can drift silently |
 | Fixed result search | `rg -n 'CLOUD_RESULT=.*good|"result":"good"|result=good|待接入|固定|/1000' main.cpp qml/Main.qml defect-cos-upload README.md` has no unreviewed detection payload defaults | A touched path may still send placeholder content or old confidence scaling |
 | Upload helper validation | `CLOUD_RESULT=bad sh defect-cos-upload ...` creates a `bad` payload; `CLOUD_RESULT=badness sh defect-cos-upload ...` fails before create-record | Invalid or missing result values can become cloud records |
-| Board self-test BAD case | `--detect-self-test` can produce `status=BAD ... total_time_ms=<nonzero> upload_status=OK` | The classifier result, segmentation result, timing, or upload path is not wired together |
+| Board self-test BAD case | `--detect-self-test` can produce `fused_result=bad ... total_time_ms=<nonzero> upload_status=OK` when either the classifier is `BAD` or UNet reports defects | The classifier result, segmentation result, timing, fusion, or upload path is not wired together |
 | Cloud detail BAD round-trip | For the returned `record_id`, detail JSON contains `"result":"bad"` and `"effective_result":"bad"` | The board sent a fixed/default good payload or the backend interpreted it incorrectly |
 | Home part display | A class such as `washer_bad` displays part `washer` on the home page | The UI still shows a fixed part name or exposes quality suffix as part identity |
 | Home confidence display | A confidence value renders on a 0-100 percent scale and no QML `/1000` scaling remains | The UI still uses the old permille contract |
-| First-model display timing | Board binary contains `detectClassificationReady`; on the LCD, part/class/GOOD-BAD/confidence update immediately after classifier completion while UNet or upload can still be running | The UI is tied to final upload completion or all-model completion instead of the first model result |
+| First-model display timing | Board binary contains `detectClassificationReady`; on the LCD, part/class/classifier tendency/confidence update immediately after classifier completion while the main banner still says waiting for fusion | The UI is tied to final upload completion or all-model completion, or it prematurely shows classifier GOOD as final good |
 | All-model time display timing | Board binary contains `detectModelsReady`; on the LCD, `total_time_ms` updates after UNet completion before COS upload returns | The elapsed-time UI is tied to `detectCurrentFrameFinished` and waits for the network |
 | Total time display | Home page prefers `total_time_ms` over the first model's elapsed time | The operator sees only classifier latency instead of the complete detection latency |
 
 ### 5. Good / Base / Bad Cases
 
 ```cpp
-/* Good: the cloud payload is derived from the model status for this detection transaction. */
-const QString cloudResult = cloudResultFromClassificationResult(classificationResult);
+/* Good: the cloud payload is derived from both model outputs for this detection transaction. */
+const FusedDetectResult fusedResult = fusedResultFromModelResults(classificationResult, segmentationResult);
+const QString cloudResult = cloudResultFromFusedResult(fusedResult);
 env.insert(QStringLiteral("CLOUD_RESULT"), cloudResult);
 ```
 
@@ -790,12 +853,13 @@ onDetectClassificationReady: {
 // Good: total model time updates after the local model chain finishes, before COS upload returns.
 onDetectModelsReady: {
     updateDetectClassificationFields(resultText)
+    updateDetectFusedFields(resultText)
     updateDetectModelTimeFields(resultText)
 }
 ```
 
 ```text
-Bad: the classifier reports BAD, but the upload helper creates `"result":"good"` because the script has a fixed default.
+Bad: the classifier reports GOOD, UNet reports `segment_status=NG`, but the upload helper creates `"result":"good"` because the Qt controller only used the first model.
 ```
 
 ```text
@@ -811,11 +875,11 @@ Bad: the classifier result is already known, but the home page still shows "当�
 - Run `./test_qt_kms_overlay_assets.sh` after changing detection, result display, history, upload, or README contracts.
 - Run `sh -n defect-cos-upload` after changing the upload helper, then test at least one accepted `CLOUD_RESULT` and one rejected value.
 - Search touched files for old fixed payload/display markers: `CLOUD_RESULT`, hard-coded `good`, fixed part names, fixed IDs, placeholder text such as `待接入`, and confidence `/1000`.
-- Cross-build `qt_camera_display` in `cfr-vm` and confirm the ARM binary contains the expected detection markers such as `cloudResultFromClassificationResult`, `CLOUD_RESULT`, `total_time_ms`, `detectClassificationReady`, and `detectModelsReady`.
+- Cross-build `qt_camera_display` in `cfr-vm` and confirm the ARM binary contains the expected detection markers such as `fusedResultFromModelResults`, `cloudResultFromFusedResult`, `CLOUD_RESULT`, `fused_status`, `total_time_ms`, `detectClassificationReady`, and `detectModelsReady`.
 - On the board, run `--detect-self-test` and assert the result line includes `classification_result`, `segmentation_result`, nonzero `total_time_ms`, and `upload_status=OK` when network credentials are available.
-- For at least one BAD detection acceptance test, query the returned cloud detail and assert both `result` and `effective_result` are `bad`. Do not accept the feature based only on upload stdout.
+- For at least one BAD detection acceptance test and one classifier-GOOD/UNet-NG conflict case, query the returned cloud detail and assert both `result` and `effective_result` are `bad`. Do not accept the feature based only on upload stdout.
 - On the LCD, verify the home page shows the model-derived part name, 0-100 percent confidence, and total two-model detection time without overlapping controls.
-- On the LCD, verify timing explicitly: part/class/GOOD-BAD/confidence appear after the first classifier finishes; `total_time_ms` appears after the final local model finishes; upload completion only changes final status/history.
+- On the LCD, verify timing explicitly: part/class/classifier tendency/confidence appear after the first classifier finishes while the main banner waits for fusion; `total_time_ms` and final good/bad/review appear after the final local model finishes; upload completion only changes final status/history.
 
 ### 7. Wrong vs Correct
 
@@ -828,7 +892,7 @@ The upload succeeded, so sending the helper's default `"result":"good"` is accep
 #### Correct
 
 ```text
-The classifier result is mapped to `CLOUD_RESULT=bad`, the helper validates that value, create-record sends `"result":"bad"`, and cloud detail returns `result/effective_result=bad` for the same `record_id`.
+The classifier and UNet results are fused first. If either model detects a defect, Qt passes `CLOUD_RESULT=bad`, the helper validates that value, create-record sends `"result":"bad"`, and cloud detail returns `result/effective_result=bad` for the same `record_id`.
 ```
 
 #### Wrong
@@ -1073,6 +1137,8 @@ Use this convention when the STM32MP157 Qt camera UI records, displays, or revie
 ### 1. Scope / Trigger
 
 - Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp`, `qml/Main.qml`, `uvc_kms_overlay.c`, or any save/upload path that should appear in the Qt `历史记录` page.
+- Trigger: adding or fixing failed-upload retry, especially code that reuses saved local images and updates cloud `record_id`/`record_no`.
+- Trigger: changing what "show the latest history record" means in QML navigation, list selection, detail entry, or statistics-to-history handoff.
 - Data source: upload history is local board evidence under `/mnt/sdcard/images/upload_history.json`, not a live cloud query.
 - Display boundary: in `kms-overlay` mode, the live camera plane is outside the QML scene and can visually cover history images unless it is explicitly hidden.
 
@@ -1085,9 +1151,15 @@ Use this convention when the STM32MP157 Qt camera UI records, displays, or revie
 | QML context property | `view.rootContext()->setContextProperty(QStringLiteral("uploadHistory"), &uploadHistory)` |
 | Append hook | `appendUploadHistoryRecord(pair, uploadResult)` after `uploadSavedImagesToCos(pair)` |
 | Delete hook | `Q_INVOKABLE QString removeRecord(int row)` from QML `deleteHistoryRecord(index)` |
+| Retry payload hook | `retryPayloadAt(row, &sourcePath, &annotatedPaths, &classificationResult, &segmentationResult, &errorText)` |
+| Retry upload entry | `Q_INVOKABLE void retryUploadRecord(int row)` |
+| Retry model update | `bool updateRecordUploadResult(int row, const QString &uploadStatus, const QString &recordId, const QString &recordNo, QString *errorText)` |
+| Retry completion signal | `retryUploadFinished(row, resultText)` |
 | Required JSON fields | `upload_time`, `result_text`, `workflow_text`, `jpg_path`, `png_path`, `upload_status`, `record_id`, `record_no`, `jpg_size_bytes`, `png_size_bytes` |
 | QML list state | `historyDetailVisible == false`, `historyListPanel`, `historyListView` with horizontal `ListView` bound to `uploadHistory` |
 | QML detail state | `historyDetailVisible == true`, `historyDetailPanel`, `selectedHistoryRecord`, `imageCarousel`, `backToHistoryList()` |
+| QML latest-list focus | `switchPage("history")` calls `focusLatestHistoryListRecord()`; that helper sets `selectedHistoryIndex = uploadHistory.count - 1`, keeps `historyDetailVisible = false`, and calls `positionHistoryListAtSelected()` |
+| Retry success ordering | `updateRecordUploadResult()` uses `beginMoveRows(...)`, `m_entries.move(row, lastRow)`, then updates `m_entries[lastRow].uploadTime = refreshedUploadTime` before saving JSON |
 | Overlay hide/show | `VISIBLE 0` when entering history, `VISIBLE 1` when returning home |
 | Cloud status summary | `compactUploadStatus(uploadResult)` in C++ and `cloudStatusSummary(rawStatus)` in QML |
 
@@ -1098,16 +1170,22 @@ Use this convention when the STM32MP157 Qt camera UI records, displays, or revie
 | Append timing | Append a history record after local JPG/PNG save succeeds and the upload helper returns success or failure. Upload failure must still create a local history entry so the saved evidence can be reviewed. |
 | Persistence | Write history JSON through a temporary file, flush, `fsync`, close, then rename. The history file lives beside the images so SD-card backup/removal keeps evidence and metadata together. |
 | Self-test parity | `--storage-self-test` must use the same `CameraStorageController` and `UploadHistoryModel` path as the screen button, so SSH save tests appear in the same history page. |
-| QML navigation | The left `历史记录` item switches `activePage` to `history` and resets `historyDetailVisible=false`; cards are ordered by append order and can scroll horizontally beyond screen width. |
+| QML navigation | The left `历史记录` item switches `activePage` to `history`, keeps the list layer visible with `historyDetailVisible=false`, and focuses the newest card at `uploadHistory.count - 1`. It must not automatically open the newest detail page; detail opens only after `查看` or an explicit detail handoff. |
+| Latest entry meaning | "显示最新一条记录" means "the latest card is selected and scrolled into view on the list layer." It does not mean replacing the list with the newest detail panel, because operators still need to see and choose from the history cards. |
+| Retry success local time | A retry success creates a new cloud record with the current time, but the board JSON is a separate local store. `updateRecordUploadResult()` must update the same local record's `upload_time` to the retry completion time, update `upload_status`/`record_id`/`record_no`, and move that entry to the end of `m_entries` so it becomes the newest board record. |
+| Retry failure stability | A retry failure must not refresh `upload_time`, must not move the row, and must preserve the old cloud identity unless the helper returned a valid new identity. This keeps old failed evidence available for another retry and prevents false "latest" ordering. |
+| Retry persistence rollback | If JSON save fails after a successful retry update or row move, restore the old model entries and notify QML through reset/data change. Do not leave QML showing a moved row while `/mnt/sdcard/images/upload_history.json` still has the old order. |
+| Retry QML selection | After `retryUploadFinished` reports `重新发送成功`, QML must select `uploadHistory.count - 1` and refresh `selectedHistoryRecord`. Continuing to read the old row can show the pre-retry time even though C++ moved the record. |
 | Delete behavior | A card-level `删除` command deletes both the JSON history entry and the local JPG/PNG files referenced by that entry. The model must write the new JSON successfully before deleting image files; if JSON persistence fails, restore the model row and return a `删除失败：...` message. |
 | Delete safety boundary | Only delete regular files under the history file directory, currently `/mnt/sdcard/images`. Skip and log paths outside that directory instead of trying to be clever, because a damaged JSON path must not delete arbitrary board files. |
 | Swipe feel | Horizontal history lists and image carousels should set bounded velocity/deceleration and cache neighboring pages so touch swipes feel continuous on STM32MP157. Avoid settings that let a light flick skip several records. |
 | Selection without auto-scroll | Selecting a history card must only update visual selection state, such as comparing delegate `index` with `selectedHistoryIndex`. Do not bind the horizontal history `ListView.currentIndex` to `selectedHistoryIndex` or use `ListView.ApplyRange`, because Qt will automatically scroll the list to the selected item and make the UI look like it jumped from the beginning. |
 | Two-level layout | The first layer must show only upload record cards and commands such as `查看`; the image carousel and detection details must be hidden until the user taps `查看`. Do not place the list and full detail view in the same visible layer on a 1024x600 screen. |
-| Detail layout | The detail view shows the selected upload's images on the left with horizontal swiping, and detection result, cloud record info, file sizes, upload status, and local path on the right. It must provide `返回列表` without returning all the way to `首页`. |
+| Detail layout | The detail view shows the selected upload's images on the left with horizontal swiping, and detection result, cloud record info, file sizes, upload status, and image archive summary on the right. It must provide `返回列表` without returning all the way to `首页`. Do not show local filesystem paths as a standalone operator-facing section. |
+| Detection-info text budget | The `检测信息` panel must use bounded text such as `maximumLineCount`, `elide`, and `clip: true`. Long model confidence text, defect hints, or archive summaries must not overflow the panel or overlap the next page section. |
 | Overlay ownership | QML must not draw required history content under the KMS overlay video plane. Call `storageController.setOverlayVisible(false)` on history entry and `true` when returning home. |
 | Cloud identity | `record_id` and `record_no` are parsed from the upload helper output only after the helper created an isolated cloud record. Do not invent IDs in QML. |
-| Display text budget | List cards must not show raw file paths or raw upload script output. Long paths belong only in the detail page with `Text.ElideMiddle`; cloud status must be a short summary such as `上传成功 ID 21 MP157-...`. |
+| Display text budget | List cards and detail panels must not show raw file paths or raw upload script output. Local image paths may be used internally to load images, but the operator-facing text should describe the archive count/purpose. Cloud status must be a short summary such as `上传成功 ID 21 MP157-...`. |
 | Legacy status cleanup | Old `upload_status` values may contain mojibake or verbose script output. QML must derive display text from `record_id`/`record_no` tokens when possible instead of rendering the raw string. |
 
 ### 4. Validation & Error Matrix
@@ -1118,10 +1196,14 @@ Use this convention when the STM32MP157 Qt camera UI records, displays, or revie
 | Qt build | `./build_qt_camera_display.sh` recompiles `main.cpp`, regenerates `qrc_qml.cpp`, and outputs an ARM ELF | C++ model, context property, or QML resource packaging is broken |
 | Overlay build | `./build_uvc_kms_overlay.sh` outputs an ARM ELF with `VISIBLE` support | History page can still be covered by the live video plane |
 | History JSON | `test -s /mnt/sdcard/images/upload_history.json` and `tail -n 40` show the newest paths and status | Save/upload completed but the UI has no durable history source |
-| History UI list layer | Touch `历史记录`; only upload cards are visible, with no large image carousel or right-side detection panel | The list and detail layers are still collapsed together and will crowd/truncate text |
+| History UI list layer | Touch `历史记录`; only upload cards are visible, the newest card is selected and visible, with no large image carousel or right-side detection panel | The list and detail layers are still collapsed together, or "latest record" was incorrectly implemented as auto-opening detail |
 | History UI detail layer | Tap `查看`; detail view appears, images swipe on the left, detection/cloud/file data appears on the right, and `返回列表` returns to cards | Navigation, horizontal card overflow, image carousel, or detail-state transition is broken |
 | Selection stability | Swipe to the middle of the history list, tap a visible card body, then continue swiping; the tapped card becomes highlighted but the list does not animate back from the first card or snap to the selected card | `currentIndex` or highlight-range binding is still coupled to selection state |
 | Cloud status display | New history JSON has a short `upload_status`; old verbose/garbled entries display as clean status using extracted IDs | UI renders raw helper output, causing mojibake and clipped cards |
+| Retry success JSON | Start with a row whose `upload_status` contains `上传失败`, tap `重新发送`, then `tail -n 120 /mnt/sdcard/images/upload_history.json`; on success the same evidence entry is the last JSON item and its `upload_time` is the retry completion time | Cloud retry succeeded but board history still shows the old failure time or old order |
+| Retry failure JSON | Force retry failure; the row keeps its old `upload_time`, old order, and failure status while the button remains available | Retry failure was treated as a new/latest successful board record |
+| Retry detail selection | After successful retry, the detail page shows the last row's refreshed time/status instead of the old row | QML did not reselect `uploadHistory.count - 1` after C++ moved the record |
+| Detection-info bounds | Use a long `classification_result` or defect hint; the `检测信息` panel clips/elides within its rectangle and does not cover lower content | Missing `maximumLineCount`, `elide`, or `clip` lets text overflow on 1024x600 |
 | Overlay visibility | Entering history hides live video; returning home restores it | QML content is fighting the external KMS plane instead of controlling its visibility |
 | Delete record and files | Capture one entry's `jpg_path`/`png_path`, tap `删除`, then verify both files no longer exist and `upload_history.json` no longer contains the deleted path | QML deleted only the visible row, C++ failed to persist JSON, or entity files were left behind on the SD card |
 
@@ -1138,6 +1220,16 @@ appendUploadHistoryRecord(pair, uploadResult);
 activePage = "history"
 historyDetailVisible = false
 storageController.setOverlayVisible(false)
+```
+
+```qml
+// Good: entering history focuses the latest card while staying on the list layer.
+function focusLatestHistoryListRecord() {
+    selectedHistoryIndex = uploadHistory.count - 1
+    selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
+    historyDetailVisible = false
+    positionHistoryListAtSelected()
+}
 ```
 
 ```qml
@@ -1158,6 +1250,25 @@ color: root.selectedHistoryIndex === index ? "#1f3a2f" : "#20262a"
 // Bad: this couples selection to ListView positioning and causes automatic scrolling.
 currentIndex: root.selectedHistoryIndex
 highlightRangeMode: ListView.ApplyRange
+```
+
+```cpp
+/* Good: retry success refreshes local time after moving the record to the newest position. */
+if (uploadSucceeded) {
+    const int lastRow = m_entries.size() - 1;
+    if (row != lastRow) {
+        beginMoveRows(QModelIndex(), row, row, QModelIndex(), m_entries.size());
+        m_entries.move(row, lastRow);
+        endMoveRows();
+    }
+    m_entries[lastRow].uploadTime = refreshedUploadTime;
+}
+```
+
+```cpp
+/* Bad: cloud upload used current time, but local JSON keeps the old failed upload_time and old row position. */
+m_entries[row].uploadStatus = QStringLiteral("上传成功 ...");
+saveToDisk();
 ```
 
 ```qml
@@ -1198,8 +1309,11 @@ Base: If the cloud is offline, the latest history entry may show `上传失败�
 - Cross-build `uvc_kms_overlay` after adding or changing `VISIBLE` command handling.
 - Before deploying, prove the VM source and ARM binary contain the intended history markers, for example `historyDetailVisible`, `historyListPanel`, `backToHistoryList`, `deleteHistoryRecord`, `removeRecord`, and `compactUploadStatus`.
 - On the board, save at least one image pair, then assert `/mnt/sdcard/images/upload_history.json` contains the newest `jpg_path`, `png_path`, and `upload_status`.
-- On the LCD, open `历史记录`; verify the first layer shows only upload cards, then tap `查看`, swipe between JPG and PNG, tap `返回列表`, and finally return to `首页`.
+- On the LCD, open `历史记录`; verify the first layer shows only upload cards and the latest card is selected/visible. It must not auto-open the latest detail page. Then tap `查看`, swipe between JPG and PNG, tap `返回列表`, and finally return to `首页`.
 - On the LCD, swipe the history list away from the first card, tap a visible card body to select it, and verify the list does not automatically scroll back or snap to the selected card.
+- Prepare or keep one failed upload entry, tap `重新发送`, then verify success and failure cases separately in `/mnt/sdcard/images/upload_history.json`: success updates `upload_time` and moves the same entry to the last array position; failure preserves old time and old position.
+- After retry success, verify QML detail selection reads `uploadHistory.count - 1` so the visible time/status matches the last JSON item.
+- Verify the detail `检测信息` panel with long model text; text must elide/clip inside the panel and the screen must not show a standalone `本地图片位置` section.
 - On the LCD, tap a history card's `删除`, then assert the removed `jpg_path` and `png_path` files no longer exist and the JSON no longer contains that path.
 - In KMS overlay mode, verify the live video plane is hidden on the history page and restored on the home page.
 
@@ -1229,6 +1343,145 @@ This crowds the screen, truncates Chinese text, and makes the user think the det
 
 ```text
 `历史记录` opens a list-only layer. `查看` switches to a detail-only layer with `返回列表`, and cloud status is summarized instead of rendering raw script output.
+```
+
+#### Wrong
+
+```text
+The cloud retry uses the current time, so the local board history can keep the old failed upload_time.
+```
+
+#### Correct
+
+```text
+Cloud time and board history time are separate stores. Retry success updates the local JSON `upload_time`, moves the same entry to the last array position, and refreshes QML selection to that last row.
+```
+
+#### Wrong
+
+```text
+"Enter history and show the latest record" means immediately opening the newest detail panel.
+```
+
+#### Correct
+
+```text
+"Enter history and show the latest record" means the history list remains visible, the latest card is selected and scrolled into view, and detail opens only after `查看`.
+```
+
+---
+
+## Qt Small-Screen Text Budget Contract
+
+Use this convention when a Qt Quick screen on the 1024x600 STM32MP157 LCD displays model output, cloud status, file metadata, diagnostic text, or any operator-facing string whose length can change at runtime.
+
+### 1. Scope / Trigger
+
+- Trigger: adding or changing `Text`, `Label`, `Repeater` rows, status cards, history detail panels, result panels, toasts, or navigation labels in `20_uvc_camera/qt_camera_display/qml/Main.qml`.
+- Trigger: displaying raw model classes such as `splitwasher_good`, fused result reasons, upload helper output, filesystem paths, diagnostics, or any text derived from JSON/script/model output.
+- Display boundary: the KMS overlay layout leaves narrow QML side panels such as the 182 px home result panel, so a string that looks acceptable in source code can be unreadable or truncated on the board.
+- Goal: every required operator-facing string must either fit completely, wrap within a bounded area, or be intentionally summarized with a short display helper while preserving full details in history/logs.
+
+### 2. Signatures
+
+| Surface | Signature / Marker |
+|---|---|
+| Home short class helper | `function compactHomeClassText(classText)` |
+| Home short result helper | `function compactHomeModelText(stateText)` |
+| History text cleanup helper | `function compactHistoryInfoLine(lineText)` |
+| Bounded QML text | `Text { width: ...; wrapMode: Text.Wrap; maximumLineCount: ...; elide: Text.ElideRight }` |
+| Clipped panel | `Rectangle { clip: true; ... }` |
+| Dense detail text | `lineHeightMode: Text.ProportionalHeight` plus `lineHeight: <value>` |
+| Static contract | `test_qt_kms_overlay_assets.sh` must grep for the helper names and bounded-text markers when the screen depends on them |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Raw vs display text | Keep raw model/script values in C++ records or JSON fields, but never render long raw strings directly in narrow panels. Use a display helper for the visible value. |
+| Home result panel | In `videoBackend === "kms-overlay"`, the right result panel must show short values for `类别` and `模型`, such as `弹垫-良`, `综合良品`, or `分类坏，等UNet`. Full model names and fused reasons belong in history detail or logs. |
+| History detail panel | The `检测信息` block must remove extra whitespace, avoid blank lines, set `clip: true`, and bound every text row with `maximumLineCount` and `elide`. If all required rows cannot fit, shorten the text or increase the panel height intentionally. |
+| Dynamic text budget | Before adding a field, estimate the longest realistic Chinese and ASCII value, then assign either fixed width plus elide, wrapping plus line count, or a short helper. Do not rely on the current sample value being short. |
+| UI meaning preservation | Short text may summarize, but it must not change the decision meaning. For example, `splitwasher_good` can become `弹垫-良`, while full class and confidence remain in the underlying record. |
+| No accidental empty lines | Do not assemble detail text with untrimmed raw output that may contain `\n`, tabs, or repeated spaces. Normalize with a helper such as `compactHistoryInfoLine()`. |
+| Board-first verification | QML layout correctness is not proven by compilation. Verify the actual 1024x600 board screen or a screenshot/photo after deploying, especially when the user reports clipped text. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning |
+|---|---|---|
+| Static helper markers | `./test_qt_kms_overlay_assets.sh` finds `compactHomeClassText`, `compactHomeModelText`, and `compactHistoryInfoLine` when these display paths exist | Long model/status strings may be rendered directly again |
+| Bounded history text | The test finds `clip: true`, `maximumLineCount`, `elide`, `spacing: 1`, and `lineHeight` inside the history detection-info panel | A long defect hint or archive line can overflow or hide the last row |
+| Home result display | The home result `Repeater` uses `compactHomeClassText(root.detectClassName)` and `compactHomeModelText(root.detectState)` | The 182 px KMS result panel can clip `splitwasher_good` or fused reason text |
+| Long-value smoke case | Test with `splitwasher_good`, `综合判定坏品：分类GOOD；UNet发现缺陷`, and a long defect hint; required labels remain readable | The display was only tested with short placeholders |
+| Board screenshot/photo | On the 1024x600 LCD, no required row is cut off, hidden behind another row, or clipped without an intentional ellipsis | Desktop/source review missed font metrics, scaling, or panel-size limits |
+| Raw evidence retention | JSON/history still stores the full model result and upload status even when QML shows a short summary | The UI fix lost diagnostic information needed for review or retry |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: the narrow home panel shows a short value, while the raw class remains in detectClassName.
+{"name": "类别", "value": root.compactHomeClassText(root.detectClassName)}
+{"name": "模型", "value": root.compactHomeModelText(root.detectState)}
+```
+
+```qml
+// Base: a detail line wraps in a bounded rectangle and is clipped instead of overlapping the next row.
+Rectangle {
+    clip: true
+
+    Text {
+        width: parent.width
+        text: root.compactHistoryInfoLine("缺陷提示：" + root.historyDefectHintText(record))
+        wrapMode: Text.Wrap
+        maximumLineCount: 2
+        elide: Text.ElideRight
+        lineHeightMode: Text.ProportionalHeight
+        lineHeight: 0.86
+    }
+}
+```
+
+```qml
+// Bad: raw model output is rendered directly in a narrow status row.
+Text {
+    width: 120
+    text: root.detectState
+}
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing home result text, history detail text, model-result display helpers, or panel geometry.
+- Run `git diff --check` so whitespace-only layout edits do not introduce formatting defects.
+- Cross-build `qt_camera_display` after QML changes and confirm the build log runs `rcc -name qml`; otherwise the board can run stale embedded QML.
+- Deploy to the board and compare the actual LCD screen against long-value cases: home `类别/模型`, history `检测信息`, cloud status, and any button labels touched by the change.
+- When a user supplies a photo showing clipped text, verify the same screen after the fix with a fresh board run, not only by code inspection.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The string is correct, so it is fine if the 1024x600 screen cuts the end off.
+```
+
+#### Correct
+
+```text
+The visible string must fit the target panel. Use a short helper for the panel and preserve the full raw value in history JSON or logs.
+```
+
+#### Wrong
+
+```text
+The history detail panel has clip: true, so clipped final content is acceptable.
+```
+
+#### Correct
+
+```text
+clip: true prevents overlap; it does not prove required content is visible. Required rows need line budgets, compact wording, and board-photo verification.
 ```
 
 ---
@@ -1601,3 +1854,4 @@ The segmentation ONNX proves export/inference/overlay flow only. For the MP157 p
 - Forgetting that this workspace's “检测缺陷模型” points to `D:\model_picture`, or treating the Severstal segmentation flow-validation model as the final real-part MP157 inspection model.
 - Parsing a create-record JSON response with a generic `"id"` matcher; use a top-level record parser and a regression fixture with nested `part.id/device.id` so a new save cannot be registered under an old cloud record.
 - Treating a correct COS upload timestamp as proof that the Qt screen clock is correct. The Qt top-bar clock comes from QML `new Date()` inside the `qt_camera_display` process, so always verify `/proc/$(pidof qt_camera_display)/environ` contains `TZ=CST-8`; fix `main.cpp` and the Qt startup scripts, not `defect-cos-upload`, backend time formatting, or QML `+8` hour arithmetic.
+- Treating correct text content as sufficient on the 1024x600 Qt screen. Dynamic model names, fused reasons, cloud status, and diagnostic lines must have a display budget: short helper, fixed width with elide, bounded wrap, compact line height, and board-screen verification.

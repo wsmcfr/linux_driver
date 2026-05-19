@@ -41,6 +41,9 @@ require_file "build_uvc_kms_overlay.sh"
 require_file "run_qt_kms_overlay_display.sh"
 require_file "fb_boot_splash.c"
 require_file "build_fb_boot_splash.sh"
+require_file "generate_boot_splash_asset.py"
+require_file "boot_splash.rgb565"
+require_file "boot_splash.png"
 require_file "qml/Main.qml"
 require_file "../S90uvc-camera"
 require_file "../S05display-quiet"
@@ -84,6 +87,8 @@ require_grep "fb_boot_splash" "../S05display-quiet"
 require_grep "S05display-quiet" "deploy_qt_camera_display.sh"
 require_grep "S90uvc-camera" "deploy_qt_camera_display.sh"
 require_grep "FB_SPLASH_SRC" "deploy_qt_camera_display.sh"
+require_grep "FB_SPLASH_ASSET_SRC" "deploy_qt_camera_display.sh"
+require_grep "boot_splash.rgb565" "deploy_qt_camera_display.sh"
 require_grep "fb_boot_splash" "deploy_qt_camera_display.sh"
 require_grep "uvc_kms_overlay.c" "build_uvc_kms_overlay.sh"
 require_grep "ldrm" "build_uvc_kms_overlay.sh"
@@ -136,17 +141,86 @@ require_grep "historyMetricGrid" "qml/Main.qml"
 require_grep "historyAnalysisPanel" "qml/Main.qml"
 require_grep "historyReadableInspectionText" "qml/Main.qml"
 require_grep "historyConfidenceSummaryText" "qml/Main.qml"
+require_grep "compactHomeClassText" "qml/Main.qml"
+require_grep "compactHomeModelText" "qml/Main.qml"
+require_grep "compactHistoryInfoLine" "qml/Main.qml"
+require_grep "focusLatestHistoryListRecord" "qml/Main.qml"
+require_grep "retryUploadHistoryRecord" "qml/Main.qml"
+require_grep "retryUploadRecord" "main.cpp"
+require_grep "updateRecordUploadResult" "main.cpp"
+require_grep "refreshedUploadTime" "main.cpp"
+require_grep "beginMoveRows" "main.cpp"
+require_grep "m_entries.move" "main.cpp"
+require_grep "updateRecordUploadResult\\(row," "main.cpp"
+require_grep "重新发送" "qml/Main.qml"
 require_grep "检测结论" "qml/Main.qml"
 require_grep "可信度" "qml/Main.qml"
 require_grep "缺陷提示" "qml/Main.qml"
 require_grep "原始图片" "main.cpp"
-require_grep "本地图片位置" "qml/Main.qml"
 if grep -Eq '分类原图' "$SCRIPT_DIR/main.cpp" "$SCRIPT_DIR/qml/Main.qml"; then
     fail "历史详情面向操作员展示时不能继续使用“分类原图”，应显示为“原始图片”"
+fi
+if grep -Eq 'text:[[:space:]]*"本地图片位置"' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "历史详情不能再把本地图片路径作为独立展示项，路径信息应收进检测信息区内部说明"
 fi
 history_detail_metrics="$(sed -n '/id: historyMetricGrid/,/id: historyAnalysisPanel/p' "$SCRIPT_DIR/qml/Main.qml")"
 if echo "$history_detail_metrics" | grep -Eq '分类图|检测图总量|流程状态'; then
     fail "历史详情右侧指标只允许展示上传时间、记录ID、图片数量和云端编号，不能继续显示分类图、检测图总量或流程状态"
+fi
+switch_page_block="$(sed -n '/^    function switchPage(pageName)/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$switch_page_block" | grep -q 'openLatestHistoryDetail()'; then
+    fail "进入历史页不能直接打开记录详情，应停留在检测历史列表并聚焦最新卡片"
+fi
+if ! printf '%s\n' "$switch_page_block" | grep -q 'focusLatestHistoryListRecord()'; then
+    fail "进入历史页必须聚焦最新一条检测卡片，不能停留在旧选中记录"
+fi
+focus_latest_block="$(sed -n '/^    function focusLatestHistoryListRecord()/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$focus_latest_block" | grep -q 'historyDetailVisible = true'; then
+    fail "focusLatestHistoryListRecord() 只能聚焦检测历史列表，不能切换到记录详情"
+fi
+if ! printf '%s\n' "$focus_latest_block" | grep -q 'historyDetailVisible = false'; then
+    fail "focusLatestHistoryListRecord() 进入历史页时必须保持列表层可见"
+fi
+if ! grep -q 'positionHistoryListAtSelected' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "进入历史页选中最新记录后必须滚动 historyListView，让最新卡片立即可见"
+fi
+history_analysis_block="$(awk '
+    /id: historyAnalysisPanel/ { in_panel = 1 }
+    /id: statsPage/ { in_panel = 0 }
+    in_panel { print }
+' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$history_analysis_block" | grep -q 'clip: true'; then
+    fail "历史详情检测信息面板必须裁剪内容，避免长检测信息越界"
+fi
+if ! printf '%s\n' "$history_analysis_block" | grep -q 'maximumLineCount'; then
+    fail "历史详情检测信息文本必须限制行数，避免模型信息过长挤出面板"
+fi
+if ! printf '%s\n' "$history_analysis_block" | grep -q 'spacing: 1'; then
+    fail "历史详情检测信息面板必须使用紧凑行距，避免空行导致末尾内容被截断"
+fi
+if ! printf '%s\n' "$history_analysis_block" | grep -q 'lineHeight:'; then
+    fail "历史详情检测信息文本必须压缩行高，保证四条检测说明都能显示"
+fi
+home_result_block="$(sed -n '/id: resultPanel/,/\/\* storageControls/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$home_result_block" | grep -q 'compactHomeClassText(root.detectClassName)'; then
+    fail "首页类别必须使用紧凑文本，避免完整模型类别名在窄屏结果面板中显示不全"
+fi
+if ! printf '%s\n' "$home_result_block" | grep -q 'compactHomeModelText(root.detectState)'; then
+    fail "首页模型结果必须使用紧凑文本，避免综合判定长句挤出结果面板"
+fi
+update_upload_block="$(sed -n '/bool updateRecordUploadResult(int row/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$update_upload_block" | grep -q 'uploadStatus.startsWith(QStringLiteral("上传成功"))'; then
+    fail "历史重发只有上传成功时才能刷新本地时间和移动到最新位置，失败不应扰乱原记录顺序"
+fi
+if ! printf '%s\n' "$update_upload_block" | grep -q 'm_entries.move(row, lastRow)'; then
+    fail "历史重发成功后必须把该记录移动到本地历史数组末尾，列表才会显示为最新记录"
+fi
+if ! printf '%s\n' "$update_upload_block" | grep -Fq 'm_entries[lastRow].uploadTime = refreshedUploadTime'; then
+    fail "历史重发成功后必须把本地 upload_time 更新为本次重发完成时间"
+fi
+retry_finished_block="$(sed -n '/onRetryUploadFinished:/,/^        }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$retry_finished_block" | grep -q 'root.selectedHistoryIndex = uploadHistory.count - 1'; then
+    fail "历史重发成功移动记录后，QML 必须重新选中末尾最新记录"
 fi
 require_grep "statsPageVisible" "qml/Main.qml"
 require_grep "statsSummary" "qml/Main.qml"
@@ -362,8 +436,20 @@ if grep -Eq '/1000' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "qml/Main.qml 首页检测置信度不能继续显示千分制 /1000，必须改为 0-100 百分制"
 fi
 require_grep "uvc-kms-overlay-control.sock" "uvc_kms_overlay.c"
-require_grep "工业缺陷检测系统" "fb_boot_splash.c"
-require_grep "STM32MP157 Vision Inspection Terminal" "fb_boot_splash.c"
+require_grep "AI赋能设计" "fb_boot_splash.c"
+require_grep "第九届嵌入式芯片与系统设计竞赛" "fb_boot_splash.c"
+require_grep "AI for Design" "fb_boot_splash.c"
+require_grep "MP157 Edge AI" "fb_boot_splash.c"
+require_grep "Framebuffer Splash" "fb_boot_splash.c"
+require_grep "Qt Vision Ready" "fb_boot_splash.c"
+require_grep "DEFAULT_SPLASH_ASSET" "fb_boot_splash.c"
+require_grep "boot_splash.rgb565" "fb_boot_splash.c"
+require_grep "draw_splash_asset" "fb_boot_splash.c"
+require_grep "draw_splash_fallback" "fb_boot_splash.c"
+require_grep "AI 开机静态启动图预览" "generate_boot_splash_asset.py"
+if grep -Eq '18%|LOADING CAMERA|BOOT SELF CHECK' "$SCRIPT_DIR/fb_boot_splash.c"; then
+    fail "fb_boot_splash.c 真实早期静态图不能继续保留旧进度条、加载相机或 BOOT SELF CHECK 文案"
+fi
 require_grep "/dev/fb0" "fb_boot_splash.c"
 require_grep "FBIOGET_VSCREENINFO" "fb_boot_splash.c"
 require_grep "mmap" "fb_boot_splash.c"
@@ -404,7 +490,19 @@ fi
 
 require_grep "defect-cos-upload" "main.cpp"
 require_grep "--annotated" "main.cpp"
-require_grep "cloudResultFromClassificationResult" "main.cpp"
+require_grep "fusedResultFromModelResults" "main.cpp"
+require_grep "cloudResultFromFusedResult" "main.cpp"
+require_grep "historyTextFromFusedResult" "main.cpp"
+require_grep "uiStatusFromFusedResult" "main.cpp"
+require_grep "fused_status" "main.cpp"
+require_grep "fused_reason" "main.cpp"
+require_grep "综合判定" "qml/Main.qml"
+if grep -Eq 'cloudResult = cloudResultFromClassificationResult\(classificationResult\)' "$SCRIPT_DIR/main.cpp"; then
+    fail "detectCurrentFrameOnce() 不能只根据分类模型生成 CLOUD_RESULT，必须综合分类和 UNet 分割结果"
+fi
+if grep -Eq 'cloudResultFromClassificationResult\(classificationResult\)' "$SCRIPT_DIR/main.cpp"; then
+    fail "历史重发不能只根据分类模型恢复云端结果，必须综合 classification_result 和 segmentation_result"
+fi
 require_grep "CLOUD_RESULT" "main.cpp"
 require_grep "total_time_ms" "main.cpp"
 require_grep "source" "defect-cos-upload"

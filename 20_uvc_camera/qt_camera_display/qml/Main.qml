@@ -55,7 +55,7 @@ Rectangle {
     /* detectState 保存检测按钮最近一次结果摘要；初始为等待用户手动触发。 */
     property string detectState: "等待检测"
 
-    /* detectStatus 保存模型输出 GOOD/BAD/WAIT/ERROR 状态，决定结果色和主结果文案。 */
+    /* detectStatus 保存检测输出 GOOD/BAD/REVIEW/WAIT/ERROR 状态，决定结果色和主结果文案。 */
     property string detectStatus: "WAIT"
 
     /* detectPartName 保存模型识别出的零件名称，由类别名前缀提取，例如 gasket_good -> gasket。 */
@@ -795,6 +795,41 @@ Rectangle {
     }
 
     /*
+     * updateDetectFusedFields 的作用：
+     *   在分类和 UNet 都完成后，用综合判定覆盖单个分类模型的 GOOD/BAD 状态。
+     *
+     * 主要流程：
+     *   1. 从 RESULT 行读取 fused_status、fused_result 和 fused_reason。
+     *   2. fused_status 存在时更新首页主状态，确保 UNet 检出缺陷时不会继续显示良品。
+     *   3. 保留分类模型给出的零件名、类别和概率，便于现场看清两个模型各自证据。
+     *
+     * 参数：
+     *   resultText 是 detectModelsReady 或最终 detectCurrentFrameFinished 携带的 RESULT 文本。
+     *
+     * 返回值：
+     *   读取到 fused_status 时返回 true；旧结果没有该字段时返回 false。
+     */
+    function updateDetectFusedFields(resultText) {
+        var fusedStatusText = resultTokenValue(resultText, "fused_status")
+        var fusedReasonText = resultTokenValue(resultText, "fused_reason")
+
+        if (fusedStatusText.length <= 0) {
+            return false
+        }
+
+        detectStatus = fusedStatusText
+        if (fusedStatusText === "BAD") {
+            detectState = fusedReasonText.length > 0 ? "综合判定坏品：" + fusedReasonText : "综合判定坏品"
+        } else if (fusedStatusText === "GOOD") {
+            detectState = fusedReasonText.length > 0 ? "综合判定良品：" + fusedReasonText : "综合判定良品"
+        } else {
+            detectState = fusedReasonText.length > 0 ? "综合判定待复核：" + fusedReasonText : "综合判定待复核"
+        }
+
+        return true
+    }
+
+    /*
      * updateDetectModelTimeFields 的作用：
      *   解析双模型完成后的 RESULT，并刷新“耗时”字段。
      *
@@ -838,6 +873,7 @@ Rectangle {
             return
         }
 
+        updateDetectFusedFields(resultText)
         updateDetectModelTimeFields(resultText)
     }
 
@@ -1340,7 +1376,7 @@ Rectangle {
      *
      * 主要流程：
      *   1. 更新 activePage，让对应页面的 QML 内容显示。
-     *   2. 第一次进入历史页时，如果已有检测记录，默认选中最新一条。
+     *   2. 每次进入历史页时，如果已有检测记录，停留在检测历史列表并聚焦最新一条卡片。
      *   3. KMS overlay 模式下，非首页需要隐藏视频 plane，返回首页时也必须等 Qt 启动遮罩结束后再恢复。
      *
      * 参数：
@@ -1356,20 +1392,75 @@ Rectangle {
         }
 
         activePage = pageName
-        historyDetailVisible = false
 
-        if (pageName === "history" && selectedHistoryIndex < 0 && uploadHistory.count > 0) {
-            selectedHistoryIndex = uploadHistory.count - 1
-            selectedHistoryImageIndex = 0
+        if (pageName === "history") {
+            focusLatestHistoryListRecord()
+        } else {
+            historyDetailVisible = false
+            selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
         }
-
-        selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
 
         if (root.usingKmsOverlay) {
             storageController.setOverlayVisible(pageName === "home"
                                                 && root.bootOverlayRestoreFinished
                                                 && !root.splashOverlayVisible)
         }
+    }
+
+    /*
+     * positionHistoryListAtSelected 的作用：
+     *   把横向历史列表滚动到当前选中的检测卡片。
+     *
+     * 主要流程：
+     *   1. 检查 historyListView 是否已经创建，避免页面初始化阶段访问空对象。
+     *   2. 使用 Qt.callLater 延后滚动，让 ListView 在 visible/model 更新后再计算位置。
+     *   3. 使用 ListView.Contain，只保证最新卡片进入可视区域，不强行居中造成跳动。
+     *
+     * 返回值：
+     *   无返回值；函数只影响历史列表的滚动位置。
+     */
+    function positionHistoryListAtSelected() {
+        if (selectedHistoryIndex < 0 || selectedHistoryIndex >= uploadHistory.count) {
+            return
+        }
+
+        if (!historyListView) {
+            return
+        }
+
+        Qt.callLater(function() {
+            if (selectedHistoryIndex >= 0 && selectedHistoryIndex < uploadHistory.count) {
+                historyListView.positionViewAtIndex(selectedHistoryIndex, ListView.Contain)
+            }
+        })
+    }
+
+    /*
+     * focusLatestHistoryListRecord 的作用：
+     *   进入历史记录页时停留在检测历史列表，并自动选中最新一条检测卡片。
+     *
+     * 主要流程：
+     *   1. 没有历史记录时清空选中索引，并保持列表空状态。
+     *   2. 有历史记录时选中最后一条，因为 UploadHistoryModel 追加顺序是旧在前、新在后。
+     *   3. 关闭详情层并滚动横向列表，让最新卡片像现场标注那样直接出现在可视区域。
+     *
+     * 返回值：
+     *   无返回值；函数只更新历史页列表层状态。
+     */
+    function focusLatestHistoryListRecord() {
+        if (uploadHistory.count <= 0) {
+            selectedHistoryIndex = -1
+            selectedHistoryImageIndex = 0
+            selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
+            historyDetailVisible = false
+            return
+        }
+
+        selectedHistoryIndex = uploadHistory.count - 1
+        selectedHistoryImageIndex = 0
+        selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
+        historyDetailVisible = false
+        positionHistoryListAtSelected()
     }
 
     /*
@@ -1416,6 +1507,12 @@ Rectangle {
             return
         }
 
+        if (storageController.retryUploadInProgress) {
+            storageState = "重新发送中，暂不能删除历史记录"
+            showStorageToast()
+            return
+        }
+
         var nextIndex = index
         var resultText = uploadHistory.removeRecord(index)
         storageState = resultText
@@ -1446,8 +1543,41 @@ Rectangle {
         selectedHistoryIndex = nextIndex
         selectedHistoryImageIndex = 0
         selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
-        historyListView.positionViewAtIndex(selectedHistoryIndex, ListView.Contain)
+        positionHistoryListAtSelected()
         showStorageToast()
+    }
+
+    /*
+     * retryUploadHistoryRecord 的作用：
+     *   响应历史详情页的“重新发送”按钮，把上传失败记录的本地图片重新提交到云端。
+     *
+     * 主要流程：
+     *   1. 校验 index，避免删除或切换后重发不存在的记录。
+     *   2. 检查后台重发忙状态，防止用户连续点击造成多条重复云端记录。
+     *   3. 调用 C++ 控制器在后台执行 defect-cos-upload；结果由 retryUploadFinished 信号回填。
+     *
+     * 参数：
+     *   index 是当前详情页对应的历史记录索引。
+     *
+     * 返回值：
+     *   无返回值；函数通过 storageState 和底部提示条反馈启动状态。
+     */
+    function retryUploadHistoryRecord(index) {
+        if (index < 0 || index >= uploadHistory.count) {
+            storageState = "重新发送失败：记录不存在"
+            showStorageToast()
+            return
+        }
+
+        if (storageController.retryUploadInProgress) {
+            storageState = "重新发送中，请等待完成"
+            showStorageToast()
+            return
+        }
+
+        storageState = "正在重新发送历史图片..."
+        showStorageToast()
+        storageController.retryUploadRecord(index)
     }
 
     /*
@@ -1462,6 +1592,7 @@ Rectangle {
      */
     function backToHistoryList() {
         historyDetailVisible = false
+        positionHistoryListAtSelected()
     }
 
     /*
@@ -1620,13 +1751,101 @@ Rectangle {
     }
 
     /*
+     * compactHomeClassText 的作用：
+     *   把模型输出的完整类别名压缩成首页右侧窄面板可读的短类别。
+     *
+     * 主要流程：
+     *   1. 空类别和占位类别原样返回，避免检测前显示异常。
+     *   2. 删除类别名前缀中的 good/bad 后缀，只保留零件族和良坏方向。
+     *   3. 常见垫圈类别转换成中文短词，让 182px 结果面板也能完整显示。
+     *
+     * 参数：
+     *   classText 是分类模型输出的类别名，例如 splitwasher_good。
+     *
+     * 返回值：
+     *   返回适合首页显示的短类别文本。
+     */
+    function compactHomeClassText(classText) {
+        var rawText = classText ? String(classText) : ""
+        if (rawText.length <= 0 || rawText === "未检测" || rawText === "检测失败" || rawText === "未知类别") {
+            return rawText.length > 0 ? rawText : "未检测"
+        }
+
+        var isGood = rawText.indexOf("_good") >= 0 || rawText.indexOf("good") >= 0
+        var isBad = rawText.indexOf("_bad") >= 0 || rawText.indexOf("bad") >= 0
+        var baseText = rawText.replace(/_good/g, "").replace(/_bad/g, "")
+
+        if (baseText === "splitwasher") {
+            baseText = "弹垫"
+        } else if (baseText === "washer") {
+            baseText = "平垫"
+        } else if (baseText === "gasket") {
+            baseText = "垫片"
+        }
+
+        if (isGood) {
+            return baseText + "-良"
+        }
+        if (isBad) {
+            return baseText + "-坏"
+        }
+
+        return baseText
+    }
+
+    /*
+     * compactHomeModelText 的作用：
+     *   把首页模型结果长句压缩成“分类/UNet/综合”短结论，避免右侧面板显示不全。
+     *
+     * 主要流程：
+     *   1. 检测中、等待检测等短状态直接显示。
+     *   2. 分类初判阶段显示“分类良/分类坏”，提醒还在等 UNet。
+     *   3. 综合阶段显示“综合良/综合坏/待复核”，详细原因保留在历史详情里。
+     *
+     * 参数：
+     *   stateText 是 detectState 保存的当前检测状态。
+     *
+     * 返回值：
+     *   返回适合首页窄栏显示的模型结果短文本。
+     */
+    function compactHomeModelText(stateText) {
+        var rawText = stateText ? String(stateText) : ""
+        if (rawText.length <= 0) {
+            return "等待检测"
+        }
+        if (rawText === "等待检测" || rawText === "检测中..." || rawText === "等待综合判定") {
+            return rawText
+        }
+        if (rawText.indexOf("分类模型判定坏品") >= 0 || rawText.indexOf("模型判定坏品") >= 0) {
+            return "分类坏，等UNet"
+        }
+        if (rawText.indexOf("分类模型判定良品") >= 0 || rawText.indexOf("模型判定良品") >= 0) {
+            return "分类良，等UNet"
+        }
+        if (rawText.indexOf("综合判定坏品") >= 0) {
+            return "综合坏品"
+        }
+        if (rawText.indexOf("综合判定良品") >= 0) {
+            return "综合良品"
+        }
+        if (rawText.indexOf("综合判定待复核") >= 0 || rawText.indexOf("待复核") >= 0) {
+            return "综合待复核"
+        }
+        if (rawText.length > 8) {
+            return rawText.substring(0, 8)
+        }
+
+        return rawText
+    }
+
+    /*
      * historyConfidenceSummaryText 的作用：
-     *   把模型 confidence 原始小数转换成普通人能看懂的可信度说明。
+     *   把分类模型 confidence 原始小数转换成普通人能看懂的可信度说明。
      *
      * 主要流程：
      *   1. 从 classificationResult 中提取 confidence 和 status。
      *   2. 把 0~1 的小数转换成百分比。
-     *   3. 根据 GOOD/BAD 状态解释“模型更倾向于良品还是坏品”。
+     *   3. 根据 GOOD/BAD 状态解释“分类模型更倾向于良品还是坏品”。
      *
      * 参数：
      *   record 是当前历史记录，里面可能包含 classificationResult。
@@ -1646,10 +1865,10 @@ Rectangle {
 
         var percentText = Math.max(0, Math.min(100, confidenceValue * 100)).toFixed(1) + "%"
         if (statusText === "BAD") {
-            return "模型倾向于坏品，可信度 " + percentText + "。"
+            return "分类模型倾向于坏品，可信度 " + percentText + "。"
         }
         if (statusText === "GOOD") {
-            return "模型倾向于良品，可信度 " + percentText + "。"
+            return "分类模型倾向于良品，可信度 " + percentText + "，最终结论仍以分类和UNet综合判定为准。"
         }
 
         return "模型已给出判断，可信度 " + percentText + "。"
@@ -1669,11 +1888,11 @@ Rectangle {
         var resultText = record && record.resultText ? record.resultText : ""
 
         if (resultText === "良品") {
-            return "系统认为该零件外观正常，可以进入良品流程。"
+            return "分类和UNet均未发现缺陷，系统认为该零件可以进入良品流程。"
         }
 
         if (resultText === "待复核") {
-            return "系统发现可疑缺陷，建议人工复核后再分拣。"
+            return "分类或UNet发现可疑缺陷，建议人工复核后再分拣。"
         }
 
         return "该记录需要结合图片和云端状态确认。"
@@ -1709,6 +1928,86 @@ Rectangle {
         }
 
         return "检测图未标出明显缺陷区域，可结合原图做最终确认。"
+    }
+
+    /*
+     * historyUploadFailed 的作用：
+     *   判断当前历史记录是否需要显示“重新发送”按钮。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   uploadStatus 含“失败”时返回 true；即使失败过程中已经创建过 record_id，也允许重新发送本地图片。
+     */
+    function historyUploadFailed(record) {
+        if (!record) {
+            return false
+        }
+
+        return record.uploadStatus && record.uploadStatus.indexOf("失败") >= 0
+    }
+
+    /*
+     * historyImageArchiveText 的作用：
+     *   把旧的本地路径展示区转换成操作员可读的检测信息说明。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   返回图片数量和用途说明，不直接显示本地文件路径。
+     */
+    function historyImageArchiveText(record) {
+        if (!record || record.imageCount <= 0) {
+            return "暂无本地图片，建议重新检测。"
+        }
+
+        return "本机保留 " + record.imageCount + " 张图片，左侧可切换复核。"
+    }
+
+    /*
+     * compactHistoryInfoLine 的作用：
+     *   把历史详情检测信息中的多余空白压掉，防止小面板里出现空行和末尾截断。
+     *
+     * 主要流程：
+     *   1. 把换行、制表符和连续空格统一压缩成一个空格。
+     *   2. 去掉句首句尾空白，保留原本的中文结论含义。
+     *
+     * 参数：
+     *   lineText 是某一条检测说明。
+     *
+     * 返回值：
+     *   返回单段紧凑文本，供 Text.Wrap 在固定宽度内自然换行。
+     */
+    function compactHistoryInfoLine(lineText) {
+        if (!lineText) {
+            return ""
+        }
+
+        return String(lineText).replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "")
+    }
+
+    /*
+     * historyUploadAdviceText 的作用：
+     *   根据云端状态给出历史详情里的处理建议。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   上传失败提示重新发送；上传成功提示可按云端编号追溯。
+     */
+    function historyUploadAdviceText(record) {
+        if (historyUploadFailed(record)) {
+            return "云端上传失败，可点击上方重新发送，把本地留档图片再次提交到云端。"
+        }
+
+        if (isUploadSuccess(record)) {
+            return "云端已归档，可按记录ID或云端编号追溯该样本。"
+        }
+
+        return "云端状态未确认，可先查看本地检测图片并保留样本。"
     }
 
     /*
@@ -2167,10 +2466,14 @@ Rectangle {
 
         /*
          * onDetectClassificationReady 的作用：
-         *   第一个分类模型完成后立刻刷新零件、类别、GOOD/BAD 和置信度。
+         *   第一个分类模型完成后立刻刷新零件、类别、分类初判和置信度。
          */
         onDetectClassificationReady: {
             if (updateDetectClassificationFields(resultText)) {
+                detectState = detectStatus === "BAD"
+                              ? "分类模型判定坏品，等待UNet综合"
+                              : "分类模型判定良品，等待UNet综合"
+                detectStatus = "REVIEW"
                 storageState = "分类完成，正在运行UNet..."
                 showStorageToast()
             }
@@ -2182,8 +2485,9 @@ Rectangle {
          */
         onDetectModelsReady: {
             if (updateDetectClassificationFields(resultText)) {
+                updateDetectFusedFields(resultText)
                 updateDetectModelTimeFields(resultText)
-                storageState = "双模型检测完成，正在上传..."
+                storageState = "综合判定完成，正在上传..."
                 showStorageToast()
             }
         }
@@ -2195,6 +2499,28 @@ Rectangle {
         onDetectCurrentFrameFinished: {
             detectImageBusy = false
             handleDetectResultText(resultText)
+            storageState = resultText
+            showStorageToast()
+        }
+
+        /*
+         * onRetryUploadFinished 的作用：
+         *   接收历史图片重新发送的最终结果，并刷新当前详情页绑定的记录快照。
+         *
+         * 主要流程：
+         *   1. 重发成功时 C++ 会把该记录移动到本地历史末尾，并把 upload_time 改成本次重发时间。
+         *   2. 当前详情页要同步选中末尾记录，否则还会读旧 row，界面时间和云端记录会对不上。
+         *   3. 重发失败时记录顺序不变，继续刷新原 row 详情。
+         */
+        onRetryUploadFinished: {
+            if (resultText.indexOf("重新发送成功") === 0 && uploadHistory.count > 0) {
+                root.selectedHistoryIndex = uploadHistory.count - 1
+                root.selectedHistoryImageIndex = 0
+                root.selectedHistoryRecord = uploadHistory.entryAt(root.selectedHistoryIndex)
+            } else if (row === root.selectedHistoryIndex) {
+                root.selectedHistoryRecord = uploadHistory.entryAt(root.selectedHistoryIndex)
+            }
+
             storageState = resultText
             showStorageToast()
         }
@@ -2507,15 +2833,15 @@ Rectangle {
                     {"name": "零件", "value": root.detectPartName},
                     {"name": "状态", "value": root.workflowState},
                     {"name": "偏差", "value": (root.dxPixels >= 0 ? "+" : "") + root.dxPixels + " px"},
-                    {"name": "类别", "value": root.detectClassName},
-                    {"name": "模型", "value": root.detectState},
+                    {"name": "类别", "value": root.compactHomeClassText(root.detectClassName)},
+                    {"name": "模型", "value": root.compactHomeModelText(root.detectState)},
                     {"name": "耗时", "value": root.detectTimeText}
                 ] : [
                     {"name": "当前零件", "value": root.detectPartName},
                     {"name": "流程状态", "value": root.workflowState},
                     {"name": "视觉偏差", "value": (root.dxPixels >= 0 ? "+" : "") + root.dxPixels + " px"},
-                    {"name": "模型类别", "value": root.detectClassName},
-                    {"name": "检测状态", "value": root.detectState},
+                    {"name": "模型类别", "value": root.compactHomeClassText(root.detectClassName)},
+                    {"name": "检测状态", "value": root.compactHomeModelText(root.detectState)},
                     {"name": "推理耗时", "value": root.detectTimeText}
                 ]
 
@@ -2551,10 +2877,10 @@ Rectangle {
             height: root.usingKmsOverlay ? 38 : 46
             radius: 8
             color: root.detectStatus === "BAD" ? "#3a1b1f"
-                   : root.detectStatus === "ERROR" ? "#33251a"
+                   : root.detectStatus === "ERROR" || root.detectStatus === "REVIEW" ? "#33251a"
                    : root.detectStatus === "WAIT" ? "#252a2e" : "#173524"
             border.color: root.detectStatus === "BAD" ? root.accentRed
-                          : root.detectStatus === "ERROR" || root.detectStatus === "WAIT"
+                          : root.detectStatus === "ERROR" || root.detectStatus === "WAIT" || root.detectStatus === "REVIEW"
                             ? root.accentAmber : root.accentGreen
             border.width: 1
 
@@ -2562,6 +2888,8 @@ Rectangle {
                 anchors.centerIn: parent
                 text: root.detectStatus === "BAD" ? (root.usingKmsOverlay ? "检测：坏品" : "模型检测：坏品")
                       : root.detectStatus === "GOOD" ? (root.usingKmsOverlay ? "检测：良品" : "模型检测：良品")
+                      : root.detectStatus === "REVIEW" && root.detectImageBusy ? "等待综合判定"
+                      : root.detectStatus === "REVIEW" ? "检测：待复核"
                       : root.detectStatus === "ERROR" ? "检测失败" : "等待检测"
                 color: "#ffffff"
                 font.pixelSize: root.usingKmsOverlay ? 17 : 22
@@ -2595,7 +2923,7 @@ Rectangle {
                     height: parent.height
                     radius: 4
                     color: root.detectStatus === "BAD" ? root.accentRed
-                           : root.detectStatus === "ERROR" || root.detectStatus === "WAIT"
+                           : root.detectStatus === "ERROR" || root.detectStatus === "WAIT" || root.detectStatus === "REVIEW"
                              ? root.accentAmber : root.accentGreen
                 }
             }
@@ -2634,7 +2962,7 @@ Rectangle {
                     height: parent.height
                     radius: 4
                     color: root.detectStatus === "BAD" ? root.accentRed
-                           : root.detectStatus === "ERROR" || root.detectStatus === "WAIT"
+                           : root.detectStatus === "ERROR" || root.detectStatus === "WAIT" || root.detectStatus === "REVIEW"
                              ? root.accentAmber : root.accentGreen
                 }
             }
@@ -3338,7 +3666,7 @@ Rectangle {
 
                 Rectangle {
                     width: parent.width
-                    height: 58
+                    height: 82
                     radius: 8
                     color: root.selectedHistoryRecord.uploadStatus
                            && root.selectedHistoryRecord.uploadStatus.indexOf("失败") >= 0 ? "#3a1b1f" : "#16291f"
@@ -3357,11 +3685,52 @@ Rectangle {
                     Text {
                         x: 12
                         y: 26
-                        width: parent.width - 24
+                        width: root.historyUploadFailed(root.selectedHistoryRecord) ? parent.width - 132 : parent.width - 24
                         text: root.cloudStatusSummary(root.selectedHistoryRecord.uploadStatus)
                         color: "#edf7f0"
                         font.pixelSize: 13
                         font.bold: true
+                        elide: Text.ElideRight
+                    }
+
+                    Rectangle {
+                        x: parent.width - 112
+                        y: 24
+                        width: 100
+                        height: 32
+                        radius: 7
+                        visible: root.historyUploadFailed(root.selectedHistoryRecord)
+                        color: retryHistoryUploadMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: storageController.retryUploadInProgress ? "#65706a" : root.accentGreen
+                        border.width: 1
+                        opacity: storageController.retryUploadInProgress ? 0.62 : 1.0
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: storageController.retryUploadInProgress ? "发送中" : "重新发送"
+                            color: "#eafff2"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: retryHistoryUploadMouse
+                            anchors.fill: parent
+                            enabled: !storageController.retryUploadInProgress
+
+                            onClicked: {
+                                root.retryUploadHistoryRecord(root.selectedHistoryIndex)
+                            }
+                        }
+                    }
+
+                    Text {
+                        x: 12
+                        y: 58
+                        width: parent.width - 24
+                        text: root.historyUploadAdviceText(root.selectedHistoryRecord)
+                        color: "#c9d1d5"
+                        font.pixelSize: 10
                         elide: Text.ElideRight
                     }
                 }
@@ -3369,16 +3738,17 @@ Rectangle {
                 Rectangle {
                     id: historyAnalysisPanel
                     width: parent.width
-                    height: 124
+                    height: 159
                     radius: 8
                     color: "#20262a"
                     border.color: "#343c42"
                     border.width: 1
+                    clip: true
 
                     Column {
                         anchors.fill: parent
-                        anchors.margins: 10
-                        spacing: 5
+                        anchors.margins: 8
+                        spacing: 1
 
                         Text {
                             width: parent.width
@@ -3386,67 +3756,60 @@ Rectangle {
                             color: "#f1f4f5"
                             font.pixelSize: 14
                             font.bold: true
-                        }
-
-                        Text {
-                            width: parent.width
-                            text: "检测结论：" + root.historyReadableInspectionText(root.selectedHistoryRecord)
-                            color: "#c9d1d5"
-                            font.pixelSize: 11
-                            wrapMode: Text.Wrap
+                            maximumLineCount: 1
                             elide: Text.ElideRight
                         }
 
                         Text {
                             width: parent.width
-                            text: root.selectedHistoryRecord.classificationResult
+                            text: root.compactHistoryInfoLine("检测结论：" + root.historyReadableInspectionText(root.selectedHistoryRecord))
+                            color: "#c9d1d5"
+                            font.pixelSize: 10
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 2
+                            elide: Text.ElideRight
+                            lineHeightMode: Text.ProportionalHeight
+                            lineHeight: 0.86
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: root.compactHistoryInfoLine(root.selectedHistoryRecord.classificationResult
                                   && root.selectedHistoryRecord.classificationResult.length > 0
                                   ? "可信度：" + root.historyConfidenceSummaryText(root.selectedHistoryRecord)
-                                  : "可信度：暂无模型可信度数据。"
+                                  : "可信度：暂无模型可信度数据。")
                             color: "#c9d1d5"
-                            font.pixelSize: 11
+                            font.pixelSize: 10
                             wrapMode: Text.Wrap
+                            maximumLineCount: 2
                             elide: Text.ElideRight
+                            lineHeightMode: Text.ProportionalHeight
+                            lineHeight: 0.86
                         }
 
                         Text {
                             width: parent.width
-                            text: "缺陷提示：" + root.historyDefectHintText(root.selectedHistoryRecord)
+                            text: root.compactHistoryInfoLine("缺陷提示：" + root.historyDefectHintText(root.selectedHistoryRecord))
                             color: "#c9d1d5"
-                            font.pixelSize: 11
+                            font.pixelSize: 10
                             wrapMode: Text.Wrap
+                            maximumLineCount: 2
                             elide: Text.ElideRight
+                            lineHeightMode: Text.ProportionalHeight
+                            lineHeight: 0.86
                         }
-                    }
-                }
 
-                Rectangle {
-                    width: parent.width
-                    height: 58
-                    radius: 8
-                    color: "#141719"
-                    border.color: "#2d343a"
-                    border.width: 1
-
-                    Text {
-                        x: 12
-                        y: 7
-                        text: "本地图片位置"
-                        color: "#8f9aa1"
-                        font.pixelSize: 11
-                    }
-
-                    Text {
-                        x: 12
-                        y: 25
-                        width: parent.width - 24
-                        text: root.selectedHistoryRecord.sourcePath
-                              && root.selectedHistoryRecord.sourcePath.length > 0
-                              ? root.selectedHistoryRecord.sourcePath
-                              : root.selectedHistoryRecord.jpgPath
-                        color: "#c4ccd1"
-                        font.pixelSize: 11
-                        elide: Text.ElideMiddle
+                        Text {
+                            width: parent.width
+                            text: root.compactHistoryInfoLine("图片留档：" + root.historyImageArchiveText(root.selectedHistoryRecord))
+                            color: "#c9d1d5"
+                            font.pixelSize: 10
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 1
+                            elide: Text.ElideRight
+                            lineHeightMode: Text.ProportionalHeight
+                            lineHeight: 0.86
+                        }
                     }
                 }
             }
