@@ -1,4 +1,3 @@
-#include <linux/atomic.h>             /* 提供 atomic_t 和 atomic_cmpxchg()，用于恢复工作项的防重复排队。 */
 #include <linux/delay.h>              /* 提供 msleep()，用于 Goodix 触摸 IC 的复位和上电等待。 */
 #include <linux/gpio.h>               /* 提供 legacy GPIO 接口，用于课程设备树中的 reset-gpios 和 irq-gpios。 */
 #include <linux/i2c.h>                /* 提供 I2C client、i2c_transfer() 等接口，GT911/GT9147 通过 I2C 通信。 */
@@ -11,13 +10,15 @@
 #include <linux/of.h>                 /* 提供设备树通用读取接口，用于读取 touchscreen-size-x/y。 */
 #include <linux/of_gpio.h>            /* 提供 of_get_named_gpio()，用于读取设备树 GPIO。 */
 #include <linux/slab.h>               /* 提供 devm_kzalloc()，用于分配驱动私有数据。 */
-#include <linux/workqueue.h>          /* 提供 work_struct，把耗时复位流程放到普通进程上下文执行。 */
 
 #define GOODIX_CTRL_REG		0x8040 /* Goodix 控制寄存器，官方例程用于软件复位，本驱动只读取触摸数据。 */
 #define GOODIX_CFG_REG		0x8047 /* Goodix 配置起始寄存器，可读取配置版本，但不自动覆盖芯片配置。 */
 #define GOODIX_PID_REG		0x8140 /* Goodix 产品 ID 寄存器，GT911 会返回 ASCII 字符串 "911"。 */
 #define GOODIX_STATUS_REG	0x814e /* Goodix 触摸状态寄存器，bit7 表示有新数据，bit3:0 表示触点数。 */
 #define GOODIX_POINT_REG	0x814f /* Goodix 第一个触点数据起始寄存器，每个触点占 8 字节。 */
+
+#define GOODIX_ADDR_14		0x14 /* Goodix 复位采样 INT 后可能进入的 7-bit I2C 地址之一。 */
+#define GOODIX_ADDR_5D		0x5d /* 当前设备树声明的 7-bit I2C 地址，也是正点原子例程常用地址。 */
 
 #define GOODIX_STATUS_READY	BIT(7) /* 触摸状态寄存器 bit7，置 1 表示控制器准备好了新一帧数据。 */
 #define GOODIX_POINT_SIZE	8 /* Goodix 每个触点数据长度：ID、X、Y、触摸面积等，共 8 字节。 */
@@ -42,11 +43,10 @@
  * @reset_gpio: 设备树 reset-gpios 对应的 GPIO 编号，用于硬件复位。
  * @irq_gpio: 设备树 irq-gpios 或 interrupt-gpios 对应的 GPIO 编号，用于触摸中断。
  * @irq: 最终申请到的 Linux IRQ 编号，可能来自 client->irq，也可能来自 gpio_to_irq()。
+ * @active_addr: 当前实际可通信的 Goodix 7-bit I2C 地址，可能是设备树地址 0x5d，也可能恢复到 0x14。
  * @slot_active: 记录每个 slot 是否已经按下，用于触点消失或 I2C 出错时补发抬起事件。
  * @recover_lock: 保护恢复流程，确保同一时间只有一个复位/重新识别流程运行。
- * @recover_work: I2C 连续失败后调度的恢复任务，普通工作队列上下文可以安全睡眠。
- * @recover_pending: 标记恢复任务已经排队或正在执行，避免中断线程重复排队。
- * @stopping: 标记驱动正在移除，阻止 IRQ 线程继续排队新的恢复任务。
+ * @stopping: 标记驱动正在移除，阻止 IRQ 线程继续执行新的恢复动作。
  * @i2c_fail_count: 记录连续 I2C 失败次数，成功读写后清零。
  * @next_recover_jiffies: 下一次允许触发恢复的时间点，用于故障状态下限频。
  */
@@ -58,16 +58,97 @@ struct goodix_ts_data {
 	int reset_gpio;                                    /* 保存复位 GPIO 编号，GPIO 无效时为负数。 */
 	int irq_gpio;                                      /* 保存中断 GPIO 编号，GPIO 无效时为负数。 */
 	int irq;                                           /* 保存最终使用的 Linux IRQ 编号。 */
+	u16 active_addr;                                   /* 保存当前寄存器读写真正使用的 7-bit I2C 地址。 */
 	bool slot_active[GOODIX_MAX_POINTS];               /* 保存每个触摸 slot 当前是否处于按下状态。 */
 	struct mutex recover_lock;                         /* 恢复流程互斥锁，防止并发复位和并发访问恢复状态。 */
-	struct work_struct recover_work;                   /* 恢复工作项，用于异步执行硬件复位和重新识别。 */
-	atomic_t recover_pending;                          /* 恢复工作排队标志，1 表示已有恢复任务在等待或运行。 */
 	bool stopping;                                     /* 驱动移除标志，true 表示不再接受新的恢复任务。 */
 	unsigned int i2c_fail_count;                       /* 连续 I2C 通信失败次数，读触摸数据成功后清零。 */
 	unsigned long next_recover_jiffies;                /* 下一次允许恢复的 jiffies 时间，节流恢复日志和复位动作。 */
 };
 
 static int goodix_identify(struct goodix_ts_data *ts);       /* 前向声明产品识别函数，恢复工作中需要复用 probe 的识别逻辑。 */
+static int goodix_recover_controller(struct goodix_ts_data *ts, int err); /* 前向声明同步恢复函数，中断线程中会直接调用它。 */
+static int goodix_select_active_addr(struct goodix_ts_data *ts); /* 前向声明地址选择函数，读写失败时会立即重新探测 0x5d/0x14。 */
+
+/*
+ * goodix_read_regs_addr - 按指定 I2C 地址从 Goodix 触摸 IC 连续读取寄存器。
+ * @ts: 驱动私有数据，函数通过 ts->client 找到 I2C 适配器。
+ * @addr: 本次访问使用的 7-bit I2C 地址，例如 0x5d 或 0x14。
+ * @reg: 16 位寄存器地址，Goodix 寄存器地址高字节先发送。
+ * @buf: 保存读取结果的缓冲区。
+ * @len: 要读取的字节数。
+ *
+ * 返回值：
+ * 0 表示读取成功；负数表示 I2C 传输失败。
+ */
+static int goodix_read_regs_addr(struct goodix_ts_data *ts, u16 addr, u16 reg, u8 *buf, int len)
+{
+	struct i2c_client *client = ts->client;             /* 取出 I2C client，后续访问适配器需要它。 */
+	u8 regbuf[2];                                       /* 保存 Goodix 16 位寄存器地址，高字节在前。 */
+	struct i2c_msg msgs[2];                             /* 定义两个 I2C 消息：先写寄存器地址，再读数据。 */
+	int ret;                                            /* 保存 i2c_transfer() 返回值。 */
+
+	regbuf[0] = reg >> 8;                                /* 保存寄存器地址高 8 位。 */
+	regbuf[1] = reg & 0xff;                              /* 保存寄存器地址低 8 位。 */
+
+	msgs[0].addr = addr;                                 /* 第一个消息访问调用者指定的 Goodix I2C 地址。 */
+	msgs[0].flags = 0;                                   /* flags 为 0 表示写操作。 */
+	msgs[0].len = sizeof(regbuf);                        /* 写入 2 字节寄存器地址。 */
+	msgs[0].buf = regbuf;                                /* 写缓冲区指向寄存器地址数组。 */
+
+	msgs[1].addr = addr;                                 /* 第二个消息继续访问同一个 Goodix 地址。 */
+	msgs[1].flags = I2C_M_RD;                            /* I2C_M_RD 表示读操作。 */
+	msgs[1].len = len;                                   /* 读取调用者指定的字节数。 */
+	msgs[1].buf = buf;                                   /* 读出的数据保存到调用者缓冲区。 */
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs)); /* 执行组合 I2C 传输。 */
+	if (ret == ARRAY_SIZE(msgs))                         /* 两个消息都完成时表示读取成功。 */
+		return 0;                                      /* 返回 0 给调用者。 */
+
+	if (ret < 0)                                        /* 负数表示 I2C 控制器返回了明确错误。 */
+		return ret;                                    /* 保留底层错误码，便于 dmesg 定位。 */
+
+	return -EIO;                                        /* 非负但消息数不足，说明传输不完整。 */
+}
+
+/*
+ * goodix_write_regs_addr - 按指定 I2C 地址向 Goodix 触摸 IC 连续写入寄存器。
+ * @ts: 驱动私有数据，函数通过 ts->client 找到 I2C 适配器。
+ * @addr: 本次访问使用的 7-bit I2C 地址，例如 0x5d 或 0x14。
+ * @reg: 16 位寄存器地址，Goodix 寄存器地址高字节先发送。
+ * @buf: 要写入的数据缓冲区。
+ * @len: 要写入的数据长度。
+ *
+ * 返回值：
+ * 0 表示写入成功；负数表示写入失败。
+ */
+static int goodix_write_regs_addr(struct goodix_ts_data *ts, u16 addr, u16 reg, const u8 *buf, int len)
+{
+	u8 txbuf[2 + 16];                                    /* 保存寄存器地址和少量写入数据，本驱动只写 1 字节状态清除。 */
+	struct i2c_msg msg;                                  /* Goodix 写寄存器只需要一个 I2C 写消息。 */
+	int ret;                                             /* 保存 i2c_transfer() 返回值。 */
+
+	if (len < 0 || len > 16)                              /* 防止调用者写入超过栈缓冲区容量的数据。 */
+		return -EINVAL;                                 /* 返回参数错误，避免栈内存越界。 */
+
+	txbuf[0] = reg >> 8;                                  /* 保存寄存器地址高 8 位。 */
+	txbuf[1] = reg & 0xff;                                /* 保存寄存器地址低 8 位。 */
+	memcpy(&txbuf[2], buf, len);                          /* 把要写入的数据拼接到寄存器地址之后。 */
+
+	msg.addr = addr;                                      /* 写消息访问调用者指定的 Goodix I2C 地址。 */
+	msg.flags = 0;                                        /* flags 为 0 表示写操作。 */
+	msg.len = len + 2;                                    /* 写入总长度等于 2 字节地址加数据长度。 */
+	msg.buf = txbuf;                                      /* 写缓冲区指向拼接好的地址和数据。 */
+
+	ret = i2c_transfer(ts->client->adapter, &msg, 1);      /* 执行 I2C 写传输。 */
+	if (ret == 1)                                         /* 返回 1 表示一个写消息完整完成。 */
+		return 0;                                       /* 返回 0，表示写入成功。 */
+
+	if (ret < 0)                                          /* 负数表示底层 I2C 错误。 */
+		return ret;                                     /* 保留底层错误码。 */
+
+	return -EIO;                                          /* 非负但不是 1，表示写传输不完整。 */
+}
 
 /*
  * goodix_reset_sequence - 对已经申请好的 RESET/INT GPIO 执行 Goodix 复位时序。
@@ -75,9 +156,13 @@ static int goodix_identify(struct goodix_ts_data *ts);       /* 前向声明产�
  *
  * 主要流程：
  * 1. 把 RESET 拉低，让 Goodix 进入硬件复位状态。
- * 2. 把 INT 配成输出低电平，让芯片在释放 RESET 时选择 0x5d 地址。
+ * 2. 把 INT 配成输出低电平，优先尝试让芯片在释放 RESET 时选择 0x5d 地址。
  * 3. 拉高 RESET，等待芯片固件重新启动。
  * 4. 把 INT 切回输入，让触摸 IC 继续用该脚产生触摸中断。
+ *
+ * 注意：
+ * 不同屏幕小板或 GPIO 极性可能导致芯片实际落到 0x14。
+ * 因此复位后还会通过 goodix_select_active_addr() 主动探测 0x5d/0x14。
  *
  * 返回值：
  * 0 表示复位时序完成；负数表示 GPIO 方向切换失败或 GPIO 资源无效。
@@ -105,7 +190,7 @@ static int goodix_reset_sequence(struct goodix_ts_data *ts)
 
 	msleep(GOODIX_RESET_LOW_MS);                          /* 保持复位低电平，确保芯片内部状态完全清空。 */
 
-	ret = gpio_direction_output(ts->irq_gpio, 0);         /* 把 INT 配成输出低电平，让释放 RESET 时选择 0x5d 地址。 */
+	ret = gpio_direction_output(ts->irq_gpio, 0);         /* 把 INT 配成输出低电平，优先让释放 RESET 时选择 0x5d 地址。 */
 	if (ret) {                                            /* 如果 INT 方向切换失败。 */
 		dev_err(dev, "set irq gpio output low failed: %d\n", ret); /* 打印失败原因。 */
 		return ret;                                      /* 返回底层错误码，停止复位流程。 */
@@ -141,32 +226,20 @@ static int goodix_reset_sequence(struct goodix_ts_data *ts)
  */
 static int goodix_read_regs(struct goodix_ts_data *ts, u16 reg, u8 *buf, int len)
 {
-	struct i2c_client *client = ts->client;             /* 取出 I2C client，后续访问地址和适配器都需要它。 */
-	u8 regbuf[2];                                       /* 保存 Goodix 16 位寄存器地址，高字节在前。 */
-	struct i2c_msg msgs[2];                             /* 定义两个 I2C 消息：先写寄存器地址，再读数据。 */
-	int ret;                                            /* 保存 i2c_transfer() 返回值。 */
+	int ret;                                             /* 保存当前地址读取和 fallback 后重试的返回值。 */
 
-	regbuf[0] = reg >> 8;                                /* 保存寄存器地址高 8 位。 */
-	regbuf[1] = reg & 0xff;                              /* 保存寄存器地址低 8 位。 */
+	ret = goodix_read_regs_addr(ts, ts->active_addr, reg, buf, len); /* 先使用当前已探测成功的地址访问寄存器。 */
+	if (!ret)                                             /* 如果当前地址读取成功。 */
+		return 0;                                       /* 直接返回成功，不做额外探测。 */
 
-	msgs[0].addr = client->addr;                         /* 第一个消息访问设备树 reg 指定的 I2C 地址。 */
-	msgs[0].flags = 0;                                   /* flags 为 0 表示写操作。 */
-	msgs[0].len = sizeof(regbuf);                        /* 写入 2 字节寄存器地址。 */
-	msgs[0].buf = regbuf;                                /* 写缓冲区指向寄存器地址数组。 */
+	dev_warn_ratelimited(&ts->client->dev,                /* 限速提示当前 active 地址读失败，避免故障时刷屏。 */
+			     "read reg 0x%04x at active addr 0x%02x failed: %d, rescan Goodix addr\n",
+			     reg, ts->active_addr, ret);             /* 打印失败寄存器、当前地址和错误码。 */
 
-	msgs[1].addr = client->addr;                         /* 第二个消息继续访问同一个 Goodix 设备。 */
-	msgs[1].flags = I2C_M_RD;                            /* I2C_M_RD 表示读操作。 */
-	msgs[1].len = len;                                   /* 读取调用者指定的字节数。 */
-	msgs[1].buf = buf;                                   /* 读出的数据保存到调用者缓冲区。 */
+	if (goodix_select_active_addr(ts))                    /* 如果 0x5d/0x14 都无法读取 PID。 */
+		return ret;                                      /* 保留原始寄存器读取错误码，交给调用方触发复位恢复。 */
 
-	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs)); /* 执行组合 I2C 传输。 */
-	if (ret == ARRAY_SIZE(msgs))                         /* 两个消息都完成时表示读取成功。 */
-		return 0;                                      /* 返回 0 给调用者。 */
-
-	if (ret < 0)                                        /* 负数表示 I2C 控制器返回了明确错误。 */
-		return ret;                                    /* 保留底层错误码，便于 dmesg 定位。 */
-
-	return -EIO;                                        /* 非负但消息数不足，说明传输不完整。 */
+	return goodix_read_regs_addr(ts, ts->active_addr, reg, buf, len); /* 地址切换成功后，用新 active 地址重试本次读取。 */
 }
 
 /*
@@ -181,30 +254,71 @@ static int goodix_read_regs(struct goodix_ts_data *ts, u16 reg, u8 *buf, int len
  */
 static int goodix_write_regs(struct goodix_ts_data *ts, u16 reg, const u8 *buf, int len)
 {
-	u8 txbuf[2 + 16];                                    /* 保存寄存器地址和少量写入数据，本驱动只写 1 字节状态清除。 */
-	struct i2c_msg msg;                                  /* Goodix 写寄存器只需要一个 I2C 写消息。 */
-	int ret;                                             /* 保存 i2c_transfer() 返回值。 */
+	int ret;                                             /* 保存当前地址写入和 fallback 后重试的返回值。 */
 
-	if (len < 0 || len > 16)                              /* 防止调用者写入超过栈缓冲区容量的数据。 */
-		return -EINVAL;                                 /* 返回参数错误，避免栈内存越界。 */
+	ret = goodix_write_regs_addr(ts, ts->active_addr, reg, buf, len); /* 先使用当前已探测成功的地址写寄存器。 */
+	if (!ret)                                             /* 如果当前地址写入成功。 */
+		return 0;                                       /* 直接返回成功，不做额外探测。 */
 
-	txbuf[0] = reg >> 8;                                  /* 保存寄存器地址高 8 位。 */
-	txbuf[1] = reg & 0xff;                                /* 保存寄存器地址低 8 位。 */
-	memcpy(&txbuf[2], buf, len);                          /* 把要写入的数据拼接到寄存器地址之后。 */
+	dev_warn_ratelimited(&ts->client->dev,                /* 限速提示当前 active 地址写失败，避免故障时刷屏。 */
+			     "write reg 0x%04x at active addr 0x%02x failed: %d, rescan Goodix addr\n",
+			     reg, ts->active_addr, ret);             /* 打印失败寄存器、当前地址和错误码。 */
 
-	msg.addr = ts->client->addr;                          /* 写消息访问当前 Goodix I2C 地址。 */
-	msg.flags = 0;                                        /* flags 为 0 表示写操作。 */
-	msg.len = len + 2;                                    /* 写入总长度等于 2 字节地址加数据长度。 */
-	msg.buf = txbuf;                                      /* 写缓冲区指向拼接好的地址和数据。 */
+	if (goodix_select_active_addr(ts))                    /* 如果 0x5d/0x14 都无法读取 PID。 */
+		return ret;                                      /* 保留原始寄存器写入错误码，交给调用方触发复位恢复。 */
 
-	ret = i2c_transfer(ts->client->adapter, &msg, 1);      /* 执行 I2C 写传输。 */
-	if (ret == 1)                                         /* 返回 1 表示一个写消息完整完成。 */
-		return 0;                                       /* 返回 0，表示写入成功。 */
+	return goodix_write_regs_addr(ts, ts->active_addr, reg, buf, len); /* 地址切换成功后，用新 active 地址重试本次写入。 */
+}
 
-	if (ret < 0)                                          /* 负数表示底层 I2C 错误。 */
-		return ret;                                     /* 保留底层错误码。 */
+/*
+ * goodix_select_active_addr - 在 0x5d 和 0x14 之间选择当前真正有 ACK 的 Goodix 地址。
+ * @ts: 驱动私有数据，函数会读取 PID 寄存器并更新 ts->active_addr。
+ *
+ * 背景：
+ * Goodix 复位释放时会采样 INT 引脚选择 I2C 地址。
+ * 当前设备树节点固定写在 0x5d，但实际硬件复位后可能落到 0x14。
+ * 如果驱动继续只访问 0x5d，就会出现 `read touch data failed: -6`。
+ *
+ * 主要流程：
+ * 1. 优先尝试设备树声明的 client->addr。
+ * 2. 失败后尝试另一个 Goodix 常见地址。
+ * 3. 哪个地址能读出 PID，就把 ts->active_addr 更新为哪个地址。
+ *
+ * 返回值：
+ * 0 表示找到可通信地址；负数表示两个地址都无法读取 PID。
+ */
+static int goodix_select_active_addr(struct goodix_ts_data *ts)
+{
+	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印地址切换日志。 */
+	u16 first_addr = ts->client->addr;                    /* 优先尝试设备树 reg 声明的地址。 */
+	u16 second_addr;                                      /* 保存备用地址，和 first_addr 互补。 */
+	u8 pid[6];                                           /* 保存 PID 读取结果，用于验证地址是否可通信。 */
+	int ret;                                             /* 保存 I2C 读取返回值。 */
 
-	return -EIO;                                          /* 非负但不是 1，表示写传输不完整。 */
+	if (first_addr == GOODIX_ADDR_14)                     /* 如果设备树声明的是 0x14。 */
+		second_addr = GOODIX_ADDR_5D;                    /* 备用地址就尝试 0x5d。 */
+	else                                                  /* 其他情况，包括当前设备树的 0x5d。 */
+		second_addr = GOODIX_ADDR_14;                    /* 备用地址尝试 0x14。 */
+
+	ret = goodix_read_regs_addr(ts, first_addr, GOODIX_PID_REG, pid, sizeof(pid)); /* 尝试设备树声明地址。 */
+	if (!ret) {                                           /* 如果设备树地址可以读出 PID。 */
+		ts->active_addr = first_addr;                    /* 使用设备树地址作为当前有效地址。 */
+		return 0;                                       /* 返回成功。 */
+	}
+
+	dev_warn(dev, "Goodix addr 0x%02x no ACK: %d, try fallback addr 0x%02x\n",
+		 first_addr, ret, second_addr);                  /* 打印地址 fallback 原因，便于解释复位后为何切地址。 */
+
+	ret = goodix_read_regs_addr(ts, second_addr, GOODIX_PID_REG, pid, sizeof(pid)); /* 尝试备用地址。 */
+	if (!ret) {                                           /* 如果备用地址可以读出 PID。 */
+		ts->active_addr = second_addr;                   /* 把后续触摸读写切换到备用地址。 */
+		dev_warn(dev, "Goodix active I2C addr switched to 0x%02x\n", second_addr); /* 打印当前使用地址。 */
+		return 0;                                       /* 返回成功。 */
+	}
+
+	dev_err(dev, "Goodix addr 0x%02x and 0x%02x both failed, last error %d\n",
+		first_addr, second_addr, ret);                   /* 两个地址都失败时打印明确错误。 */
+	return ret;                                           /* 返回最后一次 I2C 错误码。 */
 }
 
 /*
@@ -262,41 +376,38 @@ static void goodix_release_all_slots(struct goodix_ts_data *ts)
 }
 
 /*
- * goodix_schedule_recovery - 在连续 I2C 失败后调度一次异步恢复。
- * @ts: 驱动私有数据，里面保存失败计数、恢复工作项和节流时间。
+ * goodix_maybe_recover - 在 I2C 失败后按节流规则直接执行恢复。
+ * @ts: 驱动私有数据，里面保存失败计数、恢复锁和节流时间。
  * @err: 本次 I2C 失败的错误码，用于日志定位底层失败来源。
  *
  * 主要流程：
  * 1. 递增连续失败次数。
  * 2. 未达到阈值时只记录失败，不复位硬件。
  * 3. 达到阈值后检查恢复冷却时间，避免触摸 IC 离线时频繁复位。
- * 4. 使用 atomic_cmpxchg() 确保同一时间只排队一个恢复工作项。
+ * 4. 直接在 threaded IRQ 线程中恢复，因为当前中断处理函数本身允许睡眠。
  *
  * 返回值：
- * 无。恢复工作异步执行，调用方仍然按 IRQ_HANDLED 结束当前中断线程。
+ * 0 表示没有执行恢复或恢复成功；负数表示恢复流程执行过但仍失败。
  */
-static void goodix_schedule_recovery(struct goodix_ts_data *ts, int err)
+static int goodix_maybe_recover(struct goodix_ts_data *ts, int err)
 {
-	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印恢复调度日志。 */
+	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印恢复日志。 */
 	unsigned long now = jiffies;                         /* 保存当前 jiffies，用于和冷却时间比较。 */
 
 	if (ts->stopping)                                    /* 如果驱动正在卸载或解绑。 */
-		return;                                        /* 不再排队恢复任务，避免卸载后访问旧资源。 */
+		return 0;                                      /* 不再恢复，避免 remove 阶段访问旧资源。 */
 
 	ts->i2c_fail_count++;                                /* 连续失败计数加 1，成功读触摸数据后会清零。 */
 	if (ts->i2c_fail_count < GOODIX_RECOVERY_FAIL_THRESHOLD) /* 如果还没达到恢复阈值。 */
-		return;                                        /* 暂不复位，避免偶发 I2C 毛刺导致触摸 IC 重启。 */
+		return 0;                                      /* 暂不复位，避免偶发 I2C 毛刺导致触摸 IC 重启。 */
 
 	if (time_before(now, ts->next_recover_jiffies))       /* 如果距离上一次恢复还没超过冷却时间。 */
-		return;                                        /* 直接返回，避免硬件持续异常时重复复位刷屏。 */
-
-	if (atomic_cmpxchg(&ts->recover_pending, 0, 1) != 0)  /* 如果已经有恢复任务排队或正在执行。 */
-		return;                                        /* 不重复排队，避免多个 work 同时操作 GPIO。 */
+		return 0;                                      /* 直接返回，避免硬件持续异常时重复复位刷屏。 */
 
 	ts->next_recover_jiffies = now + msecs_to_jiffies(GOODIX_RECOVERY_COOLDOWN_MS); /* 更新下一次允许恢复的时间。 */
-	dev_warn(dev, "schedule touch recovery after %u I2C failures, last error %d\n",
-		 ts->i2c_fail_count, err);                      /* 打印一次恢复调度日志，说明连续失败次数和最后错误码。 */
-	schedule_work(&ts->recover_work);                     /* 把耗时复位动作交给系统工作队列异步执行。 */
+	dev_warn(dev, "start touch recovery after %u I2C failures, last error %d\n",
+		 ts->i2c_fail_count, err);                      /* 打印恢复开始原因，说明连续失败次数和最后错误码。 */
+	return goodix_recover_controller(ts, err);            /* 在当前 threaded IRQ 上下文同步执行复位和地址探测。 */
 }
 
 /*
@@ -389,7 +500,7 @@ static irqreturn_t goodix_irq_thread(int irq, void *dev_id)
 		dev_err_ratelimited(&ts->client->dev,            /* 限速打印错误，避免中断风暴刷屏。 */
 				    "read touch data failed: %d\n", ret); /* 打印 I2C 错误码。 */
 		goodix_release_all_slots(ts);                    /* 释放旧触点，避免应用层触摸卡住。 */
-		goodix_schedule_recovery(ts, ret);               /* 连续失败达到阈值后异步复位并重新识别触摸 IC。 */
+		goodix_maybe_recover(ts, ret);                   /* 连续失败达到阈值后同步复位并重新识别触摸 IC。 */
 		return IRQ_HANDLED;                              /* 中断已经处理，返回 HANDLED。 */
 	}
 
@@ -401,7 +512,7 @@ static irqreturn_t goodix_irq_thread(int irq, void *dev_id)
 		if (ret) {                                       /* 如果清除状态失败，下一次可能重复收到同一帧。 */
 			dev_err_ratelimited(&ts->client->dev,        /* 限速打印状态清除失败。 */
 					    "clear touch status failed: %d\n", ret); /* 打印 I2C 错误码。 */
-			goodix_schedule_recovery(ts, ret);           /* 清状态也属于 I2C 写失败，连续失败时同样触发恢复。 */
+			goodix_maybe_recover(ts, ret);               /* 清状态也属于 I2C 写失败，连续失败时同样触发恢复。 */
 		}
 	}
 
@@ -413,10 +524,10 @@ static irqreturn_t goodix_irq_thread(int irq, void *dev_id)
  * @ts: 驱动私有数据，里面保存 I2C client 和 GPIO 编号。
  *
  * 地址选择说明：
- * 当前板子通过 i2cdetect 已确认 Goodix 芯片在 7-bit 地址 0x5d。
+ * 当前设备树把 Goodix 节点声明在 7-bit 地址 0x5d。
  * Goodix 上电/复位时会采样 INT 引脚状态选择地址：
- * INT 高电平选择 0x14，INT 低电平选择 0x5d。
- * 因此这里在释放 RESET 前保持 INT 为低电平。
+ * 上游 Goodix 驱动按 client->addr 判断 INT 输出电平，不同硬件小板可能表现为 0x5d 或 0x14。
+ * 因此这里复位时优先按 0x5d 处理，复位后再通过 goodix_select_active_addr() 自动选择实际 ACK 地址。
  *
  * 返回值：
  * 0 表示复位成功；负数表示 GPIO 申请或方向配置失败。
@@ -450,7 +561,7 @@ static int goodix_hw_reset(struct goodix_ts_data *ts)
 		return ret;                                      /* 返回错误码，中止 probe。 */
 	}
 
-	ret = devm_gpio_request_one(dev, ts->irq_gpio, GPIOF_OUT_INIT_LOW, "gt9147 irq"); /* 申请 INT GPIO，先输出低电平选择 0x5d。 */
+	ret = devm_gpio_request_one(dev, ts->irq_gpio, GPIOF_OUT_INIT_LOW, "gt9147 irq"); /* 申请 INT GPIO，先输出低电平，后续会再探测实际 I2C 地址。 */
 	if (ret) {                                            /* 如果中断 GPIO 申请失败。 */
 		dev_err(dev, "request irq gpio %d failed: %d\n", ts->irq_gpio, ret); /* 打印失败 GPIO 和错误码。 */
 		return ret;                                      /* 返回错误码，中止 probe。 */
@@ -560,57 +671,61 @@ static int goodix_identify(struct goodix_ts_data *ts)
 }
 
 /*
- * goodix_recover_work - Goodix 触摸 IC 运行中 I2C 掉线后的恢复工作。
- * @work: 内核工作队列传入的 work_struct 指针，可反推出 goodix_ts_data。
+ * goodix_recover_controller - Goodix 触摸 IC 运行中 I2C 掉线后的同步恢复函数。
+ * @ts: 驱动私有数据，里面保存 GPIO、I2C 地址和 input 状态。
+ * @err: 触发本次恢复的 I2C 错误码，用于日志保留故障来源。
  *
  * 主要流程：
- * 1. 禁用触摸 IRQ，阻止恢复期间继续进入中断线程。
- * 2. 释放所有已按下 slot，避免 UI 保持“手指未抬起”的错误状态。
- * 3. 按上电时序重新复位 Goodix，并保持 INT 低电平选择 0x5d 地址。
+ * 1. 释放所有已按下 slot，避免 UI 保持“手指未抬起”的错误状态。
+ * 2. 按上电时序重新复位 Goodix，并尝试让芯片回到默认地址。
+ * 3. 自动探测 0x5d/0x14，选择当前真正有 ACK 的地址。
  * 4. 重新读取产品 ID 验证 I2C 是否恢复。
- * 5. 清理失败计数、恢复排队标志，并重新打开 IRQ。
+ * 5. 恢复成功后清理失败计数。
  *
- * 这个函数不重新注册 input 设备，也不重新申请 GPIO/IRQ，因为这些资源仍然归当前驱动实例持有。
+ * 这个函数由 threaded IRQ 调用；该上下文本身允许睡眠，并且 IRQF_ONESHOT 会避免同一 IRQ 重入。
+ * 因此这里不再调用 disable_irq()，避免工作队列恢复时等待当前 IRQ 线程造成 pending 卡住。
+ *
+ * 返回值：
+ * 0 表示恢复成功；负数表示复位、地址选择或 PID 识别失败。
  */
-static void goodix_recover_work(struct work_struct *work)
+static int goodix_recover_controller(struct goodix_ts_data *ts, int err)
 {
-	struct goodix_ts_data *ts = container_of(work, struct goodix_ts_data, recover_work); /* 从 work 指针反推出驱动私有数据。 */
 	struct device *dev = &ts->client->dev;               /* 取出设备对象，用于打印恢复过程日志。 */
-	bool irq_disabled = false;                           /* 标记本函数是否已经禁用 IRQ，用于退出时成对恢复。 */
 	int ret;                                             /* 保存复位和重新识别返回值。 */
 
 	mutex_lock(&ts->recover_lock);                        /* 加锁，防止极端情况下多个恢复流程同时操作 GPIO/I2C。 */
 	if (ts->stopping) {                                   /* 如果模块正在卸载，恢复动作已经没有意义。 */
-		atomic_set(&ts->recover_pending, 0);              /* 清除恢复排队标志，保证状态收尾干净。 */
 		mutex_unlock(&ts->recover_lock);                  /* 释放互斥锁，避免 remove 等待时死锁。 */
-		return;                                          /* 直接退出，不再操作 IRQ、GPIO 或 I2C。 */
+		return 0;                                        /* 直接退出，不再操作 IRQ、GPIO 或 I2C。 */
 	}
 
-	disable_irq(ts->irq);                                /* 禁用触摸中断，避免复位期间中断线程继续读取 I2C。 */
-	irq_disabled = true;                                 /* 记录 IRQ 已由本函数禁用，后续退出路径需要成对 enable。 */
 	goodix_release_all_slots(ts);                         /* 复位前释放所有触摸点，避免用户界面卡在按下状态。 */
 
-	dev_warn(dev, "start touch recovery: reset controller and re-read product id\n"); /* 打印恢复开始日志。 */
+	dev_warn(dev, "reset touch controller for recovery, trigger error %d\n", err); /* 打印恢复开始日志。 */
 	ret = goodix_reset_sequence(ts);                      /* 执行硬件复位和地址选择时序。 */
 	if (ret) {                                            /* 如果 GPIO 复位流程失败。 */
 		dev_err(dev, "touch recovery reset failed: %d\n", ret); /* 打印复位失败错误码。 */
-		goto out_enable_irq;                             /* 仍然需要恢复 IRQ 状态并清理 pending 标志。 */
+		goto out_unlock;                                 /* 跳到统一出口释放互斥锁。 */
+	}
+
+	ret = goodix_select_active_addr(ts);                  /* 复位后重新探测 0x5d/0x14，处理芯片地址漂移。 */
+	if (ret) {                                            /* 如果两个 Goodix 地址都读不到 PID。 */
+		dev_err(dev, "touch recovery select addr failed: %d\n", ret); /* 打印地址探测失败错误码。 */
+		goto out_unlock;                                 /* 跳到统一出口，等待下一轮限频恢复。 */
 	}
 
 	ret = goodix_identify(ts);                            /* 复位后重新读取 PID，验证 I2C 是否重新有应答。 */
 	if (ret) {                                            /* 如果 PID 仍然读取失败。 */
 		dev_err(dev, "touch recovery identify failed: %d\n", ret); /* 打印识别失败错误码，提示硬件仍未恢复。 */
-		goto out_enable_irq;                             /* 跳到统一出口，避免 IRQ 长期关闭。 */
+		goto out_unlock;                                 /* 跳到统一出口释放互斥锁。 */
 	}
 
 	ts->i2c_fail_count = 0;                               /* 恢复成功后清零连续失败计数。 */
 	dev_info(dev, "touch recovery completed\n");          /* 打印恢复成功日志，便于现场确认恢复发生过。 */
 
-out_enable_irq:
-	atomic_set(&ts->recover_pending, 0);                  /* 清除恢复排队标志，允许后续新故障重新调度恢复。 */
-	if (irq_disabled)                                     /* 如果本函数曾经成功禁用 IRQ。 */
-		enable_irq(ts->irq);                              /* 重新启用触摸中断，让正常触摸事件继续上报。 */
+out_unlock:
 	mutex_unlock(&ts->recover_lock);                      /* 释放恢复互斥锁，恢复流程结束。 */
+	return ret;                                           /* 返回恢复结果，调用方当前只用于调试扩展。 */
 }
 
 /*
@@ -644,9 +759,8 @@ static int goodix_probe(struct i2c_client *client, const struct i2c_device_id *i
 	ts->reset_gpio = -EINVAL;                             /* 初始化复位 GPIO 为无效状态。 */
 	ts->irq_gpio = -EINVAL;                               /* 初始化中断 GPIO 为无效状态。 */
 	ts->irq = -EINVAL;                                    /* 初始化 IRQ 为无效状态。 */
-	mutex_init(&ts->recover_lock);                        /* 初始化恢复互斥锁，后续 workqueue 会用它串行化复位流程。 */
-	INIT_WORK(&ts->recover_work, goodix_recover_work);    /* 初始化恢复工作项，连续 I2C 失败后由中断线程调度。 */
-	atomic_set(&ts->recover_pending, 0);                  /* 初始没有恢复任务排队或运行。 */
+	ts->active_addr = client->addr;                       /* 默认先使用设备树 reg 地址，复位后会再主动探测备用地址。 */
+	mutex_init(&ts->recover_lock);                        /* 初始化恢复互斥锁，后续 threaded IRQ 恢复流程会用它串行化复位操作。 */
 	ts->stopping = false;                                 /* probe 阶段驱动处于运行状态，允许后续故障恢复。 */
 	ts->i2c_fail_count = 0;                               /* 初始连续 I2C 失败次数为 0。 */
 	ts->next_recover_jiffies = 0;                         /* 初始不限制第一次恢复触发时间。 */
@@ -669,7 +783,13 @@ static int goodix_probe(struct i2c_client *client, const struct i2c_device_id *i
 		return ret;                                      /* 返回错误码，中止 probe。 */
 	}
 
-	ret = goodix_identify(ts);                            /* 读取产品 ID，确认 0x5d 地址上确实是 Goodix 芯片。 */
+	ret = goodix_select_active_addr(ts);                  /* 复位后探测 0x5d/0x14，避免芯片落到非设备树地址。 */
+	if (ret) {                                            /* 如果两个地址都无法读取 PID。 */
+		dev_err(&client->dev, "select active I2C addr failed: %d\n", ret); /* 打印地址探测失败错误。 */
+		return ret;                                      /* 返回错误码，中止 probe。 */
+	}
+
+	ret = goodix_identify(ts);                            /* 读取产品 ID，确认当前 active_addr 上确实是 Goodix 芯片。 */
 	if (ret) {                                            /* 如果产品 ID 读取失败。 */
 		dev_err(&client->dev, "read product id failed: %d\n", ret); /* 打印 I2C 通信失败错误码。 */
 		return ret;                                      /* 返回错误码，中止 probe。 */
@@ -687,8 +807,8 @@ static int goodix_probe(struct i2c_client *client, const struct i2c_device_id *i
 		return ret;                                      /* 返回错误码，中止 probe。 */
 	}
 
-	dev_info(&client->dev, "Goodix touch initialized, addr 0x%02x, max %ux%u, irq %d, reset gpio %d, irq gpio %d\n",
-		 client->addr, ts->max_x, ts->max_y, ts->irq, ts->reset_gpio, ts->irq_gpio); /* 打印初始化成功信息。 */
+	dev_info(&client->dev, "Goodix touch initialized, dt addr 0x%02x, active addr 0x%02x, max %ux%u, irq %d, reset gpio %d, irq gpio %d\n",
+		 client->addr, ts->active_addr, ts->max_x, ts->max_y, ts->irq, ts->reset_gpio, ts->irq_gpio); /* 打印初始化成功信息和当前实际 I2C 地址。 */
 	return 0;                                             /* 返回 0，表示驱动绑定成功。 */
 }
 
@@ -704,7 +824,6 @@ static int goodix_remove(struct i2c_client *client)
 	struct goodix_ts_data *ts = i2c_get_clientdata(client); /* 取回 probe 保存的驱动私有数据，用于取消恢复工作。 */
 
 	ts->stopping = true;                                  /* 标记驱动正在移除，阻止 IRQ 线程继续调度恢复工作。 */
-	cancel_work_sync(&ts->recover_work);                  /* 等待可能正在运行的恢复工作结束，避免卸载后继续访问已释放资源。 */
 	devm_free_irq(&client->dev, ts->irq, ts);             /* 主动释放 devm IRQ，确保 input 注销前不会再进入中断线程。 */
 	goodix_release_all_slots(ts);                         /* 卸载前释放所有触摸 slot，避免用户空间残留按下状态。 */
 	return 0;                                             /* 没有额外手工资源需要释放，直接返回成功。 */

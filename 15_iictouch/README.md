@@ -27,10 +27,20 @@
 | 触发条件 | `GOODIX_STATUS_REG` 读失败或清状态寄存器写失败，失败达到 `GOODIX_RECOVERY_FAIL_THRESHOLD = 1`。 |
 | 典型错误 | `read touch data failed: -6`，其中 `-6` 是 `-ENXIO`，通常表示 I2C 地址无应答。 |
 | 防刷屏/防抖 | 两次恢复之间至少间隔 `GOODIX_RECOVERY_COOLDOWN_MS = 3000 ms`，因此即使每次中断都读失败，也最多约 3 秒复位一次。 |
-| 恢复上下文 | 中断线程只负责计数和调度 `recover_work`，真正复位放到 workqueue 中执行。 |
-| 恢复动作 | 禁用触摸 IRQ、释放所有 active slot、执行 RESET/INT 地址选择复位时序、重新读取产品 ID、恢复 IRQ。 |
+| 恢复上下文 | 直接在线程化 IRQ 中执行恢复；该 IRQ 使用 `IRQF_ONESHOT`，可以睡眠且能避免同一 IRQ 重入。 |
+| 恢复动作 | 释放所有 active slot、执行 RESET/INT 复位时序、自动探测 `0x5d/0x14` 当前有效地址、重新读取产品 ID。 |
 | 恢复范围 | 不重新注册 input 设备，不重新申请 GPIO/IRQ，只恢复当前 Goodix 控制器通信状态。 |
-| 卸载保护 | `remove()` 设置 `stopping` 标志、取消恢复 work、释放 IRQ，并释放所有 slot。 |
+| 卸载保护 | `remove()` 设置 `stopping` 标志、释放 IRQ，并释放所有 slot。 |
+
+## I2C 地址自动选择
+
+| 项目 | 当前实现 |
+|---|---|
+| 设备树默认地址 | 节点仍然是 `gt9147@5d`，驱动 probe 时优先尝试 `0x5d`。 |
+| 备用地址 | 如果 `0x5d` 读取 PID 失败，驱动会自动尝试 Goodix 常见备用地址 `0x14`。 |
+| 触发时机 | probe 初始复位后探测一次；运行中任意寄存器读写失败会立即重新探测；恢复复位后也会重新探测。 |
+| 运行日志 | 如果切换地址，会看到 `Goodix addr 0x5d no ACK... try fallback addr 0x14` 和 `Goodix active I2C addr switched to 0x14`。 |
+| 解决的问题 | 开发板复位后触摸 IC 可能采样 INT 引脚进入 `0x14`，而设备树仍绑定 `1-005d`，导致固定访问 `0x5d` 时持续 `-ENXIO`。 |
 
 ## 设备树契约
 
@@ -51,7 +61,7 @@ gt911@5d {
 | 属性 | 要求 | 说明 |
 |---|---|---|
 | `compatible` | 三个支持字符串之一 | 用于 I2C 驱动匹配。 |
-| `reg` | 常见 `0x5d` | 当前驱动复位流程按已确认的 7-bit 地址 `0x5d` 处理。 |
+| `reg` | 常见 `0x5d` | 当前驱动优先按设备树 `0x5d` 处理；如果复位后 IC 实际落到 `0x14`，会自动切到 `0x14` 读写寄存器。 |
 | `reset-gpios` | 必填 | 用于硬件复位和地址选择。 |
 | `irq-gpios` 或 `interrupt-gpios` | 必填 | 用于触摸中断，驱动不走轮询替代。 |
 | `touchscreen-size-x/y` | 可选 | 缺省为 1024x600；写 0 会回退默认值。 |
@@ -74,12 +84,12 @@ gt911@5d {
 | Test goal | Run location | Command | Expected result | Failure triage |
 |---|---|---|---|---|
 | 编译模块和应用 | 虚拟机 `15_iictouch/` | `make` | `iictouch.ko`、`iictouchapp` 生成。 | 查 `CROSS_COMPILE` 是否匹配当前工具链；默认是 `arm-none-linux-gnueabihf-`。 |
-| I2C 地址确认 | 开发板 | `i2cdetect -y <bus>` | 能看到 Goodix 地址，常见 `0x5d`。 | 若看不到，先查触摸供电、I2C pinctrl、reset/irq 引脚和总线号。 |
+| I2C 地址确认 | 开发板 | `i2cdetect -y <bus>` | 能看到 Goodix 地址，常见 `0x5d` 或 `0x14`；驱动绑定的地址会显示 `UU`。 | 若两个地址都看不到，先查触摸供电、I2C pinctrl、reset/irq 引脚和总线号。 |
 | 驱动 probe | 开发板 `/root/` | `insmod iictouch.ko; dmesg | tail -n 100` | 输出 `Goodix product id ...` 和 `Goodix touch initialized ...`。 | 若 `missing reset-gpios` 或 `missing irq-gpios`，修 DTS；若 product id 读取失败，查 I2C 地址和复位时序。 |
 | input 设备发现 | 开发板 | `grep -A8 -B2 "Goodix GT911/GT9147 Capacitive Touch" /proc/bus/input/devices` | 能找到 `Handlers=... eventX`。 | 若 probe 成功但无 event，查 `input_register_device` 是否失败。 |
 | 单点触摸 | 开发板 `/root/` | `./iictouchapp /dev/input/eventX` | 触摸时打印 `slot 0 down`、坐标和 `BTN_TOUCH down/up`。 | 若无输出，查 IRQ 是否触发：`cat /proc/interrupts | grep -i goodix`。 |
 | 多点触摸 | 开发板 `/root/` | `./iictouchapp /dev/input/eventX` | 多指触摸时多个 slot 坐标同时更新。 | 若坐标异常，查 `touchscreen-size-x/y` 和屏幕方向映射。 |
-| I2C 掉线自动恢复 | 开发板 | `dmesg -w | grep -Ei "read touch data failed|schedule touch recovery|start touch recovery|touch recovery completed|touch recovery identify failed"` | I2C 失败后最多每 3 秒调度一次恢复；恢复成功后重新打印 Goodix product id 和 `touch recovery completed`。 | 如果一直 `identify failed: -6`，说明复位后芯片仍不应答，继续查供电、排线、I2C 上拉、RESET/INT 引脚和 I2C 总线占用。 |
+| I2C 掉线自动恢复 | 开发板 | `cat /dev/kmsg | grep -Ei "read touch data failed|schedule touch recovery|start touch recovery|touch recovery completed|active I2C addr|touch recovery identify failed"` | I2C 失败后最多每 3 秒调度一次恢复；恢复成功后重新打印 Goodix product id、当前 active 地址和 `touch recovery completed`。 | 如果 `0x5d` 和 `0x14` 都失败，说明复位后芯片仍不应答，继续查供电、排线、I2C 上拉、RESET/INT 引脚和 I2C 总线占用。 |
 | 通用工具交叉验证 | 开发板 | `evtest /dev/input/eventX` | 能看到 `EV_ABS`、`ABS_MT_POSITION_X/Y`、`BTN_TOUCH`。 | 若没有 `evtest`，使用 `iictouchapp`。 |
 | 卸载清理 | 开发板 `/root/` | `rmmod iictouch` | event 节点消失。 | 若模块忙，先停止 `iictouchapp` 或 Qt 触摸程序。 |
 
@@ -91,6 +101,7 @@ gt911@5d {
 | input 事件读路径 | `./iictouchapp /dev/input/eventX` | 这是用户态验证触摸数据的主路径。 |
 | 写路径 | 驱动内部写 `GOODIX_STATUS_REG = 0` 清中断状态 | 用户态不直接写触摸设备；清状态由驱动完成。 |
 | 恢复写路径 | 驱动内部控制 `reset-gpios` 和 `irq-gpios` | 运行中 I2C 连续失败后，驱动会重新执行 Goodix 地址选择和硬件复位时序。 |
+| 地址 fallback 路径 | 驱动内部临时访问 `0x5d/0x14` | 读取 PID 成功的地址会保存为 `active_addr`，后续触点读取和状态清除都走该地址。 |
 
 ## 文件保存和图片等待规则
 
@@ -128,5 +139,8 @@ sdcard-safe-remove
 
 | 时间 | 修改点 | 结果 |
 |---|---|---|
+| 2026-05-20 | 为寄存器读写增加失败后立即重新探测 `0x5d/0x14` 并重试 | 触摸 IC 已经跑到备用地址时，不必等完整复位流程，驱动会先切换 active 地址继续读写。 |
+| 2026-05-20 | 将恢复流程从 workqueue 改为 threaded IRQ 内同步执行 | 避免恢复 work 调用 `disable_irq()` 等待当前 IRQ 线程造成恢复 pending 卡住，导致只刷 `read touch data failed`。 |
+| 2026-05-20 | 增加 Goodix `0x5d/0x14` 地址自动选择 | 解决开发板复位后触摸 IC 可能落到 `0x14`，而设备树固定 `0x5d` 导致一直 `-ENXIO` 的问题。 |
 | 2026-05-19 | 为 `iictouch.c` 增加连续 I2C 失败后的异步恢复逻辑 | `read touch data failed: -6` 连续出现时，驱动会限频复位触摸 IC、重新读取 PID，并释放旧 slot 防止 UI 卡住。 |
 | 2026-05-03 | 新增模块 README | 按新版提示词补齐设备树契约、测试矩阵、触摸事件验证和图片保存等待规则。 |
