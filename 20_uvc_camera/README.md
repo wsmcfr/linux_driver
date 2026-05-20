@@ -17,6 +17,16 @@
 | Qt 真实健康状态 | 顶部状态栏和告警设备健康矩阵由 `DeviceHealthController` 真实探测：4G 必须 `4g-ppp test` 通过才在线，KMS 相机必须 overlay `STATUS` 已出帧才在线，F4 必须串口 STATUS 握手成功才接入，云端必须 health 请求成功才已连接；健康检测每 8 秒后台刷新一次，网络/云端保留上一轮稳定状态，不在每轮刷新时闪回“检测中”。 |
 | 云端复核回写 | 最终运行时由板端开机自启 `S91board-review-tunnel` 主动建立并守护 `ssh -R 127.0.0.1:18081:127.0.0.1:18080`；云端后端访问本机 `127.0.0.1:18081` 回写板端，云端 systemd timer 只负责周期检查和记录，不负责主动连回 NAT 后面的板端。 |
 
+## 2026-05-20 本次经验总结
+
+| 主题 | 做了什么 | 怎么测试 |
+|---|---|---|
+| 检测信息完整显示 | 板端历史详情固定小面板只保留短摘要，完整云端修正原因、UNet 提示和模型原始输出放到可滚动完整说明弹层。 | 虚拟机执行 `cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh`；板端打开历史详情后点击 `查看完整说明`，确认长文本能滚动读完。 |
+| 板端云端连接可行性 | 正式链路改为板端开机自启并守护 `ssh -R 127.0.0.1:18081:127.0.0.1:18080`，云端通过本机 `127.0.0.1:18081` 回写板端。 | 板端执行 `/etc/init.d/S91board-review-tunnel status`；云服务器执行 `ss -ltnp | grep 127.0.0.1:18081` 和 `curl -i --max-time 5 http://127.0.0.1:18081/api/v1/review-result`。 |
+| 云端只检查不重连 | 云端部署 systemd timer 每 60 秒检查隧道监听和 HTTP 转发；断线重连由板端 monitor 完成，最终不依赖 Windows 或虚拟机。 | 云服务器执行 `systemctl status yunduan-board-review-tunnel-check.timer` 和 `tail -n 80 /var/log/yunduan-board-review-tunnel-check.log`，日志应周期出现 `OK 反向隧道可达`。 |
+| 垫圈类命名经验 | `gasket` 是历史训练错误命名，业务显示为波形垫圈；`washer` 是平垫圈；`垫圈类` 只是分类，不是某一个零件。 | 上传脚本自检中检查 `gasket_good/gasket_bad` 归到同一个 `gasket`，`washer_good` 归到另一个零件；云端零件页确认分类和具体零件同时正确。 |
+| 统计页分布越界 | `统计分析` 页的 `分布概览` 改为左右两列：左列良品/坏品/待复核，右列上传成功/上传失败，避免“上传失败”在 160px 面板内纵向超出。 | Windows 本地执行 `"C:/Program Files/Git/bin/bash.exe" 20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`；板端点击 `统计分析`，确认五条分布全部在面板边框内。 |
+
 ## 修改文件清单
 
 | 路径 | 修改原因 |
@@ -42,10 +52,10 @@
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S91board-review-tunnel` | 板端云端复核回写反向隧道自启入口，在 Qt 18080 回写服务启动后守护 `ssh -R`。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/root/qt_camera_display/board-review-tunnel.sh` | 板端反向隧道 watchdog 脚本，断线后自动重连云端 `127.0.0.1:18081`。 |
 | `20_uvc_camera/qt_camera_display/main.cpp` | Qt 控制器保留旧后台保存自检入口，同时正式检测入口在后台完成当前帧保存、分类、UNet、COS 上传和历史记录写入，避免阻塞主界面触摸；新增 `DeviceHealthController`，异步探测 4G、相机、F4、云端和 SD 卡真实状态；4G 和云端进程启动失败通过 Qt 信号异步回写，不在状态刷新路径等待启动；相机离线后只重启 overlay 视频进程，不重启 Qt 界面。 |
-| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 首页不再暴露独立 `保存图片` 按钮；`检测` 按钮改为分阶段刷新结果，分类完成先显示零件/类别，UNet 完成再显示双模型耗时；顶部状态栏、手动页安全状态和告警页健康矩阵改为绑定真实 `deviceHealth` 状态；相机重新在线时必须等 Qt splash 完全淡出并停留在首页，才自动恢复 KMS 视频层可见性，避免摄像头画面早于 Qt 界面出现。 |
+| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 首页不再暴露独立 `保存图片` 按钮；`检测` 按钮改为分阶段刷新结果，分类完成先显示零件/类别，UNet 完成再显示双模型耗时；顶部状态栏、手动页安全状态和告警页健康矩阵改为绑定真实 `deviceHealth` 状态；相机重新在线时必须等 Qt splash 完全淡出并停留在首页，才自动恢复 KMS 视频层可见性，避免摄像头画面早于 Qt 界面出现；统计页 `分布概览` 使用左右两列显示五项分布指标，避免上传失败条超出面板。 |
 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c` | 新增 overlay 控制命令 `STATUS`，返回 `has_frame/serial/visible/width/height`，供 Qt 判断 USB 摄像头是否真实出帧。 |
 | `20_uvc_camera/qt_camera_display/run_qt_kms_overlay_display.sh` | 新增 `restart-overlay`，只重启 `uvc_kms_overlay` 且保持视频层隐藏，用于 USB 摄像头热拔插恢复，不杀 Qt 界面；画面是否恢复显示由 QML 在首页状态下发送 `VISIBLE 1` 决定。 |
-| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 增加静态契约，禁止 QML 主线程直接同步调用 `saveCurrentFrameToSdCard()`，并检查真实设备健康控制器、overlay `STATUS`、`restart-overlay` 和健康检测不等待 `waitForStarted()` 的非阻塞契约。 |
+| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 增加静态契约，禁止 QML 主线程直接同步调用 `saveCurrentFrameToSdCard()`，并检查真实设备健康控制器、overlay `STATUS`、`restart-overlay`、统计分布两列布局和健康检测不等待 `waitForStarted()` 的非阻塞契约。 |
 
 ## 使用流程
 

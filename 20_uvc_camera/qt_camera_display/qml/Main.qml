@@ -2492,6 +2492,30 @@ Rectangle {
     }
 
     /*
+     * statsDistributionLeftBars 的作用：
+     *   生成“分布概览”左列数据，只放检测结果类指标。
+     *   左列固定为良品、坏品、待复核三项，避免五条统计全部纵向堆叠后超出 160px 面板。
+     *
+     * 返回值：
+     *   返回数组，每项格式与 statsDistributionBars() 相同，供左侧 Repeater 直接渲染。
+     */
+    function statsDistributionLeftBars() {
+        return statsDistributionBars().slice(0, 3)
+    }
+
+    /*
+     * statsDistributionRightBars 的作用：
+     *   生成“分布概览”右列数据，只放上传链路类指标。
+     *   右列固定为上传成功和上传失败两项，让现场人员能单独判断云端链路健康。
+     *
+     * 返回值：
+     *   返回数组，每项格式与 statsDistributionBars() 相同，供右侧 Repeater 直接渲染。
+     */
+    function statsDistributionRightBars() {
+        return statsDistributionBars().slice(3, 5)
+    }
+
+    /*
      * statsRecentRows 的作用：
      *   生成统计页底部最近记录表数据，最新记录排在最上方。
      *   最近记录区域已经改成 ListView 竖向滑动，所以这里保留全部历史记录，
@@ -4435,53 +4459,85 @@ Rectangle {
                     font.bold: true
                 }
 
-                Column {
-                    id: statsDistributionBarColumn
+                /* statsDistributionSplitRow 把五条分布数据拆成左右两列，避免上传失败条在小屏面板底部越界。 */
+                Row {
+                    id: statsDistributionSplitRow
                     x: 14
                     y: 34
                     width: parent.width - 28
-                    spacing: 4
+                    height: parent.height - 46
+                    spacing: 16
 
-                    Repeater {
-                        model: root.statsDistributionBars()
+                    /* statsDistributionLeftColumn 显示良品、坏品、待复核三类检测结果分布。 */
+                    Column {
+                        id: statsDistributionLeftColumn
+                        width: (statsDistributionSplitRow.width - statsDistributionSplitRow.spacing) / 2
+                        height: parent.height
+                        spacing: 6
 
-                        Column {
-                            width: statsDistributionBarColumn.width
-                            spacing: 5
+                        Repeater {
+                            model: root.statsDistributionLeftBars()
+                            delegate: statsDistributionBarDelegate
+                        }
+                    }
 
-                            Row {
-                                width: parent.width
-                                height: 14
+                    /* statsDistributionRightColumn 显示上传成功和上传失败两类云端链路分布。 */
+                    Column {
+                        id: statsDistributionRightColumn
+                        width: (statsDistributionSplitRow.width - statsDistributionSplitRow.spacing) / 2
+                        height: parent.height
+                        spacing: 6
 
-                                Text {
-                                    width: 72
-                                    text: modelData.name
-                                    color: "#cfd7db"
-                                    font.pixelSize: 11
-                                    font.bold: true
-                                }
+                        Repeater {
+                            model: root.statsDistributionRightBars()
+                            delegate: statsDistributionBarDelegate
+                        }
+                    }
+                }
 
-                                Text {
-                                    width: parent.width - 72
-                                    text: modelData.value + "  " + modelData.percent
-                                    color: "#aab4ba"
-                                    font.pixelSize: 11
-                                    horizontalAlignment: Text.AlignRight
-                                }
+                /* statsDistributionBarDelegate 是左右两列共用的单条分布条，保证名称、数值和进度条样式一致。 */
+                Component {
+                    id: statsDistributionBarDelegate
+
+                    Column {
+                        width: parent.width
+                        height: 34
+                        spacing: 4
+
+                        Row {
+                            width: parent.width
+                            height: 14
+
+                            Text {
+                                width: 58
+                                text: modelData.name
+                                color: "#cfd7db"
+                                font.pixelSize: 11
+                                font.bold: true
+                                elide: Text.ElideRight
                             }
 
-                            Rectangle {
-                                width: parent.width
-                                height: 8
-                                radius: 4
-                                color: "#252c31"
+                            Text {
+                                width: parent.width - 58
+                                text: modelData.value + "  " + modelData.percent
+                                color: "#aab4ba"
+                                font.pixelSize: 11
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideLeft
+                            }
+                        }
 
-                                Rectangle {
-                                    width: parent.width * (modelData.total > 0 ? modelData.value / modelData.total : 0)
-                                    height: parent.height
-                                    radius: 4
-                                    color: modelData.color
-                                }
+                        Rectangle {
+                            width: parent.width
+                            height: 8
+                            radius: 4
+                            color: "#252c31"
+
+                            Rectangle {
+                                width: parent.width * (modelData.total > 0 ? modelData.value / modelData.total : 0)
+                                height: parent.height
+                                radius: 4
+                                color: modelData.color
                             }
                         }
                     }

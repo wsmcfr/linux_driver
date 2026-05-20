@@ -24,7 +24,13 @@ require_grep "statsPageVisible" "qml/Main.qml"
 require_grep "statsSummary" "qml/Main.qml"
 require_grep "statsRecentBars" "qml/Main.qml"
 require_grep "statsDistributionBars" "qml/Main.qml"
+require_grep "statsDistributionLeftBars" "qml/Main.qml"
+require_grep "statsDistributionRightBars" "qml/Main.qml"
 require_grep "statsRecentRows" "qml/Main.qml"
+require_grep "id: statsRecentListView" "qml/Main.qml"
+require_grep "id: statsDistributionLeftColumn" "qml/Main.qml"
+require_grep "id: statsDistributionRightColumn" "qml/Main.qml"
+require_grep "上下滑动查看更多" "qml/Main.qml"
 require_grep "openHistoryDetailFromStats" "qml/Main.qml"
 require_grep "id: statsPage" "qml/Main.qml"
 ```
@@ -54,7 +60,7 @@ property bool statsPageVisible: activePage === "stats"
 
 **Step 2: 增加统计 helper**
 
-新增 `isUploadSuccess()`、`isGoodRecord()`、`percentText()`、`statsSummary()`、`statsRecentBars()`、`statsDistributionBars()`、`statsRecentRows()` 和 `openHistoryDetailFromStats()`。
+新增 `isUploadSuccess()`、`isGoodRecord()`、`percentText()`、`statsSummary()`、`statsRecentBars()`、`statsDistributionBars()`、`statsDistributionLeftBars()`、`statsDistributionRightBars()`、`statsRecentRows()` 和 `openHistoryDetailFromStats()`。
 
 **Step 3: Overlay 可见性**
 
@@ -75,8 +81,8 @@ property bool statsPageVisible: activePage === "stats"
 |---|---|
 | KPI 卡片 | `statsKpiGrid` |
 | 最近保存趋势 | `statsTrendPanel` |
-| 分布概览 | `statsDistributionPanel` |
-| 最近记录 | `statsRecentPanel` |
+| 分布概览 | `statsDistributionPanel`，内部用 `statsDistributionLeftColumn` 显示良品/坏品/待复核，用 `statsDistributionRightColumn` 显示上传成功/上传失败 |
+| 最近记录 | `statsRecentPanel`，内部使用 `statsRecentListView` 竖向滑动 |
 | 云端与文件状态 | `statsCloudPanel` |
 
 **Step 3: 最近记录跳转**
@@ -86,6 +92,14 @@ property bool statsPageVisible: activePage === "stats"
 ```qml
 root.openHistoryDetailFromStats(modelData.index)
 ```
+
+**Step 4: 最近记录卡片内滑动**
+
+`statsRecentRows()` 按最新在前返回全部历史记录；`statsRecentPanel` 内部使用竖向 `ListView`，并显示 `共 N 条 · 上下滑动查看更多` 提示，避免记录多时只能看到固定 5 条。
+
+**Step 5: 分布概览两列防溢出**
+
+`statsDistributionBars()` 保留五项完整统计；`statsDistributionLeftBars()` 返回前三项检测结果，`statsDistributionRightBars()` 返回后两项上传状态。`statsDistributionPanel` 内部用左右两列和共享 `statsDistributionBarDelegate` 绘制，避免“上传失败”在 160px 面板底部越界。
 
 ### Task 4: 文档和规范同步
 
@@ -119,12 +133,11 @@ root.openHistoryDetailFromStats(modelData.index)
 **Step 2: 标记检查**
 
 ```bash
-rg -n "statsPageVisible|statsSummary|statsRecentBars|statsDistributionBars|statsRecentRows|openHistoryDetailFromStats|id: statsPage" 20_uvc_camera/qt_camera_display/qml/Main.qml
+rg -n "statsPageVisible|statsSummary|statsRecentBars|statsDistributionBars|statsDistributionLeftBars|statsDistributionRightBars|statsRecentRows|openHistoryDetailFromStats|id: statsPage|id: statsDistributionLeftColumn|id: statsDistributionRightColumn" 20_uvc_camera/qt_camera_display/qml/Main.qml
 ```
 
 预期：列出统计页状态、函数和页面 ID。
 
 **Step 3: 板端人工验证**
 
-部署后在 LCD 上点击 `统计分析`，确认页面显示 KPI、趋势、分布、最近记录和云端状态；点击最近记录进入历史详情页；返回首页后视频恢复。
-
+部署后在 LCD 上点击 `统计分析`，确认页面显示 KPI、趋势、分布、最近记录和云端状态；确认“分布概览”左列显示良品/坏品/待复核，右列显示上传成功/上传失败，所有文字和条形图都在面板边框内；在最近记录卡片内上下滑动能看到更多记录；点击最近记录进入历史详情页；返回首页后视频恢复。

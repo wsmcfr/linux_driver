@@ -27,8 +27,8 @@
 | 顶部标题 | `统计分析`、样本数量、返回首页按钮 |
 | KPI 行 | 总记录、良品、待复核、上传成功率、图片总量 |
 | 最近保存趋势 | 最近 8 条记录的轻量柱状图，绿色表示云端登记成功，黄色表示本地保存但上传待排查 |
-| 分布概览 | 良品、待复核、上传成功、上传失败四条水平分布条 |
-| 最近记录 | 最新 5 条记录的时间、结果、云端编号、图片数和状态 |
+| 分布概览 | 左列显示良品、坏品、待复核三条检测结果分布；右列显示上传成功、上传失败两条云端链路分布，避免五条纵向堆叠超出 160px 面板 |
+| 最近记录 | 按最新在前显示上传记录；卡片内部使用竖向滑动查看更多记录，行内显示时间、结果、云端编号、图片数和状态 |
 | 云端与文件状态 | 最近时间、最近编号、云端状态、平均文件大小、最大批次大小 |
 
 ## 数据契约
@@ -42,6 +42,15 @@
 | `jpgSizeBytes` / `pngSizeBytes` | 本地文件大小 | 计算图片总大小、平均文件和最大批次 |
 | `imageCount` | JPG/PNG 路径数量 | 统计图片总量和最近记录图片数 |
 
+## 2026-05-20 布局修正
+
+| 项目 | 修正结论 |
+|---|---|
+| 问题 | `statsDistributionBars()` 已经包含良品、坏品、待复核、上传成功、上传失败五项，原单列布局在 1024x600 LCD 的 160px 分布面板内会让最后一项“上传失败”越界。 |
+| 布局 | 保留全部五项，但拆成左右两列：左列三项检测结果，右列两项上传状态。 |
+| QML 契约 | 新增 `statsDistributionLeftBars()`、`statsDistributionRightBars()`、`statsDistributionLeftColumn` 和 `statsDistributionRightColumn`，静态测试防止后续退回单列五项。 |
+| 验证 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`，板端打开 `统计分析` 后确认“上传失败”不再超出分布面板。 |
+
 ## 验收方式
 
 | 测试目标 | 执行位置 | 命令/动作 | 预期输出/现象 | 失败时排查 |
@@ -49,6 +58,7 @@
 | 静态契约 | 本地仓库 | `./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract` | 检查 `statsPageVisible`、`statsSummary`、`statsPage` 等标记 |
 | 历史数据 | 开发板 | `test -s /mnt/sdcard/images/upload_history.json; grep -c '"upload_time"' /mnt/sdcard/images/upload_history.json` | JSON 非空且输出记录数 | 先点击首页 `保存图片` 生成记录 |
 | 页面入口 | 开发板屏幕 | 点击左侧 `统计分析` | 页面显示 KPI、趋势、分布、最近记录和云端状态 | 查 `switchPage("stats")` 和触摸输入 |
+| 分布概览防溢出 | 开发板屏幕 | 点击左侧 `统计分析`，观察“分布概览”面板 | 良品/坏品/待复核在左列，上传成功/上传失败在右列，五项全部位于面板边框内 | 查 `statsDistributionLeftColumn`、`statsDistributionRightColumn` 和 `statsDistributionBarDelegate` 是否仍存在 |
+| 最近记录滑动 | 开发板屏幕 | 在 `最近记录` 卡片内上下滑动 | 能继续看到更早记录，不需要离开统计页 | 查 `statsRecentListView` 是否仍为竖向 `ListView`，以及 `statsRecentRows()` 是否返回全部历史记录 |
 | 详情跳转 | 开发板屏幕 | 点击统计页最近记录行 | 进入对应历史详情页，可查看 JPG/PNG | 查 `openHistoryDetailFromStats()` 和 `showHistoryDetail()` |
 | Overlay 隐藏 | 开发板屏幕 | 进入统计页再返回首页 | 统计页不被视频覆盖，返回首页后视频恢复 | 查 `setOverlayVisible(pageName === "home")` 和 overlay `VISIBLE` 命令 |
-
