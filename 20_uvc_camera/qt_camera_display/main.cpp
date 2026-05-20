@@ -25,6 +25,7 @@
  *   --storage-self-test   不启动 QML，只走 Qt 保存控制器保存一张 SD 卡图片，便于 SSH 验证按钮同路径逻辑。
  *   --detect-self-test    不启动 QML，只走双模型检测链路，便于 SSH 验证分类、UNet、上传和历史记录。
  *   --alarm-snapshot-self-test  不启动 QML，只写一份告警诊断快照，便于 SSH 验证日志落盘逻辑。
+ *   --alarm-log-self-test  不启动 QML，只写一份自动告警日志，便于 SSH 验证每问题一文件逻辑。
  *   --windowed            使用 1024x600 窗口模式，便于桌面或远程调试。
  *
  * 返回值：
@@ -126,11 +127,14 @@ static const char *DEFAULT_SDCARD_MOUNT_POINT = "/mnt/sdcard";
 /* SD 卡图片保存目录，overlay 收到 SAVE 请求后会在这里生成 PPM 图片。 */
 static const char *DEFAULT_SDCARD_IMAGE_DIR = "/mnt/sdcard/images";
 
-/* SD 卡诊断日志目录，告警维护页保存诊断时会把文本快照写到这里。 */
+/* SD 卡诊断日志目录，告警维护页保存诊断和自动告警日志时会把文本写到这里。 */
 static const char *DEFAULT_SDCARD_LOG_DIR = "/mnt/sdcard/logs";
 
-/* 告警诊断快照固定文件名；重复点击会覆盖旧快照，方便 SSH 直接查看最新状态。 */
-static const char *DEFAULT_ALARM_SNAPSHOT_FILE = "/mnt/sdcard/logs/qt_alarm_snapshot.txt";
+/* ALARM_SNAPSHOT_PREFIX 是诊断快照文件名前缀，实际文件名会追加当前时间戳，避免重复点击覆盖旧文件。 */
+static const char *ALARM_SNAPSHOT_PREFIX = "qt_alarm_snapshot";
+
+/* ALARM_LOG_PREFIX 是自动告警日志文件名前缀，实际文件名会追加发生时间和告警来源。 */
+static const char *ALARM_LOG_PREFIX = "qt_alarm";
 
 /* 板端 COS 上传脚本默认部署路径，保存按钮会在本地 JPG/PNG 落盘后调用它。 */
 static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-cos-upload";
@@ -2115,7 +2119,6 @@ public:
           m_mountPoint(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
           m_imageDir(QString::fromLatin1(DEFAULT_SDCARD_IMAGE_DIR)),
           m_logDir(QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR)),
-          m_alarmSnapshotFile(QString::fromLatin1(DEFAULT_ALARM_SNAPSHOT_FILE)),
           m_historyModel(nullptr),
           m_appendHistoryInSave(true),
           m_saveInProgress(false),
@@ -2204,22 +2207,18 @@ public:
      *   mountPoint 是 SD 卡挂载点。
      *   imageDir 是 JPG/PNG 图片保存目录。
      *   logDir 是诊断日志目录。
-     *   alarmSnapshotFile 是告警快照固定文件路径。
-     *
      * 返回值：
      *   无返回值。
      */
     void setStoragePaths(const QString &socketPath,
                          const QString &mountPoint,
                          const QString &imageDir,
-                         const QString &logDir,
-                         const QString &alarmSnapshotFile)
+                         const QString &logDir)
     {
         m_socketPath = socketPath;
         m_mountPoint = mountPoint;
         m_imageDir = imageDir;
         m_logDir = logDir;
-        m_alarmSnapshotFile = alarmSnapshotFile;
     }
 
     /*
@@ -2339,9 +2338,6 @@ public:
         /* logDir 保存诊断日志目录，保持后台控制器和主控制器路径配置一致。 */
         const QString logDir = m_logDir;
 
-        /* alarmSnapshotFile 保存告警快照路径，保持后台控制器完整复制主控制器配置。 */
-        const QString alarmSnapshotFile = m_alarmSnapshotFile;
-
         /* workerResult 保存后台线程执行结果，线程结束后主线程从这里读取并更新 QML。 */
         const QSharedPointer<QString> workerResult(new QString(QStringLiteral("保存失败：后台保存线程没有返回结果")));
 
@@ -2350,15 +2346,13 @@ public:
                                                  mountPoint,
                                                  imageDir,
                                                  logDir,
-                                                 alarmSnapshotFile,
                                                  workerResult]() {
             CameraStorageController workerController;
 
             workerController.setStoragePaths(socketPath,
                                              mountPoint,
                                              imageDir,
-                                             logDir,
-                                             alarmSnapshotFile);
+                                             logDir);
             workerController.setAppendHistoryInSave(false);
 
             *workerResult = workerController.saveCurrentFrameToSdCard();
@@ -2478,8 +2472,7 @@ public:
             workerController.setStoragePaths(socketPath,
                                              mountPoint,
                                              imageDir,
-                                             QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR),
-                                             QString::fromLatin1(DEFAULT_ALARM_SNAPSHOT_FILE));
+                                             QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR));
             workerController.setAppendHistoryInSave(false);
 
             *workerResult = workerController.detectCurrentFrameOnce(mountPoint,
@@ -2616,86 +2609,55 @@ public:
 
     /*
      * saveAlarmSnapshotToSdCard 的作用：
-     *   响应告警维护页“保存诊断”按钮，把 QML 汇总的告警状态写入 SD 卡日志文件。
+     *   响应告警维护页“保存诊断”按钮，把 QML 汇总的告警状态写入独立时间戳快照文件。
      *
      * 主要流程：
-     *   1. 先确认 /mnt/sdcard 是真实挂载点，避免 SD 卡未挂载时误写 rootfs。
-     *   2. 创建 /mnt/sdcard/logs 目录，保证用户进入该目录能看到快照文件。
-     *   3. 用 UTF-8 文本覆盖写入最新快照，随后 flush 并 fsync，确保数据进入内核文件系统。
+     *   1. 通过 saveAlarmTextToSdCard() 复用挂载点检查、目录创建、可写校验和 fsync 写入逻辑。
+     *   2. 每次调用都按当前时间生成 qt_alarm_snapshot_YYYYMMDD_HHMMSS_zzz.txt。
+     *   3. 把真实文件路径返回给 QML，现场人员可直接 SSH 打开该次点击生成的快照。
      *
      * 参数：
      *   snapshotText 是 QML 组装的告警码、处理状态、设备健康和参数摘要。
      *
      * 返回值：
-     *   成功返回“诊断已保存：/mnt/sdcard/logs/qt_alarm_snapshot.txt”；
-     *   失败返回“诊断保存失败：<原因>”。
+     *   成功返回“诊断已保存：/mnt/sdcard/logs/qt_alarm_snapshot_*.txt”；
+     *   失败返回“诊断保存失败：<中文原因>”。
      */
     Q_INVOKABLE QString saveAlarmSnapshotToSdCard(const QString &snapshotText)
     {
-        QString mountError;
-        QString result;
+        return saveAlarmTextToSdCard(QStringLiteral("alarm-snapshot"),
+                                     QStringLiteral("诊断"),
+                                     QString::fromLatin1(ALARM_SNAPSHOT_PREFIX),
+                                     QString(),
+                                     QStringLiteral(".txt"),
+                                     snapshotText);
+    }
 
-        qInfo() << "storage action alarm-snapshot requested"
-                << "mount" << m_mountPoint
-                << "logDir" << m_logDir
-                << "snapshot" << m_alarmSnapshotFile;
-
-        if (!isMountPointMounted(m_mountPoint, &mountError)) {
-            result = QStringLiteral("诊断保存失败：") + mountError;
-            qWarning() << "storage action alarm-snapshot result" << result;
-            return result;
-        }
-
-        if (!QDir().mkpath(m_logDir)) {
-            result = QStringLiteral("诊断保存失败：无法创建 ") + m_logDir;
-            qWarning() << "storage action alarm-snapshot result" << result;
-            return result;
-        }
-
-        QFile snapshotFile(m_alarmSnapshotFile);
-        if (!snapshotFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-            result = QStringLiteral("诊断保存失败：无法打开 ")
-                + m_alarmSnapshotFile
-                + QStringLiteral("：")
-                + snapshotFile.errorString();
-            qWarning() << "storage action alarm-snapshot result" << result;
-            return result;
-        }
-
-        QTextStream stream(&snapshotFile);
-        stream.setCodec("UTF-8");
-        stream << snapshotText;
-        if (!snapshotText.endsWith(QLatin1Char('\n'))) {
-            stream << '\n';
-        }
-        stream.flush();
-
-        if (stream.status() != QTextStream::Ok) {
-            result = QStringLiteral("诊断保存失败：写入文本流失败");
-            qWarning() << "storage action alarm-snapshot result" << result;
-            snapshotFile.close();
-            return result;
-        }
-
-        if (!snapshotFile.flush()) {
-            result = QStringLiteral("诊断保存失败：flush 失败：") + snapshotFile.errorString();
-            qWarning() << "storage action alarm-snapshot result" << result;
-            snapshotFile.close();
-            return result;
-        }
-
-        if (::fsync(snapshotFile.handle()) != 0) {
-            result = QStringLiteral("诊断保存失败：fsync 失败：")
-                + QString::fromLocal8Bit(strerror(errno));
-            qWarning() << "storage action alarm-snapshot result" << result;
-            snapshotFile.close();
-            return result;
-        }
-
-        snapshotFile.close();
-        result = QStringLiteral("诊断已保存：") + m_alarmSnapshotFile;
-        qInfo() << "storage action alarm-snapshot result" << result;
-        return result;
+    /*
+     * recordAlarmIssueToSdCard 的作用：
+     *   响应 QML 自动告警触发，把每一次新出现的真实问题写成独立告警日志。
+     *
+     * 主要流程：
+     *   1. QML 在健康状态、保存/上传/模型结果变化时判定是否出现新问题。
+     *   2. C++ 按告警来源生成 qt_alarm_YYYYMMDD_HHMMSS_zzz_<source>.log。
+     *   3. 复用 writeTextFileWithFsync() 完成 UTF-8 写入、flush 和 fsync。
+     *
+     * 参数：
+     *   sourceKey 是告警来源标识，例如 camera-kms-no-frame、cloud-offline。
+     *   alarmText 是 QML 组装的发生时间、问题、状态和排查建议。
+     *
+     * 返回值：
+     *   成功返回“告警日志已保存：/mnt/sdcard/logs/qt_alarm_*.log”；
+     *   失败返回“告警日志保存失败：<中文原因>”。
+     */
+    Q_INVOKABLE QString recordAlarmIssueToSdCard(const QString &sourceKey, const QString &alarmText)
+    {
+        return saveAlarmTextToSdCard(QStringLiteral("alarm-log"),
+                                     QStringLiteral("告警日志"),
+                                     QString::fromLatin1(ALARM_LOG_PREFIX),
+                                     sourceKey,
+                                     QStringLiteral(".log"),
+                                     alarmText);
     }
 
     /*
@@ -2951,6 +2913,224 @@ private:
             *errorText = mountPoint + QStringLiteral(" 未挂载");
         }
         return false;
+    }
+
+    /*
+     * sanitizeLogFileToken 的作用：
+     *   把 QML 传入的告警来源转换成安全文件名片段，防止斜杠、空格或中文标点破坏路径结构。
+     *
+     * 主要流程：
+     *   逐字符保留英文字母、数字、横线和下划线，其它字符统一替换成下划线；
+     *   如果清洗后为空，使用 fallback 兜底，保证日志文件名始终可预测。
+     *
+     * 参数：
+     *   token 是原始来源标识。
+     *   fallback 是 token 为空或全非法时使用的默认片段。
+     *
+     * 返回值：
+     *   返回只包含 [A-Za-z0-9_-] 的文件名片段。
+     */
+    QString sanitizeLogFileToken(const QString &token, const QString &fallback) const
+    {
+        QString sanitized;
+
+        for (const QChar &ch : token) {
+            const ushort code = ch.unicode();
+            if ((code >= 'a' && code <= 'z')
+                    || (code >= 'A' && code <= 'Z')
+                    || (code >= '0' && code <= '9')
+                    || code == '-'
+                    || code == '_') {
+                sanitized.append(ch);
+            } else {
+                sanitized.append(QLatin1Char('_'));
+            }
+        }
+
+        sanitized = sanitized.trimmed();
+        while (sanitized.contains(QStringLiteral("__"))) {
+            sanitized.replace(QStringLiteral("__"), QStringLiteral("_"));
+        }
+
+        if (sanitized.isEmpty()) {
+            return fallback;
+        }
+        return sanitized;
+    }
+
+    /*
+     * timestampedLogFilePath 的作用：
+     *   为告警日志和诊断快照生成带毫秒时间戳的完整路径，避免不同点击或不同问题互相覆盖。
+     *
+     * 主要流程：
+     *   1. 读取当前板端本地时间，格式化成 YYYYMMDD_HHMMSS_zzz。
+     *   2. 可选追加 sourceKey，告警日志能从文件名看出问题来源。
+     *   3. 返回位于 /mnt/sdcard/logs 下的完整文件路径。
+     *
+     * 参数：
+     *   prefix 是文件名前缀，例如 qt_alarm_snapshot 或 qt_alarm。
+     *   sourceKey 是可选来源标识，诊断快照可以为空。
+     *   suffix 是扩展名，例如 .txt 或 .log。
+     *
+     * 返回值：
+     *   返回可直接交给 QFile 打开的完整路径。
+     */
+    QString timestampedLogFilePath(const QString &prefix,
+                                   const QString &sourceKey,
+                                   const QString &suffix) const
+    {
+        const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+        const QString safePrefix = sanitizeLogFileToken(prefix, QStringLiteral("qt_alarm"));
+        QString fileName = safePrefix + QLatin1Char('_') + timestamp;
+
+        if (!sourceKey.trimmed().isEmpty()) {
+            fileName += QLatin1Char('_') + sanitizeLogFileToken(sourceKey, QStringLiteral("runtime"));
+        }
+
+        fileName += suffix;
+        return QDir(m_logDir).filePath(fileName);
+    }
+
+    /*
+     * writeTextFileWithFsync 的作用：
+     *   把 UTF-8 文本可靠写入一个新文件，并在成功返回前完成 flush 和 fsync。
+     *
+     * 主要流程：
+     *   1. 使用 WriteOnly|NewOnly 打开文件，避免极小概率下同名时间戳覆盖已有文件。
+     *   2. 通过 QTextStream 写入 UTF-8 文本，必要时补一个换行，方便 tail/cat 阅读。
+     *   3. 先 flush Qt 缓冲，再 fsync 文件描述符，最后关闭文件。
+     *
+     * 参数：
+     *   filePath 是目标完整路径。
+     *   text 是要写入的 UTF-8 文本。
+     *   errorText 用于带出中文失败原因。
+     *
+     * 返回值：
+     *   true 表示文件写入、flush 和 fsync 都成功；false 表示失败，errorText 保存原因。
+     */
+    bool writeTextFileWithFsync(const QString &filePath,
+                                const QString &text,
+                                QString *errorText) const
+    {
+        QFile file(filePath);
+
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::NewOnly)) {
+            if (errorText) {
+                *errorText = QStringLiteral("无法打开 ")
+                    + filePath
+                    + QStringLiteral("：")
+                    + file.errorString();
+            }
+            return false;
+        }
+
+        QTextStream stream(&file);
+        stream.setCodec("UTF-8");
+        stream << text;
+        if (!text.endsWith(QLatin1Char('\n'))) {
+            stream << '\n';
+        }
+        stream.flush();
+
+        if (stream.status() != QTextStream::Ok) {
+            if (errorText) {
+                *errorText = QStringLiteral("写入文本流失败");
+            }
+            file.close();
+            return false;
+        }
+
+        if (!file.flush()) {
+            if (errorText) {
+                *errorText = QStringLiteral("flush 失败：") + file.errorString();
+            }
+            file.close();
+            return false;
+        }
+
+        if (::fsync(file.handle()) != 0) {
+            if (errorText) {
+                *errorText = QStringLiteral("fsync 失败：")
+                    + QString::fromLocal8Bit(strerror(errno));
+            }
+            file.close();
+            return false;
+        }
+
+        file.close();
+        return true;
+    }
+
+    /*
+     * saveAlarmTextToSdCard 的作用：
+     *   为“保存诊断”和“自动告警日志”提供同一条可靠落盘控制路径。
+     *
+     * 主要流程：
+     *   1. 先确认 /mnt/sdcard 已挂载，防止 SD 卡异常时误写 rootfs。
+     *   2. 创建 /mnt/sdcard/logs 并检查目录可写，失败时返回明确中文原因。
+     *   3. 生成时间戳文件名并调用 writeTextFileWithFsync() 写入文本。
+     *
+     * 参数：
+     *   actionName 是日志里的动作名，例如 alarm-snapshot 或 alarm-log。
+     *   successLabel 是返回给 QML 的中文对象名，例如“诊断”或“告警日志”。
+     *   filePrefix 是文件名前缀。
+     *   sourceKey 是可选来源标识。
+     *   suffix 是扩展名。
+     *   text 是要写入的文本内容。
+     *
+     * 返回值：
+     *   成功返回“<对象>已保存：<路径>”；失败返回“<对象>保存失败：<原因>”。
+     */
+    QString saveAlarmTextToSdCard(const QString &actionName,
+                                  const QString &successLabel,
+                                  const QString &filePrefix,
+                                  const QString &sourceKey,
+                                  const QString &suffix,
+                                  const QString &text)
+    {
+        QString mountError;
+        QString writeError;
+        QString result;
+
+        qInfo() << "storage action" << actionName << "requested"
+                << "mount" << m_mountPoint
+                << "logDir" << m_logDir
+                << "source" << sourceKey;
+        if (actionName == QStringLiteral("alarm-snapshot")) {
+            qInfo() << "storage action alarm-snapshot marker";
+        } else if (actionName == QStringLiteral("alarm-log")) {
+            qInfo() << "storage action alarm-log marker";
+        }
+
+        if (!isMountPointMounted(m_mountPoint, &mountError)) {
+            result = successLabel + QStringLiteral("保存失败：") + mountError;
+            qWarning() << "storage action" << actionName << "result" << result;
+            return result;
+        }
+
+        if (!QDir().mkpath(m_logDir)) {
+            result = successLabel + QStringLiteral("保存失败：无法创建 ") + m_logDir;
+            qWarning() << "storage action" << actionName << "result" << result;
+            return result;
+        }
+
+        const QFileInfo logDirInfo(m_logDir);
+        if (!logDirInfo.isDir() || !logDirInfo.isWritable()) {
+            result = successLabel + QStringLiteral("保存失败：日志目录不可写 ") + m_logDir;
+            qWarning() << "storage action" << actionName << "result" << result;
+            return result;
+        }
+
+        const QString filePath = timestampedLogFilePath(filePrefix, sourceKey, suffix);
+        if (!writeTextFileWithFsync(filePath, text, &writeError)) {
+            result = successLabel + QStringLiteral("保存失败：") + writeError;
+            qWarning() << "storage action" << actionName << "result" << result;
+            return result;
+        }
+
+        result = successLabel + QStringLiteral("已保存：") + filePath;
+        qInfo() << "storage action" << actionName << "result" << result;
+        return result;
     }
 
     /*
@@ -4242,8 +4422,7 @@ private:
     QString m_socketPath;  /* m_socketPath 是 overlay 控制 socket 路径。 */
     QString m_mountPoint;  /* m_mountPoint 是 SD 卡挂载点。 */
     QString m_imageDir;    /* m_imageDir 是图片保存目录。 */
-    QString m_logDir;      /* m_logDir 是 SD 卡诊断日志目录。 */
-    QString m_alarmSnapshotFile; /* m_alarmSnapshotFile 是告警诊断快照固定文件路径。 */
+    QString m_logDir;      /* m_logDir 是 SD 卡诊断和自动告警日志目录。 */
     UploadHistoryModel *m_historyModel; /* m_historyModel 指向 QML 使用的上传历史模型，保存成功后会追加记录。 */
     bool m_appendHistoryInSave; /* m_appendHistoryInSave 控制同步保存函数是否立即追加历史记录。 */
     bool m_saveInProgress; /* m_saveInProgress 只在 Qt 主线程维护，用于防止保存图片任务重复启动。 */
@@ -4866,11 +5045,19 @@ private:
             std::fclose(mounts);
         }
 
-        if (mounted) {
-            setSdcardStatus(QStringLiteral("已挂载"), QStringLiteral("#35d07f"));
-        } else {
+        if (!mounted) {
             setSdcardStatus(QStringLiteral("未挂载"), QStringLiteral("#f4b942"));
+            return;
         }
+
+        const QFileInfo mountInfo(m_sdcardMount);
+        if (!mountInfo.isDir() || !mountInfo.isWritable()) {
+            setSdcardStatus(QStringLiteral("不可写"), QStringLiteral("#ef5b5b"));
+            setDetailText(QStringLiteral("SD 卡已挂载但不可写：") + m_sdcardMount);
+            return;
+        }
+
+        setSdcardStatus(QStringLiteral("可写"), QStringLiteral("#35d07f"));
     }
 
     /*
@@ -5566,12 +5753,12 @@ static int run_detect_self_test(int argc, char *argv[])
 
 /*
  * run_alarm_snapshot_self_test 的作用：
- *   不启动 QML 界面，直接复用 CameraStorageController 写一份告警诊断快照。
+ *   不启动 QML 界面，直接复用 CameraStorageController 写一份时间戳告警诊断快照。
  *
  * 主要流程：
  *   1. 创建 QCoreApplication，保证 Qt 文本编码、时区和文件接口可用。
  *   2. 构造一份包含告警码、相机状态、存储状态和历史段落的最小诊断文本。
- *   3. 调用 saveAlarmSnapshotToSdCard() 写入 /mnt/sdcard/logs/qt_alarm_snapshot.txt。
+ *   3. 调用 saveAlarmSnapshotToSdCard() 写入 /mnt/sdcard/logs/qt_alarm_snapshot_*.txt。
  *   4. 把返回结果打印到 stdout，便于 SSH 自动化判断文件落盘是否成功。
  *
  * 参数：
@@ -5606,6 +5793,51 @@ static int run_alarm_snapshot_self_test(int argc, char *argv[])
     const QString result = storageController.saveAlarmSnapshotToSdCard(snapshotText);
     QTextStream(stdout) << result << '\n';
     return result.startsWith(QStringLiteral("诊断已保存：")) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/*
+ * run_alarm_log_self_test 的作用：
+ *   不启动 QML 界面，直接复用 CameraStorageController 写一份时间戳自动告警日志。
+ *
+ * 主要流程：
+ *   1. 创建 QCoreApplication，保证 Qt 文本编码、时区和文件接口可用。
+ *   2. 构造一份模拟“模型检测失败”的告警文本，字段与 QML buildAlarmLogText() 保持一致。
+ *   3. 调用 recordAlarmIssueToSdCard() 写入 /mnt/sdcard/logs/qt_alarm_*.log。
+ *   4. 把返回结果打印到 stdout，便于 SSH 自动化判断文件落盘是否成功。
+ *
+ * 参数：
+ *   argc/argv 是 main 收到的原始参数。
+ *
+ * 返回值：
+ *   返回 EXIT_SUCCESS 表示告警日志保存成功；返回 EXIT_FAILURE 表示保存失败。
+ */
+static int run_alarm_log_self_test(int argc, char *argv[])
+{
+    /* 自检入口也设置默认业务时区，保证 occurrence_time 与屏幕顶部北京时间一致。 */
+    set_default_environment();
+
+    QCoreApplication app(argc, argv);
+    CameraStorageController storageController;
+
+    /* alarmText 保存最小但可判定的自动告警内容，便于静态和板端 SSH 验证日志字段。 */
+    const QString alarmText =
+        QStringLiteral("STM32MP157 Qt Alarm Log\n")
+        + QStringLiteral("occurrence_time=")
+        + QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+        + QLatin1Char('\n')
+        + QStringLiteral("source=model-detect-failed\n")
+        + QStringLiteral("alarm_code=ALM-MODEL-001\n")
+        + QStringLiteral("alarm_title=SSH automatic alarm log self test\n")
+        + QStringLiteral("alarm_level=预警\n")
+        + QStringLiteral("current_status=自检\n")
+        + QStringLiteral("device_health=SSH自检\n")
+        + QStringLiteral("[troubleshooting]\n")
+        + QStringLiteral("1. 检查模型程序、模型文件、标签文件和 SD 卡图片路径。\n");
+
+    const QString result = storageController.recordAlarmIssueToSdCard(QStringLiteral("model-detect-failed"),
+                                                                      alarmText);
+    QTextStream(stdout) << result << '\n';
+    return result.startsWith(QStringLiteral("告警日志已保存：")) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 /*
@@ -5817,6 +6049,11 @@ int main(int argc, char *argv[])
     /* --alarm-snapshot-self-test 用于 SSH 验证告警维护保存诊断同一条 C++ 落盘路径。 */
     if (has_raw_argument(argc, argv, "--alarm-snapshot-self-test")) {
         return run_alarm_snapshot_self_test(argc, argv);
+    }
+
+    /* --alarm-log-self-test 用于 SSH 验证自动告警日志同一条 C++ 落盘路径。 */
+    if (has_raw_argument(argc, argv, "--alarm-log-self-test")) {
+        return run_alarm_log_self_test(argc, argv);
     }
 
     /* 先初始化 GStreamer，让 qmlglsink 插件能在 QML 加载前注册 GstGLVideoItem。 */

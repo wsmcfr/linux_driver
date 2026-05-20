@@ -153,24 +153,21 @@ wait_for_process()
 
 wait_for_qt_boot_surface()
 {
-    # 等待 QML 根对象完成加载并写出启动层日志。
-    # 这个日志出现后再启动 overlay，可让 Qt splash 先占住 LCD，避免摄像头首帧抢先显示。
+    # 等待 Qt 界面进入启动动画稳定窗口。
+    # 这里不依赖 QML 控制台输出，因为正式版本会关闭调试输出；只要 Qt 进程在缓冲期内持续存活，
+    # 就说明 eglfs 主界面已经接管 LCD，随后 overlay 仍会以 -V 0 隐藏方式启动，避免摄像头首帧抢先显示。
     timeout="${1:-8}"
+    elapsed=0
 
-    while [ "$timeout" -gt 0 ]; do
-        if [ -f "$QT_LOG" ] && grep -q "boot overlay visible false" "$QT_LOG" 2>/dev/null; then
-            return 0
-        fi
-
+    while [ "$elapsed" -lt "$timeout" ]; do
         if ! pidof "$QT_PID_NAME" >/dev/null 2>&1; then
             return 1
         fi
 
         sleep 1
-        timeout=$((timeout - 1))
+        elapsed=$((elapsed + 1))
     done
 
-    log_msg "警告：未在日志中看到 boot overlay visible false，继续延迟启动 overlay"
     return 0
 }
 

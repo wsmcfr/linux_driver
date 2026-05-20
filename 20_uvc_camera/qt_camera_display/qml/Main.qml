@@ -139,8 +139,11 @@ Rectangle {
     /* manualLightLevel 表示补光亮度档位，后续可作为串口命令中的亮度参数。 */
     property int manualLightLevel: 2
 
-    /* settingsPartType 保存当前工艺参数对应的零件类型，第一版只影响界面摘要，后续可写入配置文件。 */
-    property string settingsPartType: "平垫圈A"
+    /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
+    property var settingsSupportedPartTypes: ["波形垫圈", "平垫圈", "弹性垫圈"]
+
+    /* settingsPartType 保存当前参数页选中的真实零件类型；当前只影响 QML 摘要，不写入配置文件。 */
+    property string settingsPartType: "波形垫圈"
 
     /* settingsDecisionThreshold 保存良坏分类置信度阈值，单位为千分比，便于和串口协议定点数保持一致。 */
     property int settingsDecisionThreshold: 850
@@ -148,44 +151,35 @@ Rectangle {
     /* settingsReviewThreshold 保存低于该值时进入待复核的阈值，避免低置信度样本被强行分拣。 */
     property int settingsReviewThreshold: 650
 
-    /* settingsFineCenterPx 保存精定位像素阈值，满足连续稳定后才允许抓拍检测图。 */
-    property int settingsFineCenterPx: 8
-
-    /* settingsStableFrames 保存连续稳定帧数，用于抑制传送带抖动造成的误触发。 */
-    property int settingsStableFrames: 4
-
-    /* settingsPulsePerPx 保存像素到编码器脉冲的标定比例，后续同步给 F4 做微调。 */
-    property int settingsPulsePerPx: 12
-
-    /* settingsBeltSpeed 保存参数页配置的自动输送低速档，单位 mm/s。 */
-    property int settingsBeltSpeed: 40
-
-    /* settingsSortTimeoutMs 保存分拣动作超时时间，超时后应进入告警维护流程。 */
-    property int settingsSortTimeoutMs: 1500
-
-    /* settingsAutoUpload 表示检测结果是否自动触发 COS 上传，当前只作为界面配置状态。 */
+    /* settingsAutoUpload 表示检测结果是否自动触发 COS 上传，当前只作为 QML 本地目标值。 */
     property bool settingsAutoUpload: true
 
     /* settingsLastActionText 保存参数页最近一次应用、保存或恢复默认的结果提示。 */
-    property string settingsLastActionText: "参数未修改"
+    property string settingsLastActionText: "UI目标值：尚未写JSON，尚未下发F4"
 
-    /* alarmCurrentCode 保存当前主告警码；第一版使用模拟值，后续由 F4/MP157 告警帧覆盖。 */
-    property string alarmCurrentCode: "0x0007"
+    /* alarmCurrentCode 保存当前主告警码；运行期由相机、SD 卡、4G、云端、F4 和检测链路真实状态覆盖。 */
+    property string alarmCurrentCode: "ALM-INIT"
 
     /* alarmCurrentTitle 保存当前主告警名称，用于告警维护页顶部醒目展示。 */
-    property string alarmCurrentTitle: "急停按下"
+    property string alarmCurrentTitle: "等待真实告警"
 
     /* alarmCurrentLevel 保存当前告警等级，影响页面颜色和处理建议优先级。 */
-    property string alarmCurrentLevel: "严重"
+    property string alarmCurrentLevel: "记录"
 
-    /* alarmCurrentTime 保存当前告警发生时间，第一版启动时使用固定演示值。 */
-    property string alarmCurrentTime: "09:42:16"
+    /* alarmCurrentTime 保存当前告警发生时间，启动时先显示占位，真实问题出现后改成发生时间。 */
+    property string alarmCurrentTime: "--:--:--"
 
     /* alarmAcknowledged 表示操作员是否已确认当前告警；确认不等于故障清除。 */
     property bool alarmAcknowledged: false
 
-    /* alarmCleared 表示当前模拟告警是否已清除；真实接入后以 F4 状态帧为准。 */
-    property bool alarmCleared: false
+    /* alarmCleared 表示当前是否没有未处理真实告警；自动检测到新问题时会重新置为 false。 */
+    property bool alarmCleared: true
+
+    /* activeAlarmKeys 保存已经记录过的未恢复问题，用于状态反复刷新时去重，避免每 8 秒刷爆 SD 卡日志。 */
+    property var activeAlarmKeys: ({})
+
+    /* alarmLastLogResult 保存最近一次自动告警日志落盘结果，便于保存诊断快照时一起记录。 */
+    property string alarmLastLogResult: "尚未生成自动告警日志"
 
     /* historyDetailVisible 表示历史页是否进入“查看详情”二级页面；false 时只显示第一层检测记录列表。 */
     property bool historyDetailVisible: false
@@ -422,7 +416,7 @@ Rectangle {
      *   visible 表示目标视频层可见状态。
      *
      * 返回值：
-     *   无返回值；控制失败只写日志，不阻塞 Qt 界面启动。
+     *   返回 C++ 控制器的执行结果文本；控制失败交给重试逻辑处理，不阻塞 Qt 界面启动。
      */
     function setBootOverlayVisible(visible) {
         if (!root.usingKmsOverlay) {
@@ -432,7 +426,6 @@ Rectangle {
         var result = visible
             ? storageController.setOverlayVisible(true)
             : storageController.setOverlayVisible(false)
-        console.log("boot overlay visible", visible, result)
         return result
     }
 
@@ -446,7 +439,7 @@ Rectangle {
      *   3. 达到最大重试次数后停止，避免 overlay 异常时一直占用 Qt 事件循环。
      *
      * 返回值：
-     *   无返回值；恢复结果通过 console.log 写入板端 Qt 日志。
+     *   无返回值；恢复结果通过 setBootOverlayVisible 的返回文本驱动重试判断。
      */
     function startBootOverlayRestore() {
         if (!root.usingKmsOverlay) {
@@ -1148,13 +1141,28 @@ Rectangle {
      *   生成参数设置页右侧摘要，让操作员应用参数前能快速确认关键值。
      *
      * 返回值：
-     *   返回包含零件类型、判定阈值、居中阈值和上传策略的短文本。
+     *   返回包含零件类型、模型阈值、复核阈值和上传策略的短文本。
      */
     function settingsSummaryText() {
         return settingsPartType
-                + "  判定" + settingsThresholdText(settingsDecisionThreshold)
-                + "  定位" + settingsFineCenterPx + "px"
+                + "  模型" + settingsThresholdText(settingsDecisionThreshold)
+                + "  复核" + settingsThresholdText(settingsReviewThreshold)
                 + "  上传" + (settingsAutoUpload ? "自动" : "手动")
+    }
+
+    /*
+     * settingsNextPartType 的作用：
+     *   在三种真实垫圈零件之间循环，避免参数页继续出现非真实零件名。
+     *
+     * 返回值：
+     *   返回下一种零件名称；如果当前值异常，回到列表第一项。
+     */
+    function settingsNextPartType() {
+        var index = settingsSupportedPartTypes.indexOf(settingsPartType)
+        if (index < 0) {
+            return settingsSupportedPartTypes[0]
+        }
+        return settingsSupportedPartTypes[(index + 1) % settingsSupportedPartTypes.length]
     }
 
     /*
@@ -1174,21 +1182,6 @@ Rectangle {
         } else if (key === "review") {
             settingsReviewThreshold = Math.max(300, Math.min(settingsDecisionThreshold - 50, settingsReviewThreshold + delta))
             settingsLastActionText = "已调整复核阈值：" + settingsThresholdText(settingsReviewThreshold)
-        } else if (key === "fine") {
-            settingsFineCenterPx = Math.max(3, Math.min(30, settingsFineCenterPx + delta))
-            settingsLastActionText = "已调整精定位阈值：" + settingsFineCenterPx + " px"
-        } else if (key === "stable") {
-            settingsStableFrames = Math.max(1, Math.min(10, settingsStableFrames + delta))
-            settingsLastActionText = "已调整稳定帧数：" + settingsStableFrames + " 帧"
-        } else if (key === "pulse") {
-            settingsPulsePerPx = Math.max(1, Math.min(80, settingsPulsePerPx + delta))
-            settingsLastActionText = "已调整标定比例：" + settingsPulsePerPx + " pulse/px"
-        } else if (key === "belt") {
-            settingsBeltSpeed = Math.max(10, Math.min(120, settingsBeltSpeed + delta))
-            settingsLastActionText = "已调整低速档：" + settingsBeltSpeed + " mm/s"
-        } else if (key === "timeout") {
-            settingsSortTimeoutMs = Math.max(500, Math.min(5000, settingsSortTimeoutMs + delta))
-            settingsLastActionText = "已调整分拣超时：" + settingsSortTimeoutMs + " ms"
         }
 
         storageState = settingsLastActionText
@@ -1200,8 +1193,8 @@ Rectangle {
      *   统一处理参数页“应用、保存、恢复默认、导出摘要”等操作。
      *
      * 主要流程：
-     *   1. 应用参数只更新界面状态，后续接入时再通过 CMD_PARAM_SYNC 下发给 F4。
-     *   2. 保存配置第一版只给出路径提示，真实持久化后续放到 C++ 控制器。
+     *   1. 应用参数只更新界面状态，当前不会写 JSON，也不会通过串口下发 F4。
+     *   2. 保存配置只提示后续目标路径，真实持久化后续放到 C++ 控制器。
      *   3. 恢复默认会把关键参数回到比赛演示推荐值。
      *
      * 参数：
@@ -1212,33 +1205,22 @@ Rectangle {
      */
     function settingsApplyAction(action) {
         if (action === "apply") {
-            settingsLastActionText = "已应用，待 F4 同步"
+            settingsLastActionText = "仅更新UI目标值：尚未写JSON，尚未下发F4"
         } else if (action === "save") {
-            settingsLastActionText = "保存目标：/mnt/sdcard/config/defect_ui_config.json"
+            settingsLastActionText = "后续目标：/mnt/sdcard/config/defect_ui_config.json"
         } else if (action === "reset") {
-            settingsPartType = "平垫圈A"
+            settingsPartType = "波形垫圈"
             settingsDecisionThreshold = 850
             settingsReviewThreshold = 650
-            settingsFineCenterPx = 8
-            settingsStableFrames = 4
-            settingsPulsePerPx = 12
-            settingsBeltSpeed = 40
-            settingsSortTimeoutMs = 1500
             settingsAutoUpload = true
-            settingsLastActionText = "已恢复比赛演示默认参数"
+            settingsLastActionText = "已恢复三类垫圈默认UI目标值"
         } else if (action === "export") {
             settingsLastActionText = "诊断摘要：" + settingsSummaryText()
         } else if (action === "upload-toggle") {
             settingsAutoUpload = !settingsAutoUpload
-            settingsLastActionText = settingsAutoUpload ? "已切换为自动上传" : "已切换为手动上传"
+            settingsLastActionText = settingsAutoUpload ? "UI目标值：COS自动上传" : "UI目标值：仅本地保存"
         } else if (action === "part-next") {
-            if (settingsPartType === "平垫圈A") {
-                settingsPartType = "异形垫片B"
-            } else if (settingsPartType === "异形垫片B") {
-                settingsPartType = "冲压片C"
-            } else {
-                settingsPartType = "平垫圈A"
-            }
+            settingsPartType = settingsNextPartType()
             settingsLastActionText = "已切换零件类型：" + settingsPartType
         }
 
@@ -1247,23 +1229,37 @@ Rectangle {
     }
 
     /*
-     * alarmLevelColor 的作用：
-     *   根据告警等级和清除状态返回统一状态色，避免只靠文字判断告警状态。
+     * alarmLevelColorFor 的作用：
+     *   按传入告警等级返回统一状态色，供当前告警和历史列表共同使用。
+     *
+     * 参数：
+     *   levelText 是“严重/预警/记录”等中文等级。
      *
      * 返回值：
-     *   已清除返回绿色，严重返回红色，预警返回黄色，其它返回蓝色。
+     *   严重返回红色，预警返回黄色，记录/其它返回蓝色。
+     */
+    function alarmLevelColorFor(levelText) {
+        if (levelText === "严重") {
+            return accentRed
+        }
+        if (levelText === "预警") {
+            return accentAmber
+        }
+        return "#5aa7ff"
+    }
+
+    /*
+     * alarmLevelColor 的作用：
+     *   根据告警等级和清除状态返回当前告警状态色，避免只靠文字判断告警状态。
+     *
+     * 返回值：
+     *   已清除返回绿色；未清除时按 alarmCurrentLevel 返回严重、预警或记录色。
      */
     function alarmLevelColor() {
         if (alarmCleared) {
             return accentGreen
         }
-        if (alarmCurrentLevel === "严重") {
-            return accentRed
-        }
-        if (alarmCurrentLevel === "预警") {
-            return accentAmber
-        }
-        return "#5aa7ff"
+        return alarmLevelColorFor(alarmCurrentLevel)
     }
 
     /*
@@ -1284,6 +1280,331 @@ Rectangle {
     }
 
     /*
+     * alarmSourceAdvice 的作用：
+     *   根据告警来源返回现场优先排查步骤，写入告警日志和诊断快照。
+     *
+     * 参数：
+     *   sourceKey 是自动告警来源标识，例如 camera-kms-no-frame、sdcard-not-writable。
+     *
+     * 返回值：
+     *   返回字符串数组，每一项是一条可以直接执行或观察的排查建议。
+     */
+    function alarmSourceAdvice(sourceKey) {
+        if (sourceKey === "camera-kms-no-frame") {
+            return [
+                "检查 /tmp/uvc-kms-overlay-control.sock 是否存在并能返回 STATUS。",
+                "查看 /tmp/uvc_kms_overlay.log 是否有 V4L2、DRM 或相机断开错误。",
+                "检查 /dev/video0、USB 摄像头供电和 run_qt_kms_overlay_display.sh restart-overlay。"
+            ]
+        }
+        if (sourceKey === "sdcard-not-writable") {
+            return [
+                "执行 mount | grep ' /mnt/sdcard ' 确认 SD 卡真实挂载。",
+                "执行 df -h /mnt/sdcard 和 echo/readback 测试确认空间与写权限。",
+                "只在文件存在、大小非零并完成 fsync/sync 后再安全移除 SD 卡。"
+            ]
+        }
+        if (sourceKey === "network-4g-offline") {
+            return [
+                "执行 4g-ppp test 查看 PPP、SIM 卡、天线和运营商网络状态。",
+                "检查 ppp0 地址、默认路由和 4G USB 模块供电。",
+                "确认弱网恢复后再重新检测或重新上传失败历史。"
+            ]
+        }
+        if (sourceKey === "cloud-offline") {
+            return [
+                "确认 4G 或以太网链路在线后再访问云端 health。",
+                "检查 defect-cos-upload 的后端地址、token 和云端服务状态。",
+                "保留 /mnt/sdcard/images 本地图片，网络恢复后从历史详情重新发送。"
+            ]
+        }
+        if (sourceKey === "f4-heartbeat-lost") {
+            return [
+                "检查 /dev/ttySTM2 是否存在，确认 F4 供电、复位和串口线序。",
+                "用串口工具发送 STATUS，确认 F4 返回 ACK/OK/F4/READY。",
+                "不要把 QML 清故障当成真实联锁解除，最终以 F4 状态帧为准。"
+            ]
+        }
+        if (sourceKey === "storage-save-failed") {
+            return [
+                "检查保存或上传返回的中文失败原因，优先确认 SD 卡挂载和剩余空间。",
+                "查看 overlay SAVE_DETECT/SAVE_DUAL 是否返回 ERR。",
+                "确认目标图片或日志文件非空，并检查 /tmp/qt_camera_display.log。"
+            ]
+        }
+        if (sourceKey === "cloud-upload-failed") {
+            return [
+                "检查 defect-cos-upload stdout/stderr 中的 HTTP、COS 或 token 错误。",
+                "确认 source 与 annotated 图片仍在 /mnt/sdcard/images。",
+                "网络恢复后在历史详情点击重新发送。"
+            ]
+        }
+        if (sourceKey === "model-detect-failed") {
+            return [
+                "检查 defect-classify、defect-segment、ONNX 模型和 labels 文件是否部署。",
+                "确认当前帧 source JPG 存在且非空，模型程序可以读取。",
+                "用 --detect-self-test 复现实验，并查看模型原始输出。"
+            ]
+        }
+        return [
+            "先保存诊断快照，再查看最近设备健康详情和 Qt 日志。",
+            "确认问题恢复后再执行清故障或重新检测。"
+        ]
+    }
+
+    /*
+     * activeAlarmKeyCount 的作用：
+     *   统计当前仍处于异常状态的问题数量，决定页面是否显示“无未处理告警”。
+     *
+     * 返回值：
+     *   返回 activeAlarmKeys 中值为 true 的数量。
+     */
+    function activeAlarmKeyCount() {
+        var count = 0
+        for (var key in activeAlarmKeys) {
+            if (activeAlarmKeys[key]) {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /*
+     * markAlarmRecovered 的作用：
+     *   在某个来源恢复正常时解除去重标记，让同一问题下次重新出现时能生成新的告警日志。
+     *
+     * 参数：
+     *   sourceKey 是要解除的告警来源标识。
+     *
+     * 返回值：
+     *   无返回值；函数会在全部问题恢复时更新当前告警状态。
+     */
+    function markAlarmRecovered(sourceKey) {
+        if (!activeAlarmKeys[sourceKey]) {
+            return
+        }
+
+        activeAlarmKeys[sourceKey] = false
+        if (activeAlarmKeyCount() === 0) {
+            alarmCleared = true
+            alarmAcknowledged = false
+            alarmCurrentLevel = "记录"
+            alarmCurrentCode = "ALM-OK"
+            alarmCurrentTitle = "运行状态未发现新告警"
+            alarmCurrentTime = Qt.formatDateTime(new Date(), "hh:mm:ss")
+        }
+    }
+
+    /*
+     * appendAlarmHistory 的作用：
+     *   把自动告警或人工维护动作写入告警历史，保持最新记录在最上方。
+     *
+     * 参数：
+     *   timeText 是发生或操作时间。
+     *   codeText 是告警码。
+     *   levelText 是告警等级。
+     *   titleText 是问题或操作摘要。
+     *   statusText 是处理状态或 C++ 写文件结果。
+     *
+     * 返回值：
+     *   无返回值；函数最多保留 12 条，避免小屏列表无限增长。
+     */
+    function appendAlarmHistory(timeText, codeText, levelText, titleText, statusText) {
+        alarmHistoryModel.insert(0, {
+            "time": timeText,
+            "code": codeText,
+            "level": levelText,
+            "title": titleText,
+            "status": statusText
+        })
+
+        while (alarmHistoryModel.count > 12) {
+            alarmHistoryModel.remove(alarmHistoryModel.count - 1)
+        }
+    }
+
+    /*
+     * deviceHealthSummaryText 的作用：
+     *   汇总相机、KMS、SD 卡、4G、云端和 F4 当前状态，写入日志便于 SSH 离线复盘。
+     *
+     * 返回值：
+     *   返回单行中文摘要。
+     */
+    function deviceHealthSummaryText() {
+        return "相机=" + cameraStatusText()
+                + "；KMS=" + (usingKmsOverlay ? deviceHealth.cameraStatusText : "非KMS后端")
+                + "；SD卡=" + deviceHealth.sdcardStatusText
+                + "；4G=" + deviceHealth.networkStatusText
+                + "；云端=" + deviceHealth.cloudStatusText
+                + "；F4=" + deviceHealth.f4StatusText
+                + "；详情=" + deviceHealth.detailText
+    }
+
+    /*
+     * buildAlarmLogText 的作用：
+     *   组装自动告警日志文本，让每个真实问题都有独立可读的现场记录。
+     *
+     * 参数：
+     *   sourceKey 是告警来源标识。
+     *   codeText 是告警码。
+     *   levelText 是告警等级。
+     *   titleText 是问题标题。
+     *   detailText 是触发时的原始状态或失败原因。
+     *
+     * 返回值：
+     *   返回多行 UTF-8 文本，由 C++ recordAlarmIssueToSdCard() 写入时间戳日志文件。
+     */
+    function buildAlarmLogText(sourceKey, codeText, levelText, titleText, detailText) {
+        var lines = [
+            "STM32MP157 Qt Alarm Log",
+            "occurrence_time=" + Qt.formatDateTime(new Date(), "yyyy-MM-dd hh:mm:ss"),
+            "source=" + sourceKey,
+            "alarm_code=" + codeText,
+            "alarm_title=" + titleText,
+            "alarm_level=" + levelText,
+            "current_status=" + alarmCurrentStatusText(),
+            "detail=" + detailText,
+            "device_health=" + deviceHealthSummaryText(),
+            "storage_state=" + storageState,
+            "detect_state=" + detectState,
+            "detect_status=" + detectStatus,
+            "",
+            "[troubleshooting]"
+        ]
+        var advice = alarmSourceAdvice(sourceKey)
+        for (var i = 0; i < advice.length; ++i) {
+            lines.push((i + 1) + ". " + advice[i])
+        }
+        return lines.join("\n") + "\n"
+    }
+
+    /*
+     * raiseRuntimeAlarm 的作用：
+     *   把一个新出现的真实问题升级为当前告警、写入历史并请求 C++ 生成独立告警日志。
+     *
+     * 主要流程：
+     *   1. activeAlarmKeys 对同一来源做未恢复期间去重，避免健康检测周期性重复写日志。
+     *   2. 更新当前告警字段，让告警维护页立即显示真实问题。
+     *   3. 调用 recordAlarmIssueToSdCard()，按发生时间创建独立 qt_alarm_*.log 文件。
+     *
+     * 参数：
+     *   sourceKey 是告警来源标识。
+     *   codeText 是告警码。
+     *   levelText 是告警等级。
+     *   titleText 是问题标题。
+     *   detailText 是触发时的原始状态或失败原因。
+     *
+     * 返回值：
+     *   无返回值；函数会更新告警状态、历史和底部提示。
+     */
+    function raiseRuntimeAlarm(sourceKey, codeText, levelText, titleText, detailText) {
+        if (activeAlarmKeys[sourceKey]) {
+            return
+        }
+
+        activeAlarmKeys[sourceKey] = true
+        alarmCurrentCode = codeText
+        alarmCurrentTitle = titleText
+        alarmCurrentLevel = levelText
+        alarmCurrentTime = Qt.formatDateTime(new Date(), "hh:mm:ss")
+        alarmAcknowledged = false
+        alarmCleared = false
+
+        var logText = buildAlarmLogText(sourceKey, codeText, levelText, titleText, detailText)
+        alarmLastLogResult = storageController.recordAlarmIssueToSdCard(sourceKey, logText)
+        appendAlarmHistory(alarmCurrentTime, codeText, levelText, titleText, alarmLastLogResult)
+        storageState = alarmLastLogResult
+        showStorageToast()
+    }
+
+    /*
+     * runtimeStatusAbnormal 的作用：
+     *   判断健康状态文本是否代表异常，而不是“在线/已连接/可写”等正常状态。
+     *
+     * 参数：
+     *   statusText 是 deviceHealth 或检测链路返回的中文状态。
+     *   goodValues 是认为正常的状态文本数组。
+     *
+     * 返回值：
+     *   true 表示状态非空且不属于正常值；false 表示正常或仍为空。
+     */
+    function runtimeStatusAbnormal(statusText, goodValues) {
+        if (statusText.length <= 0 || statusText === "检测中") {
+            return false
+        }
+        for (var i = 0; i < goodValues.length; ++i) {
+            if (statusText === goodValues[i]) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /*
+     * evaluateRuntimeAlarms 的作用：
+     *   从已有运行状态中识别相机/KMS、SD 卡、4G、云端和 F4 的真实问题。
+     *
+     * 主要流程：
+     *   1. 每次 deviceHealth 状态变化或手动刷新后调用本函数。
+     *   2. 正常状态调用 markAlarmRecovered()，异常状态调用 raiseRuntimeAlarm()。
+     *   3. 不执行 shell、不访问硬件，只消费 C++ 已异步探测出的状态，保证 QML 不阻塞。
+     *
+     * 返回值：
+     *   无返回值；函数会根据状态更新当前告警和日志。
+     */
+    function evaluateRuntimeAlarms() {
+        if (runtimeStatusAbnormal(cameraStatusText(), ["在线", "GL在线"])) {
+            raiseRuntimeAlarm("camera-kms-no-frame",
+                              "ALM-CAM-001",
+                              "严重",
+                              "相机/KMS 无有效帧",
+                              cameraStatusText())
+        } else {
+            markAlarmRecovered("camera-kms-no-frame")
+        }
+
+        if (runtimeStatusAbnormal(deviceHealth.sdcardStatusText, ["可写", "已挂载"])) {
+            raiseRuntimeAlarm("sdcard-not-writable",
+                              "ALM-SD-001",
+                              "严重",
+                              "SD 卡未挂载或不可写",
+                              deviceHealth.sdcardStatusText)
+        } else {
+            markAlarmRecovered("sdcard-not-writable")
+        }
+
+        if (runtimeStatusAbnormal(deviceHealth.networkStatusText, ["在线"])) {
+            raiseRuntimeAlarm("network-4g-offline",
+                              "ALM-NET-001",
+                              "预警",
+                              "4G/网络链路异常",
+                              deviceHealth.networkStatusText)
+        } else {
+            markAlarmRecovered("network-4g-offline")
+        }
+
+        if (runtimeStatusAbnormal(deviceHealth.cloudStatusText, ["已连接"])) {
+            raiseRuntimeAlarm("cloud-offline",
+                              "ALM-CLOUD-001",
+                              "预警",
+                              "云端 health 异常",
+                              deviceHealth.cloudStatusText)
+        } else {
+            markAlarmRecovered("cloud-offline")
+        }
+
+        if (runtimeStatusAbnormal(deviceHealth.f4StatusText, ["接入"])) {
+            raiseRuntimeAlarm("f4-heartbeat-lost",
+                              "ALM-F4-001",
+                              "严重",
+                              "F4 心跳/串口握手异常",
+                              deviceHealth.f4StatusText)
+        } else {
+            markAlarmRecovered("f4-heartbeat-lost")
+        }
+    }
+
+    /*
      * alarmSnapshotText 的作用：
      *   组装保存到 SD 卡的告警诊断文本，让 SSH 打开快照时能直接看到关键状态。
      *
@@ -1293,7 +1614,7 @@ Rectangle {
      *   3. 写入最近告警历史，便于现场复盘按钮点击前后的处理轨迹。
      *
      * 返回值：
-     *   返回多行 UTF-8 文本，由 C++ 控制器落盘到 /mnt/sdcard/logs/qt_alarm_snapshot.txt。
+     *   返回多行 UTF-8 文本，由 C++ 控制器落盘到 /mnt/sdcard/logs/qt_alarm_snapshot_*.txt。
      */
     function alarmSnapshotText() {
         var summary = statsSummary()
@@ -1308,6 +1629,8 @@ Rectangle {
             "alarm_acknowledged=" + (alarmAcknowledged ? "true" : "false"),
             "alarm_cleared=" + (alarmCleared ? "true" : "false"),
             "camera_status=" + cameraStatusText(),
+            "device_health=" + deviceHealthSummaryText(),
+            "last_alarm_log_result=" + alarmLastLogResult,
             "video_backend=" + videoBackend,
             "kms_overlay=" + (usingKmsOverlay ? "true" : "false"),
             "manual_mode=" + (manualMode ? "true" : "false"),
@@ -1340,7 +1663,7 @@ Rectangle {
      * 主要流程：
      *   1. 确认告警只改变操作员确认状态，不代表 F4 已释放联锁。
      *   2. 清故障会同步释放手动页模拟急停状态，保持两个页面状态一致。
-     *   3. 保存诊断调用 C++ 控制器写入 /mnt/sdcard/logs/qt_alarm_snapshot.txt。
+     *   3. 保存诊断调用 C++ 控制器写入新的 /mnt/sdcard/logs/qt_alarm_snapshot_*.txt。
      *
      * 参数：
      *   action 是 ack、clear、refresh 或 snapshot。
@@ -1355,12 +1678,20 @@ Rectangle {
             alarmAcknowledged = true
             resultText = "已确认告警：" + alarmCurrentCode
         } else if (action === "clear") {
-            alarmAcknowledged = true
-            alarmCleared = true
             manualEmergencyStop = false
-            resultText = "清故障：等待 F4 复核"
+            evaluateRuntimeAlarms()
+            if (activeAlarmKeyCount() > 0) {
+                alarmAcknowledged = true
+                alarmCleared = false
+                resultText = "清故障：仍有真实问题未恢复"
+            } else {
+                alarmAcknowledged = true
+                alarmCleared = true
+                resultText = "清故障：等待 F4 复核"
+            }
         } else if (action === "refresh") {
             deviceHealth.refreshAllStatus()
+            evaluateRuntimeAlarms()
             resultText = "已刷新设备健康状态"
         } else if (action === "snapshot") {
             resultText = storageController.saveAlarmSnapshotToSdCard(alarmSnapshotText())
@@ -1368,17 +1699,11 @@ Rectangle {
             resultText = "未知告警维护动作"
         }
 
-        alarmHistoryModel.insert(0, {
-            "time": Qt.formatDateTime(new Date(), "hh:mm:ss"),
-            "code": alarmCurrentCode,
-            "level": alarmCleared ? "记录" : alarmCurrentLevel,
-            "title": resultText,
-            "status": alarmCurrentStatusText()
-        })
-
-        while (alarmHistoryModel.count > 8) {
-            alarmHistoryModel.remove(alarmHistoryModel.count - 1)
-        }
+        appendAlarmHistory(Qt.formatDateTime(new Date(), "hh:mm:ss"),
+                           alarmCurrentCode,
+                           alarmCleared ? "记录" : alarmCurrentLevel,
+                           resultText,
+                           alarmCurrentStatusText())
 
         storageState = resultText
         showStorageToast()
@@ -2575,32 +2900,16 @@ Rectangle {
         }
     }
 
-    /* alarmHistoryModel 保存告警维护页最近处理记录，第一版由 QML 模拟生成，后续可接日志控制器。 */
+    /* alarmHistoryModel 保存告警维护页最近处理记录，自动告警和人工维护动作都会插入最新一行。 */
     ListModel {
         id: alarmHistoryModel
 
         ListElement {
-            time: "09:42:16"
-            code: "0x0007"
-            level: "严重"
-            title: "急停按下"
-            status: "待确认"
-        }
-
-        ListElement {
-            time: "09:31:08"
-            code: "0x0009"
-            level: "预警"
-            title: "图像抓拍失败后已重试"
-            status: "已恢复"
-        }
-
-        ListElement {
-            time: "09:18:22"
-            code: "0x0011"
-            level: "预警"
-            title: "COS 上传失败，保留本地图片"
-            status: "待排查"
+            time: "--:--:--"
+            code: "ALM-INIT"
+            level: "记录"
+            title: "等待设备健康检测"
+            status: "未发现新告警"
         }
     }
 
@@ -2678,6 +2987,7 @@ Rectangle {
      */
     Component.onCompleted: {
         root.setBootOverlayVisible(false)
+        root.evaluateRuntimeAlarms()
     }
 
     Connections {
@@ -2718,6 +3028,8 @@ Rectangle {
          *   如果当前在历史、统计、手动、参数或告警页，则保持视频层隐藏，避免覆盖功能页面。
          */
         onCameraStatusChanged: {
+            root.evaluateRuntimeAlarms()
+
             if (!root.usingKmsOverlay || deviceHealth.cameraStatusText !== "在线") {
                 return
             }
@@ -2725,6 +3037,38 @@ Rectangle {
             if (root.bootOverlayRestoreFinished && !root.splashOverlayVisible && root.activePage === "home") {
                 root.setBootOverlayVisible(true)
             }
+        }
+
+        /*
+         * onNetworkStatusChanged 的作用：
+         *   4G 状态变化后复用自动告警评估，首次离线会写入独立告警日志，恢复后解除去重标记。
+         */
+        onNetworkStatusChanged: {
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4StatusChanged 的作用：
+         *   F4 串口握手状态变化后检查心跳类告警，避免只在顶部状态栏显示待接入。
+         */
+        onF4StatusChanged: {
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onCloudStatusChanged 的作用：
+         *   云端 health 状态变化后检查上传/云端类告警，弱网恢复时允许下一次失败重新记录。
+         */
+        onCloudStatusChanged: {
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onSdcardStatusChanged 的作用：
+         *   SD 卡挂载或可写状态变化后检查存储类告警，避免日志误写 rootfs 前没有界面提示。
+         */
+        onSdcardStatusChanged: {
+            root.evaluateRuntimeAlarms()
         }
     }
 
@@ -2754,6 +3098,16 @@ Rectangle {
         onSaveCurrentFrameFinished: {
             saveImageBusy = false
             storageState = resultText
+            if (resultText.indexOf("保存失败") === 0 || resultText.indexOf("上传失败") === 0) {
+                root.raiseRuntimeAlarm(resultText.indexOf("上传失败") === 0 ? "cloud-upload-failed" : "storage-save-failed",
+                                       resultText.indexOf("上传失败") === 0 ? "ALM-UPLOAD-001" : "ALM-SAVE-001",
+                                       "预警",
+                                       resultText.indexOf("上传失败") === 0 ? "云端上传失败" : "图片保存失败",
+                                       resultText)
+            } else if (resultText.indexOf("保存成功") === 0 || resultText.indexOf("上传成功") === 0) {
+                root.markAlarmRecovered("storage-save-failed")
+                root.markAlarmRecovered("cloud-upload-failed")
+            }
             showStorageToast()
         }
 
@@ -2793,6 +3147,24 @@ Rectangle {
             detectImageBusy = false
             handleDetectResultText(resultText)
             storageState = resultText
+            if (resultText.indexOf("检测失败") === 0) {
+                root.raiseRuntimeAlarm("model-detect-failed",
+                                       "ALM-MODEL-001",
+                                       "预警",
+                                       "模型检测链路失败",
+                                       resultText)
+            } else {
+                root.markAlarmRecovered("model-detect-failed")
+                if (resultText.indexOf("上传失败") >= 0) {
+                    root.raiseRuntimeAlarm("cloud-upload-failed",
+                                           "ALM-UPLOAD-001",
+                                           "预警",
+                                           "云端上传失败",
+                                           resultText)
+                } else {
+                    root.markAlarmRecovered("cloud-upload-failed")
+                }
+            }
             showStorageToast()
         }
 
@@ -2810,11 +3182,19 @@ Rectangle {
                 root.selectedHistoryIndex = uploadHistory.count - 1
                 root.selectedHistoryImageIndex = 0
                 root.selectedHistoryRecord = uploadHistory.entryAt(root.selectedHistoryIndex)
+                root.markAlarmRecovered("cloud-upload-failed")
             } else if (row === root.selectedHistoryIndex) {
                 root.selectedHistoryRecord = uploadHistory.entryAt(root.selectedHistoryIndex)
             }
 
             storageState = resultText
+            if (resultText.indexOf("重新发送失败") === 0) {
+                root.raiseRuntimeAlarm("cloud-upload-failed",
+                                       "ALM-UPLOAD-001",
+                                       "预警",
+                                       "云端上传失败",
+                                       resultText)
+            }
             showStorageToast()
         }
     }
@@ -5495,7 +5875,7 @@ Rectangle {
             }
         }
 
-        /* settingsProcessPanel 负责零件类型、判定阈值和待复核阈值，直接对应检测结果融合策略。 */
+        /* settingsProcessPanel 负责真实零件类型、模型阈值和复核阈值，直接对应当前检测结果融合策略。 */
         Rectangle {
             id: settingsProcessPanel
             x: 16
@@ -5511,9 +5891,9 @@ Rectangle {
             Text {
                 x: 14
                 y: 10
-                text: "工艺与判定"
+                text: "零件与模型判定"
                 color: "#f1f4f5"
-                font.pixelSize: 16
+                font.pixelSize: 15
                 font.bold: true
             }
 
@@ -5530,11 +5910,14 @@ Rectangle {
                 Text {
                     anchors.left: parent.left
                     anchors.leftMargin: 10
+                    anchors.right: parent.right
+                    anchors.rightMargin: 58
                     anchors.verticalCenter: parent.verticalCenter
                     text: "零件：" + root.settingsPartType
                     color: "#ffffff"
                     font.pixelSize: 13
                     font.bold: true
+                    elide: Text.ElideRight
                 }
 
                 Text {
@@ -5565,8 +5948,8 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"label": "良坏阈值", "value": root.settingsThresholdText(root.settingsDecisionThreshold), "key": "decision", "step": 10, "note": "判定线"},
-                        {"label": "复核阈值", "value": root.settingsThresholdText(root.settingsReviewThreshold), "key": "review", "step": 10, "note": "复核线"}
+                        {"label": "模型阈值", "value": root.settingsThresholdText(root.settingsDecisionThreshold), "key": "decision", "step": 10, "note": "好坏线"},
+                        {"label": "复核阈值", "value": root.settingsThresholdText(root.settingsReviewThreshold), "key": "review", "step": 10, "note": "低可信"}
                     ]
 
                     Row {
@@ -5667,7 +6050,7 @@ Rectangle {
             }
         }
 
-        /* settingsVisionPanel 负责视觉居中参数，支撑“先停到中心再检测”的项目核心流程。 */
+        /* settingsVisionPanel 展示当前视觉检测链路中真实存在的模型策略，不再伪装成已经下发硬件参数。 */
         Rectangle {
             id: settingsVisionPanel
             x: 284
@@ -5683,7 +6066,7 @@ Rectangle {
             Text {
                 x: 14
                 y: 10
-                text: "视觉定位"
+                text: "视觉检测策略"
                 color: "#f1f4f5"
                 font.pixelSize: 16
                 font.bold: true
@@ -5693,7 +6076,7 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.rightMargin: 14
                 y: 14
-                text: "ROI 固定"
+                text: "UI目标值"
                 color: "#9fdcff"
                 font.pixelSize: 12
                 font.bold: true
@@ -5703,107 +6086,55 @@ Rectangle {
                 x: 14
                 y: 38
                 width: parent.width - 28
-                spacing: 6
+                spacing: 7
 
                 Repeater {
                     model: [
-                        {"label": "精定位", "value": root.settingsFineCenterPx + " px", "key": "fine", "step": 1, "hint": "中心容差"},
-                        {"label": "稳定帧", "value": root.settingsStableFrames + " 帧", "key": "stable", "step": 1, "hint": "连续帧"},
-                        {"label": "脉冲标定", "value": root.settingsPulsePerPx + " p/px", "key": "pulse", "step": 1, "hint": "px->pulse"}
+                        {"name": "分类模型", "value": "MobileNetV3 INT8", "color": root.accentGreen},
+                        {"name": "分割复核", "value": "UNet 低频复核", "color": "#9fdcff"},
+                        {"name": "低可信度", "value": "进入人工复核", "color": root.accentAmber},
+                        {"name": "ROI策略", "value": "中心区域检测", "color": "#eef3f4"},
+                        {"name": "配置状态", "value": "尚未写JSON", "color": "#9aa5ab"}
                     ]
 
                     Row {
                         width: parent.width
-                        height: 34
-                        spacing: 6
+                        height: 20
+                        spacing: 8
 
-                        Column {
-                            width: 78
+                        Rectangle {
+                            width: 8
+                            height: 8
+                            radius: 4
                             anchors.verticalCenter: parent.verticalCenter
-                            spacing: 2
-
-                            Text {
-                                text: modelData.label
-                                color: "#dce3e6"
-                                font.pixelSize: 11
-                                font.bold: true
-                            }
-
-                            Text {
-                                text: modelData.hint
-                                color: "#7f898f"
-                                font.pixelSize: 9
-                                elide: Text.ElideRight
-                            }
+                            color: modelData.color
                         }
 
                         Text {
-                            width: 60
+                            width: 70
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.name
+                            color: "#9aa5ab"
+                            font.pixelSize: 11
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            width: parent.width - 94
                             anchors.verticalCenter: parent.verticalCenter
                             text: modelData.value
-                            color: root.accentAmber
+                            color: modelData.color
                             font.pixelSize: 12
                             font.bold: true
-                            horizontalAlignment: Text.AlignHCenter
-                        }
-
-                        Rectangle {
-                            width: 30
-                            height: 30
-                            radius: 6
-                            color: visionMinusMouse.pressed ? "#30363b" : "#22272b"
-                            border.color: "#5a6268"
-                            border.width: 1
-
-                            Text {
-                                anchors.centerIn: parent
-                                text: "-"
-                                color: "#ffffff"
-                                font.pixelSize: 16
-                                font.bold: true
-                            }
-
-                            MouseArea {
-                                id: visionMinusMouse
-                                anchors.fill: parent
-
-                                onClicked: {
-                                    root.changeSettingValue(modelData.key, -modelData.step)
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            width: 30
-                            height: 30
-                            radius: 6
-                            color: visionPlusMouse.pressed ? "#30363b" : "#22272b"
-                            border.color: root.accentGreen
-                            border.width: 1
-
-                            Text {
-                                anchors.centerIn: parent
-                                text: "+"
-                                color: "#ffffff"
-                                font.pixelSize: 16
-                                font.bold: true
-                            }
-
-                            MouseArea {
-                                id: visionPlusMouse
-                                anchors.fill: parent
-
-                                onClicked: {
-                                    root.changeSettingValue(modelData.key, modelData.step)
-                                }
-                            }
+                            elide: Text.ElideRight
                         }
                     }
                 }
             }
         }
 
-        /* settingsMotionPanel 负责输送与分拣超时参数，后续接入时由 F4 做最终限幅和联锁。 */
+        /* settingsMotionPanel 说明 F4 运动控制边界；当前 Qt 参数页不提供会误导用户的硬件运动可调项。 */
         Rectangle {
             id: settingsMotionPanel
             x: 552
@@ -5819,9 +6150,19 @@ Rectangle {
             Text {
                 x: 14
                 y: 10
-                text: "输送与分拣"
+                text: "F4接入边界"
                 color: "#f1f4f5"
                 font.pixelSize: 16
+                font.bold: true
+            }
+
+            Text {
+                anchors.right: parent.right
+                anchors.rightMargin: 14
+                y: 14
+                text: "尚未下发F4"
+                color: root.accentAmber
+                font.pixelSize: 12
                 font.bold: true
             }
 
@@ -5829,99 +6170,48 @@ Rectangle {
                 x: 14
                 y: 38
                 width: parent.width - 28
-                spacing: 8
+                spacing: 7
 
                 Repeater {
                     model: [
-                        {"label": "低速档", "value": root.settingsBeltSpeed + " mm/s", "key": "belt", "step": 5, "hint": "居中速度"},
-                        {"label": "分拣超时", "value": root.settingsSortTimeoutMs + " ms", "key": "timeout", "step": 100, "hint": "维护告警"}
+                        {"name": "运动控制", "value": "由F4固件执行", "color": "#9fdcff"},
+                        {"name": "分拣动作", "value": "依赖F4联锁", "color": "#9fdcff"},
+                        {"name": "参数通道", "value": "串口协议预留", "color": root.accentAmber},
+                        {"name": "页面作用", "value": "只展示目标值", "color": "#eef3f4"},
+                        {"name": "生效状态", "value": "尚未下发F4", "color": root.accentAmber}
                     ]
 
                     Row {
                         width: parent.width
-                        height: 36
-                        spacing: 6
+                        height: 20
+                        spacing: 8
 
-                        Column {
-                            width: 82
+                        Rectangle {
+                            width: 8
+                            height: 8
+                            radius: 4
                             anchors.verticalCenter: parent.verticalCenter
-                            spacing: 2
-
-                            Text {
-                                text: modelData.label
-                                color: "#dce3e6"
-                                font.pixelSize: 11
-                                font.bold: true
-                            }
-
-                            Text {
-                                text: modelData.hint
-                                color: "#7f898f"
-                                font.pixelSize: 9
-                                elide: Text.ElideRight
-                            }
+                            color: modelData.color
                         }
 
                         Text {
-                            width: 74
+                            width: 70
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.name
+                            color: "#9aa5ab"
+                            font.pixelSize: 11
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            width: parent.width - 94
                             anchors.verticalCenter: parent.verticalCenter
                             text: modelData.value
-                            color: "#e8f7ee"
+                            color: modelData.color
                             font.pixelSize: 12
                             font.bold: true
-                            horizontalAlignment: Text.AlignHCenter
-                        }
-
-                        Rectangle {
-                            width: 30
-                            height: 30
-                            radius: 6
-                            color: motionMinusMouse.pressed ? "#30363b" : "#22272b"
-                            border.color: "#5a6268"
-                            border.width: 1
-
-                            Text {
-                                anchors.centerIn: parent
-                                text: "-"
-                                color: "#ffffff"
-                                font.pixelSize: 16
-                                font.bold: true
-                            }
-
-                            MouseArea {
-                                id: motionMinusMouse
-                                anchors.fill: parent
-
-                                onClicked: {
-                                    root.changeSettingValue(modelData.key, -modelData.step)
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            width: 30
-                            height: 30
-                            radius: 6
-                            color: motionPlusMouse.pressed ? "#30363b" : "#22272b"
-                            border.color: root.accentGreen
-                            border.width: 1
-
-                            Text {
-                                anchors.centerIn: parent
-                                text: "+"
-                                color: "#ffffff"
-                                font.pixelSize: 16
-                                font.bold: true
-                            }
-
-                            MouseArea {
-                                id: motionPlusMouse
-                                anchors.fill: parent
-
-                                onClicked: {
-                                    root.changeSettingValue(modelData.key, modelData.step)
-                                }
-                            }
+                            elide: Text.ElideRight
                         }
                     }
                 }
@@ -5931,7 +6221,7 @@ Rectangle {
                 x: 14
                 y: 132
                 width: parent.width - 28
-                text: "F4 负责限幅和联锁"
+                text: "Qt不直接控制运动/分拣"
                 color: "#8f9aa1"
                 font.pixelSize: 11
                 elide: Text.ElideRight
@@ -6108,8 +6398,8 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"text": "应用参数", "action": "apply", "color": root.accentGreen},
-                        {"text": "保存配置", "action": "save", "color": "#5aa7ff"},
+                        {"text": "应用到UI", "action": "apply", "color": root.accentGreen},
+                        {"text": "保存预留", "action": "save", "color": "#5aa7ff"},
                         {"text": "恢复默认", "action": "reset", "color": root.accentAmber},
                         {"text": "导出摘要", "action": "export", "color": "#9aa6ad"}
                     ]
@@ -6387,7 +6677,7 @@ Rectangle {
                         {"name": "相机", "value": root.cameraStatusText(), "color": root.cameraDotColor()},
                         {"name": "F4心跳", "value": deviceHealth.f4StatusText, "color": deviceHealth.f4StatusColor},
                         {"name": "机械臂", "value": root.manualArmHomeOk ? "已回零" : "未回零", "color": root.manualArmHomeOk ? root.accentGreen : root.accentAmber},
-                        {"name": "急停", "value": root.manualEmergencyStop || !root.alarmCleared ? "需检查" : "释放", "color": root.manualEmergencyStop || !root.alarmCleared ? root.accentRed : root.accentGreen},
+                        {"name": "当前告警", "value": root.alarmCleared ? "无未处理" : root.alarmCurrentLevel, "color": root.alarmCleared ? root.accentGreen : root.alarmLevelColor()},
                         {"name": "SD卡", "value": deviceHealth.sdcardStatusText, "color": deviceHealth.sdcardStatusColor},
                         {"name": "云端", "value": deviceHealth.cloudStatusText, "color": deviceHealth.cloudStatusColor},
                         {"name": "KMS视频", "value": root.usingKmsOverlay ? deviceHealth.cameraStatusText : "预览/桥接", "color": root.usingKmsOverlay ? deviceHealth.cameraStatusColor : root.accentAmber},
@@ -6514,7 +6804,7 @@ Rectangle {
                     height: 28
                     radius: 6
                     color: "#20262a"
-                    border.color: level === "严重" ? root.accentRed : (level === "预警" ? root.accentAmber : "#3b454b")
+                    border.color: root.alarmLevelColorFor(level)
                     border.width: 1
 
                     Row {
@@ -6545,7 +6835,7 @@ Rectangle {
                             width: 38
                             anchors.verticalCenter: parent.verticalCenter
                             text: level
-                            color: level === "严重" ? root.accentRed : (level === "预警" ? root.accentAmber : root.accentGreen)
+                            color: root.alarmLevelColorFor(level)
                             font.pixelSize: 10
                             font.bold: true
                         }
@@ -6603,10 +6893,10 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"step": "1", "text": "确认急停/安全门"},
-                        {"step": "2", "text": "手动页停止并回零"},
-                        {"step": "3", "text": "检查相机、SD卡、云端"},
-                        {"step": "4", "text": "清故障后单步试运行"}
+                        {"step": "1", "text": root.alarmSourceAdvice("camera-kms-no-frame")[0]},
+                        {"step": "2", "text": root.alarmSourceAdvice("sdcard-not-writable")[0]},
+                        {"step": "3", "text": root.alarmSourceAdvice("cloud-upload-failed")[0]},
+                        {"step": "4", "text": root.alarmSourceAdvice("f4-heartbeat-lost")[0]}
                     ]
 
                     Row {
