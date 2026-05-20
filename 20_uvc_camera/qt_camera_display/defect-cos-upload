@@ -27,6 +27,10 @@ CLOUD_ACCOUNT_OVERRIDE="${CLOUD_ACCOUNT:-}"
 CLOUD_PASSWORD_OVERRIDE="${CLOUD_PASSWORD:-}"
 CLOUD_DEVICE_ID_OVERRIDE="${CLOUD_DEVICE_ID:-}"
 CLOUD_PART_ID_OVERRIDE="${CLOUD_PART_ID:-}"
+CLOUD_PART_CODE_OVERRIDE="${CLOUD_PART_CODE:-}"
+CLOUD_PART_NAME_OVERRIDE="${CLOUD_PART_NAME:-}"
+CLOUD_PART_CATEGORY_OVERRIDE="${CLOUD_PART_CATEGORY:-}"
+CLOUD_CLASS_LABEL_OVERRIDE="${CLOUD_CLASS_LABEL:-}"
 CLOUD_RESULT_OVERRIDE="${CLOUD_RESULT:-}"
 CLOUD_HEALTH_URL_OVERRIDE="${CLOUD_HEALTH_URL:-}"
 CLOUD_TIME_TZ_OVERRIDE="${CLOUD_TIME_TZ:-}"
@@ -96,6 +100,169 @@ extract_json_number()
     tr ',{}[]' '\n\n\n\n\n' < "$file" \
         | sed -n 's/^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         | head -n 1
+}
+
+json_items_as_lines()
+{
+    # json_items_as_lines 的作用：
+    #   把云端列表响应里的对象粗略拆成一行一个对象，方便在 BusyBox 环境里按零件字段匹配。
+    # 主要流程：
+    #   1. 删除换行，避免格式化 JSON 影响后续正则。
+    #   2. 在相邻对象 `},{` 中间插入换行。
+    #   3. 去掉列表响应头尾的方括号噪声，只保留每个对象所在行。
+    # 参数：
+    #   $1：保存云端列表 JSON 的文件路径。
+    # 返回值：
+    #   stdout 输出若干行，每行尽量是一条零件对象。
+    file="$1"
+    tr -d '\r\n' < "$file" \
+        | sed 's/},{/}\
+{/g' \
+        | sed -n '/"id"[[:space:]]*:[[:space:]]*[0-9][0-9]*/p'
+}
+
+json_value_from_object_line()
+{
+    # json_value_from_object_line 的作用：
+    #   从单行 JSON 对象里提取一个简单字符串或数字字段。
+    # 主要流程：
+    #   1. 先尝试匹配字符串字段，例如 part_code/name/category。
+    #   2. 匹配不到字符串时再尝试匹配数字字段，例如 id。
+    # 参数：
+    #   $1：单行 JSON 对象。
+    #   $2：字段名。
+    # 返回值：
+    #   stdout 输出字段值；匹配不到时输出空字符串。
+    object_line="$1"
+    field="$2"
+
+    printf '%s\n' "$object_line" \
+        | tr ',{}[]' '\n\n\n\n\n' \
+        | sed -n 's/^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+
+    printf '%s\n' "$object_line" \
+        | tr ',{}[]' '\n\n\n\n\n' \
+        | sed -n 's/^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | head -n 1
+}
+
+normalize_part_match_key()
+{
+    # normalize_part_match_key 的作用：
+    #   把分类标签、零件编码、零件名称归一化成便于比较的短键。
+    # 主要流程：
+    #   1. 统一转小写。
+    #   2. 去掉空格、横线、下划线等分隔符，让 `PART-WASHER`、`part_washer` 可匹配。
+    # 参数：
+    #   $1：待归一化文本。
+    # 返回值：
+    #   stdout 输出归一化后的键。
+    printf '%s' "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9]//g'
+}
+
+class_label_to_part_code()
+{
+    # class_label_to_part_code 的作用：
+    #   把分类模型输出的 class 标签转换成云端零件类型候选编码。
+    # 主要流程：
+    #   1. 如果显式传入 CLOUD_PART_CODE，直接使用它。
+    #   2. 否则使用 CLOUD_CLASS_LABEL，并去掉常见的 `_good/_bad/-good/-bad` 好坏后缀。
+    #   3. 只输出零件类型本身，例如 `gasket_good` 输出 `gasket`。
+    # 参数：
+    #   无显式参数；读取 CLOUD_PART_CODE 和 CLOUD_CLASS_LABEL。
+    # 返回值：
+    #   stdout 输出零件类型候选；两者都为空时输出空字符串。
+    candidate="${CLOUD_PART_CODE:-}"
+
+    if [ -z "$candidate" ]; then
+        candidate="${CLOUD_CLASS_LABEL:-}"
+    fi
+
+    if [ -z "$candidate" ]; then
+        return 0
+    fi
+
+    printf '%s\n' "$candidate" \
+        | sed 's/\([_-]\)\([Gg][Oo][Oo][Dd]\|[Bb][Aa][Dd]\)$//'
+}
+
+part_matches_candidate()
+{
+    # part_matches_candidate 的作用：
+    #   判断云端一条零件对象是否匹配板端传入的零件类型候选。
+    # 主要流程：
+    #   1. 优先用 part_code 精确匹配。
+    #   2. 再用 part_code/name/category 的归一化结果匹配分类标签去掉好坏后缀后的值。
+    #   3. 兼容云端编码写成 `PART-GASKET`、`gasket` 或名称写成 `gasket` 的情况。
+    # 参数：
+    #   $1：单行零件对象 JSON。
+    #   $2：板端零件类型候选。
+    # 返回值：
+    #   匹配返回 0；不匹配返回 1。
+    part_line="$1"
+    candidate="$2"
+    candidate_key="$(normalize_part_match_key "$candidate")"
+    candidate_without_part_prefix="$(printf '%s\n' "$candidate_key" | sed 's/^part//')"
+
+    part_code="$(json_value_from_object_line "$part_line" "part_code")"
+    part_name="$(json_value_from_object_line "$part_line" "name")"
+    part_category="$(json_value_from_object_line "$part_line" "category")"
+    part_code_key="$(normalize_part_match_key "$part_code")"
+    part_name_key="$(normalize_part_match_key "$part_name")"
+    part_category_key="$(normalize_part_match_key "$part_category")"
+    part_code_without_part_prefix="$(printf '%s\n' "$part_code_key" | sed 's/^part//')"
+
+    if [ -z "$candidate_key" ]; then
+        return 1
+    fi
+
+    if [ "$part_code_key" = "$candidate_key" ] \
+        || [ "$part_name_key" = "$candidate_key" ] \
+        || [ "$part_category_key" = "$candidate_key" ]; then
+        return 0
+    fi
+
+    if [ -n "$candidate_without_part_prefix" ] \
+        && { [ "$part_code_key" = "$candidate_without_part_prefix" ] \
+             || [ "$part_code_without_part_prefix" = "$candidate_without_part_prefix" ] \
+             || [ "$part_name_key" = "$candidate_without_part_prefix" ] \
+             || [ "$part_category_key" = "$candidate_without_part_prefix" ]; }; then
+        return 0
+    fi
+
+    return 1
+}
+
+extract_part_id_by_code()
+{
+    # extract_part_id_by_code 的作用：
+    #   从 `GET /api/v1/parts?limit=100` 响应中按板端零件类型候选找到云端 part_id。
+    # 主要流程：
+    #   1. 遍历 items 中的每个零件对象。
+    #   2. 对 part_code/name/category 做精确或归一化匹配。
+    #   3. 返回第一条匹配零件的 id。
+    # 参数：
+    #   $1：零件列表 JSON 文件路径。
+    #   $2：板端零件类型候选。
+    # 返回值：
+    #   stdout 输出匹配到的 id；匹配不到时输出空字符串。
+    file="$1"
+    candidate="$2"
+
+    json_items_as_lines "$file" | while IFS= read -r part_line; do
+        [ -n "$part_line" ] || continue
+
+        if part_matches_candidate "$part_line" "$candidate"; then
+            part_id="$(json_value_from_object_line "$part_line" "id")"
+            if is_positive_number "$part_id"; then
+                printf '%s\n' "$part_id"
+                break
+            fi
+        fi
+    done | head -n 1
 }
 
 record_response_top_level_fields()
@@ -259,6 +426,212 @@ run_time_format_self_test()
     if [ "$parsed_time" != "2026-05-08T13:07:02+08:00" ]; then
         fail "时间格式自检失败：期望 2026-05-08T13:07:02+08:00，实际 $parsed_time"
     fi
+}
+
+run_part_code_self_test()
+{
+    # run_part_code_self_test 的作用：
+    #   验证“零件类型”和“好坏结果”分离的上传契约。
+    # 主要流程：
+    #   1. 构造云端零件列表，列表里只有 gasket、washer、splitwasher 三种零件类型。
+    #   2. 分别用 gasket_good 和 gasket_bad 匹配，二者必须得到同一个 gasket part_id。
+    #   3. 再用 washer_good 匹配，必须得到 washer 的另一个 part_id，证明不同零件才切换类型。
+    # 参数：
+    #   无。
+    # 返回值：
+    #   映射正确返回 0；好坏后缀导致零件类型分裂时返回非 0。
+    tmp_file="${TMPDIR:-/tmp}/defect-cos-parts-self-test.$$"
+    old_part_code="${CLOUD_PART_CODE:-}"
+    old_class_label="${CLOUD_CLASS_LABEL:-}"
+    trap 'rm -f "$tmp_file"' EXIT HUP INT TERM
+
+    cat > "$tmp_file" <<'JSON'
+{"items":[{"id":11,"part_code":"gasket","name":"垫片","category":"washer-family"},{"id":12,"part_code":"washer","name":"平垫圈","category":"washer-family"},{"id":13,"part_code":"splitwasher","name":"弹垫","category":"washer-family"}],"total":3,"skip":0,"limit":100}
+JSON
+
+    CLOUD_PART_CODE=""
+    CLOUD_CLASS_LABEL="gasket_good"
+    if [ "$(class_label_to_part_code)" != "gasket" ]; then
+        CLOUD_PART_CODE="$old_part_code"
+        CLOUD_CLASS_LABEL="$old_class_label"
+        fail "零件类型自检失败：gasket_good 未归一成 gasket"
+    fi
+    good_part_id="$(extract_part_id_by_code "$tmp_file" "$(class_label_to_part_code)")"
+
+    CLOUD_CLASS_LABEL="gasket_bad"
+    if [ "$(class_label_to_part_code)" != "gasket" ]; then
+        CLOUD_PART_CODE="$old_part_code"
+        CLOUD_CLASS_LABEL="$old_class_label"
+        fail "零件类型自检失败：gasket_bad 未归一成 gasket"
+    fi
+    bad_part_id="$(extract_part_id_by_code "$tmp_file" "$(class_label_to_part_code)")"
+
+    CLOUD_CLASS_LABEL="washer_good"
+    washer_part_id="$(extract_part_id_by_code "$tmp_file" "$(class_label_to_part_code)")"
+
+    CLOUD_PART_CODE="$old_part_code"
+    CLOUD_CLASS_LABEL="$old_class_label"
+
+    if [ "$good_part_id" != "11" ] || [ "$bad_part_id" != "11" ]; then
+        fail "零件类型自检失败：gasket_good/gasket_bad 必须映射到同一个 part_id=11，实际 good=$good_part_id bad=$bad_part_id"
+    fi
+
+    if [ "$washer_part_id" != "12" ]; then
+        fail "零件类型自检失败：不同零件 washer 应映射到 part_id=12，实际 $washer_part_id"
+    fi
+}
+
+cloud_part_name_from_code()
+{
+    # cloud_part_name_from_code 的作用：
+    #   把板端模型输出的零件编码转换成云端自动创建零件时使用的中文名称。
+    # 主要流程：
+    #   1. 优先保留部署现场显式设置的 CLOUD_PART_NAME。
+    #   2. 对已知模型类别做中文名称映射，避免云端出现错误翻译或生硬编码。
+    #   3. 未知类别回退为原始 part_code，让云端仍能创建并保留可追踪编码。
+    # 参数：
+    #   $1：归一化后的零件编码，例如 wave_washer。
+    # 返回值：
+    #   stdout 输出云端 Part.name。
+    part_code="$1"
+
+    if [ -n "${CLOUD_PART_NAME:-}" ]; then
+        printf '%s\n' "$CLOUD_PART_NAME"
+        return 0
+    fi
+
+    case "$part_code" in
+        wave_washer)
+            printf '%s\n' "波形垫圈"
+            ;;
+        gasket)
+            printf '%s\n' "波形垫圈"
+            ;;
+        washer)
+            printf '%s\n' "平垫圈"
+            ;;
+        splitwasher)
+            printf '%s\n' "弹性垫圈"
+            ;;
+        *)
+            printf '%s\n' "$part_code"
+            ;;
+    esac
+}
+
+cloud_part_category_from_code()
+{
+    # cloud_part_category_from_code 的作用：
+    #   为云端自动创建零件补充分类字段，方便零件列表和统计页按类别聚合。
+    # 主要流程：
+    #   1. 优先使用部署现场显式设置的 CLOUD_PART_CATEGORY。
+    #   2. 对已知垫圈类零件写入稳定中文分类。
+    #   3. 未知类别返回空字符串，让云端创建未分类零件。
+    # 参数：
+    #   $1：归一化后的零件编码。
+    # 返回值：
+    #   stdout 输出云端 Part.category；未知时输出空字符串。
+    part_code="$1"
+
+    if [ -n "${CLOUD_PART_CATEGORY:-}" ]; then
+        printf '%s\n' "$CLOUD_PART_CATEGORY"
+        return 0
+    fi
+
+    case "$part_code" in
+        wave_washer)
+            printf '%s\n' "垫圈类"
+            ;;
+        gasket|washer|splitwasher)
+            printf '%s\n' "垫圈类"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+record_part_payload_fields()
+{
+    # record_part_payload_fields 的作用：
+    #   根据当前脚本解析到的零件身份生成 POST /api/v1/records 所需的 JSON 字段片段。
+    # 主要流程：
+    #   1. 如果已有 CLOUD_PART_ID，保持旧协议字段 `"part_id":<id>`，兼容手工指定和云端已存在零件。
+    #   2. 如果没有 part_id 但有 part_code，改走云端自动创建路径，发送 part_code、part_name、part_category 和 auto_create_part。
+    #   3. 如果两者都缺失，立即失败，避免创建没有零件归属的检测记录。
+    # 参数：
+    #   无显式参数；读取 CLOUD_PART_ID、CLOUD_PART_CODE、CLOUD_PART_NAME、CLOUD_PART_CATEGORY。
+    # 返回值：
+    #   stdout 输出带前导两个空格的 JSON 字段片段，调用方直接拼入 record_body。
+    request_part_code="$(class_label_to_part_code)"
+
+    if is_positive_number "${CLOUD_PART_ID:-}"; then
+        printf '  "part_id":%s' "$CLOUD_PART_ID"
+        return 0
+    fi
+
+    if [ -z "$request_part_code" ]; then
+        fail "缺少零件类型：请设置 CLOUD_PART_CODE/CLOUD_CLASS_LABEL 或 CLOUD_PART_ID"
+    fi
+
+    request_part_name="$(cloud_part_name_from_code "$request_part_code")"
+    request_part_category="$(cloud_part_category_from_code "$request_part_code")"
+    request_part_code_json="$(json_escape "$request_part_code")"
+    request_part_name_json="$(json_escape "$request_part_name")"
+    request_part_category_json="$(json_escape "$request_part_category")"
+
+    if [ -n "$request_part_category" ]; then
+        printf '  "part_code":"%s",\n  "part_name":"%s",\n  "part_category":"%s",\n  "auto_create_part":true' \
+            "$request_part_code_json" \
+            "$request_part_name_json" \
+            "$request_part_category_json"
+    else
+        printf '  "part_code":"%s",\n  "part_name":"%s",\n  "auto_create_part":true' \
+            "$request_part_code_json" \
+            "$request_part_name_json"
+    fi
+}
+
+run_auto_create_part_self_test()
+{
+    # run_auto_create_part_self_test 的作用：
+    #   验证未知零件类型不再让板端脚本提前失败，而是能生成云端自动创建零件请求字段。
+    # 主要流程：
+    #   1. 模拟云端未返回 part_id 的状态。
+    #   2. 设置 CLOUD_PART_CODE=wave_washer，检查请求字段包含自动创建开关和正确中文名称。
+    #   3. 恢复进入自检前的全局变量，避免影响其它自检。
+    # 参数：
+    #   无。
+    # 返回值：
+    #   自动创建字段正确返回 0；字段缺失或中文名称错误时终止脚本。
+    old_part_id="${CLOUD_PART_ID:-}"
+    old_part_code="${CLOUD_PART_CODE:-}"
+    old_part_name="${CLOUD_PART_NAME:-}"
+    old_part_category="${CLOUD_PART_CATEGORY:-}"
+    old_class_label="${CLOUD_CLASS_LABEL:-}"
+
+    CLOUD_PART_ID=""
+    CLOUD_PART_CODE="wave_washer"
+    CLOUD_PART_NAME=""
+    CLOUD_PART_CATEGORY=""
+    CLOUD_CLASS_LABEL="wave_washer_good"
+
+    payload_fields="$(record_part_payload_fields)"
+
+    CLOUD_PART_ID="$old_part_id"
+    CLOUD_PART_CODE="$old_part_code"
+    CLOUD_PART_NAME="$old_part_name"
+    CLOUD_PART_CATEGORY="$old_part_category"
+    CLOUD_CLASS_LABEL="$old_class_label"
+
+    printf '%s\n' "$payload_fields" | grep -q '"part_code":"wave_washer"' \
+        || fail "自动创建零件自检失败：请求体缺少 part_code=wave_washer"
+    printf '%s\n' "$payload_fields" | grep -q '"part_name":"波形垫圈"' \
+        || fail "自动创建零件自检失败：wave_washer 必须写入中文名称“波形垫圈”"
+    printf '%s\n' "$payload_fields" | grep -q '"part_category":"垫圈类"' \
+        || fail "自动创建零件自检失败：wave_washer 必须写入分类“垫圈类”"
+    printf '%s\n' "$payload_fields" | grep -q '"auto_create_part":true' \
+        || fail "自动创建零件自检失败：请求体缺少 auto_create_part=true"
 }
 
 add_annotated_file()
@@ -445,6 +818,10 @@ apply_runtime_overrides()
     [ -z "$CLOUD_PASSWORD_OVERRIDE" ] || CLOUD_PASSWORD="$CLOUD_PASSWORD_OVERRIDE"
     [ -z "$CLOUD_DEVICE_ID_OVERRIDE" ] || CLOUD_DEVICE_ID="$CLOUD_DEVICE_ID_OVERRIDE"
     [ -z "$CLOUD_PART_ID_OVERRIDE" ] || CLOUD_PART_ID="$CLOUD_PART_ID_OVERRIDE"
+    [ -z "$CLOUD_PART_CODE_OVERRIDE" ] || CLOUD_PART_CODE="$CLOUD_PART_CODE_OVERRIDE"
+    [ -z "$CLOUD_PART_NAME_OVERRIDE" ] || CLOUD_PART_NAME="$CLOUD_PART_NAME_OVERRIDE"
+    [ -z "$CLOUD_PART_CATEGORY_OVERRIDE" ] || CLOUD_PART_CATEGORY="$CLOUD_PART_CATEGORY_OVERRIDE"
+    [ -z "$CLOUD_CLASS_LABEL_OVERRIDE" ] || CLOUD_CLASS_LABEL="$CLOUD_CLASS_LABEL_OVERRIDE"
     [ -z "$CLOUD_RESULT_OVERRIDE" ] || CLOUD_RESULT="$CLOUD_RESULT_OVERRIDE"
     [ -z "$CLOUD_HEALTH_URL_OVERRIDE" ] || CLOUD_HEALTH_URL="$CLOUD_HEALTH_URL_OVERRIDE"
     [ -z "$CLOUD_TIME_TZ_OVERRIDE" ] || CLOUD_TIME_TZ="$CLOUD_TIME_TZ_OVERRIDE"
@@ -467,9 +844,18 @@ CLOUD_ACCOUNT="${CLOUD_ACCOUNT:-}"
 CLOUD_PASSWORD="${CLOUD_PASSWORD:-}"
 
 # CLOUD_DEVICE_ID/CLOUD_PART_ID 可显式指定云端已有的 MP157 设备和零件 ID。
-# 留空时脚本会在登录后自动取当前账号可访问的第一条设备/零件，避免默认 ID 不属于当前公司时创建记录失败。
+# CLOUD_PART_ID 优先级最高；CLOUD_PART_CODE/CLOUD_CLASS_LABEL 用来按零件类型查询云端 part_id。
+# 如果云端没有匹配零件，脚本会保留 part_code 并在创建检测记录时请求云端自动创建零件。
 CLOUD_DEVICE_ID="${CLOUD_DEVICE_ID:-}"
 CLOUD_PART_ID="${CLOUD_PART_ID:-}"
+
+# CLOUD_PART_CODE 是板端明确传入的零件类型，例如 gasket、washer、splitwasher。
+# CLOUD_CLASS_LABEL 是分类模型原始类别，例如 gasket_good；脚本会去掉 good/bad 后缀再匹配零件。
+# CLOUD_PART_NAME/CLOUD_PART_CATEGORY 是自动创建零件时的可选中文名称和分类覆盖值。
+CLOUD_PART_CODE="${CLOUD_PART_CODE:-}"
+CLOUD_PART_NAME="${CLOUD_PART_NAME:-}"
+CLOUD_PART_CATEGORY="${CLOUD_PART_CATEGORY:-}"
+CLOUD_CLASS_LABEL="${CLOUD_CLASS_LABEL:-}"
 
 # CLOUD_RESULT 是本次模型检测结果，Qt 检测链路会显式传入 good、bad 或 review。
 # 默认 review 是保守值，避免没有模型结果时把云端记录静默写成良品。
@@ -518,16 +904,38 @@ ensure_cloud_session()
 
 resolve_cloud_ids()
 {
-    # 如果部署现场没有指定 ID，就读取当前账号能访问的第一条零件和设备。
-    # 这样脚本不会把源码里的固定默认值误当成所有公司的通用 ID。
+    # 如果部署现场没有指定 ID，就按板端零件类型查询云端零件列表，再读取当前账号能访问的设备。
+    # 查不到零件时不再失败，而是让 create_record() 走云端自动创建路径。
     if [ -z "$CLOUD_PART_ID" ]; then
-        http_get "$CLOUD_BASE_URL/api/v1/parts?limit=1" "/tmp/defect-cos-parts.json" \
+        requested_part_code="$(class_label_to_part_code)"
+
+        http_get "$CLOUD_BASE_URL/api/v1/parts?limit=100" "/tmp/defect-cos-parts.json" \
             || fail "自动查询零件列表失败，请手动设置 CLOUD_PART_ID"
 
-        CLOUD_PART_ID=$(extract_json_number "id" "/tmp/defect-cos-parts.json")
-        if [ -z "$CLOUD_PART_ID" ]; then
-            fail "当前账号没有可用零件，请先在云端创建零件或设置 CLOUD_PART_ID"
+        if [ -n "$requested_part_code" ]; then
+            CLOUD_PART_ID=$(extract_part_id_by_code "/tmp/defect-cos-parts.json" "$requested_part_code")
+            if [ -z "$CLOUD_PART_ID" ]; then
+                CLOUD_PART_CODE="$requested_part_code"
+                log_upload_step "resolved_part_code=$CLOUD_PART_CODE"
+                log_upload_step "resolved_part_id=未匹配到云端零件，将由云端自动创建"
+            else
+                CLOUD_PART_CODE="$requested_part_code"
+                log_upload_step "resolved_part_code=$CLOUD_PART_CODE"
+                log_upload_step "resolved_part_id=$CLOUD_PART_ID"
+            fi
+        else
+            CLOUD_PART_ID=$(extract_json_number "id" "/tmp/defect-cos-parts.json")
+            if [ -n "$CLOUD_PART_ID" ]; then
+                log_upload_step "resolved_part_code=未传零件类型，使用第一条零件兜底"
+            fi
+            if [ -z "$CLOUD_PART_ID" ]; then
+                fail "当前账号没有可用零件，且板端没有传入 CLOUD_PART_CODE/CLOUD_CLASS_LABEL，无法自动创建零件"
+            fi
         fi
+    fi
+
+    if [ -n "$CLOUD_PART_ID" ]; then
+        log_upload_step "resolved_part_id=$CLOUD_PART_ID"
     fi
 
     if [ -z "$CLOUD_DEVICE_ID" ]; then
@@ -587,16 +995,21 @@ create_record()
     #   3. POST /api/v1/records 后，只解析响应顶层 id，不能读取嵌套 part.id/device.id。
     #   4. 校验云端返回的 record_no 与本次请求一致，防止后端复用旧演示记录。
     # 参数：
-    #   无显式参数；读取 CLOUD_PART_ID/CLOUD_DEVICE_ID/CLOUD_RESULT。
+    #   无显式参数；读取 CLOUD_PART_ID/CLOUD_PART_CODE/CLOUD_DEVICE_ID/CLOUD_RESULT。
     # 返回值：
     #   stdout 输出正整数 record_id；失败时终止脚本。
     record_no="MP157-$(date '+%Y%m%d-%H%M%S')"
     captured_at="$(iso8601_local_now)"
+    request_part_code="$(class_label_to_part_code)"
+    request_part_code_json="$(json_escape "$request_part_code")"
+    request_class_label_json="$(json_escape "${CLOUD_CLASS_LABEL:-}")"
+    record_part_fields="$(record_part_payload_fields)"
     record_body="{
 \"record_no\":\"$record_no\",
-\"part_id\":$CLOUD_PART_ID,
+$record_part_fields,
 \"device_id\":$CLOUD_DEVICE_ID,
 \"result\":\"$CLOUD_RESULT\",
+\"device_context\":{\"part_code\":\"$request_part_code_json\",\"class_label\":\"$request_class_label_json\"},
 \"captured_at\":\"$captured_at\",
 \"detected_at\":\"$captured_at\"
 }"
@@ -855,6 +1268,8 @@ while [ "$#" -gt 0 ]; do
         --self-test-json-parser)
             run_json_parser_self_test
             run_time_format_self_test
+            run_part_code_self_test
+            run_auto_create_part_self_test
             exit 0
             ;;
         --self-test-args)

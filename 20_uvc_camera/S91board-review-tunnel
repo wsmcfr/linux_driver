@@ -1,0 +1,45 @@
+#!/bin/sh
+#
+# 作用：
+#   Buildroot/SysV 开机入口，启动 STM32MP157 板端到云服务器的复核回写反向隧道守护。
+#
+# 运行顺序：
+#   1. S90uvc-camera 启动 Qt 检测界面和板端 18080 回写服务。
+#   2. S91board-review-tunnel 再启动 board-review-tunnel.sh 守护循环。
+#   3. 守护循环长期维护云端 127.0.0.1:18081 -> 板端 127.0.0.1:18080 的 ssh -R。
+
+# TUNNEL_CTL 是真正执行 start/stop/status 的板端脚本。
+TUNNEL_CTL="${TUNNEL_CTL:-/root/qt_camera_display/board-review-tunnel.sh}"
+
+case "${1:-start}" in
+    start)
+        if [ ! -x "$TUNNEL_CTL" ]; then
+            echo "错误：找不到可执行隧道控制脚本：$TUNNEL_CTL" >&2
+            exit 1
+        fi
+        "$TUNNEL_CTL" start
+        ;;
+    stop)
+        if [ -x "$TUNNEL_CTL" ]; then
+            "$TUNNEL_CTL" stop
+        fi
+        ;;
+    restart)
+        if [ ! -x "$TUNNEL_CTL" ]; then
+            echo "错误：找不到可执行隧道控制脚本：$TUNNEL_CTL" >&2
+            exit 1
+        fi
+        "$TUNNEL_CTL" restart
+        ;;
+    status)
+        if [ ! -x "$TUNNEL_CTL" ]; then
+            echo "隧道控制脚本不存在：$TUNNEL_CTL" >&2
+            exit 1
+        fi
+        "$TUNNEL_CTL" status
+        ;;
+    *)
+        echo "用法：$0 {start|stop|restart|status}" >&2
+        exit 2
+        ;;
+esac

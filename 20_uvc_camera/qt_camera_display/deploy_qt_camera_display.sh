@@ -32,6 +32,9 @@ OVERLAY_SRC="$SCRIPT_DIR/$BUILD_DIR/uvc_kms_overlay"
 # FB_SPLASH_SRC 是早期静态启动首帧绘制器，负责在 Qt/GPU 启动前先写 /dev/fb0。
 FB_SPLASH_SRC="$SCRIPT_DIR/$BUILD_DIR/fb_boot_splash"
 
+# FB_SPLASH_ASSET_SRC 是由 HTML 预览稿生成的 RGB565 静态图资源，fb_boot_splash 会优先整张 blit 它。
+FB_SPLASH_ASSET_SRC="$SCRIPT_DIR/boot_splash.rgb565"
+
 # DEFECT_CLASSIFY_SRC 是 MobileNetV3-Small INT8 ONNX 独立推理程序。
 DEFECT_CLASSIFY_SRC="$SCRIPT_DIR/$BUILD_DIR/defect-classify"
 
@@ -46,6 +49,9 @@ PROBE_SRC="$SCRIPT_DIR/probe_zero_copy_video_path.sh"
 
 # COS_UPLOAD_SRC 是检测流程自动上传 source/annotated 图片到云端 COS 的板端脚本。
 COS_UPLOAD_SRC="$SCRIPT_DIR/defect-cos-upload"
+
+# BOARD_REVIEW_TUNNEL_SRC 是板端反向隧道守护脚本，负责独立维持云端回写板端的 ssh -R。
+BOARD_REVIEW_TUNNEL_SRC="$SCRIPT_DIR/board-review-tunnel.sh"
 
 # DEFECT_MODEL_SRC 是待部署的 INT8 ONNX 模型路径，可通过环境变量覆盖。
 DEFECT_MODEL_SRC="${DEFECT_MODEL_SRC:-/mnt/d/model_picture/checkpoints_classify/defect_classifier_static_mixed_int8.onnx}"
@@ -64,6 +70,9 @@ DISPLAY_QUIET_INIT_SRC="$SCRIPT_DIR/../S05display-quiet"
 
 # UVC_INIT_SRC 是正式开机自启动脚本，负责启动 Qt + KMS overlay 工业界面。
 UVC_INIT_SRC="$SCRIPT_DIR/../S90uvc-camera"
+
+# BOARD_REVIEW_TUNNEL_INIT_SRC 是板端反向隧道开机自启动入口；它依赖 Qt 已经启动 18080 服务。
+BOARD_REVIEW_TUNNEL_INIT_SRC="$SCRIPT_DIR/../S91board-review-tunnel"
 
 # INSTALL_DIR 是开发板启动后可见的持久目录。
 INSTALL_DIR="$ROOTFS/root/qt_camera_display"
@@ -187,6 +196,13 @@ if [ ! -f "$FB_SPLASH_SRC" ]; then
     exit 1
 fi
 
+# 检查 RGB565 启动图资源是否已生成；缺失会让板端只能回退到低保真 C 绘制。
+if [ ! -f "$FB_SPLASH_ASSET_SRC" ]; then
+    echo "错误：找不到早期静态启动图资源：$FB_SPLASH_ASSET_SRC" >&2
+    echo "请先执行：python3 generate_boot_splash_asset.py" >&2
+    exit 1
+fi
+
 if [ ! -f "$DEFECT_CLASSIFY_SRC" ]; then
     echo "错误：找不到缺陷分类推理程序：$DEFECT_CLASSIFY_SRC" >&2
     echo "请先执行：ORT_ROOT=/path/to/onnxruntime-arm ./build_defect_classify.sh" >&2
@@ -213,6 +229,12 @@ fi
 # 检查 COS 上传脚本是否存在；检测流程会在本地图片落盘后调用它。
 if [ ! -f "$COS_UPLOAD_SRC" ]; then
     echo "错误：找不到 COS 上传脚本：$COS_UPLOAD_SRC" >&2
+    exit 1
+fi
+
+# 检查板端反向隧道守护脚本是否存在；云端复核回写依赖它长期维持 ssh -R。
+if [ ! -f "$BOARD_REVIEW_TUNNEL_SRC" ]; then
+    echo "错误：找不到板端反向隧道守护脚本：$BOARD_REVIEW_TUNNEL_SRC" >&2
     exit 1
 fi
 
@@ -244,6 +266,11 @@ if [ ! -f "$UVC_INIT_SRC" ]; then
     exit 1
 fi
 
+if [ ! -f "$BOARD_REVIEW_TUNNEL_INIT_SRC" ]; then
+    echo "错误：找不到板端反向隧道开机脚本：$BOARD_REVIEW_TUNNEL_INIT_SRC" >&2
+    exit 1
+fi
+
 # 创建安装目录；NFS rootfs 通常需要 sudo 才能写入 root 目录。
 sudo mkdir -p "$INSTALL_DIR"
 sudo mkdir -p "$MODEL_INSTALL_DIR"
@@ -254,17 +281,20 @@ sudo mkdir -p "$ROOTFS/etc/init.d"
 sudo cp "$APP_SRC" "$INSTALL_DIR/qt_camera_display"
 sudo cp "$OVERLAY_SRC" "$INSTALL_DIR/uvc_kms_overlay"
 sudo cp "$FB_SPLASH_SRC" "$INSTALL_DIR/fb_boot_splash"
+sudo cp "$FB_SPLASH_ASSET_SRC" "$INSTALL_DIR/boot_splash.rgb565"
 sudo cp "$DEFECT_CLASSIFY_SRC" "$INSTALL_DIR/defect-classify"
 sudo cp "$DEFECT_SEGMENT_SRC" "$INSTALL_DIR/defect-segment"
 sudo cp "$SCRIPT_DIR/run_qt_camera_display.sh" "$INSTALL_DIR/run_qt_camera_display.sh"
 sudo cp "$OVERLAY_RUN_SRC" "$INSTALL_DIR/run_qt_kms_overlay_display.sh"
 sudo cp "$PROBE_SRC" "$INSTALL_DIR/probe_zero_copy_video_path.sh"
 sudo cp "$COS_UPLOAD_SRC" "$INSTALL_DIR/defect-cos-upload"
+sudo cp "$BOARD_REVIEW_TUNNEL_SRC" "$INSTALL_DIR/board-review-tunnel.sh"
 sudo cp "$DEFECT_MODEL_SRC" "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8.onnx"
 sudo cp "$DEFECT_LABELS_SRC" "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8_labels.json"
 sudo cp "$DEFECT_UNET_MODEL_SRC" "$MODEL_INSTALL_DIR/defect_unet_test_decoder_head_int8.onnx"
 sudo cp "$DISPLAY_QUIET_INIT_SRC" "$ROOTFS/etc/init.d/S05display-quiet"
 sudo cp "$UVC_INIT_SRC" "$ROOTFS/etc/init.d/S90uvc-camera"
+sudo cp "$BOARD_REVIEW_TUNNEL_INIT_SRC" "$ROOTFS/etc/init.d/S91board-review-tunnel"
 
 # 如果 ORT_ROOT/lib/libonnxruntime.so 存在，则一起部署到私有 lib 目录；缺失时提示用户手动补运行库。
 if [ -f "$ORT_ROOT/lib/libonnxruntime.so" ]; then
@@ -281,12 +311,14 @@ fi
 sudo chmod 755 "$INSTALL_DIR/qt_camera_display"
 sudo chmod 755 "$INSTALL_DIR/uvc_kms_overlay"
 sudo chmod 755 "$INSTALL_DIR/fb_boot_splash"
+sudo chmod 644 "$INSTALL_DIR/boot_splash.rgb565"
 sudo chmod 755 "$INSTALL_DIR/defect-classify"
 sudo chmod 755 "$INSTALL_DIR/defect-segment"
 sudo chmod 755 "$INSTALL_DIR/run_qt_camera_display.sh"
 sudo chmod 755 "$INSTALL_DIR/run_qt_kms_overlay_display.sh"
 sudo chmod 755 "$INSTALL_DIR/probe_zero_copy_video_path.sh"
 sudo chmod 755 "$INSTALL_DIR/defect-cos-upload"
+sudo chmod 755 "$INSTALL_DIR/board-review-tunnel.sh"
 sudo chmod 644 "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8.onnx"
 sudo chmod 644 "$MODEL_INSTALL_DIR/defect_classifier_static_mixed_int8_labels.json"
 sudo chmod 644 "$MODEL_INSTALL_DIR/defect_unet_test_decoder_head_int8.onnx"
@@ -295,6 +327,7 @@ if [ -n "${ORT_REAL_NAME:-}" ] && [ -f "$LIB_INSTALL_DIR/$ORT_REAL_NAME" ]; then
 fi
 sudo chmod 755 "$ROOTFS/etc/init.d/S05display-quiet"
 sudo chmod 755 "$ROOTFS/etc/init.d/S90uvc-camera"
+sudo chmod 755 "$ROOTFS/etc/init.d/S91board-review-tunnel"
 
 # 可选写入默认上传账号配置；没有部署环境变量时不覆盖板端已有配置。
 write_cos_upload_env_file
@@ -311,3 +344,5 @@ echo "手动验证当前帧分割程序："
 echo "  LD_LIBRARY_PATH=/root/qt_camera_display/lib:\$LD_LIBRARY_PATH /root/qt_camera_display/defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images"
 echo "零拷贝/硬件视频探测："
 echo "  /root/qt_camera_display/probe_zero_copy_video_path.sh"
+echo "云端复核回写反向隧道："
+echo "  /etc/init.d/S91board-review-tunnel restart && /etc/init.d/S91board-review-tunnel status"

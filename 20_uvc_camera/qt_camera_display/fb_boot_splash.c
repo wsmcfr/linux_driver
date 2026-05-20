@@ -8,18 +8,19 @@
  * 主要流程：
  *   1. 解析命令行，确定要写入的 framebuffer 设备节点。
  *   2. 打开 framebuffer，读取固定信息、可变信息和像素位域。
- *   3. mmap 映射 LCD 显存，按当前像素格式写入背景、检测窗口、ROI、扫描线和进度条。
- *   4. 调用 msync/fsync 尽快把静态首帧刷新到屏幕，然后释放映射并退出。
+ *   3. 优先读取 HTML 渲染生成的 RGB565 静态图资源，整张写入 framebuffer。
+ *   4. 如果资源缺失或尺寸不匹配，再回退到 C 几何图元绘制，避免开机阶段黑屏。
+ *   5. 调用 msync/fsync 尽快把静态首帧刷新到屏幕，然后释放映射并退出。
  *
  * 关键说明：
  *   - 本程序不依赖 Qt、OpenGL、DRM、图片解码库或字体库，适合放到 Buildroot SysV init
  *     的早期阶段运行，用来填补 Qt 启动画面出现前的黑屏时间。
- *   - 早期 framebuffer 阶段只内置 5x7 ASCII 点阵字体，因此首帧用英文标题表达
- *     “工业缺陷检测系统”；Qt 真正启动后，QML splashOverlay 会继续显示中文标题
- *     “工业缺陷检测系统”和完整动画。
+ *   - 复杂中文、光晕和半透明层不再用 C 手工重画，而是由 generate_boot_splash_asset.py
+ *     把 ai_boot_splash_preview.html 渲染为 boot_splash.rgb565；本程序只做资源 blit。
  *
  * 参数：
  *   -f /dev/fb0  指定 framebuffer 设备节点，默认 /dev/fb0。
+ *   -a path      指定 RGB565 启动图资源，默认 /root/qt_camera_display/boot_splash.rgb565。
  *   -q           静默模式，只绘制不输出普通日志，适合 init 脚本调用。
  *   -h           打印帮助。
  *
@@ -43,17 +44,41 @@
 /* DEFAULT_FB_DEVICE 是正点原子 STM32MP157 RGB LCD 通常暴露的 framebuffer 设备节点。 */
 #define DEFAULT_FB_DEVICE "/dev/fb0"
 
+/* DEFAULT_SPLASH_ASSET 是部署脚本安装的 HTML 渲染版 RGB565 启动图资源路径。 */
+#define DEFAULT_SPLASH_ASSET "/root/qt_camera_display/boot_splash.rgb565"
+
 /* REF_WIDTH 是 QML 主界面的设计宽度，早期静态图按它做比例换算。 */
 #define REF_WIDTH 1024
 
 /* REF_HEIGHT 是 QML 主界面的设计高度，和 7 寸 RGB 屏 1024x600 对齐。 */
 #define REF_HEIGHT 600
 
-/* SPLASH_TITLE_CN 保留 QML 启动画面的中文标题语义，日志和静态检查会用到它。 */
-static const char *SPLASH_TITLE_CN = "工业缺陷检测系统";
+/* SPLASH_ASSET_BYTES 是 1024x600 RGB565 每像素 2 字节时必须满足的资源大小。 */
+#define SPLASH_ASSET_BYTES ((size_t)REF_WIDTH * (size_t)REF_HEIGHT * 2U)
 
-/* SPLASH_SUBTITLE_EN 与 QML splashOverlay 的英文副标题保持一致，便于视觉衔接。 */
-static const char *SPLASH_SUBTITLE_EN = "STM32MP157 Vision Inspection Terminal";
+/* SPLASH_TITLE_CN 保留 HTML 预览稿中的中文主标语，日志和静态检查会用到它。 */
+static const char *SPLASH_TITLE_CN = "AI赋能设计，设计点亮AI!";
+
+/* SPLASH_CONTEST_CN 保留用户要求必须出现的赛事名称，便于确认真实启动图主题。 */
+static const char *SPLASH_CONTEST_CN = "第九届嵌入式芯片与系统设计竞赛";
+
+/* SPLASH_CONTEST_EN 是赛事名称的英文版本，日志和后续扩展字库时会用到它。 */
+static const char *SPLASH_CONTEST_EN = "Embedded Chip & System Design Contest";
+
+/* SPLASH_BRAND_EN 是主品牌标语的英文点阵版本，会绘制到白色 Logo 面板。 */
+static const char *SPLASH_BRAND_EN = "AI for Design & Design for AI!";
+
+/* SPLASH_SYSTEM_EN 是底部系统名称，用于连接启动图和后续 Qt 工业视觉界面。 */
+static const char *SPLASH_SYSTEM_EN = "AI Vision Design Terminal";
+
+/* SPLASH_BADGE_EDGE_AI 是底部第一枚技术铭牌的语义文本。 */
+static const char *SPLASH_BADGE_EDGE_AI = "MP157 Edge AI";
+
+/* SPLASH_BADGE_FRAMEBUFFER 是底部第二枚技术铭牌的语义文本。 */
+static const char *SPLASH_BADGE_FRAMEBUFFER = "Framebuffer Splash";
+
+/* SPLASH_BADGE_QT 是底部第三枚技术铭牌的语义文本。 */
+static const char *SPLASH_BADGE_QT = "Qt Vision Ready";
 
 /*
  * rgb_color 保存一个 8bit RGB 颜色。
@@ -84,10 +109,12 @@ struct framebuffer_device {
 /*
  * app_config 保存命令行配置。
  * fb_device 是要写入的 framebuffer 节点。
+ * asset_path 是 HTML 渲染生成的 RGB565 静态图资源路径。
  * quiet 为 1 时不输出普通日志，避免 init 脚本污染控制台。
  */
 struct app_config {
     const char *fb_device;
+    const char *asset_path;
     int quiet;
 };
 
@@ -103,8 +130,9 @@ struct app_config {
  */
 static void print_usage(const char *prog)
 {
-    printf("用法: %s [-f /dev/fb0] [-q] [-h]\n", prog);
+    printf("用法: %s [-f /dev/fb0] [-a boot_splash.rgb565] [-q] [-h]\n", prog);
     printf("  -f  指定 framebuffer 设备，默认 %s\n", DEFAULT_FB_DEVICE);
+    printf("  -a  指定 RGB565 启动图资源，默认 %s\n", DEFAULT_SPLASH_ASSET);
     printf("  -q  静默绘制，不输出普通日志，适合 init 脚本调用\n");
     printf("  -h  显示帮助\n");
 }
@@ -115,7 +143,7 @@ static void print_usage(const char *prog)
  *
  * 主要流程：
  *   1. 设置默认 `/dev/fb0`。
- *   2. 逐个解析 `-f`、`-q` 和 `-h`。
+ *   2. 逐个解析 `-f`、`-a`、`-q` 和 `-h`。
  *   3. 对缺少参数或未知参数返回错误，避免启动脚本误传值时静默失败。
  *
  * 参数：
@@ -130,6 +158,7 @@ static int parse_args(int argc, char *argv[], struct app_config *cfg)
     int i;
 
     cfg->fb_device = DEFAULT_FB_DEVICE;
+    cfg->asset_path = DEFAULT_SPLASH_ASSET;
     cfg->quiet = 0;
 
     for (i = 1; i < argc; ++i) {
@@ -139,6 +168,12 @@ static int parse_args(int argc, char *argv[], struct app_config *cfg)
                 return -1;
             }
             cfg->fb_device = argv[++i];
+        } else if (strcmp(argv[i], "-a") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "错误：-a 缺少 RGB565 启动图资源路径\n");
+                return -1;
+            }
+            cfg->asset_path = argv[++i];
         } else if (strcmp(argv[i], "-q") == 0) {
             cfg->quiet = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -408,7 +443,7 @@ static void put_pixel(struct framebuffer_device *fb, int x, int y, struct rgb_co
 
 /*
  * fill_rect 的作用：
- *   绘制一个实心矩形，是背景、面板、进度条和标签的基础绘制函数。
+ *   绘制一个实心矩形，是背景、面板、芯片图形和标签的基础绘制函数。
  *
  * 参数：
  *   fb 是 framebuffer 状态。
@@ -450,7 +485,7 @@ static void fill_rect(struct framebuffer_device *fb, int x, int y, int w, int h,
 
 /*
  * draw_rect_border 的作用：
- *   绘制矩形边框，用于模拟 QML 启动画面的检测窗口、ROI 框和进度条轨道。
+ *   绘制矩形边框，用于模拟启动图中的 Logo 面板、ROI 线稿和技术铭牌。
  *
  * 参数：
  *   fb 是 framebuffer 状态。
@@ -500,6 +535,9 @@ static const uint8_t *glyph_for_char(char ch)
     static const uint8_t colon[7] = { 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00 };
     static const uint8_t slash[7] = { 0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10 };
     static const uint8_t percent[7] = { 0x19, 0x1a, 0x02, 0x04, 0x08, 0x0b, 0x13 };
+    static const uint8_t exclamation[7] = { 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04 };
+    static const uint8_t ampersand[7] = { 0x0c, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0d };
+    static const uint8_t comma[7] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x08 };
 
     static const uint8_t digits[10][7] = {
         { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e },
@@ -568,6 +606,15 @@ static const uint8_t *glyph_for_char(char ch)
     }
     if (upper == '%') {
         return percent;
+    }
+    if (upper == '!') {
+        return exclamation;
+    }
+    if (upper == '&') {
+        return ampersand;
+    }
+    if (upper == ',') {
+        return comma;
     }
 
     return question;
@@ -669,7 +716,7 @@ static void draw_text_center(struct framebuffer_device *fb,
 
 /*
  * draw_grid 的作用：
- *   绘制低对比度工业坐标网格，模拟 QML splashOverlay 中的 subtleGrid。
+ *   绘制低对比度科技背景网格，模拟 HTML 预览稿里的启动画布结构线。
  *
  * 参数：
  *   fb 是 framebuffer 状态。
@@ -689,29 +736,495 @@ static void draw_grid(struct framebuffer_device *fb,
                       int rows,
                       struct rgb_color color)
 {
+    /* i 是网格线循环索引，先遍历竖线，再遍历横线。 */
     int i;
+    /* line 是网格线宽，按屏幕缩放后至少保留 1 个像素。 */
     int line = scale_ref_min(fb, 1);
 
     for (i = 0; i <= columns; ++i) {
+        /* gx 是当前竖向网格线的屏幕 x 坐标。 */
         int gx = x + i * w / columns;
         fill_rect(fb, gx, y, line, h, color);
     }
 
     for (i = 0; i <= rows; ++i) {
+        /* gy 是当前横向网格线的屏幕 y 坐标。 */
         int gy = y + i * h / rows;
         fill_rect(fb, x, gy, w, line, color);
     }
 }
 
 /*
- * draw_splash 的作用：
- *   绘制与 QML 启动动画第一帧风格一致的静态画面。
+ * unpack_rgb565 的作用：
+ *   把 RGB565 little-endian 像素转换成 8bit RGB，便于非 16bpp 或缩放路径复用 put_pixel。
  *
  * 主要流程：
- *   1. 绘制深色背景和低对比度网格。
- *   2. 绘制系统标题、副标题和居中的检测窗口。
- *   3. 绘制 ROI 框、扫描线、SELF CHECK 标识和首阶段进度条。
- *   4. 使用 18% 初始进度，对应 QML splashStageModel 第一阶段“加载相机”。
+ *   1. 从 raw 文件的低字节和高字节还原 16bit RGB565 值。
+ *   2. 分别提取 R5、G6、B5 分量。
+ *   3. 使用位扩展把低位补齐到 8bit，减少颜色发暗。
+ *
+ * 参数：
+ *   lo 是 RGB565 低字节。
+ *   hi 是 RGB565 高字节。
+ *
+ * 返回值：
+ *   返回 8bit RGB 颜色结构。
+ */
+static struct rgb_color unpack_rgb565(uint8_t lo, uint8_t hi)
+{
+    /* value 是 little-endian 还原后的 RGB565 像素值。 */
+    uint16_t value = (uint16_t)lo | (uint16_t)((uint16_t)hi << 8);
+    /* r5/g6/b5 是从 RGB565 中拆出来的原始颜色分量。 */
+    uint8_t r5 = (uint8_t)((value >> 11) & 0x1fU);
+    uint8_t g6 = (uint8_t)((value >> 5) & 0x3fU);
+    uint8_t b5 = (uint8_t)(value & 0x1fU);
+    /* color 保存扩展到 8bit 后的 RGB 颜色。 */
+    struct rgb_color color;
+
+    color.r = (uint8_t)((r5 << 3) | (r5 >> 2));
+    color.g = (uint8_t)((g6 << 2) | (g6 >> 4));
+    color.b = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+    return color;
+}
+
+/*
+ * read_exact_file 的作用：
+ *   从启动图资源文件读取固定字节数，防止半截 raw 被误认为可用。
+ *
+ * 主要流程：
+ *   1. 打开资源文件。
+ *   2. 循环读取直到达到 expected_size。
+ *   3. 再尝试多读 1 字节，确认文件没有额外尾巴。
+ *   4. 所有路径都关闭文件描述符，避免 init 阶段泄漏资源。
+ *
+ * 参数：
+ *   path 是资源文件路径。
+ *   buffer 是接收数据的缓冲区。
+ *   expected_size 是必须读取到的字节数。
+ *
+ * 返回值：
+ *   成功返回 0；打开失败、长度不足或长度超出时返回 -1。
+ */
+static int read_exact_file(const char *path, uint8_t *buffer, size_t expected_size)
+{
+    /* fd 是资源文件描述符，函数结束前必须关闭。 */
+    int fd;
+    /* offset 是已经读入 buffer 的字节数。 */
+    size_t offset = 0U;
+    /* extra 用于确认文件正好结束，没有多余尾部。 */
+    uint8_t extra;
+    /* ret 保存最后一次 read 的返回值。 */
+    ssize_t ret;
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+
+    while (offset < expected_size) {
+        ret = read(fd, buffer + offset, expected_size - offset);
+        if (ret < 0) {
+            close(fd);
+            return -1;
+        }
+        if (ret == 0) {
+            close(fd);
+            return -1;
+        }
+        offset += (size_t)ret;
+    }
+
+    ret = read(fd, &extra, 1U);
+    close(fd);
+
+    if (ret != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * draw_splash_asset_fast_rgb565 的作用：
+ *   在 1024x600 且 framebuffer 为 16bpp 时，把 RGB565 资源按行直接复制到显存。
+ *
+ * 主要流程：
+ *   1. 遍历 600 行设计图。
+ *   2. 按 framebuffer 的 line_length 找到目标行。
+ *   3. 每行复制 1024*2 字节，保留 framebuffer 可能存在的行尾 padding。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   asset 是 boot_splash.rgb565 文件内容。
+ *
+ * 返回值：
+ *   无返回值；调用方已确认分辨率、位深和映射长度合法。
+ */
+static void draw_splash_asset_fast_rgb565(struct framebuffer_device *fb, const uint8_t *asset)
+{
+    /* row 是当前复制的设计图行号。 */
+    int row;
+    /* row_bytes 是一行 1024 个 RGB565 像素占用的字节数。 */
+    size_t row_bytes = (size_t)REF_WIDTH * 2U;
+
+    for (row = 0; row < REF_HEIGHT; ++row) {
+        /* dst_offset 是 framebuffer 中当前行的起始字节偏移。 */
+        size_t dst_offset = (size_t)(row + (int)fb->var.yoffset) * fb->fix.line_length
+                          + (size_t)fb->var.xoffset * 2U;
+        /* src_offset 是 raw 资源中当前行的起始字节偏移。 */
+        size_t src_offset = (size_t)row * row_bytes;
+
+        if (dst_offset + row_bytes <= fb->mem_len) {
+            memcpy(fb->mem + dst_offset, asset + src_offset, row_bytes);
+        }
+    }
+}
+
+/*
+ * draw_splash_asset_scaled 的作用：
+ *   在 framebuffer 不是 1024x600 RGB565 直拷场景时，对 raw 资源做最近邻缩放绘制。
+ *
+ * 主要流程：
+ *   1. 遍历当前 framebuffer 的所有可见像素。
+ *   2. 按比例映射到 1024x600 资源坐标。
+ *   3. 把 RGB565 解包成 RGB888，再交给 put_pixel 按实际位域写屏。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   asset 是 boot_splash.rgb565 文件内容。
+ *
+ * 返回值：
+ *   无返回值。
+ */
+static void draw_splash_asset_scaled(struct framebuffer_device *fb, const uint8_t *asset)
+{
+    /* y 是当前 framebuffer 输出行。 */
+    int y;
+
+    for (y = 0; y < (int)fb->var.yres; ++y) {
+        /* src_y 是映射到资源图上的行号。 */
+        int src_y = y * REF_HEIGHT / (int)fb->var.yres;
+        /* x 是当前 framebuffer 输出列。 */
+        int x;
+
+        for (x = 0; x < (int)fb->var.xres; ++x) {
+            /* src_x 是映射到资源图上的列号。 */
+            int src_x = x * REF_WIDTH / (int)fb->var.xres;
+            /* src_offset 是资源中对应 RGB565 像素的字节偏移。 */
+            size_t src_offset = ((size_t)src_y * (size_t)REF_WIDTH + (size_t)src_x) * 2U;
+            /* color 是解包后的 8bit RGB 颜色。 */
+            struct rgb_color color = unpack_rgb565(asset[src_offset], asset[src_offset + 1U]);
+
+            put_pixel(fb, x, y, color);
+        }
+    }
+}
+
+/*
+ * framebuffer_is_rgb565 的作用：
+ *   判断当前 framebuffer 是否是标准 RGB565 little-endian 布局，决定能否安全整行 memcpy。
+ *
+ * 主要流程：
+ *   1. 检查位深必须是 16bpp。
+ *   2. 检查红色位域为 offset=11、length=5。
+ *   3. 检查绿色位域为 offset=5、length=6。
+ *   4. 检查蓝色位域为 offset=0、length=5。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *
+ * 返回值：
+ *   是标准 RGB565 返回 1；否则返回 0，调用方应走 put_pixel 转换路径。
+ */
+static int framebuffer_is_rgb565(const struct framebuffer_device *fb)
+{
+    return fb->var.bits_per_pixel == 16U
+        && fb->var.red.offset == 11U
+        && fb->var.red.length == 5U
+        && fb->var.green.offset == 5U
+        && fb->var.green.length == 6U
+        && fb->var.blue.offset == 0U
+        && fb->var.blue.length == 5U;
+}
+
+/*
+ * draw_splash_asset 的作用：
+ *   优先显示 HTML 渲染生成的 RGB565 启动图，让板端首帧尽量和浏览器预览一致。
+ *
+ * 主要流程：
+ *   1. 申请固定大小缓冲区并读取 boot_splash.rgb565。
+ *   2. 当前屏幕为 1024x600 16bpp 时走按行 memcpy 的快速路径。
+ *   3. 其它位深或分辨率走最近邻缩放路径，保证调试屏幕也能看到完整图。
+ *   4. 释放缓冲区并返回是否成功。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   asset_path 是 RGB565 启动图资源路径。
+ *
+ * 返回值：
+ *   成功绘制资源返回 0；资源不可用或内存不足返回 -1，由调用方决定是否 fallback。
+ */
+static int draw_splash_asset(struct framebuffer_device *fb, const char *asset_path)
+{
+    /* asset 保存完整 1024x600 RGB565 原始像素数据。 */
+    uint8_t *asset = (uint8_t *)malloc(SPLASH_ASSET_BYTES);
+    /* ret 保存资源读取和绘制流程的结果。 */
+    int ret = 0;
+
+    if (asset == NULL) {
+        return -1;
+    }
+
+    if (read_exact_file(asset_path, asset, SPLASH_ASSET_BYTES) != 0) {
+        free(asset);
+        return -1;
+    }
+
+    if (fb->var.xres == REF_WIDTH && fb->var.yres == REF_HEIGHT && framebuffer_is_rgb565(fb)) {
+        draw_splash_asset_fast_rgb565(fb, asset);
+    } else {
+        draw_splash_asset_scaled(fb, asset);
+    }
+
+    free(asset);
+    return ret;
+}
+
+/*
+ * draw_hline 的作用：
+ *   绘制一条水平实线，用于背景电路、芯片连线和弱化扫描线稿。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   x/y 是线条起点。
+ *   w 是线条长度。
+ *   thickness 是线条厚度。
+ *   color 是线条颜色。
+ *
+ * 返回值：
+ *   无返回值；底层 fill_rect 会负责越界裁剪。
+ */
+static void draw_hline(struct framebuffer_device *fb,
+                       int x,
+                       int y,
+                       int w,
+                       int thickness,
+                       struct rgb_color color)
+{
+    fill_rect(fb, x, y, w, thickness > 0 ? thickness : 1, color);
+}
+
+/*
+ * draw_vline 的作用：
+ *   绘制一条垂直实线，用于背景电路、芯片连线和弱化扫描线稿。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   x/y 是线条起点。
+ *   h 是线条长度。
+ *   thickness 是线条厚度。
+ *   color 是线条颜色。
+ *
+ * 返回值：
+ *   无返回值；底层 fill_rect 会负责越界裁剪。
+ */
+static void draw_vline(struct framebuffer_device *fb,
+                       int x,
+                       int y,
+                       int h,
+                       int thickness,
+                       struct rgb_color color)
+{
+    fill_rect(fb, x, y, thickness > 0 ? thickness : 1, h, color);
+}
+
+/*
+ * draw_corner_brackets 的作用：
+ *   绘制四个 L 形角标，用于把普通矩形变成更像机器视觉 ROI 的线稿。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   x/y/w/h 描述角标所在矩形区域。
+ *   length 是每个角标向内延伸的长度。
+ *   thickness 是角标线宽。
+ *   color 是角标颜色。
+ *
+ * 返回值：
+ *   无返回值。
+ */
+static void draw_corner_brackets(struct framebuffer_device *fb,
+                                 int x,
+                                 int y,
+                                 int w,
+                                 int h,
+                                 int length,
+                                 int thickness,
+                                 struct rgb_color color)
+{
+    draw_hline(fb, x, y, length, thickness, color);
+    draw_vline(fb, x, y, length, thickness, color);
+    draw_hline(fb, x + w - length, y, length, thickness, color);
+    draw_vline(fb, x + w - thickness, y, length, thickness, color);
+    draw_hline(fb, x, y + h - thickness, length, thickness, color);
+    draw_vline(fb, x, y + h - length, length, thickness, color);
+    draw_hline(fb, x + w - length, y + h - thickness, length, thickness, color);
+    draw_vline(fb, x + w - thickness, y + h - length, length, thickness, color);
+}
+
+/*
+ * draw_circuit_trace 的作用：
+ *   绘制 HTML 预览稿背景里的电路线和端点节点，增强芯片启动图氛围。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   x/y 是电路线起点。
+ *   horizontal_len 是水平线长度。
+ *   vertical_len 是末端竖线长度，可正可负。
+ *   color 是电路线颜色。
+ *   node_color 是端点节点颜色。
+ *
+ * 返回值：
+ *   无返回值。
+ */
+static void draw_circuit_trace(struct framebuffer_device *fb,
+                               int x,
+                               int y,
+                               int horizontal_len,
+                               int vertical_len,
+                               struct rgb_color color,
+                               struct rgb_color node_color)
+{
+    /* line 是电路线宽，适当比背景网格更粗，保证 LCD 上可见。 */
+    int line = scale_ref_min(fb, 2);
+    /* node 是电路线端点节点的方块尺寸，用于模拟 HTML 中的发光节点。 */
+    int node = scale_ref_min(fb, 7);
+    /* end_x 是水平电路线末端，也是竖向分支线所在的 x 坐标。 */
+    int end_x = x + horizontal_len;
+    /* vertical_y 是竖向分支的上边界，兼容向上和向下两种分支方向。 */
+    int vertical_y = vertical_len >= 0 ? y : y + vertical_len;
+
+    draw_hline(fb, x, y, horizontal_len, line, color);
+    draw_vline(fb, end_x, vertical_y, vertical_len >= 0 ? vertical_len : -vertical_len, line, color);
+    fill_rect(fb, end_x - node / 2, y - node / 2, node, node, node_color);
+    fill_rect(fb,
+              end_x - node / 2,
+              y + vertical_len - node / 2,
+              node,
+              node,
+              node_color);
+}
+
+/*
+ * draw_chip_mark 的作用：
+ *   用矩形、针脚和点阵文字绘制中央 9TH 芯片 Logo，对应 HTML 预览稿中的主视觉。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   x/y 是芯片主体左上角。
+ *   size 是芯片主体边长。
+ *   body 是芯片主体颜色。
+ *   border 是芯片边框和针脚颜色。
+ *   text_color 是 9TH 文本颜色。
+ *
+ * 返回值：
+ *   无返回值。
+ */
+static void draw_chip_mark(struct framebuffer_device *fb,
+                           int x,
+                           int y,
+                           int size,
+                           struct rgb_color body,
+                           struct rgb_color border,
+                           struct rgb_color text_color)
+{
+    /* i 是针脚循环索引，按四边同步绘制芯片针脚。 */
+    int i;
+    /* pin_count 是每条边的针脚数量，控制芯片图形的复杂度和可读性。 */
+    int pin_count = 5;
+    /* pin_w 是针脚短边宽度，随屏幕缩放但至少 1 像素。 */
+    int pin_w = scale_ref_min(fb, 5);
+    /* pin_h 是针脚向外延伸长度，增强芯片轮廓识别度。 */
+    int pin_h = scale_ref_min(fb, 13);
+    /* gap 是相邻针脚中心点之间的间距，按芯片主体尺寸均匀分配。 */
+    int gap = size / (pin_count + 1);
+    /* inner 是芯片内部细边框缩进，避免主体看起来像普通色块。 */
+    int inner = scale_ref_min(fb, 10);
+
+    fill_rect(fb, x, y, size, size, body);
+    draw_rect_border(fb, x, y, size, size, border, scale_ref_min(fb, 3));
+    draw_rect_border(fb,
+                     x + inner,
+                     y + inner,
+                     size - inner * 2,
+                     size - inner * 2,
+                     (struct rgb_color){ 116, 188, 213 },
+                     scale_ref_min(fb, 1));
+
+    for (i = 1; i <= pin_count; ++i) {
+        /* px 是上下两边当前针脚的 x 坐标。 */
+        int px = x + i * gap - pin_w / 2;
+        /* py 是左右两边当前针脚的 y 坐标。 */
+        int py = y + i * gap - pin_w / 2;
+
+        fill_rect(fb, px, y - pin_h, pin_w, pin_h, border);
+        fill_rect(fb, px, y + size, pin_w, pin_h, border);
+        fill_rect(fb, x - pin_h, py, pin_h, pin_w, border);
+        fill_rect(fb, x + size, py, pin_h, pin_w, border);
+    }
+
+    draw_text(fb,
+              x + size / 2 - text_width("9TH", 5) / 2,
+              y + size / 2 - scale_ref_y(fb, 18),
+              "9TH",
+              5,
+              text_color);
+}
+
+/*
+ * draw_badge 的作用：
+ *   绘制底部技术铭牌，替代旧进度条，让启动图更像品牌静态首帧。
+ *
+ * 参数：
+ *   fb 是 framebuffer 状态。
+ *   x/y/w/h 描述铭牌位置。
+ *   text 是铭牌文本。
+ *   border 是边框颜色。
+ *   bg 是背景颜色。
+ *   text_color 是文字颜色。
+ *
+ * 返回值：
+ *   无返回值。
+ */
+static void draw_badge(struct framebuffer_device *fb,
+                       int x,
+                       int y,
+                       int w,
+                       int h,
+                       const char *text,
+                       struct rgb_color border,
+                       struct rgb_color bg,
+                       struct rgb_color text_color)
+{
+    fill_rect(fb, x, y, w, h, bg);
+    draw_rect_border(fb, x, y, w, h, border, scale_ref_min(fb, 1));
+    draw_text(fb,
+              x + (w - text_width(text, 1)) / 2,
+              y + (h - scale_ref_y(fb, 7)) / 2,
+              text,
+              1,
+              text_color);
+}
+
+/*
+ * draw_splash_fallback 的作用：
+ *   在 RGB565 资源缺失时绘制一个低保真 AI 竞赛品牌静态画面，避免开机阶段黑屏。
+ *
+ * 主要流程：
+ *   1. 绘制深蓝科技背景、电路线、网格和弱化芯片轮廓。
+ *   2. 绘制顶部赛事条，使用英文点阵承载“第九届嵌入式芯片与系统设计竞赛”的屏幕可见版本。
+ *   3. 绘制中央白色 Logo 面板、9TH 芯片图形、AI 设计英文标语和机器视觉 ROI 线稿。
+ *   4. 绘制底部系统名称和三枚技术铭牌，替代旧版进度条，避免启动画面像加载控件。
  *
  * 参数：
  *   fb 是 framebuffer 状态。
@@ -719,128 +1232,240 @@ static void draw_grid(struct framebuffer_device *fb,
  * 返回值：
  *   无返回值；绘制结果保留在 framebuffer 中，直到 Qt/DRM 后续接管显示。
  */
-static void draw_splash(struct framebuffer_device *fb)
+static void draw_splash_fallback(struct framebuffer_device *fb)
 {
-    const struct rgb_color background = { 11, 13, 15 };
-    const struct rgb_color grid = { 38, 48, 57 };
-    const struct rgb_color title = { 244, 247, 248 };
-    const struct rgb_color subtitle = { 148, 163, 173 };
-    const struct rgb_color panel = { 5, 6, 6 };
-    const struct rgb_color panel_border = { 52, 64, 71 };
-    const struct rgb_color inner_border = { 32, 39, 44 };
-    const struct rgb_color green = { 53, 208, 127 };
-    const struct rgb_color muted = { 154, 166, 173 };
-    const struct rgb_color track = { 26, 32, 36 };
-    const struct rgb_color track_border = { 48, 57, 64 };
-    const struct rgb_color label_bg = { 16, 22, 25 };
-    const struct rgb_color check_bg = { 19, 33, 25 };
+    /* 背景色采用深蓝黑，和 HTML 预览稿的科技底色保持一致。 */
+    const struct rgb_color background = { 7, 14, 31 };
+    /* 背景底部色块让画面有上下层次，避免纯色显得空。 */
+    const struct rgb_color background_low = { 10, 25, 48 };
+    /* 网格线使用低亮度蓝色，只提供结构感，不抢主 Logo。 */
+    const struct rgb_color grid = { 22, 55, 82 };
+    /* 主青色用于电路线、赛事栏边框和关键光带。 */
+    const struct rgb_color cyan = { 70, 214, 255 };
+    /* 次青色用于大面积背景线条，降低视觉干扰。 */
+    const struct rgb_color cyan_soft = { 37, 131, 168 };
+    /* 暖黄色用于届数和局部强调，呼应 HTML 预览稿的暖色点缀。 */
+    const struct rgb_color warm = { 255, 210, 96 };
+    /* 暖色弱化版本用于右上背景电路线。 */
+    const struct rgb_color warm_soft = { 160, 132, 70 };
+    /* 主面板底色是深蓝卡片，承托内部白色 Logo 区。 */
+    const struct rgb_color hero_bg = { 11, 30, 58 };
+    /* 主面板阴影用更深色模拟层叠关系。 */
+    const struct rgb_color hero_shadow = { 3, 8, 20 };
+    /* 白色 Logo 面板复刻 HTML 中参考图主体的白底视觉。 */
+    const struct rgb_color logo_bg = { 243, 247, 250 };
+    /* Logo 面板边框用浅蓝灰，避免纯白边缘贴背景。 */
+    const struct rgb_color logo_border = { 166, 190, 207 };
+    /* 深色文字用于白底面板上的品牌文案。 */
+    const struct rgb_color ink = { 15, 44, 72 };
+    /* 次级文字用于说明文案和顶部角标。 */
+    const struct rgb_color muted = { 154, 178, 196 };
+    /* 面板亮色文字用于深色背景上的标题。 */
+    const struct rgb_color light_text = { 238, 247, 252 };
+    /* 芯片主体蓝色对应 HTML 预览稿中 9th 芯片 Logo 的高饱和蓝。 */
+    const struct rgb_color chip_body = { 18, 128, 189 };
+    /* 技术铭牌背景保持深色，和底部状态区融为一体。 */
+    const struct rgb_color badge_bg = { 13, 38, 67 };
+    /* 技术铭牌边框用低亮青色，弱化控件感。 */
+    const struct rgb_color badge_border = { 72, 150, 180 };
+    /* 线宽按当前屏幕分辨率缩放，保证 1024x600 和其它尺寸都可读。 */
     const int line = scale_ref_min(fb, 1);
+    /* 粗线用于主面板和 ROI 角标，让关键结构在 LCD 上更清楚。 */
     const int thick = scale_ref_min(fb, 2);
 
-    int grid_x = scale_ref_x(fb, 72);
-    int grid_y = scale_ref_y(fb, 90);
-    int grid_w = scale_ref_x(fb, 880);
-    int grid_h = scale_ref_y(fb, 420);
+    /* 主面板位置参考 HTML 预览稿，给底部状态区留出空间。 */
+    int hero_x = scale_ref_x(fb, 132);
+    int hero_y = scale_ref_y(fb, 82);
+    int hero_w = scale_ref_x(fb, 760);
+    int hero_h = scale_ref_y(fb, 402);
 
-    int viewport_w = scale_ref_x(fb, 430);
-    int viewport_h = scale_ref_y(fb, 232);
-    int viewport_x = ((int)fb->var.xres - viewport_w) / 2;
-    int viewport_y = scale_ref_y(fb, 158);
+    /* 顶部赛事条放在主面板上方区域，形成第一视觉锚点。 */
+    int ribbon_x = hero_x + scale_ref_x(fb, 62);
+    int ribbon_y = hero_y + scale_ref_y(fb, 28);
+    int ribbon_w = hero_w - scale_ref_x(fb, 124);
+    int ribbon_h = scale_ref_y(fb, 54);
 
-    int roi_w = scale_ref_x(fb, 244);
-    int roi_h = scale_ref_y(fb, 126);
-    int roi_x = viewport_x + (viewport_w - roi_w) / 2;
-    int roi_y = viewport_y + (viewport_h - roi_h) / 2;
+    /* 白色 Logo 面板承载芯片图形和 AI 标语，是整张启动图的视觉中心。 */
+    int logo_x = hero_x + scale_ref_x(fb, 86);
+    int logo_y = hero_y + scale_ref_y(fb, 118);
+    int logo_w = hero_w - scale_ref_x(fb, 172);
+    int logo_h = scale_ref_y(fb, 178);
 
-    int progress_w = scale_ref_x(fb, 520);
-    int progress_h = scale_ref_y(fb, 12);
-    int progress_x = ((int)fb->var.xres - progress_w) / 2;
-    int progress_y = scale_ref_y(fb, 486);
+    /* 芯片 Logo 放在白色面板左侧，与右侧英文标语形成组合。 */
+    int chip_size = scale_ref_min(fb, 98);
+    int chip_x = logo_x + scale_ref_x(fb, 58);
+    int chip_y = logo_y + (logo_h - chip_size) / 2;
+
+    /* 右侧 ROI 线稿故意退到背景层，表达机器视觉主题但不干扰主 Logo。 */
+    int roi_x = hero_x + hero_w - scale_ref_x(fb, 166);
+    int roi_y = hero_y + scale_ref_y(fb, 214);
+    int roi_w = scale_ref_x(fb, 122);
+    int roi_h = scale_ref_y(fb, 86);
+
+    /* 底部状态区承接 Qt 启动前的系统身份，不再显示加载进度。 */
+    int status_y = scale_ref_y(fb, 510);
+    int badge_y = scale_ref_y(fb, 510);
+    int badge_h = scale_ref_y(fb, 30);
+    int badge_gap = scale_ref_x(fb, 12);
+    int badge1_w = scale_ref_x(fb, 122);
+    int badge2_w = scale_ref_x(fb, 150);
+    int badge3_w = scale_ref_x(fb, 136);
+    int badge_x = (int)fb->var.xres - scale_ref_x(fb, 70) - badge1_w - badge2_w - badge3_w - badge_gap * 2;
 
     fill_rect(fb, 0, 0, (int)fb->var.xres, (int)fb->var.yres, background);
+    fill_rect(fb, 0, scale_ref_y(fb, 392), (int)fb->var.xres, scale_ref_y(fb, 208), background_low);
 
-    draw_grid(fb, grid_x, grid_y, grid_w, grid_h, 11, 6, grid);
+    draw_grid(fb,
+              scale_ref_x(fb, 54),
+              scale_ref_y(fb, 76),
+              scale_ref_x(fb, 916),
+              scale_ref_y(fb, 420),
+              12,
+              6,
+              grid);
 
-    draw_text_center(fb, scale_ref_y(fb, 64), "VISION INSPECTION SYSTEM", 3, title);
-    draw_text_center(fb, scale_ref_y(fb, 112), "STM32MP157 VISION INSPECTION TERMINAL", 2, subtitle);
+    draw_circuit_trace(fb,
+                       scale_ref_x(fb, 72),
+                       scale_ref_y(fb, 104),
+                       scale_ref_x(fb, 252),
+                       scale_ref_y(fb, 78),
+                       cyan_soft,
+                       cyan);
+    draw_circuit_trace(fb,
+                       scale_ref_x(fb, 684),
+                       scale_ref_y(fb, 138),
+                       scale_ref_x(fb, 268),
+                       scale_ref_y(fb, 96),
+                       warm_soft,
+                       warm);
+    draw_circuit_trace(fb,
+                       scale_ref_x(fb, 96),
+                       scale_ref_y(fb, 468),
+                       scale_ref_x(fb, 340),
+                       -scale_ref_y(fb, 70),
+                       cyan_soft,
+                       cyan);
 
-    fill_rect(fb, viewport_x, viewport_y, viewport_w, viewport_h, panel);
-    draw_rect_border(fb, viewport_x, viewport_y, viewport_w, viewport_h, panel_border, line);
     draw_rect_border(fb,
-                     viewport_x + scale_ref_x(fb, 12),
-                     viewport_y + scale_ref_y(fb, 12),
-                     viewport_w - scale_ref_x(fb, 24),
-                     viewport_h - scale_ref_y(fb, 24),
-                     inner_border,
+                     scale_ref_x(fb, 72),
+                     scale_ref_y(fb, 164),
+                     scale_ref_x(fb, 112),
+                     scale_ref_y(fb, 112),
+                     (struct rgb_color){ 27, 83, 112 },
+                     line);
+    draw_rect_border(fb,
+                     scale_ref_x(fb, 804),
+                     scale_ref_y(fb, 300),
+                     scale_ref_x(fb, 118),
+                     scale_ref_y(fb, 104),
+                     (struct rgb_color){ 40, 86, 98 },
                      line);
 
-    fill_rect(fb,
-              viewport_x + scale_ref_x(fb, 26),
-              viewport_y + scale_ref_y(fb, 24),
-              viewport_w - scale_ref_x(fb, 52),
-              scale_ref_y(fb, 3),
-              green);
-
-    draw_rect_border(fb, roi_x, roi_y, roi_w, roi_h, green, thick);
-
-    fill_rect(fb,
-              viewport_x + scale_ref_x(fb, 28),
-              viewport_y + viewport_h - scale_ref_y(fb, 38),
-              scale_ref_x(fb, 132),
-              scale_ref_y(fb, 18),
-              label_bg);
+    fill_rect(fb, scale_ref_x(fb, 28), scale_ref_y(fb, 24), scale_ref_x(fb, 220), scale_ref_y(fb, 24), hero_shadow);
     draw_rect_border(fb,
-                     viewport_x + scale_ref_x(fb, 28),
-                     viewport_y + viewport_h - scale_ref_y(fb, 38),
-                     scale_ref_x(fb, 132),
-                     scale_ref_y(fb, 18),
-                     panel_border,
+                     scale_ref_x(fb, 28),
+                     scale_ref_y(fb, 24),
+                     scale_ref_x(fb, 220),
+                     scale_ref_y(fb, 24),
+                     (struct rgb_color){ 38, 93, 128 },
                      line);
     draw_text(fb,
-              viewport_x + scale_ref_x(fb, 44),
-              viewport_y + viewport_h - scale_ref_y(fb, 34),
-              "ROI 320X180",
+              scale_ref_x(fb, 40),
+              scale_ref_y(fb, 32),
+              "STM32MP157 BOOT VISUAL PREVIEW",
               1,
               muted);
 
-    fill_rect(fb,
-              viewport_x + viewport_w - scale_ref_x(fb, 134),
-              viewport_y + viewport_h - scale_ref_y(fb, 38),
-              scale_ref_x(fb, 106),
-              scale_ref_y(fb, 18),
-              check_bg);
+    fill_rect(fb, hero_x + scale_ref_x(fb, 8), hero_y + scale_ref_y(fb, 10), hero_w, hero_h, hero_shadow);
+    fill_rect(fb, hero_x, hero_y, hero_w, hero_h, hero_bg);
+    draw_rect_border(fb, hero_x, hero_y, hero_w, hero_h, (struct rgb_color){ 54, 118, 152 }, thick);
     draw_rect_border(fb,
-                     viewport_x + viewport_w - scale_ref_x(fb, 134),
-                     viewport_y + viewport_h - scale_ref_y(fb, 38),
-                     scale_ref_x(fb, 106),
-                     scale_ref_y(fb, 18),
-                     green,
+                     hero_x + scale_ref_x(fb, 10),
+                     hero_y + scale_ref_y(fb, 10),
+                     hero_w - scale_ref_x(fb, 20),
+                     hero_h - scale_ref_y(fb, 20),
+                     (struct rgb_color){ 17, 58, 94 },
                      line);
-    draw_text(fb,
-              viewport_x + viewport_w - scale_ref_x(fb, 120),
-              viewport_y + viewport_h - scale_ref_y(fb, 34),
-              "SELF CHECK",
-              1,
-              title);
 
-    draw_text_center(fb, scale_ref_y(fb, 420), "LOADING CAMERA", 3, green);
+    fill_rect(fb, ribbon_x, ribbon_y, ribbon_w, ribbon_h, (struct rgb_color){ 8, 48, 84 });
+    draw_rect_border(fb, ribbon_x, ribbon_y, ribbon_w, ribbon_h, cyan, line);
+    draw_hline(fb,
+               ribbon_x + scale_ref_x(fb, 18),
+               ribbon_y + ribbon_h - scale_ref_y(fb, 8),
+               ribbon_w - scale_ref_x(fb, 36),
+               scale_ref_min(fb, 2),
+               warm);
     draw_text_center(fb,
-                     scale_ref_y(fb, 456),
-                     "INITIALIZING UVC CAPTURE AND KMS DISPLAY PATH",
-                     1,
-                     subtitle);
+                     ribbon_y + scale_ref_y(fb, 17),
+                     "9TH EMBEDDED CHIP & SYSTEM DESIGN CONTEST",
+                     2,
+                     light_text);
 
-    fill_rect(fb, progress_x, progress_y, progress_w, progress_h, track);
-    draw_rect_border(fb, progress_x, progress_y, progress_w, progress_h, track_border, line);
-    fill_rect(fb, progress_x, progress_y, progress_w * 18 / 100, progress_h, green);
-
-    draw_text(fb, progress_x, progress_y + scale_ref_y(fb, 22), "BOOT SELF CHECK", 1, subtitle);
+    fill_rect(fb, logo_x, logo_y, logo_w, logo_h, logo_bg);
+    draw_rect_border(fb, logo_x, logo_y, logo_w, logo_h, logo_border, thick);
+    draw_hline(fb,
+               logo_x + scale_ref_x(fb, 26),
+               logo_y + scale_ref_y(fb, 20),
+               logo_w - scale_ref_x(fb, 52),
+               scale_ref_min(fb, 3),
+               cyan);
+    draw_chip_mark(fb, chip_x, chip_y, chip_size, chip_body, cyan, (struct rgb_color){ 255, 255, 255 });
     draw_text(fb,
-              progress_x + progress_w - text_width("18%", 1),
-              progress_y + scale_ref_y(fb, 22),
-              "18%",
+              logo_x + scale_ref_x(fb, 210),
+              logo_y + scale_ref_y(fb, 44),
+              "AI DESIGN",
+              4,
+              ink);
+    draw_text(fb,
+              logo_x + scale_ref_x(fb, 212),
+              logo_y + scale_ref_y(fb, 100),
+              "AI FOR DESIGN &",
+              2,
+              (struct rgb_color){ 26, 104, 164 });
+    draw_text(fb,
+              logo_x + scale_ref_x(fb, 212),
+              logo_y + scale_ref_y(fb, 130),
+              "DESIGN FOR AI!",
+              2,
+              (struct rgb_color){ 26, 104, 164 });
+
+    draw_corner_brackets(fb, roi_x, roi_y, roi_w, roi_h, scale_ref_x(fb, 30), thick, (struct rgb_color){ 68, 202, 226 });
+    draw_hline(fb, roi_x + scale_ref_x(fb, 20), roi_y + roi_h / 2, roi_w - scale_ref_x(fb, 40), line, (struct rgb_color){ 51, 125, 150 });
+    draw_vline(fb, roi_x + roi_w / 2, roi_y + scale_ref_y(fb, 16), roi_h - scale_ref_y(fb, 32), line, (struct rgb_color){ 51, 125, 150 });
+    draw_text(fb, roi_x + scale_ref_x(fb, 18), roi_y + roi_h + scale_ref_y(fb, 12), "VISION ROI", 1, muted);
+
+    draw_text(fb,
+              scale_ref_x(fb, 78),
+              status_y,
+              SPLASH_SYSTEM_EN,
+              2,
+              light_text);
+    draw_text(fb,
+              scale_ref_x(fb, 80),
+              status_y + scale_ref_y(fb, 34),
+              "FRAMEBUFFER HANDOFF FOR QT DISPLAY SURFACE",
               1,
-              title);
+              muted);
+
+    draw_badge(fb, badge_x, badge_y, badge1_w, badge_h, SPLASH_BADGE_EDGE_AI, badge_border, badge_bg, light_text);
+    draw_badge(fb,
+               badge_x + badge1_w + badge_gap,
+               badge_y,
+               badge2_w,
+               badge_h,
+               SPLASH_BADGE_FRAMEBUFFER,
+               badge_border,
+               badge_bg,
+               light_text);
+    draw_badge(fb,
+               badge_x + badge1_w + badge2_w + badge_gap * 2,
+               badge_y,
+               badge3_w,
+               badge_h,
+               SPLASH_BADGE_QT,
+               badge_border,
+               badge_bg,
+               light_text);
 }
 
 /*
@@ -859,6 +1484,7 @@ int main(int argc, char *argv[])
     struct app_config cfg;
     struct framebuffer_device fb;
     int parse_ret;
+    int used_asset;
 
     parse_ret = parse_args(argc, argv, &cfg);
     if (parse_ret > 0) {
@@ -873,7 +1499,10 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    draw_splash(&fb);
+    used_asset = (draw_splash_asset(&fb, cfg.asset_path) == 0);
+    if (!used_asset) {
+        draw_splash_fallback(&fb);
+    }
 
     if (msync(fb.mem, fb.mem_len, MS_SYNC) != 0) {
         perror("刷新 framebuffer 显存失败");
@@ -888,13 +1517,17 @@ int main(int argc, char *argv[])
     }
 
     if (!cfg.quiet) {
-        printf("fb_boot_splash: 已绘制 %s / %s 到 %s (%ux%u, %u bpp)\n",
+        printf("fb_boot_splash: 已绘制 %s / %s / %s / %s 到 %s (%ux%u, %u bpp, %s: %s)\n",
+               SPLASH_CONTEST_CN,
+               SPLASH_CONTEST_EN,
                SPLASH_TITLE_CN,
-               SPLASH_SUBTITLE_EN,
+               SPLASH_BRAND_EN,
                cfg.fb_device,
                fb.var.xres,
                fb.var.yres,
-               fb.var.bits_per_pixel);
+               fb.var.bits_per_pixel,
+               used_asset ? "asset" : "fallback",
+               used_asset ? cfg.asset_path : "draw_splash_fallback");
     }
 
     close_framebuffer(&fb);

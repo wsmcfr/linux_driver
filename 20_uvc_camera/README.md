@@ -13,7 +13,9 @@
 | 当前稳定路线 | `S90uvc-camera` 默认启动 Qt + KMS overlay；本目录的 `uvc_fb_preview` 保留为 framebuffer 验证和兜底路线。 |
 | 早期静态首帧 | `fb_boot_splash` 在 Qt/GPU 启动前直接写 `/dev/fb0`，显示与 Qt 启动画面第一帧风格一致的静态启动图，减少纯黑屏空窗。 |
 | Qt 检测交互 | Qt 首页只保留 `检测` 和 `安全卸载`；`检测` 在后台线程保存当前帧、运行分类模型、运行 UNet、上传 COS 并写历史。分类模型完成后立即显示零件类型和类别，UNet 完成后立即显示双模型耗时，上传完成后才写入云端状态和历史记录。 |
+| 云端记录零件类型 | 检测上传时，板端把分类 `class=gasket_good/gasket_bad` 统一归一为零件类型 `gasket` 后优先映射云端 `part_id`；好坏只写入 `records.result`，不创建 `gasket_good/gasket_bad` 两种零件。若云端没有匹配零件，板端会发送 `part_code/part_name/part_category/auto_create_part=true`，由云端自动创建零件；`gasket` 是历史训练编码，业务显示为 `波形垫圈 / 垫圈类`，`washer` 显示为 `平垫圈 / 垫圈类`，`splitwasher` 显示为 `弹性垫圈 / 垫圈类`。 |
 | Qt 真实健康状态 | 顶部状态栏和告警设备健康矩阵由 `DeviceHealthController` 真实探测：4G 必须 `4g-ppp test` 通过才在线，KMS 相机必须 overlay `STATUS` 已出帧才在线，F4 必须串口 STATUS 握手成功才接入，云端必须 health 请求成功才已连接；健康检测每 8 秒后台刷新一次，网络/云端保留上一轮稳定状态，不在每轮刷新时闪回“检测中”。 |
+| 云端复核回写 | 最终运行时由板端开机自启 `S91board-review-tunnel` 主动建立并守护 `ssh -R 127.0.0.1:18081:127.0.0.1:18080`；云端后端访问本机 `127.0.0.1:18081` 回写板端，云端 systemd timer 只负责周期检查和记录，不负责主动连回 NAT 后面的板端。 |
 
 ## 修改文件清单
 
@@ -37,6 +39,8 @@
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/root/qt_camera_display/fb_boot_splash` | 板端实际运行的早期静态启动图绘制器。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S05display-quiet` | 板端早期显示静默入口，开发板重启后由 Buildroot `rcS` 在 S90 前调用。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S90uvc-camera` | 板端开机自启入口，开发板重启后由 Buildroot `rcS` 调用。 |
+| NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S91board-review-tunnel` | 板端云端复核回写反向隧道自启入口，在 Qt 18080 回写服务启动后守护 `ssh -R`。 |
+| NFS rootfs：`/home/cfr/linux/nfs/rootfs/root/qt_camera_display/board-review-tunnel.sh` | 板端反向隧道 watchdog 脚本，断线后自动重连云端 `127.0.0.1:18081`。 |
 | `20_uvc_camera/qt_camera_display/main.cpp` | Qt 控制器保留旧后台保存自检入口，同时正式检测入口在后台完成当前帧保存、分类、UNet、COS 上传和历史记录写入，避免阻塞主界面触摸；新增 `DeviceHealthController`，异步探测 4G、相机、F4、云端和 SD 卡真实状态；4G 和云端进程启动失败通过 Qt 信号异步回写，不在状态刷新路径等待启动；相机离线后只重启 overlay 视频进程，不重启 Qt 界面。 |
 | `20_uvc_camera/qt_camera_display/qml/Main.qml` | 首页不再暴露独立 `保存图片` 按钮；`检测` 按钮改为分阶段刷新结果，分类完成先显示零件/类别，UNet 完成再显示双模型耗时；顶部状态栏、手动页安全状态和告警页健康矩阵改为绑定真实 `deviceHealth` 状态；相机重新在线时必须等 Qt splash 完全淡出并停留在首页，才自动恢复 KMS 视频层可见性，避免摄像头画面早于 Qt 界面出现。 |
 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c` | 新增 overlay 控制命令 `STATUS`，返回 `has_frame/serial/visible/width/height`，供 Qt 判断 USB 摄像头是否真实出帧。 |
@@ -70,6 +74,10 @@
 | 2026-05-16 | 修复 Qt 告警维护保存诊断无文件 | `保存诊断` 不再只显示目标路径，Qt 控制器会真实写入 `/mnt/sdcard/logs/qt_alarm_snapshot.txt` 并 `fsync`；SSH 可用 `test -s`、`wc -c`、`tail` 直接验证。 |
 | 2026-05-16 | 修复保存图片期间界面卡住 | QML 不再同步等待 `saveCurrentFrameToSdCard()`；改为 `requestSaveCurrentFrameToSdCard()` 后台保存，完成后通过信号回填结果。 |
 | 2026-05-18 | 修复检测结果显示被上传阻塞 | Qt 检测链路拆出 `detectClassificationReady` 和 `detectModelsReady` 阶段信号；首页零件类型/类别在第一个分类模型完成后显示，双模型耗时在 UNet 完成后显示，不再等 COS 上传完成。 |
+| 2026-05-19 | 检测上传携带零件类型 | 板端上传云端记录时新增零件类型映射：分类标签去掉 `_good/_bad` 后缀得到 `CLOUD_PART_CODE`，上传脚本按云端 `parts` 映射 `part_id`，并把 `device_context.part_code/class_label` 写入检测记录。 |
+| 2026-05-20 | 检测上传支持自动创建零件 | 当 `CLOUD_PART_CODE` 在云端零件列表中找不到时，`defect-cos-upload` 不再提前失败，而是在创建检测记录时发送 `part_code/part_name/part_category/auto_create_part=true`，让云端自动创建零件；`gasket/wave_washer` 中文名称固定为 `波形垫圈`，大类固定为 `垫圈类`。 |
+| 2026-05-20 | 修正垫圈类显示语义 | 首页和云端上传统一把 `gasket` 显示为 `波形垫圈`，不再显示成 `垫片`；`垫圈类` 只作为大类入口，`波形垫圈/平垫圈/弹性垫圈` 保留为具体零件类型。 |
+| 2026-05-20 | 增加板端独立反向隧道守护 | 新增 `S91board-review-tunnel` 和 `board-review-tunnel.sh`，板端开机后主动连接云端并守护 `ssh -R`；云端新增 systemd timer 周期检查 `127.0.0.1:18081`，最终运行不依赖 Windows 或虚拟机。 |
 | 2026-05-18 | 顶部和健康矩阵改为真实设备状态 | 4G、相机、F4、云端和 SD 卡均由异步探测更新；4G 测试失败不显示在线，F4 串口握手失败不显示接入，相机必须 `has_frame=1` 且帧序号持续变化才显示在线，相机拔掉后显示离线并通过 `restart-overlay` 尝试恢复；4G/云端启动失败也走异步错误信号，健康检测过程不阻塞界面触摸；周期刷新改为 8 秒且后台静默刷新，网络/云端不再在“检测中”和“在线/已连接”之间来回闪烁。 |
 | 2026-05-18 | 收紧启动阶段摄像头显示顺序 | 相机健康检测可以提前确认在线，但 QML 只有在 Qt splash 完全淡出、`bootOverlayRestoreFinished` 已置位且当前在首页时才发送 `VISIBLE 1`，避免实时摄像头层早于 Qt 界面出现。 |
 
@@ -86,6 +94,7 @@
 | `4g-ppp` | 4G 网络健康探测 | `4g-ppp test` 退出码为 0 才显示网络在线。 |
 | `/dev/ttySTM2` | MP157 到 F4 串口健康探测 | 115200 8N1 发送 `STATUS\r\n`，收到 `ACK/OK/F4/READY` 才显示 F4 接入。 |
 | `http://119.91.65.122/health` | 云端健康探测 | `curl -fsS --max-time 2` 成功才显示云端已连接。 |
+| 云端复核反向隧道 `127.0.0.1:18081 -> 127.0.0.1:18080` | 云端详情页把复核结果回写板端本地历史 | 板端主动建立和守护隧道；云端只能检查本机端口和 HTTP 转发状态，不能主动重连 NAT 后面的板端。 |
 
 ## 验证证据
 
@@ -117,6 +126,7 @@
 | 4G 网络真实状态 | 开发板 | `4g-ppp test; echo "exit=$?"` | 退出码为 0 时 Qt 网络显示在线；非 0 或超时不能显示在线。 | 若显示不一致，确认运行的是新版 Qt 二进制。 |
 | F4 接入真实状态 | 开发板 | `test -e /dev/ttySTM2 && stty -F /dev/ttySTM2 115200 raw -echo -crtscts; printf 'STATUS\r\n' > /dev/ttySTM2; timeout 1 cat /dev/ttySTM2 | head -c 80` | 回复包含 `ACK/OK/F4/READY` 时显示接入，否则显示待接入。 | 若没有回复，查 F4 固件、串口线、波特率和设备树串口节点。 |
 | 云端 health 状态 | 开发板 | `curl -fsS --max-time 2 http://119.91.65.122/health >/tmp/cloud-health.txt; echo "exit=$?"; cat /tmp/cloud-health.txt` | curl 退出码为 0 时显示已连接；失败或超时不显示已连接。 | 若 curl 缺失，先补 rootfs；若接口改路径，同步修改 Qt 常量和文档。 |
+| 云端复核反向隧道 | 开发板和云服务器 | 开发板执行 `/etc/init.d/S91board-review-tunnel status`；云服务器执行 `ss -ltnp | grep 127.0.0.1:18081; curl -i --max-time 5 http://127.0.0.1:18081/api/v1/review-result` | 开发板显示 monitor 和 ssh_tunnel 都 running；云端 `ss` 看到 `sshd` 监听，curl 返回板端 404 JSON。 | 若开发板 ssh_tunnel 停止，查 `/tmp/board-review-tunnel.log`、4G 和私钥；若云端无监听，等待板端重连；若云端 curl 连接拒绝，查板端 Qt 18080 服务。 |
 | 检测阶段显示响应 | 开发板屏幕 | 点击 `检测` 后观察右侧结果面板，同时点击左侧 `历史记录`、`统计分析`、`手动控制`、`参数设置` 或 `告警维护` | 页面应立即响应触摸；分类完成后零件类型/类别先显示，UNet 完成后双模型耗时显示，不能等 COS 上传完成才一起显示；重复 `检测` 和 `安全卸载` 暂时不可点。 | 若页面切换卡住，查 `Main.qml` 是否又直接同步调用检测函数；若零件/类别仍等上传后显示，确认 Qt 二进制包含 `detectClassificationReady` 和 `detectModelsReady`。 |
 | CPU 占用对照 | 开发板 | `top -b -n 2 | grep -E "uvc_fb_preview|uvc_kms_overlay|qt_camera_display"` | 能看到对应进程 CPU 样本，用于对比路线。 | 若没有进程，说明显示链路未运行，先回到 status 和日志。 |
 

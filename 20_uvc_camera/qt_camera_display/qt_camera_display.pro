@@ -5,8 +5,9 @@
 
 # QT 指定本程序依赖的 Qt 模块：
 # quick/qml 负责 QML 界面和 Qt Quick Scene Graph；
-# gui 提供 OpenGL ES/FBO/shader 相关类型。
-QT += quick qml gui
+# gui 提供 OpenGL ES/FBO/shader 相关类型；
+# network 提供云端复核结果回写时使用的 QTcpServer/QTcpSocket。
+QT += quick qml gui network
 
 # QT_CONFIG -= no-pkg-config 避免 qmake 禁用 pkg-config，后续要通过它寻找 GStreamer。
 QT_CONFIG -= no-pkg-config

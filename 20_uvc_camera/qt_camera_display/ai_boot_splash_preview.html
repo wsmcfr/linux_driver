@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 开机静态启动图预览</title>
+  <style>
+    /*
+     * 文件作用：
+     *   这个 HTML 只用于在电脑浏览器里预览 STM32MP157 Qt 启动前的静态图片视觉方向。
+     *   当前版本不会被板端程序直接加载，后续确认风格后再把结构翻译到 fb_boot_splash.c。
+     */
+
+    :root {
+      /* --screen-w / --screen-h 固定模拟 7 寸 RGB LCD 的 1024x600 显示比例。 */
+      --screen-w: 1024px;
+      --screen-h: 600px;
+
+      /* --brand-blue 保存参考图中的主蓝色，用于芯片、标题和光带统一色彩。 */
+      --brand-blue: #1d5d91;
+
+      /* --deep-blue 保存开机画面的深色科技背景主色。 */
+      --deep-blue: #071c31;
+
+      /* --cyan-glow 保存电路线、节点和扫描光的冷色强调色。 */
+      --cyan-glow: #42d6ff;
+
+      /* --warm-light 保存右侧少量暖色点光，避免画面只有单一蓝色。 */
+      --warm-light: #ffd56a;
+
+      /* --paper 保存 Logo 白底芯片的填充色，保证参考内容清晰可读。 */
+      --paper: #f8fbff;
+    }
+
+    * {
+      /* border-box 让固定尺寸的启动画布和内部面板不会被 padding 撑大。 */
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      /* min-height 让预览页在桌面浏览器中始终居中展示启动图。 */
+      min-height: 100%;
+
+      /* margin 清零，避免浏览器默认空白影响 1024x600 视觉判断。 */
+      margin: 0;
+    }
+
+    body {
+      /* display/grid 用于把启动画布放到浏览器窗口中心。 */
+      display: grid;
+
+      /* place-items 同时水平和垂直居中预览画布。 */
+      place-items: center;
+
+      /* padding 给小屏浏览器留出呼吸空间，避免画布贴边。 */
+      padding: 18px;
+
+      /* background 使用深色外框，模拟设备开机时 LCD 周围的暗环境。 */
+      background: #020910;
+
+      /* 中文字体优先选择常见黑体族，离线预览不依赖网络字体。 */
+      font-family: "HarmonyOS Sans SC", "Microsoft YaHei UI", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+    }
+
+    .boot-frame {
+      /* width 用 min 保证大屏显示真实 1024 宽，小屏自动等比缩放。 */
+      width: min(100vw - 36px, var(--screen-w));
+
+      /* aspect-ratio 固定板端 1024x600 比例，便于评估最终裁切效果。 */
+      aspect-ratio: 1024 / 600;
+
+      /* position relative 作为所有装饰层、Logo 层和状态层的定位容器。 */
+      position: relative;
+
+      /* overflow hidden 模拟真实屏幕边界，超出部分不可见。 */
+      overflow: hidden;
+
+      /* background 叠加径向光、线性底色和暗角，形成科技启动屏背景。 */
+      background:
+        radial-gradient(circle at 17% 18%, rgba(66, 214, 255, 0.26), transparent 24%),
+        radial-gradient(circle at 82% 22%, rgba(255, 213, 106, 0.16), transparent 20%),
+        radial-gradient(circle at 76% 78%, rgba(29, 93, 145, 0.30), transparent 30%),
+        linear-gradient(135deg, #0b2740 0%, #123653 45%, #eef6fb 100%);
+
+      /* border 设为 0，保证导出的板端启动图真正铺满 1024x600，没有额外黑边。 */
+      border: 0;
+
+      /* box-shadow 设为 none，避免无头截图时把预览阴影误导出到启动图资源里。 */
+      box-shadow: none;
+    }
+
+    .boot-frame::before {
+      /* content 创建低对比度网格层，表达 AI 芯片与电路背景。 */
+      content: "";
+
+      /* position absolute 让网格覆盖整张启动图。 */
+      position: absolute;
+
+      /* inset 统一贴齐四边。 */
+      inset: 0;
+
+      /* background 使用两组线性渐变绘制网格，避免依赖图片资源。 */
+      background:
+        linear-gradient(rgba(255, 255, 255, 0.050) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.050) 1px, transparent 1px);
+
+      /* background-size 控制网格间距，适配 1024x600 屏幕。 */
+      background-size: 42px 42px;
+
+      /* mask-image 制作中心强、边缘弱的网格可见区域，避免背景太花。 */
+      mask-image: radial-gradient(circle at 58% 48%, black 0%, transparent 76%);
+
+      /* opacity 降低网格强度，让 Logo 成为第一视觉焦点。 */
+      opacity: 0.70;
+    }
+
+    .boot-frame::after {
+      /* content 创建极轻层次光，避免真实 LCD 边缘出现明显黑边。 */
+      content: "";
+
+      /* position absolute 覆盖整个画布。 */
+      position: absolute;
+
+      /* inset 统一贴齐四边。 */
+      inset: 0;
+
+      /* background 保留轻微层次，不再用深色暗角压住四边。 */
+      background:
+        radial-gradient(circle at 50% 46%, transparent 0%, transparent 62%, rgba(8, 26, 45, 0.16) 100%),
+        linear-gradient(90deg, rgba(66, 214, 255, 0.035), transparent 18%, transparent 82%, rgba(66, 214, 255, 0.035));
+
+      /* pointer-events none 避免遮挡调试时可能加入的交互元素。 */
+      pointer-events: none;
+    }
+
+    .circuit {
+      /* position absolute 让电路线可以作为背景装饰层摆放。 */
+      position: absolute;
+
+      /* background 用当前颜色填充，具体颜色由各实例设置。 */
+      background: currentColor;
+
+      /* opacity 让电路线保持辅助层级。 */
+      opacity: 0.50;
+    }
+
+    .circuit.horizontal {
+      /* height 定义水平电路线厚度。 */
+      height: 2px;
+    }
+
+    .circuit.vertical {
+      /* width 定义垂直电路线厚度。 */
+      width: 2px;
+    }
+
+    .node {
+      /* position absolute 用于放置电路节点。 */
+      position: absolute;
+
+      /* width/height 保持节点为圆点。 */
+      width: 8px;
+      height: 8px;
+
+      /* border-radius 生成圆形节点。 */
+      border-radius: 50%;
+
+      /* background 使用冷色发光点。 */
+      background: var(--cyan-glow);
+
+      /* box-shadow 生成节点外发光。 */
+      box-shadow: 0 0 18px rgba(66, 214, 255, 0.78);
+
+      /* opacity 控制节点不抢 Logo 视觉焦点。 */
+      opacity: 0.72;
+    }
+
+    .chip-ghost {
+      /* position absolute 放置半透明大芯片轮廓，增强 AI 芯片主题。 */
+      position: absolute;
+
+      /* width/height 使用固定比例，避免响应式缩放时变形。 */
+      width: 178px;
+      height: 178px;
+
+      /* border 绘制芯片轮廓。 */
+      border: 2px solid rgba(66, 214, 255, 0.22);
+
+      /* border-radius 使用较小圆角，贴近芯片硬朗形态。 */
+      border-radius: 18px;
+
+      /* transform 旋转芯片轮廓，形成背景层次。 */
+      transform: rotate(12deg);
+
+      /* opacity 降低背景芯片存在感。 */
+      opacity: 0.72;
+    }
+
+    .chip-ghost::before,
+    .chip-ghost::after {
+      /* content 绘制芯片内部交叉线路。 */
+      content: "";
+
+      /* position absolute 相对芯片轮廓定位。 */
+      position: absolute;
+
+      /* inset 保持线路靠内，避免贴边。 */
+      inset: 34px;
+
+      /* border 绘制内圈线路。 */
+      border: 1px solid rgba(66, 214, 255, 0.24);
+
+      /* border-radius 保持芯片内部线路的轻微圆角。 */
+      border-radius: 10px;
+    }
+
+    .chip-ghost::after {
+      /* transform 再次旋转内圈，增加电路层次。 */
+      transform: rotate(45deg);
+    }
+
+    .hero-panel {
+      /* position absolute 放置中央主体内容区。 */
+      position: absolute;
+
+      /* inset 控制主体内容离屏幕边缘的安全距离。 */
+      inset: 58px 72px 70px 72px;
+
+      /* display grid 让 Logo、说明和底部状态自然垂直排布。 */
+      display: grid;
+
+      /* grid-template-rows 分配主 Logo 和启动状态区域。 */
+      grid-template-rows: 1fr auto;
+
+      /* z-index 确保主体位于背景装饰之上。 */
+      z-index: 2;
+    }
+
+    .logo-stage {
+      /* display flex 让赛事名和重绘 Logo 作为一组居中。 */
+      display: flex;
+
+      /* align-items 控制垂直方向居中。 */
+      align-items: center;
+
+      /* justify-content 控制水平方向居中。 */
+      justify-content: center;
+
+      /* position relative 用于放置周围的局部光效。 */
+      position: relative;
+    }
+
+    .brand-stack {
+      /* position relative 让赛事名、Logo 和装饰线作为同一组视觉主体。 */
+      position: relative;
+
+      /* display grid 让赛事名铭牌位于 Logo 上方，形成清晰信息层级。 */
+      display: grid;
+
+      /* gap 控制赛事名和 Logo 之间的距离，避免像截图中上方空区脱节。 */
+      gap: 14px;
+
+      /* justify-items 让赛事名铭牌和 Logo 都在画面中心线上。 */
+      justify-items: center;
+    }
+
+    .contest-ribbon {
+      /* position relative 保证铭牌在光效之上。 */
+      position: relative;
+
+      /* display flex 让中文赛事名、英文补充和细线整齐排列。 */
+      display: flex;
+
+      /* align-items 让中文和英文在同一基线上协调。 */
+      align-items: center;
+
+      /* gap 控制赛事名内部元素间距。 */
+      gap: 12px;
+
+      /* padding 形成轻量铭牌，不再使用截图中突兀的大红框区域。 */
+      padding: 7px 18px;
+
+      /* color 设置赛事名主文字为浅色，保证深色背景上可读。 */
+      color: rgba(238, 249, 255, 0.96);
+
+      /* background 使用低透明深色，让铭牌融入科技背景。 */
+      background: linear-gradient(90deg, rgba(3, 26, 45, 0.10), rgba(3, 26, 45, 0.46), rgba(3, 26, 45, 0.10));
+
+      /* border-block 只保留上下细线，避免出现厚重卡片。 */
+      border-block: 1px solid rgba(66, 214, 255, 0.26);
+
+      /* box-shadow 加一层柔和冷光，提升精致感。 */
+      box-shadow: 0 0 26px rgba(66, 214, 255, 0.10);
+
+      /* white-space 保证赛事名在 1024px 屏幕内一行显示。 */
+      white-space: nowrap;
+    }
+
+    .contest-ribbon::before,
+    .contest-ribbon::after {
+      /* content 绘制赛事铭牌两侧短线，增强居中仪式感。 */
+      content: "";
+
+      /* width/height 控制短线尺寸。 */
+      width: 54px;
+      height: 1px;
+
+      /* background 使用渐变线条，让两侧自然淡出。 */
+      background: linear-gradient(90deg, transparent, rgba(66, 214, 255, 0.70));
+    }
+
+    .contest-ribbon::after {
+      /* transform 反转右侧线条方向。 */
+      transform: scaleX(-1);
+    }
+
+    .contest-title {
+      /* font-size 设置中文赛事名大小，让它成为 Logo 前的正式说明。 */
+      font-size: 20px;
+
+      /* font-weight 加粗赛事名，保证压缩到 framebuffer 后仍清楚。 */
+      font-weight: 900;
+
+      /* letter-spacing 保持为 0，避免中文间距不自然。 */
+      letter-spacing: 0;
+    }
+
+    .contest-title em {
+      /* font-style 取消斜体，使用颜色强调第九届。 */
+      font-style: normal;
+
+      /* color 使用暖色强调届数，与底部启动光带呼应。 */
+      color: var(--warm-light);
+    }
+
+    .contest-sub {
+      /* font-size 设置英文补充为辅助层级。 */
+      font-size: 11px;
+
+      /* font-weight 保持英文补充清楚但不抢主标题。 */
+      font-weight: 800;
+
+      /* color 降低英文补充对比度。 */
+      color: rgba(188, 226, 245, 0.72);
+    }
+
+    .logo-stage::before {
+      /* content 创建 Logo 背后的柔和白色承托光。 */
+      content: "";
+
+      /* position absolute 相对 Logo 区域定位。 */
+      position: absolute;
+
+      /* width/height 控制光晕范围。 */
+      width: 760px;
+      height: 250px;
+
+      /* border-radius 让光晕成为椭圆。 */
+      border-radius: 50%;
+
+      /* background 创建浅色中心光，提升白底 Logo 的可读性。 */
+      background: radial-gradient(circle, rgba(255, 255, 255, 0.50), transparent 70%);
+
+      /* filter 增加柔化效果。 */
+      filter: blur(5px);
+    }
+
+    .brand-mark {
+      /* position relative 让 Logo 内容盖在背景光之上。 */
+      position: relative;
+
+      /* display flex 按参考图把芯片图标和文字横向排列。 */
+      display: flex;
+
+      /* align-items 让芯片和文字基线视觉对齐。 */
+      align-items: center;
+
+      /* gap 控制芯片和文字之间的间距。 */
+      gap: 24px;
+
+      /* padding 模拟原图留白，但不使用图片。 */
+      padding: 18px 34px 20px 26px;
+
+      /* background 用半透明白底承载重绘的标识内容。 */
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(242, 248, 255, 0.90));
+
+      /* border 强化 Logo 面板边界。 */
+      border: 1px solid rgba(29, 93, 145, 0.26);
+
+      /* border-radius 保持启动图现代感，同时不做过度圆角。 */
+      border-radius: 8px;
+
+      /* box-shadow 给标识面板轻微浮起效果。 */
+      box-shadow:
+        0 18px 42px rgba(6, 34, 62, 0.22),
+        inset 0 1px 0 rgba(255, 255, 255, 0.96);
+    }
+
+    .logo-chip {
+      /* position relative 用 CSS 重绘参考图左侧芯片主体。 */
+      position: relative;
+
+      /* width/height 固定芯片图标尺寸，避免文字变化导致变形。 */
+      width: 82px;
+      height: 82px;
+
+      /* display grid 用于居中芯片内部的 9th。 */
+      display: grid;
+
+      /* place-items 同时居中芯片内部文本。 */
+      place-items: center;
+
+      /* background 生成芯片白底。 */
+      background: var(--paper);
+
+      /* border 绘制蓝色芯片外框。 */
+      border: 5px solid var(--brand-blue);
+
+      /* border-radius 保持芯片四角略圆。 */
+      border-radius: 8px;
+
+      /* color 继承参考图主蓝色。 */
+      color: var(--brand-blue);
+
+      /* box-shadow 增加芯片厚度和轻微外光。 */
+      box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.86),
+        0 10px 24px rgba(29, 93, 145, 0.20);
+    }
+
+    .pin {
+      /* position absolute 用独立元素重绘芯片四周针脚。 */
+      position: absolute;
+
+      /* background 使用参考图主蓝色。 */
+      background: var(--brand-blue);
+
+      /* border-radius 让针脚末端略微柔和。 */
+      border-radius: 2px;
+    }
+
+    .pin.top,
+    .pin.bottom {
+      /* width/height 定义上下针脚的长宽。 */
+      width: 4px;
+      height: 15px;
+
+      /* left 由内联变量 --x 控制每根针脚位置。 */
+      left: var(--x);
+    }
+
+    .pin.top {
+      /* top 让上方针脚伸出芯片。 */
+      top: -20px;
+    }
+
+    .pin.bottom {
+      /* bottom 让下方针脚伸出芯片。 */
+      bottom: -20px;
+    }
+
+    .pin.left,
+    .pin.right {
+      /* width/height 定义左右针脚的长宽。 */
+      width: 15px;
+      height: 4px;
+
+      /* top 由内联变量 --y 控制每根针脚位置。 */
+      top: var(--y);
+    }
+
+    .pin.left {
+      /* left 让左侧针脚伸出芯片。 */
+      left: -20px;
+    }
+
+    .pin.right {
+      /* right 让右侧针脚伸出芯片。 */
+      right: -20px;
+    }
+
+    .chip-text {
+      /* display flex 让 9 和 th 能按参考图排版。 */
+      display: flex;
+
+      /* align-items 让 th 靠近数字上半部分。 */
+      align-items: flex-start;
+
+      /* font-family 选择窄体数字风格，模拟参考图芯片编号。 */
+      font-family: "Bahnschrift Condensed", "DIN Condensed", "Impact", sans-serif;
+
+      /* line-height 压缩数字高度，接近原图 9th 的紧凑感。 */
+      line-height: 0.88;
+    }
+
+    .chip-number {
+      /* font-size 放大数字 9，使它成为芯片内部主视觉。 */
+      font-size: 48px;
+
+      /* font-weight 增强数字厚度。 */
+      font-weight: 700;
+    }
+
+    .chip-suffix {
+      /* font-size 缩小 th，贴近参考图上标效果。 */
+      font-size: 20px;
+
+      /* margin-top 控制 th 的上标位置。 */
+      margin-top: 2px;
+
+      /* margin-left 让 th 与数字保持紧密关系。 */
+      margin-left: 2px;
+
+      /* font-weight 保持上标清晰。 */
+      font-weight: 700;
+    }
+
+    .brand-copy {
+      /* display grid 让中文主标题和英文副标题上下排列。 */
+      display: grid;
+
+      /* gap 控制两行之间的间距，参考图中英文较紧密。 */
+      gap: 7px;
+    }
+
+    .brand-title {
+      /* margin 清零，避免标题默认边距破坏对齐。 */
+      margin: 0;
+
+      /* color 使用参考图主蓝色。 */
+      color: var(--brand-blue);
+
+      /* font-size 按 1024 启动屏比例放大中文标题。 */
+      font-size: 44px;
+
+      /* line-height 保证中文标题高度紧凑。 */
+      line-height: 1;
+
+      /* font-weight 增强主标题识别度。 */
+      font-weight: 900;
+
+      /* letter-spacing 设为 0，避免中文被强行拉开。 */
+      letter-spacing: 0;
+
+      /* white-space nowrap 保持参考图标题在一行内完整呈现。 */
+      white-space: nowrap;
+    }
+
+    .brand-subtitle {
+      /* margin 清零，避免段落默认边距。 */
+      margin: 0;
+
+      /* color 使用同一蓝色但略降低透明度，形成层级。 */
+      color: rgba(29, 93, 145, 0.96);
+
+      /* font-size 模拟参考图英文副标题的宽体比例。 */
+      font-size: 27px;
+
+      /* line-height 控制英文行高。 */
+      line-height: 1;
+
+      /* font-weight 加粗英文副标题。 */
+      font-weight: 900;
+
+      /* letter-spacing 设为 0，满足项目视觉规则并避免英文溢出。 */
+      letter-spacing: 0;
+
+      /* white-space nowrap 保持参考图英文内容一行展示。 */
+      white-space: nowrap;
+    }
+
+    .scan-card {
+      /* position absolute 放置右下角的轻量机器视觉线稿。 */
+      position: absolute;
+
+      /* right/bottom 控制线稿位置，让它退到背景层而不是压住进度条。 */
+      right: 72px;
+      bottom: 118px;
+
+      /* width/height 固定线稿大小，保证启动屏布局稳定。 */
+      width: 226px;
+      height: 126px;
+
+      /* border 绘制极淡检测窗口边界，避免截图中右下大框突兀。 */
+      border: 1px solid rgba(66, 214, 255, 0.18);
+
+      /* border-radius 使用小圆角，贴合整体硬朗科技感。 */
+      border-radius: 6px;
+
+      /* background 只保留细网格，不再使用厚重玻璃底色。 */
+      background:
+        linear-gradient(90deg, rgba(66, 214, 255, 0.050) 1px, transparent 1px),
+        linear-gradient(rgba(66, 214, 255, 0.050) 1px, transparent 1px);
+
+      /* background-size 控制检测窗口内部小网格间距。 */
+      background-size: 16px 16px;
+
+      /* opacity 让线稿成为背景纹理，避免和主 Logo 争抢。 */
+      opacity: 0.55;
+
+      /* box-shadow 生成极轻冷色外发光。 */
+      box-shadow: 0 0 24px rgba(66, 214, 255, 0.08);
+    }
+
+    .scan-card::before {
+      /* content 绘制检测 ROI 框。 */
+      content: "";
+
+      /* position absolute 相对检测窗口定位。 */
+      position: absolute;
+
+      /* inset 控制 ROI 框内缩距离。 */
+      inset: 30px 54px;
+
+      /* border 绘制淡绿色 ROI 边界，弱化视觉重量。 */
+      border: 1px solid rgba(105, 255, 188, 0.55);
+
+      /* box-shadow 让 ROI 框轻微发光。 */
+      box-shadow: 0 0 16px rgba(105, 255, 188, 0.16);
+    }
+
+    .scan-card::after {
+      /* content 绘制静态扫描线。 */
+      content: "";
+
+      /* position absolute 放在检测窗口中部。 */
+      position: absolute;
+
+      /* left/right 控制扫描线长度。 */
+      left: 24px;
+      right: 24px;
+
+      /* top 控制扫描线垂直位置。 */
+      top: 70px;
+
+      /* height 定义扫描线厚度。 */
+      height: 2px;
+
+      /* background 生成中间亮、两侧淡的扫描光带。 */
+      background: linear-gradient(90deg, transparent, rgba(105, 255, 188, 0.92), transparent);
+
+      /* box-shadow 生成扫描线光晕。 */
+      box-shadow: 0 0 14px rgba(105, 255, 188, 0.30);
+    }
+
+    .status-zone {
+      /* display grid 让系统说明和技术铭牌成为一个低调信息带。 */
+      display: grid;
+
+      /* grid-template-columns 让左侧文案和右侧技术铭牌并排，去掉进度条控件感。 */
+      grid-template-columns: minmax(0, 1fr) auto;
+
+      /* gap 控制底部状态区域内部间距。 */
+      gap: 28px;
+
+      /* align-items 让两侧垂直居中，形成底部品牌信息条。 */
+      align-items: center;
+
+      /* padding 给底部信息带留出内部空间。 */
+      padding: 16px 18px;
+
+      /* background 只做轻微渐隐底，融入画面而非独立卡片。 */
+      background: linear-gradient(90deg, rgba(2, 14, 28, 0.42), rgba(2, 14, 28, 0.18), rgba(2, 14, 28, 0.08));
+
+      /* border-top 用细线建立底部信息带的边界。 */
+      border-top: 1px solid rgba(145, 217, 255, 0.16);
+
+      /* color 设置底部文字默认浅色。 */
+      color: rgba(235, 248, 255, 0.94);
+    }
+
+    .status-line {
+      /* display block 让左侧系统名和说明成为稳定文本组。 */
+      display: block;
+
+      /* min-width 允许长说明在左侧正常裁切或换行。 */
+      min-width: 0;
+    }
+
+    .system-name {
+      /* margin 清零，避免默认边距影响底部排版。 */
+      margin: 0;
+
+      /* font-size 设置底部系统名大小。 */
+      font-size: 21px;
+
+      /* font-weight 增强系统名识别度。 */
+      font-weight: 800;
+
+      /* letter-spacing 保持为 0，避免长英文溢出。 */
+      letter-spacing: 0;
+    }
+
+    .system-sub {
+      /* margin 清零，避免默认边距。 */
+      margin: 6px 0 0;
+
+      /* font-size 设置说明文字大小。 */
+      font-size: 14px;
+
+      /* color 降低说明文字权重。 */
+      color: rgba(213, 236, 248, 0.68);
+    }
+
+    .signature-strip {
+      /* display flex 横向排列右侧技术铭牌，替代进度条。 */
+      display: flex;
+
+      /* gap 控制铭牌之间的距离。 */
+      gap: 10px;
+
+      /* flex-wrap 允许窄屏预览时铭牌换行。 */
+      flex-wrap: wrap;
+
+      /* justify-content 让铭牌靠右对齐。 */
+      justify-content: flex-end;
+    }
+
+    .signature-chip {
+      /* position relative 为铭牌的左侧光点提供定位上下文。 */
+      position: relative;
+
+      /* min-width 让三枚铭牌宽度稳定，不像进度条那样抢视觉。 */
+      min-width: 112px;
+
+      /* padding 形成小型芯片式标签。 */
+      padding: 9px 12px 9px 24px;
+
+      /* border 绘制细线边界，延续电路语言。 */
+      border: 1px solid rgba(98, 205, 255, 0.18);
+
+      /* border-radius 使用小圆角，保持工业屏硬朗感。 */
+      border-radius: 6px;
+
+      /* background 使用低透明面，避免像大框一样突兀。 */
+      background: linear-gradient(180deg, rgba(8, 42, 68, 0.22), rgba(5, 21, 39, 0.12));
+
+      /* color 设置铭牌主文字颜色。 */
+      color: rgba(225, 246, 255, 0.84);
+
+      /* font-size 设置铭牌文字大小。 */
+      font-size: 12px;
+
+      /* font-weight 增强铭牌识别度。 */
+      font-weight: 800;
+
+      /* box-shadow 用极弱内光保证质感。 */
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    }
+
+    .signature-chip::before {
+      /* content 绘制铭牌左侧状态光点，只表示系统特性，不表示进度。 */
+      content: "";
+
+      /* width/height 生成圆点。 */
+      width: 6px;
+      height: 6px;
+
+      /* border-radius 形成圆形。 */
+      border-radius: 50%;
+
+      /* position absolute 将光点固定在铭牌左侧。 */
+      position: absolute;
+
+      /* left/top 控制光点位置。 */
+      left: 12px;
+      top: 50%;
+
+      /* transform 让光点垂直居中。 */
+      transform: translateY(-50%);
+
+      /* background 使用青色状态点。 */
+      background: var(--cyan-glow);
+
+      /* box-shadow 生成轻微状态点光晕。 */
+      box-shadow: 0 0 10px rgba(66, 214, 255, 0.56);
+    }
+
+    .corner-label {
+      /* position absolute 放置左上角设备标识。 */
+      position: absolute;
+
+      /* left/top 控制位置。 */
+      left: 34px;
+      top: 26px;
+
+      /* z-index 保证角标在背景装饰之上。 */
+      z-index: 2;
+
+      /* color 设置浅色文字。 */
+      color: rgba(229, 247, 255, 0.76);
+
+      /* font-size 设置角标大小。 */
+      font-size: 13px;
+
+      /* font-weight 增强可读性。 */
+      font-weight: 700;
+    }
+
+    .corner-label strong {
+      /* color 让版本号使用暖色点缀。 */
+      color: var(--warm-light);
+    }
+
+    @media (max-width: 760px) {
+      .brand-mark {
+        /* transform 在窄屏预览时缩小 Logo，仍保持完整可见。 */
+        transform: scale(0.72);
+      }
+
+      .contest-ribbon {
+        /* transform 在窄屏预览时缩小赛事铭牌，避免溢出画布。 */
+        transform: scale(0.78);
+      }
+
+      .scan-card {
+        /* display none 避免窄屏浏览器预览时装饰窗口压住 Logo。 */
+        display: none;
+      }
+
+      .hero-panel {
+        /* inset 调整窄屏安全边距。 */
+        inset: 54px 32px 58px;
+      }
+
+      .status-zone {
+        /* grid-template-columns 窄屏下改为单列，避免横向溢出。 */
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- boot-frame 是 1024x600 启动图画布，后续可按该画面翻译成 framebuffer 绘制代码。 -->
+  <main class="boot-frame" aria-label="AI 赋能设计开机静态启动图预览">
+    <!-- 背景电路线使用 CSS 方块和圆点绘制，避免粘贴图片素材。 -->
+    <i class="circuit horizontal" style="left: 72px; top: 104px; width: 252px; color: rgba(66, 214, 255, 0.72);"></i>
+    <i class="circuit vertical" style="left: 322px; top: 104px; height: 78px; color: rgba(66, 214, 255, 0.62);"></i>
+    <i class="circuit horizontal" style="right: 72px; top: 138px; width: 268px; color: rgba(255, 213, 106, 0.58);"></i>
+    <i class="circuit vertical" style="right: 338px; top: 138px; height: 96px; color: rgba(255, 213, 106, 0.48);"></i>
+    <i class="circuit horizontal" style="left: 96px; bottom: 132px; width: 340px; color: rgba(66, 214, 255, 0.42);"></i>
+    <i class="circuit vertical" style="left: 436px; bottom: 132px; height: 70px; color: rgba(66, 214, 255, 0.38);"></i>
+    <i class="node" style="left: 318px; top: 178px;"></i>
+    <i class="node" style="right: 334px; top: 230px; background: var(--warm-light); box-shadow: 0 0 18px rgba(255, 213, 106, 0.70);"></i>
+    <i class="node" style="left: 432px; bottom: 198px;"></i>
+
+    <!-- chip-ghost 是背景大芯片轮廓，强化 AI 芯片主题但不抢主 Logo。 -->
+    <i class="chip-ghost" style="left: 72px; top: 164px;"></i>
+    <i class="chip-ghost" style="right: 92px; top: 292px; transform: rotate(-10deg) scale(0.86);"></i>
+
+    <!-- corner-label 提示这是板端启动前静态画面方向，不替代真实运行状态。 -->
+    <div class="corner-label">STM32MP157 BOOT VISUAL <strong>PREVIEW</strong></div>
+
+    <!-- hero-panel 承载重绘后的参考图核心内容和底部启动状态。 -->
+    <section class="hero-panel">
+      <div class="logo-stage">
+        <div class="brand-stack">
+          <!-- contest-ribbon 补充用户要求的赛事名称，并与主 Logo 形成一体化品牌组。 -->
+          <div class="contest-ribbon" aria-label="第九届嵌入式芯片与系统设计竞赛">
+            <span class="contest-title"><em>第九届</em> 嵌入式芯片与系统设计竞赛</span>
+            <span class="contest-sub">Embedded Chip &amp; System Design Contest</span>
+          </div>
+
+          <!-- brand-mark 用 DOM/CSS 重绘用户给出的 9th AI 赋能设计标识。 -->
+          <div class="brand-mark" role="img" aria-label="第九届嵌入式芯片与系统设计竞赛，9th AI赋能设计，设计点亮AI，AI for Design and Design for AI">
+            <div class="logo-chip" aria-hidden="true">
+              <!-- 每个 pin 元素都是芯片针脚，位置通过内联变量控制。 -->
+              <i class="pin top" style="--x: 10px;"></i>
+              <i class="pin top" style="--x: 24px;"></i>
+              <i class="pin top" style="--x: 38px;"></i>
+              <i class="pin top" style="--x: 52px;"></i>
+              <i class="pin top" style="--x: 66px;"></i>
+              <i class="pin bottom" style="--x: 10px;"></i>
+              <i class="pin bottom" style="--x: 24px;"></i>
+              <i class="pin bottom" style="--x: 38px;"></i>
+              <i class="pin bottom" style="--x: 52px;"></i>
+              <i class="pin bottom" style="--x: 66px;"></i>
+              <i class="pin left" style="--y: 10px;"></i>
+              <i class="pin left" style="--y: 24px;"></i>
+              <i class="pin left" style="--y: 38px;"></i>
+              <i class="pin left" style="--y: 52px;"></i>
+              <i class="pin left" style="--y: 66px;"></i>
+              <i class="pin right" style="--y: 10px;"></i>
+              <i class="pin right" style="--y: 24px;"></i>
+              <i class="pin right" style="--y: 38px;"></i>
+              <i class="pin right" style="--y: 52px;"></i>
+              <i class="pin right" style="--y: 66px;"></i>
+              <span class="chip-text">
+                <span class="chip-number">9</span>
+                <span class="chip-suffix">th</span>
+              </span>
+            </div>
+
+            <!-- brand-copy 保留参考图必须包含的中文与英文内容。 -->
+            <div class="brand-copy">
+              <h1 class="brand-title">AI赋能设计，设计点亮AI!</h1>
+              <p class="brand-subtitle">AI for Design &amp; Design for AI!</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- status-zone 是启动图底部状态信息，增强开机画面的完整性。 -->
+      <div class="status-zone">
+        <div class="status-line">
+          <div>
+            <p class="system-name">AI Vision Design Terminal</p>
+            <p class="system-sub">Preparing Qt display surface, framebuffer handoff and inspection interface</p>
+          </div>
+        </div>
+        <div class="signature-strip" aria-label="系统特性">
+          <span class="signature-chip">MP157 Edge AI</span>
+          <span class="signature-chip">Framebuffer Splash</span>
+          <span class="signature-chip">Qt Vision Ready</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- scan-card 是额外添加的机器视觉元素，表达后续 Qt 工业检测系统即将进入工作界面。 -->
+    <aside class="scan-card" aria-hidden="true"></aside>
+  </main>
+</body>
+</html>

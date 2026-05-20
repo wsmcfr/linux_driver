@@ -1,0 +1,8 @@
+[Unit]
+Description=Check STM32MP157 board review reverse tunnel
+After=network-online.target yunduan-backend.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/yunduan/scripts/check_board_review_tunnel.sh

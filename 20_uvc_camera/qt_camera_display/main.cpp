@@ -45,11 +45,13 @@
 #include <QFileInfo>            /* QFileInfo 用于判断 COS 上传脚本、图片文件和历史文件状态。 */
 #include <QGuiApplication>      /* QGuiApplication 是 Qt Quick 图形程序的应用对象。 */
 #include <QHash>                /* QHash 用于声明 QML 模型角色名映射。 */
+#include <QMap>                 /* QMap 用于保存 HTTP 请求头小写键值映射。 */
 #include <QTimer>               /* QTimer 用于周期性异步刷新设备真实健康状态。 */
 #include <QJsonArray>           /* QJsonArray 用于把历史记录数组保存到 JSON。 */
 #include <QJsonDocument>        /* QJsonDocument 用于解析和生成上传历史 JSON 文档。 */
 #include <QJsonObject>          /* QJsonObject 用于保存单条上传历史记录字段。 */
 #include <QJsonValue>           /* QJsonValue 用于读取历史 JSON 中的字符串或数字字段。 */
+#include <QHostAddress>         /* QHostAddress 用于指定云端复核回写 HTTP 服务监听地址。 */
 #include <QProcess>             /* QProcess 用于调用现有 sdcard-safe-remove 命令。 */
 #include <QProcessEnvironment>  /* QProcessEnvironment 用于给 sdcard-safe-remove 传入短等待环境变量。 */
 #include <QMetaObject>          /* QMetaObject 用于把后台线程的检测阶段进度安全投递回 Qt 主线程。 */
@@ -63,6 +65,8 @@
 #include <QSharedPointer>       /* QSharedPointer 用于在线程完成信号中安全保存后台任务结果。 */
 #include <QStringList>          /* QStringList 用于保存一次检测中的多张 annotated 结果图路径。 */
 #include <QSurfaceFormat>       /* QSurfaceFormat 用于声明 OpenGL ES 渲染格式。 */
+#include <QTcpServer>           /* QTcpServer 用于接收云端回写板端复核结果的 HTTP 请求。 */
+#include <QTcpSocket>           /* QTcpSocket 用于读取 HTTP 请求并写回 JSON 响应。 */
 #include <QTextStream>          /* QTextStream 用于自检入口输出保存结果，也用于写告警诊断文本。 */
 #include <QThread>              /* QThread 用于把图片保存和 COS 上传放到后台线程，避免阻塞 Qt 触摸事件循环。 */
 #include <QUrl>                 /* QUrl 用于表达 qrc 资源中的 QML 路径。 */
@@ -167,6 +171,15 @@ static const char *DEFAULT_DEFECT_SEGMENT_MODEL =
 /* 上传历史默认文件：放在 SD 卡图片目录内，随图片一起保留，重启 Qt 后仍能恢复历史界面。 */
 static const char *DEFAULT_UPLOAD_HISTORY_FILE = "/mnt/sdcard/images/upload_history.json";
 
+/* 云端复核回写默认监听地址；0.0.0.0 便于云端通过板端 IP 访问，现场可用 BOARD_REVIEW_LISTEN 收紧。 */
+static const char *DEFAULT_BOARD_REVIEW_LISTEN = "0.0.0.0";
+
+/* 云端复核回写默认端口；云端按钮调用 http://<board-ip>:18080/api/v1/review-result。 */
+static const quint16 DEFAULT_BOARD_REVIEW_PORT = 18080;
+
+/* 云端复核回写默认来源标记；写入历史 JSON 后可区分人工云端复核和板端本地模型输出。 */
+static const char *DEFAULT_BOARD_REVIEW_SOURCE = "cloud";
+
 /* Qt 界面默认业务时区：POSIX TZ 中 CST-8 表示 UTC+8，也就是北京时间。 */
 static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
 
@@ -232,6 +245,8 @@ private:
  *   jpgPath/pngPath/jpgSizeBytes/pngSizeBytes 是旧历史 JSON 兼容字段，新记录会同步写入 source/首张 annotated。
  *   uploadStatus 保存上传脚本返回的一行结果，成功和失败都要保留，便于追查云端问题。
  *   recordId/recordNo 是云端检测记录身份，用于和后台详情页、日志、COS 对象对账。
+ *   boardResultText 保存板端原始双模型结论，云端修正后仍用于追溯误判来源。
+ *   cloudReviewResult/cloudReviewText/cloudReviewTime/cloudReviewOperator/cloudReviewSource 保存云端按钮回写的复核信息。
  */
 struct UploadHistoryEntry
 {
@@ -249,6 +264,12 @@ struct UploadHistoryEntry
     QString uploadStatus;
     QString recordId;
     QString recordNo;
+    QString boardResultText;
+    QString cloudReviewResult;
+    QString cloudReviewText;
+    QString cloudReviewTime;
+    QString cloudReviewOperator;
+    QString cloudReviewSource;
     qint64 sourceSizeBytes = 0;
     qint64 jpgSizeBytes = 0;
     qint64 pngSizeBytes = 0;
@@ -292,7 +313,13 @@ public:
         PngSizeBytesRole,
         SourceSizeBytesRole,
         TotalSizeBytesRole,
-        ImageCountRole
+        ImageCountRole,
+        BoardResultTextRole,
+        CloudReviewResultRole,
+        CloudReviewTextRole,
+        CloudReviewTimeRole,
+        CloudReviewOperatorRole,
+        CloudReviewSourceRole
     };
 
     /*
@@ -377,6 +404,18 @@ public:
             return totalSizeBytesForEntry(entry);
         case ImageCountRole:
             return imageCountForEntry(entry);
+        case BoardResultTextRole:
+            return normalizedBoardResultText(entry);
+        case CloudReviewResultRole:
+            return entry.cloudReviewResult;
+        case CloudReviewTextRole:
+            return entry.cloudReviewText;
+        case CloudReviewTimeRole:
+            return entry.cloudReviewTime;
+        case CloudReviewOperatorRole:
+            return entry.cloudReviewOperator;
+        case CloudReviewSourceRole:
+            return entry.cloudReviewSource;
         default:
             return QVariant();
         }
@@ -407,6 +446,12 @@ public:
         roles.insert(SourceSizeBytesRole, "sourceSizeBytes");
         roles.insert(TotalSizeBytesRole, "totalSizeBytes");
         roles.insert(ImageCountRole, "imageCount");
+        roles.insert(BoardResultTextRole, "boardResultText");
+        roles.insert(CloudReviewResultRole, "cloudReviewResult");
+        roles.insert(CloudReviewTextRole, "cloudReviewText");
+        roles.insert(CloudReviewTimeRole, "cloudReviewTime");
+        roles.insert(CloudReviewOperatorRole, "cloudReviewOperator");
+        roles.insert(CloudReviewSourceRole, "cloudReviewSource");
 
         return roles;
     }
@@ -695,6 +740,122 @@ public:
         return true;
     }
 
+    /*
+     * applyCloudReviewResult 的作用：
+     *   接收云端“修正板端结果”按钮下发的复核结论，并更新同一条本地检测历史记录。
+     *
+     * 主要流程：
+     *   1. 优先按 record_id 查找本地历史；没有 record_id 时按 record_no 查找。
+     *   2. 校验 cloudResult 只能是 good/bad/review，避免云端字段漂移污染本地 JSON。
+     *   3. 首次回写时把板端原始 resultText 保存到 boardResultText，后续重复回写不覆盖原始依据。
+     *   4. 把 resultText 改成云端最终中文结果，让历史列表和统计优先展示修正后的业务结论。
+     *   5. 写回 upload_history.json，成功后通知 QML 刷新对应历史卡片和详情页。
+     *
+     * 参数：
+     *   recordId 是云端记录 ID，优先用于匹配。
+     *   recordNo 是云端记录编号，recordId 为空时作为兜底匹配。
+     *   cloudResult 是云端最终复核结果，只允许 good、bad 或 review。
+     *   reviewText 是云端弹窗填写的修正原因，板端要求非空。
+     *   reviewOperator 是云端操作人显示名或账号。
+     *   reviewTime 是云端复核时间；为空时板端使用当前本地时间。
+     *   reviewSource 是来源标记，默认 cloud。
+     *   updatedRecord 用于返回更新后的记录字段，HTTP 响应会复用。
+     *   errorText 用于返回中文失败原因。
+     *
+     * 返回值：
+     *   更新并写盘成功返回 true；参数非法、找不到记录或写盘失败返回 false。
+     */
+    bool applyCloudReviewResult(const QString &recordId,
+                                const QString &recordNo,
+                                const QString &cloudResult,
+                                const QString &reviewText,
+                                const QString &reviewOperator,
+                                const QString &reviewTime,
+                                const QString &reviewSource,
+                                QVariantMap *updatedRecord,
+                                QString *errorText)
+    {
+        const QString normalizedResult = cloudResult.trimmed().toLower();
+        const QString normalizedReason = reviewText.trimmed();
+        const int row = findRecordRow(recordId.trimmed(), recordNo.trimmed());
+
+        if (recordId.trimmed().isEmpty() && recordNo.trimmed().isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("缺少 record_id 或 record_no");
+            }
+            return false;
+        }
+
+        if (row < 0) {
+            if (errorText) {
+                *errorText = QStringLiteral("记录不存在");
+            }
+            return false;
+        }
+
+        if (!isValidCloudReviewResult(normalizedResult)) {
+            if (errorText) {
+                *errorText = QStringLiteral("云端复核结果非法");
+            }
+            return false;
+        }
+
+        if (normalizedReason.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("云端修正原因不能为空");
+            }
+            return false;
+        }
+
+        const UploadHistoryEntry oldEntry = m_entries.at(row);
+        UploadHistoryEntry updatedEntry = oldEntry;
+
+        if (updatedEntry.boardResultText.isEmpty()) {
+            updatedEntry.boardResultText = normalizedBoardResultText(updatedEntry);
+        }
+
+        updatedEntry.cloudReviewResult = normalizedResult;
+        updatedEntry.cloudReviewText = normalizedReason.left(240);
+        updatedEntry.cloudReviewOperator = reviewOperator.trimmed().left(80);
+        updatedEntry.cloudReviewTime = reviewTime.trimmed().isEmpty()
+            ? QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+            : reviewTime.trimmed().left(40);
+        updatedEntry.cloudReviewSource = reviewSource.trimmed().isEmpty()
+            ? QString::fromLatin1(DEFAULT_BOARD_REVIEW_SOURCE)
+            : reviewSource.trimmed().left(40);
+        updatedEntry.resultText = resultTextFromCloudReviewResult(normalizedResult);
+        updatedEntry.workflowText = QStringLiteral("云端修正为%1；板端原始结论%2；原因：%3")
+            .arg(updatedEntry.resultText,
+                 updatedEntry.boardResultText,
+                 updatedEntry.cloudReviewText);
+
+        m_entries[row] = updatedEntry;
+
+        if (!saveToDisk()) {
+            m_entries[row] = oldEntry;
+            if (errorText) {
+                *errorText = QStringLiteral("历史文件写入失败");
+            }
+            return false;
+        }
+
+        emit dataChanged(index(row, 0), index(row, 0),
+                         QVector<int>() << ResultTextRole
+                                        << WorkflowTextRole
+                                        << BoardResultTextRole
+                                        << CloudReviewResultRole
+                                        << CloudReviewTextRole
+                                        << CloudReviewTimeRole
+                                        << CloudReviewOperatorRole
+                                        << CloudReviewSourceRole);
+
+        if (updatedRecord) {
+            *updatedRecord = entryToVariantMap(updatedEntry);
+        }
+
+        return true;
+    }
+
 signals:
     /* countChanged 在历史记录数量变化时发出，QML 可用它刷新空状态和统计卡。 */
     void countChanged();
@@ -728,6 +889,101 @@ private:
     qint64 normalizedSourceSizeBytes(const UploadHistoryEntry &entry) const
     {
         return entry.sourceSizeBytes > 0 ? entry.sourceSizeBytes : entry.jpgSizeBytes;
+    }
+
+    /*
+     * normalizedBoardResultText 的作用：
+     *   返回板端原始检测结论，并兼容旧记录没有 board_result_text 的情况。
+     *
+     * 参数：
+     *   entry 是待读取的历史记录。
+     *
+     * 返回值：
+     *   boardResultText 非空时返回它；否则返回当前 resultText，仍为空时返回“待复核”。
+     */
+    QString normalizedBoardResultText(const UploadHistoryEntry &entry) const
+    {
+        if (!entry.boardResultText.isEmpty()) {
+            return entry.boardResultText;
+        }
+
+        if (!entry.resultText.isEmpty()) {
+            return entry.resultText;
+        }
+
+        return QStringLiteral("待复核");
+    }
+
+    /*
+     * isValidCloudReviewResult 的作用：
+     *   校验云端回写结果枚举，防止云端字段名变化后写入本地历史。
+     *
+     * 参数：
+     *   result 是云端传入的小写结果。
+     *
+     * 返回值：
+     *   good、bad、review 返回 true；其它值返回 false。
+     */
+    bool isValidCloudReviewResult(const QString &result) const
+    {
+        return result == QStringLiteral("good")
+            || result == QStringLiteral("bad")
+            || result == QStringLiteral("review");
+    }
+
+    /*
+     * resultTextFromCloudReviewResult 的作用：
+     *   把云端 good/bad/review 转换为板端历史页展示的中文业务结论。
+     *
+     * 参数：
+     *   result 是云端传入的小写结果。
+     *
+     * 返回值：
+     *   good 返回“良品”，bad 返回“坏品”，review 或未知返回“待复核”。
+     */
+    QString resultTextFromCloudReviewResult(const QString &result) const
+    {
+        if (result == QStringLiteral("good")) {
+            return QStringLiteral("良品");
+        }
+
+        if (result == QStringLiteral("bad")) {
+            return QStringLiteral("坏品");
+        }
+
+        return QStringLiteral("待复核");
+    }
+
+    /*
+     * findRecordRow 的作用：
+     *   按云端身份查找本地历史记录，优先 record_id，兜底 record_no。
+     *
+     * 参数：
+     *   recordId 是云端记录 ID。
+     *   recordNo 是云端记录编号。
+     *
+     * 返回值：
+     *   找到返回行号；找不到返回 -1。
+     */
+    int findRecordRow(const QString &recordId, const QString &recordNo) const
+    {
+        if (!recordId.isEmpty()) {
+            for (int i = 0; i < m_entries.size(); i++) {
+                if (m_entries.at(i).recordId == recordId) {
+                    return i;
+                }
+            }
+        }
+
+        if (!recordNo.isEmpty()) {
+            for (int i = 0; i < m_entries.size(); i++) {
+                if (m_entries.at(i).recordNo == recordNo) {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
     }
 
     /*
@@ -881,6 +1137,12 @@ private:
         object.insert(QStringLiteral("upload_status"), entry.uploadStatus);
         object.insert(QStringLiteral("record_id"), entry.recordId);
         object.insert(QStringLiteral("record_no"), entry.recordNo);
+        object.insert(QStringLiteral("board_result_text"), normalizedBoardResultText(entry));
+        object.insert(QStringLiteral("cloud_review_result"), entry.cloudReviewResult);
+        object.insert(QStringLiteral("cloud_review_text"), entry.cloudReviewText);
+        object.insert(QStringLiteral("cloud_review_time"), entry.cloudReviewTime);
+        object.insert(QStringLiteral("cloud_review_operator"), entry.cloudReviewOperator);
+        object.insert(QStringLiteral("cloud_review_source"), entry.cloudReviewSource);
         object.insert(QStringLiteral("jpg_size_bytes"), QString::number(entry.jpgSizeBytes));
         object.insert(QStringLiteral("png_size_bytes"), QString::number(entry.pngSizeBytes));
 
@@ -925,6 +1187,12 @@ private:
         entry.uploadStatus = object.value(QStringLiteral("upload_status")).toString();
         entry.recordId = object.value(QStringLiteral("record_id")).toString();
         entry.recordNo = object.value(QStringLiteral("record_no")).toString();
+        entry.boardResultText = object.value(QStringLiteral("board_result_text")).toString();
+        entry.cloudReviewResult = object.value(QStringLiteral("cloud_review_result")).toString();
+        entry.cloudReviewText = object.value(QStringLiteral("cloud_review_text")).toString();
+        entry.cloudReviewTime = object.value(QStringLiteral("cloud_review_time")).toString();
+        entry.cloudReviewOperator = object.value(QStringLiteral("cloud_review_operator")).toString();
+        entry.cloudReviewSource = object.value(QStringLiteral("cloud_review_source")).toString();
         entry.jpgSizeBytes = jsonIntegerString(object, QStringLiteral("jpg_size_bytes"));
         entry.pngSizeBytes = jsonIntegerString(object, QStringLiteral("png_size_bytes"));
 
@@ -950,6 +1218,9 @@ private:
         }
         if (entry.sourceSizeBytes <= 0) {
             entry.sourceSizeBytes = entry.jpgSizeBytes;
+        }
+        if (entry.boardResultText.isEmpty()) {
+            entry.boardResultText = entry.resultText;
         }
 
         return entry;
@@ -1004,6 +1275,12 @@ private:
         map.insert(QStringLiteral("uploadStatus"), entry.uploadStatus);
         map.insert(QStringLiteral("recordId"), entry.recordId);
         map.insert(QStringLiteral("recordNo"), entry.recordNo);
+        map.insert(QStringLiteral("boardResultText"), normalizedBoardResultText(entry));
+        map.insert(QStringLiteral("cloudReviewResult"), entry.cloudReviewResult);
+        map.insert(QStringLiteral("cloudReviewText"), entry.cloudReviewText);
+        map.insert(QStringLiteral("cloudReviewTime"), entry.cloudReviewTime);
+        map.insert(QStringLiteral("cloudReviewOperator"), entry.cloudReviewOperator);
+        map.insert(QStringLiteral("cloudReviewSource"), entry.cloudReviewSource);
         map.insert(QStringLiteral("sourceSizeBytes"), sourceSizeBytes);
         map.insert(QStringLiteral("jpgSizeBytes"), entry.jpgSizeBytes > 0 ? entry.jpgSizeBytes : sourceSizeBytes);
         map.insert(QStringLiteral("pngSizeBytes"), entry.pngSizeBytes);
@@ -1274,6 +1551,520 @@ private:
 
     QVector<UploadHistoryEntry> m_entries; /* m_entries 保存内存中的历史记录，顺序就是界面横向叠加顺序。 */
     QString m_historyFilePath;             /* m_historyFilePath 保存 SD 卡历史 JSON 文件路径。 */
+};
+
+/*
+ * CloudReviewServer 的作用：
+ *   提供一个板端 HTTP 小服务，接收云端“修正板端结果”按钮下发的复核结论。
+ *
+ * 主要流程：
+ *   1. Qt 启动时读取 BOARD_REVIEW_LISTEN、BOARD_REVIEW_PORT 和 BOARD_REVIEW_TOKEN。
+ *   2. 监听 `/api/v1/review-result`，只接受 POST JSON 请求。
+ *   3. 校验 `X-Board-Token` 或 `Authorization: Bearer <token>`，防止任意内网客户端改写历史。
+ *   4. 解析 record_id、record_no、cloud_result、cloud_reason、operator、review_time。
+ *   5. 调用 UploadHistoryModel::applyCloudReviewResult() 更新本地 upload_history.json。
+ *
+ * 关键说明：
+ *   这个类只做本机历史回写，不访问云端数据库。云端自己的复核记录和同步状态必须由云端后端保存。
+ */
+class CloudReviewServer : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString listenStatusText READ listenStatusText NOTIFY listenStatusChanged)
+
+public:
+    /*
+     * 构造函数的作用：
+     *   保存历史模型指针，并连接 QTcpServer 的新连接信号。
+     *
+     * 参数：
+     *   historyModel 是要更新的本地上传历史模型。
+     *   parent 是 Qt 对象树父对象。
+     */
+    explicit CloudReviewServer(UploadHistoryModel *historyModel, QObject *parent = nullptr)
+        : QObject(parent),
+          m_historyModel(historyModel),
+          m_listenStatusText(QStringLiteral("未启动"))
+    {
+        connect(&m_server, &QTcpServer::newConnection, this, &CloudReviewServer::handleNewConnection);
+    }
+
+    /*
+     * listenStatusText 的作用：
+     *   返回云端复核回写服务当前监听状态，QML 或日志可用于排查云端无法连接的问题。
+     *
+     * 返回值：
+     *   返回“监听 ...”或“启动失败 ...”这类中文状态。
+     */
+    QString listenStatusText() const
+    {
+        return m_listenStatusText;
+    }
+
+    /*
+     * startFromEnvironment 的作用：
+     *   根据环境变量启动板端 HTTP 回写服务。
+     *
+     * 主要流程：
+     *   1. BOARD_REVIEW_ENABLE=0 时跳过监听，便于现场临时关闭回写入口。
+     *   2. BOARD_REVIEW_LISTEN 默认 0.0.0.0，BOARD_REVIEW_PORT 默认 18080。
+     *   3. BOARD_REVIEW_TOKEN 为空时允许无 token，但日志明确警告；正式部署必须设置。
+     *
+     * 返回值：
+     *   监听成功返回 true；禁用或启动失败返回 false。
+     */
+    bool startFromEnvironment()
+    {
+        const QByteArray enableValue = qgetenv("BOARD_REVIEW_ENABLE");
+
+        if (!enableValue.isEmpty() && QString::fromLatin1(enableValue).trimmed() == QStringLiteral("0")) {
+            setListenStatus(QStringLiteral("云端复核回写已禁用"));
+            return false;
+        }
+
+        const QString listenAddress = environmentString(QStringLiteral("BOARD_REVIEW_LISTEN"),
+                                                        QString::fromLatin1(DEFAULT_BOARD_REVIEW_LISTEN));
+        const quint16 listenPort = static_cast<quint16>(
+            environmentInt(QStringLiteral("BOARD_REVIEW_PORT"), DEFAULT_BOARD_REVIEW_PORT, 1, 65535));
+
+        m_token = loadReviewTokenFromEnvironment();
+        if (m_token.isEmpty()) {
+            qWarning() << "BOARD_REVIEW_TOKEN is empty; cloud review writeback accepts unauthenticated requests";
+        }
+
+        const QHostAddress address(listenAddress);
+        const QHostAddress effectiveAddress = address.isNull() && listenAddress != QStringLiteral("0.0.0.0")
+            ? QHostAddress::Any
+            : address;
+
+        if (!m_server.listen(effectiveAddress, listenPort)) {
+            setListenStatus(QStringLiteral("云端复核回写启动失败：") + m_server.errorString());
+            qWarning() << "cloud review server listen failed"
+                       << listenAddress
+                       << listenPort
+                       << m_server.errorString();
+            return false;
+        }
+
+        setListenStatus(QStringLiteral("云端复核回写监听 %1:%2")
+                        .arg(effectiveAddress.toString())
+                        .arg(m_server.serverPort()));
+        qInfo() << "cloud review server listening"
+                << effectiveAddress.toString()
+                << m_server.serverPort();
+        return true;
+    }
+
+signals:
+    /* listenStatusChanged 在监听状态变化时通知 QML。 */
+    void listenStatusChanged();
+
+private:
+    /*
+     * handleNewConnection 的作用：
+     *   逐个接收 QTcpServer 队列里的客户端连接，并挂接读取完成处理。
+     */
+    void handleNewConnection()
+    {
+        while (m_server.hasPendingConnections()) {
+            QTcpSocket *socket = m_server.nextPendingConnection();
+
+            if (socket == nullptr) {
+                continue;
+            }
+
+            connect(socket, &QTcpSocket::readyRead, this, [this, socket]() {
+                handleReadyRead(socket);
+            });
+            connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+        }
+    }
+
+    /*
+     * handleReadyRead 的作用：
+     *   读取完整 HTTP 请求，达到 Content-Length 后交给 processHttpRequest()。
+     *
+     * 参数：
+     *   socket 是当前客户端连接。
+     */
+    void handleReadyRead(QTcpSocket *socket)
+    {
+        QByteArray buffer = socket->property("requestBuffer").toByteArray();
+
+        buffer.append(socket->readAll());
+        socket->setProperty("requestBuffer", buffer);
+
+        const int headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd < 0) {
+            return;
+        }
+
+        const QByteArray headerBytes = buffer.left(headerEnd);
+        const int contentLength = httpContentLength(headerBytes);
+        const int bodyStart = headerEnd + 4;
+
+        if (buffer.size() < bodyStart + contentLength) {
+            return;
+        }
+
+        const QByteArray body = buffer.mid(bodyStart, contentLength);
+        processHttpRequest(socket, headerBytes, body);
+    }
+
+    /*
+     * processHttpRequest 的作用：
+     *   解析 HTTP 请求行、请求头和 JSON body，并输出对应 JSON 响应。
+     *
+     * 参数：
+     *   socket 是当前客户端连接。
+     *   headerBytes 是 HTTP 头部原始字节。
+     *   body 是请求体 JSON 字节。
+     */
+    void processHttpRequest(QTcpSocket *socket, const QByteArray &headerBytes, const QByteArray &body)
+    {
+        const QList<QByteArray> headerLines = headerBytes.split('\n');
+        const QByteArray requestLine = headerLines.isEmpty() ? QByteArray() : headerLines.first().trimmed();
+        const QList<QByteArray> requestParts = requestLine.split(' ');
+        const QString method = requestParts.size() > 0 ? QString::fromLatin1(requestParts.at(0)).trimmed() : QString();
+        const QString path = requestParts.size() > 1 ? QString::fromLatin1(requestParts.at(1)).trimmed() : QString();
+        const QMap<QString, QString> headers = parseHeaders(headerLines);
+
+        if (method == QStringLiteral("OPTIONS")) {
+            sendJsonResponse(socket, 200, jsonOkObject(QStringLiteral("preflight")));
+            return;
+        }
+
+        if (method != QStringLiteral("POST") || path != QStringLiteral("/api/v1/review-result")) {
+            sendJsonResponse(socket, 404, jsonErrorObject(QStringLiteral("接口不存在")));
+            return;
+        }
+
+        if (!requestAuthorized(headers)) {
+            sendJsonResponse(socket, 401, jsonErrorObject(QStringLiteral("token 校验失败")));
+            return;
+        }
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            sendJsonResponse(socket, 400, jsonErrorObject(QStringLiteral("请求 JSON 格式错误")));
+            return;
+        }
+
+        const QJsonObject request = document.object();
+        const QString recordId = request.value(QStringLiteral("record_id")).toVariant().toString();
+        const QString recordNo = request.value(QStringLiteral("record_no")).toString();
+        const QString cloudResult = request.value(QStringLiteral("cloud_result")).toString();
+        const QString cloudReason = request.value(QStringLiteral("cloud_reason")).toString();
+        const QString reviewOperator = request.value(QStringLiteral("operator")).toString();
+        const QString reviewTime = request.value(QStringLiteral("review_time")).toString();
+        const QString reviewSource = request.value(QStringLiteral("source")).toString(QString::fromLatin1(DEFAULT_BOARD_REVIEW_SOURCE));
+        QVariantMap updatedRecord;
+        QString errorText;
+
+        if (m_historyModel == nullptr) {
+            sendJsonResponse(socket, 500, jsonErrorObject(QStringLiteral("历史模型未初始化")));
+            return;
+        }
+
+        if (!m_historyModel->applyCloudReviewResult(recordId,
+                                                    recordNo,
+                                                    cloudResult,
+                                                    cloudReason,
+                                                    reviewOperator,
+                                                    reviewTime,
+                                                    reviewSource,
+                                                    &updatedRecord,
+                                                    &errorText)) {
+            const int statusCode = errorText == QStringLiteral("记录不存在") ? 404 : 400;
+
+            sendJsonResponse(socket, statusCode, jsonErrorObject(errorText));
+            return;
+        }
+
+        QJsonObject response = jsonOkObject(QStringLiteral("updated"));
+
+        response.insert(QStringLiteral("updated"), true);
+        response.insert(QStringLiteral("record_id"), updatedRecord.value(QStringLiteral("recordId")).toString());
+        response.insert(QStringLiteral("record_no"), updatedRecord.value(QStringLiteral("recordNo")).toString());
+        response.insert(QStringLiteral("board_result_text"), updatedRecord.value(QStringLiteral("boardResultText")).toString());
+        response.insert(QStringLiteral("effective_result_text"), updatedRecord.value(QStringLiteral("resultText")).toString());
+        response.insert(QStringLiteral("cloud_review_result"), updatedRecord.value(QStringLiteral("cloudReviewResult")).toString());
+        sendJsonResponse(socket, 200, response);
+    }
+
+    /*
+     * requestAuthorized 的作用：
+     *   校验云端请求携带的 token。
+     *
+     * 参数：
+     *   headers 是小写 header 名到原始值的映射。
+     *
+     * 返回值：
+     *   未配置 token 时返回 true；配置 token 时必须匹配请求头。
+     */
+    bool requestAuthorized(const QMap<QString, QString> &headers) const
+    {
+        if (m_token.isEmpty()) {
+            return true;
+        }
+
+        const QString headerToken = headers.value(QStringLiteral("x-board-token")).trimmed();
+        const QString authorization = headers.value(QStringLiteral("authorization")).trimmed();
+        const QString bearerPrefix = QStringLiteral("Bearer ");
+
+        if (headerToken == m_token) {
+            return true;
+        }
+
+        if (authorization.startsWith(bearerPrefix, Qt::CaseInsensitive)
+                && authorization.mid(bearerPrefix.length()).trimmed() == m_token) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /*
+     * sendJsonResponse 的作用：
+     *   把 JSON 对象编码成 HTTP 响应并关闭连接。
+     *
+     * 参数：
+     *   socket 是当前客户端连接。
+     *   statusCode 是 HTTP 状态码。
+     *   object 是响应 JSON 对象。
+     */
+    void sendJsonResponse(QTcpSocket *socket, int statusCode, const QJsonObject &object)
+    {
+        const QByteArray payload = QJsonDocument(object).toJson(QJsonDocument::Compact);
+        const QByteArray reason = httpReasonPhrase(statusCode);
+        QByteArray response;
+
+        response += "HTTP/1.1 " + QByteArray::number(statusCode) + " " + reason + "\r\n";
+        response += "Content-Type: application/json; charset=utf-8\r\n";
+        response += "Access-Control-Allow-Origin: *\r\n";
+        response += "Access-Control-Allow-Headers: Content-Type, X-Board-Token, Authorization\r\n";
+        response += "Access-Control-Allow-Methods: POST, OPTIONS\r\n";
+        response += "Connection: close\r\n";
+        response += "Content-Length: " + QByteArray::number(payload.size()) + "\r\n\r\n";
+        response += payload;
+
+        socket->write(response);
+        socket->flush();
+        socket->disconnectFromHost();
+    }
+
+    /*
+     * parseHeaders 的作用：
+     *   把 HTTP 头部行解析成小写键值映射。
+     *
+     * 参数：
+     *   headerLines 是按换行拆分后的 HTTP 头部。
+     *
+     * 返回值：
+     *   返回 header 名到值的映射；请求行会被跳过。
+     */
+    QMap<QString, QString> parseHeaders(const QList<QByteArray> &headerLines) const
+    {
+        QMap<QString, QString> headers;
+
+        for (int i = 1; i < headerLines.size(); i++) {
+            const QByteArray line = headerLines.at(i).trimmed();
+            const int colon = line.indexOf(':');
+
+            if (colon <= 0) {
+                continue;
+            }
+
+            const QString key = QString::fromLatin1(line.left(colon)).trimmed().toLower();
+            const QString value = QString::fromUtf8(line.mid(colon + 1)).trimmed();
+
+            headers.insert(key, value);
+        }
+
+        return headers;
+    }
+
+    /*
+     * httpContentLength 的作用：
+     *   从 HTTP 头部读取 Content-Length，未提供时按 0 处理。
+     *
+     * 参数：
+     *   headerBytes 是 HTTP 头部原始字节。
+     *
+     * 返回值：
+     *   返回请求体字节数；非法时返回 0。
+     */
+    int httpContentLength(const QByteArray &headerBytes) const
+    {
+        const QList<QByteArray> lines = headerBytes.split('\n');
+
+        for (const QByteArray &line : lines) {
+            const QByteArray trimmed = line.trimmed();
+
+            if (!trimmed.toLower().startsWith("content-length:")) {
+                continue;
+            }
+
+            bool ok = false;
+            const int value = trimmed.mid(strlen("content-length:")).trimmed().toInt(&ok);
+
+            return ok && value > 0 ? value : 0;
+        }
+
+        return 0;
+    }
+
+    /*
+     * jsonOkObject 的作用：
+     *   生成统一成功响应基础对象。
+     */
+    QJsonObject jsonOkObject(const QString &message) const
+    {
+        QJsonObject object;
+
+        object.insert(QStringLiteral("ok"), true);
+        object.insert(QStringLiteral("message"), message);
+        return object;
+    }
+
+    /*
+     * jsonErrorObject 的作用：
+     *   生成统一失败响应基础对象。
+     */
+    QJsonObject jsonErrorObject(const QString &errorText) const
+    {
+        QJsonObject object;
+
+        object.insert(QStringLiteral("ok"), false);
+        object.insert(QStringLiteral("error"), errorText);
+        return object;
+    }
+
+    /*
+     * httpReasonPhrase 的作用：
+     *   把常用 HTTP 状态码转换成响应行说明。
+     */
+    QByteArray httpReasonPhrase(int statusCode) const
+    {
+        switch (statusCode) {
+        case 200:
+            return "OK";
+        case 400:
+            return "Bad Request";
+        case 401:
+            return "Unauthorized";
+        case 404:
+            return "Not Found";
+        default:
+            return "Internal Server Error";
+        }
+    }
+
+    /*
+     * environmentString 的作用：
+     *   读取字符串环境变量，空值时返回默认值。
+     */
+    QString environmentString(const QString &name, const QString &defaultValue) const
+    {
+        const QByteArray value = qgetenv(name.toLatin1().constData());
+
+        return value.isEmpty() ? defaultValue : QString::fromUtf8(value).trimmed();
+    }
+
+    /*
+     * environmentInt 的作用：
+     *   读取整数环境变量，并限制到指定范围。
+     */
+    int environmentInt(const QString &name, int defaultValue, int minValue, int maxValue) const
+    {
+        bool ok = false;
+        const int value = QString::fromUtf8(qgetenv(name.toLatin1().constData())).trimmed().toInt(&ok);
+
+        if (!ok) {
+            return defaultValue;
+        }
+
+        return qBound(minValue, value, maxValue);
+    }
+
+    /*
+     * loadReviewTokenFromEnvironment 的作用：
+     *   读取 BOARD_REVIEW_TOKEN；若环境变量未设置，则从 cos-upload.env 中读取同名配置。
+     *
+     * 返回值：
+     *   返回 token 文本；不存在时返回空字符串。
+     */
+    QString loadReviewTokenFromEnvironment() const
+    {
+        const QString envToken = QString::fromUtf8(qgetenv("BOARD_REVIEW_TOKEN")).trimmed();
+
+        if (!envToken.isEmpty()) {
+            return envToken;
+        }
+
+        return readTokenFromEnvFile(QString::fromUtf8(qgetenv("CLOUD_UPLOAD_ENV_FILE")).trimmed().isEmpty()
+                                    ? QStringLiteral("/root/qt_camera_display/cos-upload.env")
+                                    : QString::fromUtf8(qgetenv("CLOUD_UPLOAD_ENV_FILE")).trimmed());
+    }
+
+    /*
+     * readTokenFromEnvFile 的作用：
+     *   从 shell 风格 env 文件中读取 BOARD_REVIEW_TOKEN='...' 这类配置。
+     *
+     * 参数：
+     *   filePath 是 env 文件路径。
+     *
+     * 返回值：
+     *   找到 token 返回其值；文件不存在或未配置时返回空字符串。
+     */
+    QString readTokenFromEnvFile(const QString &filePath) const
+    {
+        QFile file(filePath);
+
+        if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            return QString();
+        }
+
+        while (!file.atEnd()) {
+            const QString line = QString::fromUtf8(file.readLine()).trimmed();
+
+            if (!line.startsWith(QStringLiteral("BOARD_REVIEW_TOKEN="))) {
+                continue;
+            }
+
+            QString value = line.mid(QStringLiteral("BOARD_REVIEW_TOKEN=").length()).trimmed();
+
+            if ((value.startsWith(QLatin1Char('\'')) && value.endsWith(QLatin1Char('\'')))
+                    || (value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"')))) {
+                value = value.mid(1, value.length() - 2);
+            }
+
+            return value.trimmed();
+        }
+
+        return QString();
+    }
+
+    /*
+     * setListenStatus 的作用：
+     *   更新监听状态并通知 QML。
+     */
+    void setListenStatus(const QString &text)
+    {
+        if (m_listenStatusText == text) {
+            return;
+        }
+
+        m_listenStatusText = text;
+        emit listenStatusChanged();
+    }
+
+    QTcpServer m_server;                 /* m_server 是板端复核回写 HTTP 监听器。 */
+    UploadHistoryModel *m_historyModel;  /* m_historyModel 指向本地历史模型，不拥有生命周期。 */
+    QString m_token;                     /* m_token 保存 BOARD_REVIEW_TOKEN，用于校验云端请求。 */
+    QString m_listenStatusText;          /* m_listenStatusText 保存监听状态，便于 QML 或日志排查。 */
 };
 
 /*
@@ -1968,14 +2759,22 @@ public:
 
         QThread *workerThread = QThread::create([sourcePath,
                                                  annotatedPaths,
+                                                 classificationResult,
                                                  cloudResult,
                                                  workerResult]() {
             CameraStorageController workerController;
 
             workerController.setAppendHistoryInSave(false);
+            const QString retryPartCode =
+                workerController.partCodeFromClassificationResult(classificationResult);
+            const QString retryClassLabel =
+                workerController.parseTokenValue(classificationResult, QStringLiteral("class"));
+
             *workerResult = workerController.uploadDetectImagesToCos(sourcePath,
                                                                      annotatedPaths,
-                                                                     cloudResult);
+                                                                     cloudResult,
+                                                                     retryPartCode,
+                                                                     retryClassLabel);
         });
 
         if (workerThread == nullptr) {
@@ -2585,6 +3384,7 @@ private:
         entry.resultText = uploadResult.startsWith(QStringLiteral("上传成功："))
             ? QStringLiteral("良品")
             : QStringLiteral("待复核");
+        entry.boardResultText = entry.resultText;
         entry.workflowText = uploadResult.startsWith(QStringLiteral("上传成功："))
             ? QStringLiteral("云端已归档")
             : QStringLiteral("本地已保存");
@@ -2634,6 +3434,7 @@ private:
 
         entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
         entry.resultText = historyTextFromFusedResult(fusedResult);
+        entry.boardResultText = entry.resultText;
         entry.workflowText = QStringLiteral("综合%1；分类%2；UNet%3；%4")
             .arg(fusedResult.reason)
             .arg(fusedResult.classifyBad ? QStringLiteral("BAD") : QStringLiteral("GOOD"))
@@ -2782,19 +3583,25 @@ private:
      *   1. 优先使用 /root/qt_camera_display/defect-cos-upload，匹配部署脚本路径。
      *   2. 传入 --jpg <source> 和多次 --annotated <result>。
      *   3. 通过 CLOUD_RESULT 把本次模型 GOOD/BAD/REVIEW 显式传给上传脚本。
-     *   4. 捕获 stdout/stderr，返回适合界面提示和历史记录的一行结果。
+     *   4. 通过 CLOUD_PART_CODE 把本次零件类型传给上传脚本；好坏后缀已提前剥离。
+     *   5. 通过 CLOUD_CLASS_LABEL 保留模型原始标签，便于云端排查零件映射。
+     *   6. 捕获 stdout/stderr，返回适合界面提示和历史记录的一行结果。
      *
      * 参数：
      *   sourcePath 是云端 file_kind=source 的原始检测图。
      *   annotatedPaths 是云端 file_kind=annotated 的所有模型结果图。
      *   cloudResult 是云端记录 result 字段，只允许 good、bad 或 review。
+     *   partCode 是云端零件类型候选，例如 gasket；同一零件 good/bad 必须传同一个值。
+     *   classLabel 是模型原始分类标签，例如 gasket_good；只用于 device_context 排障。
      *
      * 返回值：
      *   上传成功返回“上传成功：...”；失败返回“上传失败：...”。
      */
     QString uploadDetectImagesToCos(const QString &sourcePath,
                                     const QStringList &annotatedPaths,
-                                    const QString &cloudResult = QStringLiteral("review")) const
+                                    const QString &cloudResult = QStringLiteral("review"),
+                                    const QString &partCode = QString(),
+                                    const QString &classLabel = QString()) const
     {
         QProcess process;
         QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -2824,9 +3631,17 @@ private:
                 << "script" << scriptPath
                 << "source" << sourcePath
                 << "annotated" << annotatedPaths
-                << "cloudResult" << normalizedCloudResult;
+                << "cloudResult" << normalizedCloudResult
+                << "partCode" << partCode
+                << "classLabel" << classLabel;
 
         env.insert(QStringLiteral("CLOUD_RESULT"), normalizedCloudResult);
+        if (!partCode.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_PART_CODE"), partCode.trimmed());
+        }
+        if (!classLabel.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_CLASS_LABEL"), classLabel.trimmed());
+        }
         process.setProcessEnvironment(env);
         process.setProgram(scriptPath);
         process.setArguments(arguments);
@@ -2869,6 +3684,42 @@ private:
         }
 
         return QStringLiteral("上传成功：JPG/PNG 已上传到 COS");
+    }
+
+    /*
+     * partCodeFromClassificationResult 的作用：
+     *   从分类 RESULT 行中提取云端零件类型候选，并剥离 good/bad 好坏后缀。
+     *
+     * 主要流程：
+     *   1. 读取 class=<label>，例如 gasket_good、gasket_bad、washer_good。
+     *   2. 只删除最后的 `_good/_bad/-good/-bad` 后缀，保留真实零件名。
+     *   3. 返回值只表示零件类型，不表示本次检测好坏；好坏由 CLOUD_RESULT 单独传递。
+     *
+     * 参数：
+     *   classificationResult 是 defect-classify 输出的一行 RESULT。
+     *
+     * 返回值：
+     *   成功返回零件类型候选，例如 gasket；没有 class 字段时返回空字符串。
+     */
+    QString partCodeFromClassificationResult(const QString &classificationResult) const
+    {
+        QString classLabel = parseTokenValue(classificationResult, QStringLiteral("class")).trimmed();
+
+        if (classLabel.isEmpty()) {
+            return QString();
+        }
+
+        const QString lowerLabel = classLabel.toLower();
+
+        if (lowerLabel.endsWith(QStringLiteral("_good"))
+            || lowerLabel.endsWith(QStringLiteral("-good"))) {
+            classLabel.chop(5);
+        } else if (lowerLabel.endsWith(QStringLiteral("_bad"))
+                   || lowerLabel.endsWith(QStringLiteral("-bad"))) {
+            classLabel.chop(4);
+        }
+
+        return classLabel.trimmed();
     }
 
     /*
@@ -2991,7 +3842,11 @@ private:
             modelsReadyCallback(modelResult);
         }
         cloudResult = cloudResultFromFusedResult(fusedResult);
-        uploadResult = uploadDetectImagesToCos(bundle->sourcePath, bundle->annotatedPaths, cloudResult);
+        uploadResult = uploadDetectImagesToCos(bundle->sourcePath,
+                                               bundle->annotatedPaths,
+                                               cloudResult,
+                                               partCodeFromClassificationResult(classificationResult),
+                                               parseTokenValue(classificationResult, QStringLiteral("class")));
         bundle->uploadResult = uploadResult;
 
         return modelResult
@@ -5046,6 +5901,9 @@ int main(int argc, char *argv[])
     /* uploadHistory 保存每次保存/上传动作的本地历史记录，QML 历史页直接读取它。 */
     UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
 
+    /* cloudReviewServer 接收云端按钮回写的最终复核结论，并更新 upload_history.json。 */
+    CloudReviewServer cloudReviewServer(&uploadHistory);
+
     /* 保存控制器拿到历史模型后，保存/上传完成时可以立即追加一条记录。 */
     storageController.setHistoryModel(&uploadHistory);
 
@@ -5078,6 +5936,9 @@ int main(int argc, char *argv[])
     /* 把上传历史模型暴露给 QML，历史记录页面用它生成横向滑动卡片和详情页。 */
     view.rootContext()->setContextProperty(QStringLiteral("uploadHistory"), &uploadHistory);
 
+    /* 把云端复核回写服务暴露给 QML，后续状态栏或告警页可展示监听状态。 */
+    view.rootContext()->setContextProperty(QStringLiteral("cloudReviewServer"), &cloudReviewServer);
+
     /* 从 qrc 资源加载主界面，避免板端部署时遗漏单独的 QML 文件。 */
     view.setSource(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
 
@@ -5104,6 +5965,9 @@ int main(int argc, char *argv[])
 
     /* 窗口显示后启动第一轮设备健康检测；所有耗时探测均异步执行，不阻塞界面触摸。 */
     deviceHealth.start();
+
+    /* Qt 事件循环启动前先打开云端复核回写端口，云端按钮可按 record_id 修改本地历史。 */
+    cloudReviewServer.startFromEnvironment();
 
     /* gst-qml 后端需要在窗口 show 之后绑定 qmlglsink，确保 Qt Quick 窗口已进入可曝光状态。 */
     if (actualVideoBackend == QString::fromLatin1(BACKEND_GST_QML)) {

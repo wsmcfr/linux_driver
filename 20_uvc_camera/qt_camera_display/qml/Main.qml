@@ -199,6 +199,9 @@ Rectangle {
     /* selectedHistoryRecord 保存当前选中记录的完整详情字段，QML 详情页统一从这里取值。 */
     property var selectedHistoryRecord: uploadHistory.entryAt(selectedHistoryIndex)
 
+    /* historyAnalysisDetailVisible 表示是否打开检测信息完整说明浮层，解决云端长文在小面板中显示不全。 */
+    property bool historyAnalysisDetailVisible: false
+
     /* dxPixels 表示视觉中心偏差演示值，后续由 tracking_service 写入。 */
     property int dxPixels: 3
 
@@ -705,7 +708,8 @@ Rectangle {
      * 主要流程：
      *   1. 空类别返回“未知零件”。
      *   2. 对 `gasket_good`、`washer_bad` 这类命名，去掉最后的 good/bad 后缀。
-     *   3. 其它类别名原样返回，避免未来新增类别时被错误截断。
+     *   3. 已知垫圈类编码转换成标准具体零件类型，避免把历史训练标签 `gasket` 显示成“垫片”。
+     *   4. 其它类别名原样返回，避免未来新增类别时被错误截断。
      *
      * 参数：
      *   classText 是 RESULT 行里的 class 字段。
@@ -719,11 +723,21 @@ Rectangle {
         }
 
         if (classText.length > 5 && classText.substring(classText.length - 5) === "_good") {
-            return classText.substring(0, classText.length - 5)
+            classText = classText.substring(0, classText.length - 5)
         }
 
         if (classText.length > 4 && classText.substring(classText.length - 4) === "_bad") {
-            return classText.substring(0, classText.length - 4)
+            classText = classText.substring(0, classText.length - 4)
+        }
+
+        if (classText === "gasket" || classText === "wave_washer") {
+            return "波形垫圈"
+        }
+        if (classText === "washer") {
+            return "平垫圈"
+        }
+        if (classText === "splitwasher") {
+            return "弹性垫圈"
         }
 
         return classText
@@ -1397,6 +1411,7 @@ Rectangle {
             focusLatestHistoryListRecord()
         } else {
             historyDetailVisible = false
+            historyAnalysisDetailVisible = false
             selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
         }
 
@@ -1453,6 +1468,7 @@ Rectangle {
             selectedHistoryImageIndex = 0
             selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
             historyDetailVisible = false
+            historyAnalysisDetailVisible = false
             return
         }
 
@@ -1460,6 +1476,7 @@ Rectangle {
         selectedHistoryImageIndex = 0
         selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
         historyDetailVisible = false
+        historyAnalysisDetailVisible = false
         positionHistoryListAtSelected()
     }
 
@@ -1482,6 +1499,7 @@ Rectangle {
         selectedHistoryImageIndex = 0
         selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
         historyDetailVisible = true
+        historyAnalysisDetailVisible = false
     }
 
     /*
@@ -1592,6 +1610,7 @@ Rectangle {
      */
     function backToHistoryList() {
         historyDetailVisible = false
+        historyAnalysisDetailVisible = false
         positionHistoryListAtSelected()
     }
 
@@ -1757,7 +1776,7 @@ Rectangle {
      * 主要流程：
      *   1. 空类别和占位类别原样返回，避免检测前显示异常。
      *   2. 删除类别名前缀中的 good/bad 后缀，只保留零件族和良坏方向。
-     *   3. 常见垫圈类别转换成中文短词，让 182px 结果面板也能完整显示。
+     *   3. 常见垫圈类别转换成标准具体零件类型，让 182px 结果面板也能完整显示。
      *
      * 参数：
      *   classText 是分类模型输出的类别名，例如 splitwasher_good。
@@ -1776,11 +1795,13 @@ Rectangle {
         var baseText = rawText.replace(/_good/g, "").replace(/_bad/g, "")
 
         if (baseText === "splitwasher") {
-            baseText = "弹垫"
+            baseText = "弹性垫圈"
         } else if (baseText === "washer") {
-            baseText = "平垫"
+            baseText = "平垫圈"
         } else if (baseText === "gasket") {
-            baseText = "垫片"
+            baseText = "波形垫圈"
+        } else if (baseText === "wave_washer") {
+            baseText = "波形垫圈"
         }
 
         if (isGood) {
@@ -1888,14 +1909,139 @@ Rectangle {
         var resultText = record && record.resultText ? record.resultText : ""
 
         if (resultText === "良品") {
+            if (record && record.cloudReviewResult && record.cloudReviewResult.length > 0) {
+                return "云端复核后确认该零件为良品，板端原始结论为" + record.boardResultText + "。"
+            }
+
             return "分类和UNet均未发现缺陷，系统认为该零件可以进入良品流程。"
         }
 
+        if (resultText === "坏品") {
+            if (record && record.cloudReviewResult && record.cloudReviewResult.length > 0) {
+                return "云端复核后确认该零件为坏品，板端原始结论为" + record.boardResultText + "。"
+            }
+
+            return "系统认为该零件存在缺陷，应进入坏品流程。"
+        }
+
         if (resultText === "待复核") {
+            if (record && record.cloudReviewResult && record.cloudReviewResult.length > 0) {
+                return "云端复核后仍要求人工复核，板端原始结论为" + record.boardResultText + "。"
+            }
+
             return "分类或UNet发现可疑缺陷，建议人工复核后再分拣。"
         }
 
         return "该记录需要结合图片和云端状态确认。"
+    }
+
+    /*
+     * historyCloudReviewResultText 的作用：
+     *   把云端 good/bad/review 复核结果转换成中文显示文本。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   返回“良品”“坏品”“待复核”或“未修正”。
+     */
+    function historyCloudReviewResultText(record) {
+        var resultText = record && record.cloudReviewResult ? record.cloudReviewResult : ""
+
+        if (resultText === "good") {
+            return "良品"
+        }
+        if (resultText === "bad") {
+            return "坏品"
+        }
+        if (resultText === "review") {
+            return "待复核"
+        }
+
+        return "未修正"
+    }
+
+    /*
+     * historyCloudReviewText 的作用：
+     *   生成历史详情里显示的云端修正说明。
+     *
+     * 主要流程：
+     *   1. 旧记录或未被云端修正的记录显示“暂无云端复核修正”。
+     *   2. 有云端回写时显示修正结果、板端原始结论、原因、操作人和时间。
+     *   3. 原因来自云端点击“修正板端结果”按钮后的弹窗输入，不能为空。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   返回适合检测信息区展示的一行中文说明。
+     */
+    function historyCloudReviewText(record) {
+        if (!record || !record.cloudReviewResult || record.cloudReviewResult.length <= 0) {
+            return "暂无云端复核修正，本地结论以双模型综合判定为准。"
+        }
+
+        var text = "云端改为" + historyCloudReviewResultText(record)
+        var boardText = record.boardResultText && record.boardResultText.length > 0 ? record.boardResultText : "未知"
+        text += "，板端原始结论：" + boardText
+
+        if (record.cloudReviewText && record.cloudReviewText.length > 0) {
+            text += "，原因：" + record.cloudReviewText
+        }
+        if (record.cloudReviewOperator && record.cloudReviewOperator.length > 0) {
+            text += "，操作人：" + record.cloudReviewOperator
+        }
+        if (record.cloudReviewTime && record.cloudReviewTime.length > 0) {
+            text += "，时间：" + record.cloudReviewTime
+        }
+
+        return text + "。"
+    }
+
+    /*
+     * historyResultFillColor 的作用：
+     *   按历史记录最终展示结论生成结果卡片背景色。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   良品为绿色背景，坏品为红色背景，其它为黄色复核背景。
+     */
+    function historyResultFillColor(record) {
+        var resultText = record && record.resultText ? record.resultText : ""
+
+        if (resultText === "良品") {
+            return "#173524"
+        }
+        if (resultText === "坏品") {
+            return "#3a1b1f"
+        }
+
+        return "#3a2a1c"
+    }
+
+    /*
+     * historyResultBorderColor 的作用：
+     *   按历史记录最终展示结论生成结果卡片边框色。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   良品绿色，坏品红色，待复核黄色。
+     */
+    function historyResultBorderColor(record) {
+        var resultText = record && record.resultText ? record.resultText : ""
+
+        if (resultText === "良品") {
+            return root.accentGreen
+        }
+        if (resultText === "坏品") {
+            return root.accentRed
+        }
+
+        return root.accentAmber
     }
 
     /*
@@ -1986,6 +2132,99 @@ Rectangle {
         }
 
         return String(lineText).replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "")
+    }
+
+    /*
+     * historyAnalysisSummaryText 的作用：
+     *   生成历史详情固定高度小面板里的短摘要，避免云端长文直接把内容挤出面板。
+     *
+     * 主要流程：
+     *   1. 优先显示最终检测结论，让操作员先理解结果。
+     *   2. 有模型可信度时补一条短可信度说明。
+     *   3. 最后提示可以打开完整说明查看全部云端和模型文本。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   返回适合 1024x600 右侧卡片显示的 2 到 3 行摘要。
+     */
+    function historyAnalysisSummaryText(record) {
+        var lines = []
+
+        lines.push("结论：" + historyReadableInspectionText(record))
+        if (record && record.classificationResult && record.classificationResult.length > 0) {
+            lines.push("可信度：" + historyConfidenceSummaryText(record))
+        } else {
+            lines.push("可信度：暂无模型可信度数据。")
+        }
+        lines.push("详情：点击查看完整说明，可读完云端修正、UNet 提示和原始模型输出。")
+
+        return compactHistoryInfoLine(lines.join(" "))
+    }
+
+    /*
+     * historyPartNameText 的作用：
+     *   从历史记录自身的分类结果中还原零件类型，避免查看旧记录时误用当前首页的零件状态。
+     *
+     * 主要流程：
+     *   1. 优先读取 classification_result 里的 class 字段。
+     *   2. 复用 detectPartNameFromClass() 的垫圈类标准名称映射。
+     *   3. 没有分类字段时返回“见云端记录”，提示操作员以云端详情为准。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   返回历史记录对应的具体零件类型显示名。
+     */
+    function historyPartNameText(record) {
+        if (record && record.classificationResult && record.classificationResult.length > 0) {
+            var classText = resultTokenValue(record.classificationResult, "class")
+            if (classText.length > 0) {
+                return detectPartNameFromClass(classText)
+            }
+        }
+
+        return "见云端记录"
+    }
+
+    /*
+     * historyFullAnalysisText 的作用：
+     *   生成可滚动浮层中的完整检测说明，保留短摘要之外的所有排障信息。
+     *
+     * 主要流程：
+     *   1. 用分行文本展示零件身份、检测结论、可信度、缺陷提示和图片留档。
+     *   2. 云端修正说明单独成行，避免被固定小面板截断。
+     *   3. 附加分类和 UNet 原始输出，便于现场排查模型标签和置信度。
+     *
+     * 参数：
+     *   record 是当前历史记录详情。
+     *
+     * 返回值：
+     *   返回多行完整文本，供 Flickable 内的 Text 组件滚动阅读。
+     */
+    function historyFullAnalysisText(record) {
+        var lines = []
+
+        lines.push("零件类型：" + historyPartNameText(record))
+        lines.push("检测结论：" + historyReadableInspectionText(record))
+        lines.push(record && record.classificationResult && record.classificationResult.length > 0
+                   ? "可信度：" + historyConfidenceSummaryText(record)
+                   : "可信度：暂无模型可信度数据。")
+        lines.push("缺陷提示：" + historyDefectHintText(record))
+        lines.push("图片留档：" + historyImageArchiveText(record))
+        lines.push("云端修正：" + historyCloudReviewText(record))
+        lines.push("云端状态：" + cloudStatusSummary(record ? record.uploadStatus : ""))
+
+        if (record && record.classificationResult && record.classificationResult.length > 0) {
+            lines.push("分类模型原始输出：" + compactHistoryInfoLine(record.classificationResult))
+        }
+        if (record && record.segmentationResult && record.segmentationResult.length > 0) {
+            lines.push("UNet 原始输出：" + compactHistoryInfoLine(record.segmentationResult))
+        }
+
+        return lines.join("\n")
     }
 
     /*
@@ -2091,6 +2330,20 @@ Rectangle {
     }
 
     /*
+     * isBadRecord 的作用：
+     *   判断一条历史记录是否为坏品，统计页用它统计云端修正后的坏品数量。
+     *
+     * 参数：
+     *   record 是 uploadHistory.entryAt() 返回的历史记录对象。
+     *
+     * 返回值：
+     *   resultText 等于“坏品”时返回 true；其它记录返回 false。
+     */
+    function isBadRecord(record) {
+        return record && record.resultText === "坏品"
+    }
+
+    /*
      * historyRecordBytes 的作用：
      *   返回一条历史记录所有图片的总字节数，兼容旧记录只有 jpg/png 两个大小字段的格式。
      *
@@ -2139,16 +2392,17 @@ Rectangle {
      *
      * 主要流程：
      *   1. 遍历 uploadHistory 的每条记录。
-     *   2. 统计良品、待复核、上传成功、上传失败、图片数量和文件大小。
+     *   2. 统计良品、坏品、待复核、上传成功、上传失败、图片数量和文件大小。
      *   3. 保存最近一条记录的时间、云端编号和状态摘要，便于右侧云端健康区展示。
      *
      * 返回值：
-     *   返回一个普通 JS 对象，包含 total、good、review、uploadSuccess、uploadFailed 等字段。
+     *   返回一个普通 JS 对象，包含 total、good、bad、review、uploadSuccess、uploadFailed 等字段。
      */
     function statsSummary() {
         var summary = {
             total: uploadHistory.count,
             good: 0,
+            bad: 0,
             review: 0,
             uploadSuccess: 0,
             uploadFailed: 0,
@@ -2166,6 +2420,8 @@ Rectangle {
 
             if (isGoodRecord(record)) {
                 summary.good += 1
+            } else if (isBadRecord(record)) {
+                summary.bad += 1
             } else {
                 summary.review += 1
             }
@@ -2218,7 +2474,7 @@ Rectangle {
 
     /*
      * statsDistributionBars 的作用：
-     *   生成良品、待复核、上传成功、上传失败四条水平分布条的数据。
+     *   生成良品、坏品、待复核、上传成功、上传失败五条水平分布条的数据。
      *
      * 返回值：
      *   返回数组，每项包含 name、value、total、percent 和 color。
@@ -2228,6 +2484,7 @@ Rectangle {
 
         return [
             {"name": "良品", "value": summary.good, "total": summary.total, "percent": percentText(summary.good, summary.total), "color": root.accentGreen},
+            {"name": "坏品", "value": summary.bad, "total": summary.total, "percent": percentText(summary.bad, summary.total), "color": root.accentRed},
             {"name": "待复核", "value": summary.review, "total": summary.total, "percent": percentText(summary.review, summary.total), "color": root.accentAmber},
             {"name": "上传成功", "value": summary.uploadSuccess, "total": summary.total, "percent": percentText(summary.uploadSuccess, summary.total), "color": "#5aa7ff"},
             {"name": "上传失败", "value": summary.uploadFailed, "total": summary.total, "percent": percentText(summary.uploadFailed, summary.total), "color": root.accentRed}
@@ -2411,6 +2668,18 @@ Rectangle {
                 selectedHistoryIndex = uploadHistory.count - 1
                 selectedHistoryImageIndex = 0
                 selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
+            }
+        }
+
+        /*
+         * onDataChanged 的作用：
+         *   云端复核回写会原地修改某条历史记录，详情页保存的是 entryAt() 的快照。
+         *   如果当前打开的详情正好被云端修正，必须重新读取该行，才能立刻显示云端原因。
+         */
+        onDataChanged: {
+            if (root.selectedHistoryIndex >= 0
+                    && root.selectedHistoryIndex < uploadHistory.count) {
+                root.selectedHistoryRecord = uploadHistory.entryAt(root.selectedHistoryIndex)
             }
         }
     }
@@ -3333,8 +3602,8 @@ Rectangle {
                             width: 64
                             height: 28
                             radius: 6
-                            color: resultText === "良品" ? "#173524" : "#3a301a"
-                            border.color: resultText === "良品" ? root.accentGreen : root.accentAmber
+                            color: resultText === "良品" ? "#173524" : (resultText === "坏品" ? "#3a1b1f" : "#3a301a")
+                            border.color: resultText === "良品" ? root.accentGreen : (resultText === "坏品" ? root.accentRed : root.accentAmber)
                             border.width: 1
 
                             Text {
@@ -3596,8 +3865,8 @@ Rectangle {
                     width: parent.width
                     height: 54
                     radius: 8
-                    color: root.selectedHistoryRecord.resultText === "良品" ? "#173524" : "#3a2a1c"
-                    border.color: root.selectedHistoryRecord.resultText === "良品" ? root.accentGreen : root.accentAmber
+                    color: root.historyResultFillColor(root.selectedHistoryRecord)
+                    border.color: root.historyResultBorderColor(root.selectedHistoryRecord)
                     border.width: 1
 
                     Text {
@@ -3762,55 +4031,133 @@ Rectangle {
 
                         Text {
                             width: parent.width
-                            text: root.compactHistoryInfoLine("检测结论：" + root.historyReadableInspectionText(root.selectedHistoryRecord))
+                            text: root.historyAnalysisSummaryText(root.selectedHistoryRecord)
                             color: "#c9d1d5"
                             font.pixelSize: 10
                             wrapMode: Text.Wrap
-                            maximumLineCount: 2
+                            maximumLineCount: 5
                             elide: Text.ElideRight
                             lineHeightMode: Text.ProportionalHeight
-                            lineHeight: 0.86
+                            lineHeight: 0.92
                         }
 
-                        Text {
+                        Rectangle {
                             width: parent.width
-                            text: root.compactHistoryInfoLine(root.selectedHistoryRecord.classificationResult
-                                  && root.selectedHistoryRecord.classificationResult.length > 0
-                                  ? "可信度：" + root.historyConfidenceSummaryText(root.selectedHistoryRecord)
-                                  : "可信度：暂无模型可信度数据。")
-                            color: "#c9d1d5"
-                            font.pixelSize: 10
-                            wrapMode: Text.Wrap
-                            maximumLineCount: 2
-                            elide: Text.ElideRight
-                            lineHeightMode: Text.ProportionalHeight
-                            lineHeight: 0.86
-                        }
+                            height: 28
+                            radius: 7
+                            color: historyAnalysisDetailMouse.pressed ? "#30413a" : "#1f332b"
+                            border.color: root.accentGreen
+                            border.width: 1
 
-                        Text {
-                            width: parent.width
-                            text: root.compactHistoryInfoLine("缺陷提示：" + root.historyDefectHintText(root.selectedHistoryRecord))
-                            color: "#c9d1d5"
-                            font.pixelSize: 10
-                            wrapMode: Text.Wrap
-                            maximumLineCount: 2
-                            elide: Text.ElideRight
-                            lineHeightMode: Text.ProportionalHeight
-                            lineHeight: 0.86
-                        }
+                            Text {
+                                anchors.centerIn: parent
+                                text: "查看完整说明"
+                                color: "#eafff2"
+                                font.pixelSize: 12
+                                font.bold: true
+                            }
 
-                        Text {
-                            width: parent.width
-                            text: root.compactHistoryInfoLine("图片留档：" + root.historyImageArchiveText(root.selectedHistoryRecord))
-                            color: "#c9d1d5"
-                            font.pixelSize: 10
-                            wrapMode: Text.Wrap
-                            maximumLineCount: 1
-                            elide: Text.ElideRight
-                            lineHeightMode: Text.ProportionalHeight
-                            lineHeight: 0.86
+                            MouseArea {
+                                id: historyAnalysisDetailMouse
+                                anchors.fill: parent
+
+                                onClicked: {
+                                    root.historyAnalysisDetailVisible = true
+                                }
+                            }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: historyAnalysisDetailOverlay
+        anchors.fill: parent
+        z: 900
+        visible: root.historyAnalysisDetailVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.historyAnalysisDetailVisible = false
+            }
+        }
+
+        Rectangle {
+            width: 620
+            height: 438
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: root.accentGreen
+            border.width: 1
+            clip: true
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                text: "检测完整说明"
+                color: "#f1f4f5"
+                font.pixelSize: 18
+                font.bold: true
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 7
+                color: closeAnalysisDetailMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeAnalysisDetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.historyAnalysisDetailVisible = false
+                    }
+                }
+            }
+
+            Flickable {
+                id: analysisDetailFlickable
+                x: 18
+                y: 56
+                width: parent.width - 36
+                height: parent.height - 74
+                contentWidth: width
+                contentHeight: fullAnalysisText.height
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                Text {
+                    id: fullAnalysisText
+                    width: analysisDetailFlickable.width
+                    text: root.historyFullAnalysisText(root.selectedHistoryRecord)
+                    color: "#d7dee2"
+                    font.pixelSize: 15
+                    lineHeightMode: Text.ProportionalHeight
+                    lineHeight: 1.28
+                    wrapMode: Text.Wrap
                 }
             }
         }
@@ -3935,7 +4282,7 @@ Rectangle {
                     model: [
                         {"name": "总记录", "value": root.statsSummary().total, "note": "本地历史", "color": "#f0f4f5"},
                         {"name": "良品", "value": root.statsSummary().good, "note": root.percentText(root.statsSummary().good, root.statsSummary().total), "color": root.accentGreen},
-                        {"name": "待复核", "value": root.statsSummary().review, "note": root.percentText(root.statsSummary().review, root.statsSummary().total), "color": root.accentAmber},
+                        {"name": "坏品", "value": root.statsSummary().bad, "note": root.percentText(root.statsSummary().bad, root.statsSummary().total), "color": root.accentRed},
                         {"name": "上传成功率", "value": root.percentText(root.statsSummary().uploadSuccess, root.statsSummary().total), "note": root.statsSummary().uploadSuccess + "/" + root.statsSummary().total, "color": "#5aa7ff"},
                         {"name": "图片总量", "value": root.statsSummary().imageCount, "note": root.formatBytes(root.statsSummary().totalBytes), "color": "#f0f4f5"}
                     ]
@@ -4213,7 +4560,9 @@ Rectangle {
                                 width: 50
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: modelData.result
-                                color: modelData.result === "良品" ? root.accentGreen : root.accentAmber
+                                color: modelData.result === "良品" ? root.accentGreen
+                                      : modelData.result === "坏品" ? root.accentRed
+                                      : root.accentAmber
                                 font.pixelSize: 11
                                 font.bold: true
                             }

@@ -1,10 +1,12 @@
 <!--
   作用：
     qml.qrc 把 QML 文件嵌入到 Qt 资源系统，避免板端部署时遗漏 QML 文件。
+    compress="0" 明确关闭 QML 资源压缩，让部署后可以用 strings 在 ARM 二进制中
+    直接验证 historyAnalysisDetailOverlay、波形垫圈、查看完整说明等界面契约。
 -->
 <RCC>
     <qresource prefix="/">
-        <file>qml/Main.qml</file>
-        <file>qml/GstVideoSurface.qml</file>
+        <file compress="0">qml/Main.qml</file>
+        <file compress="0">qml/GstVideoSurface.qml</file>
     </qresource>
 </RCC>

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run STM32MP157 board review reverse tunnel check every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=yunduan-board-review-tunnel-check.service
+
+[Install]
+WantedBy=timers.target
