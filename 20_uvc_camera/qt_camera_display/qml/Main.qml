@@ -157,6 +157,27 @@ Rectangle {
     /* settingsLastActionText 保存参数页最近一次应用、保存或恢复默认的结果提示。 */
     property string settingsLastActionText: "UI目标值：尚未写JSON，尚未下发F4"
 
+    /* settingsDetailVisible 表示参数设置页是否打开策略详情浮层，用于承载小卡片放不下的完整说明。 */
+    property bool settingsDetailVisible: false
+
+    /* settingsDetailTitle 保存当前参数详情浮层标题，由视觉检测策略或 F4 接入边界入口写入。 */
+    property string settingsDetailTitle: ""
+
+    /* settingsDetailText 保存当前参数详情浮层正文，内容来自云端上传契约和当前板端接入边界。 */
+    property string settingsDetailText: ""
+
+    /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发送 CAL 命令。 */
+    property bool calibrationPopupVisible: false
+
+    /* calibrationWeightText 保存称重标定输入框中的克重文本，发送前会校验为 1~5000 的整数。 */
+    property string calibrationWeightText: "1000"
+
+    /* calibrationResultText 保存称重标定最近一次发送、成功或失败结果，便于操作员不看串口也能确认状态。 */
+    property string calibrationResultText: "放置砝码后输入克重，再发送 CAL 命令"
+
+    /* calibrationSending 表示当前 CAL 命令正在后台写入 F4 串口，发送完成前禁用重复点击。 */
+    property bool calibrationSending: false
+
     /* alarmCurrentCode 保存当前主告警码；运行期由相机、SD 卡、4G、云端、F4 和检测链路真实状态覆盖。 */
     property string alarmCurrentCode: "ALM-INIT"
 
@@ -180,6 +201,9 @@ Rectangle {
 
     /* alarmLastLogResult 保存最近一次自动告警日志落盘结果，便于保存诊断快照时一起记录。 */
     property string alarmLastLogResult: "尚未生成自动告警日志"
+
+    /* alarmAdviceDetailVisible 表示是否打开告警处理建议完整说明浮层，解决右下角建议面板文字显示不全。 */
+    property bool alarmAdviceDetailVisible: false
 
     /* historyDetailVisible 表示历史页是否进入“查看详情”二级页面；false 时只显示第一层检测记录列表。 */
     property bool historyDetailVisible: false
@@ -1166,6 +1190,253 @@ Rectangle {
     }
 
     /*
+     * settingsVisionDetailText 的作用：
+     *   生成参数页“视觉检测策略”的完整说明，说明 MP157 当前真正参与云端上报的数据和判定边界。
+     *
+     * 主要流程：
+     *   1. 按检测流水线说明原图保存、MobileNetV3-Small 分类、UNet 分割和综合判定。
+     *   2. 按云端契约说明 record_no、part_code、source/annotated 图片和断网补传的关系。
+     *   3. 明确当前参数页仍是 UI 目标值，尚未写 JSON，也不会直接改变模型文件。
+     *
+     * 返回值：
+     *   返回多行中文说明，供 settingsDetailFlickable 滚动显示。
+     */
+    function settingsVisionDetailText() {
+        var lines = [
+            "[检测流水线]",
+            "1. MP157 通过 KMS overlay 保存当前原始帧，原图作为 source 图片留档。",
+            "2. MobileNetV3-Small INT8 先输出零件类别、GOOD/BAD 初判和 top1 置信度。",
+            "3. UNet INT8 再输出缺陷 mask、overlay 和 raw 结果图，这些结果图作为 annotated 图片登记。",
+            "4. 综合规则保持保守：分类判坏或 UNet 检出缺陷像素时，最终结果不能直接判为良品。",
+            "5. 低于复核阈值的样本进入人工复核，不在本页伪装成自动分拣参数。",
+            "",
+            "[云端记录契约]",
+            "1. 每次检测必须生成稳定 record_no，断网补传继续复用同一个 record_no，避免云端重复记录。",
+            "2. 零件类型只在波形垫圈、平垫圈、弹性垫圈之间归一；wave_washer_good/bad 只能归到同一个 wave_washer。",
+            "3. POST /api/v1/records 顶层写 result、confidence_score、vision_context、decision_context 和 device_context。",
+            "4. 图片不直接塞进主记录，先创建记录，再申请 COS 预签名地址，最后登记 source/annotated 文件元数据。",
+            "5. source/annotated 上传成功后，历史详情才能完整展示原图、标注图、模型输出和云端记录号。",
+            "",
+            "[当前参数边界]",
+            "1. 本页模型阈值和复核阈值目前只是 UI 目标值：尚未写JSON，尚未下发F4。",
+            "2. 真正模型版本以板端部署的 ONNX Runtime、UNet 和 MobileNetV3-Small 模型文件为准。",
+            "3. COS 上传策略只影响界面目标值；断网时仍要保留 /mnt/sdcard/images 本地缓存，网络恢复后从历史记录重发。"
+        ]
+        return lines.join("\n")
+    }
+
+    /*
+     * settingsF4DetailText 的作用：
+     *   生成参数页“F4接入边界”的完整说明，避免把 MP157 页面误解成已经接管运动和分拣硬件。
+     *
+     * 主要流程：
+     *   1. 说明 MP157 与 F4 的串口状态字段，包括设备节点、波特率、心跳、CRC 和帧序号。
+     *   2. 说明 F4 负责采集或上报的光电、急停、限位、LDC1614、HX711 和 Emm42_V5.0 状态。
+     *   3. 明确 Qt 当前不直接下发速度、位置、剔除或联锁解除命令。
+     *
+     * 返回值：
+     *   返回多行中文说明，供 settingsDetailFlickable 滚动显示。
+     */
+    function settingsF4DetailText() {
+        var lines = [
+            "[串口接入]",
+            "1. 云端契约建议 MP157 通过 /dev/ttySTM1、115200 波特率接收 STM32F4 状态。",
+            "2. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
+            "3. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
+            "",
+            "[F4 上下文字段]",
+            "1. f4_io 记录 photoelectric_triggered、limit_switch_in、limit_switch_out 和 emergency_stop。",
+            "2. LDC1614 作为涡流/电感检测模块，建议上报 I2C 总线、地址、通道、原始码值、基线和判定。",
+            "3. HX711 作为称重模块，建议上报 DOUT/SCK 引脚、增益、原始 ADC、净重、稳定状态和过载状态。",
+            "4. Emm42_V5.0 闭环步进驱动由 F4 侧串口控制，记录目标速度、实际速度、位置误差、驱动故障和最近命令。",
+            "",
+            "[控制边界]",
+            "1. MP157 负责视觉推理、图片保存、COS 上传、历史补传和云端记录创建。",
+            "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
+            "3. 本页面不提供速度、位置、剔除动作、急停解除或联锁时序参数，避免绕过 F4 固件安全边界。",
+            "4. 后续若接入真实参数下发，需要先定义串口协议、ACK/NAK、CRC、状态回读和失败回滚流程。"
+        ]
+        return lines.join("\n")
+    }
+
+    /*
+     * openSettingsDetail 的作用：
+     *   根据用户点击的参数卡片入口打开对应完整说明浮层。
+     *
+     * 参数：
+     *   detailKey 是 vision 或 f4，用来决定标题和正文来源。
+     *
+     * 返回值：
+     *   无返回值；函数会更新 settingsDetailTitle、settingsDetailText 和 settingsDetailVisible。
+     */
+    function openSettingsDetail(detailKey) {
+        if (detailKey === "vision") {
+            settingsDetailTitle = "视觉检测策略详情"
+            settingsDetailText = settingsVisionDetailText()
+        } else if (detailKey === "f4") {
+            settingsDetailTitle = "F4接入边界详情"
+            settingsDetailText = settingsF4DetailText()
+        } else {
+            return
+        }
+        settingsDetailVisible = true
+        Qt.callLater(function() {
+            settingsDetailFlickable.contentY = 0
+        })
+    }
+
+    /*
+     * openCalibrationPopup 的作用：
+     *   打开称重标定弹窗，并把提示文案复位到当前 F4 串口状态。
+     *
+     * 主要流程：
+     *   1. 设置 calibrationPopupVisible 显示遮罩弹窗。
+     *   2. 清除上一次发送状态，保留用户最近使用的克重输入。
+     *   3. 立即触发一次 F4 STATUS 刷新，方便用户确认 RS485 链路是否在线。
+     *
+     * 返回值：
+     *   无返回值；弹窗状态由 QML 属性驱动。
+     */
+    function openCalibrationPopup() {
+        calibrationPopupVisible = true
+        calibrationSending = false
+        calibrationResultText = "F4状态：" + deviceHealth.f4StatusText + "，请放置砝码后发送CAL"
+        deviceHealth.refreshF4StatusNow()
+    }
+
+    /*
+     * selectCalibrationWeight 的作用：
+     *   处理弹窗中的快捷克重按钮，把常用砝码值写入输入框。
+     *
+     * 参数：
+     *   grams 是快捷按钮代表的克重，单位为 g。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 calibrationWeightText 和提示文案。
+     */
+    function selectCalibrationWeight(grams) {
+        calibrationWeightText = "" + grams
+        calibrationResultText = "已选择 " + grams + " g，确认砝码放稳后发送"
+    }
+
+    /*
+     * appendCalibrationDigit 的作用：
+     *   处理称重标定弹窗内置数字键盘的数字输入，让触摸屏不依赖系统软键盘也能输入任意克重。
+     *
+     * 主要流程：
+     *   1. 发送中的 CAL 命令不再允许改数值，避免界面显示和已下发命令不一致。
+     *   2. 把当前输入和新数字拼成候选值，并去掉前导零，保证显示始终是十进制整数文本。
+     *   3. 候选值超过 5000g 时拒绝追加，并在弹窗内提示操作员。
+     *
+     * 参数：
+     *   digit 是被点击的数字字符，取值为 "0" 到 "9"。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 calibrationWeightText 和 calibrationResultText。
+     */
+    function appendCalibrationDigit(digit) {
+        if (calibrationSending) {
+            calibrationResultText = "CAL发送中，暂不能修改克重"
+            return
+        }
+
+        var nextText = (calibrationWeightText + digit).replace(/^0+/, "")
+        if (nextText.length === 0) {
+            nextText = "0"
+        }
+
+        var nextValue = parseInt(nextText, 10)
+        if (nextValue > 5000) {
+            calibrationResultText = "克重不能超过5000g"
+            return
+        }
+
+        calibrationWeightText = nextText
+        calibrationResultText = "已输入 " + calibrationWeightText + " g，确认砝码放稳后发送"
+    }
+
+    /*
+     * backspaceCalibrationDigit 的作用：
+     *   处理称重标定数字键盘的退格键，每次删除最右侧一位数字。
+     *
+     * 主要流程：
+     *   1. 发送中的 CAL 命令不允许改输入框。
+     *   2. 删除最后一位后允许输入框为空，后续发送时由 sendCalibrationCommand() 统一提示范围错误。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 calibrationWeightText 和提示文案。
+     */
+    function backspaceCalibrationDigit() {
+        if (calibrationSending) {
+            calibrationResultText = "CAL发送中，暂不能修改克重"
+            return
+        }
+
+        calibrationWeightText = calibrationWeightText.substring(0, Math.max(0, calibrationWeightText.length - 1))
+        calibrationResultText = calibrationWeightText.length > 0
+            ? "已输入 " + calibrationWeightText + " g，确认砝码放稳后发送"
+            : "请输入1~5000g整数克重"
+    }
+
+    /*
+     * clearCalibrationWeight 的作用：
+     *   清空称重标定输入框，方便操作员重新输入任意砝码克重。
+     *
+     * 返回值：
+     *   无返回值；函数只清空 calibrationWeightText 并提示重新输入范围。
+     */
+    function clearCalibrationWeight() {
+        if (calibrationSending) {
+            calibrationResultText = "CAL发送中，暂不能修改克重"
+            return
+        }
+
+        calibrationWeightText = ""
+        calibrationResultText = "请输入1~5000g整数克重"
+    }
+
+    /*
+     * sendCalibrationCommand 的作用：
+     *   校验用户输入的标定克重，并通过 C++ DeviceHealthController 发送 `CAL <克重>`。
+     *
+     * 主要流程：
+     *   1. 去掉首尾空格后按十进制整数解析。
+     *   2. 限制 1~5000g，匹配当前 HX711 服务默认 5kg 量程。
+     *   3. 调用 deviceHealth.sendF4Command()，由 C++ 自动补 `\r\n` 并等待 F4 回复。
+     *
+     * 返回值：
+     *   无返回值；结果通过 calibrationResultText 和底部提示条反馈。
+     */
+    function sendCalibrationCommand() {
+        var trimmedText = calibrationWeightText.replace(/^\s+|\s+$/g, "")
+        var parsedWeight = parseInt(trimmedText, 10)
+
+        if (calibrationSending) {
+            calibrationResultText = "上一条CAL命令仍在发送中"
+            storageState = calibrationResultText
+            showStorageToast()
+            return
+        }
+
+        if (!/^[0-9]+$/.test(trimmedText) || parsedWeight < 1 || parsedWeight > 5000) {
+            calibrationResultText = "克重必须是1~5000之间的整数"
+            storageState = calibrationResultText
+            showStorageToast()
+            return
+        }
+
+        calibrationSending = true
+        calibrationWeightText = "" + parsedWeight
+        calibrationResultText = "正在发送 CAL " + parsedWeight + " ..."
+        storageState = calibrationResultText
+        showStorageToast()
+
+        if (!deviceHealth.sendF4Command("CAL " + parsedWeight)) {
+            calibrationSending = false
+        }
+    }
+
+    /*
      * changeSettingValue 的作用：
      *   统一处理参数页的加减按钮，保证每个参数都按固定步长变化并被限制在安全范围内。
      *
@@ -1350,6 +1621,76 @@ Rectangle {
             "先保存诊断快照，再查看最近设备健康详情和 Qt 日志。",
             "确认问题恢复后再执行清故障或重新检测。"
         ]
+    }
+
+    /*
+     * alarmFullAdviceText 的作用：
+     *   生成“查看全部”浮层里的完整告警处理建议，避免小面板只显示第一句导致现场排查信息不完整。
+     *
+     * 主要流程：
+     *   1. 先写当前告警和设备健康摘要，帮助操作员确认正在处理的对象。
+     *   2. 按固定顺序列出相机、SD 卡、4G、云端、F4、保存/上传和模型链路建议。
+     *   3. 每组建议复用 alarmSourceAdvice()，保证日志落盘文本和界面完整说明使用同一份排查内容。
+     *
+     * 返回值：
+     *   返回多行文本，供 alarmAdviceDetailFlickable 中的 Text 组件滚动阅读。
+     */
+    function alarmFullAdviceText() {
+        var groups = [
+            {"title": "当前告警", "key": alarmCleared ? "runtime-ok" : "current"},
+            {"title": "相机/KMS", "key": "camera-kms-no-frame"},
+            {"title": "SD 卡", "key": "sdcard-not-writable"},
+            {"title": "4G 网络", "key": "network-4g-offline"},
+            {"title": "云端上传", "key": "cloud-upload-failed"},
+            {"title": "云端 health", "key": "cloud-offline"},
+            {"title": "F4 串口", "key": "f4-heartbeat-lost"},
+            {"title": "保存链路", "key": "storage-save-failed"},
+            {"title": "模型检测", "key": "model-detect-failed"}
+        ]
+        var lines = [
+            "告警码：" + alarmCurrentCode,
+            "告警名称：" + alarmCurrentTitle,
+            "处理状态：" + alarmCurrentStatusText(),
+            "设备健康：" + deviceHealthSummaryText(),
+            ""
+        ]
+
+        for (var groupIndex = 0; groupIndex < groups.length; ++groupIndex) {
+            var group = groups[groupIndex]
+            var adviceKey = group.key
+            if (adviceKey === "current") {
+                if (alarmCurrentCode.indexOf("CAM") >= 0) {
+                    adviceKey = "camera-kms-no-frame"
+                } else if (alarmCurrentCode.indexOf("SD") >= 0) {
+                    adviceKey = "sdcard-not-writable"
+                } else if (alarmCurrentCode.indexOf("NET") >= 0) {
+                    adviceKey = "network-4g-offline"
+                } else if (alarmCurrentCode.indexOf("UPLOAD") >= 0) {
+                    adviceKey = "cloud-upload-failed"
+                } else if (alarmCurrentCode.indexOf("CLOUD") >= 0) {
+                    adviceKey = "cloud-offline"
+                } else if (alarmCurrentCode.indexOf("SAVE") >= 0) {
+                    adviceKey = "storage-save-failed"
+                } else if (alarmCurrentCode.indexOf("F4") >= 0) {
+                    adviceKey = "f4-heartbeat-lost"
+                } else if (alarmCurrentCode.indexOf("MODEL") >= 0) {
+                    adviceKey = "model-detect-failed"
+                } else {
+                    adviceKey = "runtime-ok"
+                }
+            }
+
+            lines.push("[" + group.title + "]")
+            var advice = alarmSourceAdvice(adviceKey)
+            for (var adviceIndex = 0; adviceIndex < advice.length; ++adviceIndex) {
+                lines.push((adviceIndex + 1) + ". " + advice[adviceIndex])
+            }
+            if (groupIndex + 1 < groups.length) {
+                lines.push("")
+            }
+        }
+
+        return lines.join("\n")
     }
 
     /*
@@ -1731,6 +2072,9 @@ Rectangle {
         }
 
         activePage = pageName
+        alarmAdviceDetailVisible = false
+        settingsDetailVisible = false
+        calibrationPopupVisible = false
 
         if (pageName === "history") {
             focusLatestHistoryListRecord()
@@ -3052,6 +3396,28 @@ Rectangle {
          *   F4 串口握手状态变化后检查心跳类告警，避免只在顶部状态栏显示待接入。
          */
         onF4StatusChanged: {
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4CommandFinished 的作用：
+         *   接收 C++ 后台串口命令结果，更新称重标定弹窗和底部提示条。
+         *
+         * 参数：
+         *   ok 表示 F4 回复是否被 C++ 判定为成功。
+         *   detail 是 F4 返回文本或 C++ 侧失败原因。
+         */
+        onF4CommandFinished: {
+            root.calibrationSending = false
+            if (ok) {
+                root.calibrationResultText = "标定命令成功：" + detail
+                root.settingsLastActionText = "已下发 CAL " + root.calibrationWeightText + " g"
+            } else {
+                root.calibrationResultText = "标定命令失败：" + detail
+                root.settingsLastActionText = root.calibrationResultText
+            }
+            root.storageState = root.calibrationResultText
+            root.showStorageToast()
             root.evaluateRuntimeAlarms()
         }
 
@@ -6083,23 +6449,23 @@ Rectangle {
             }
 
             Column {
+                id: settingsVisionSummaryColumn
                 x: 14
                 y: 38
                 width: parent.width - 28
-                spacing: 7
+                spacing: 4
 
                 Repeater {
                     model: [
                         {"name": "分类模型", "value": "MobileNetV3 INT8", "color": root.accentGreen},
                         {"name": "分割复核", "value": "UNet 低频复核", "color": "#9fdcff"},
                         {"name": "低可信度", "value": "进入人工复核", "color": root.accentAmber},
-                        {"name": "ROI策略", "value": "中心区域检测", "color": "#eef3f4"},
-                        {"name": "配置状态", "value": "尚未写JSON", "color": "#9aa5ab"}
+                        {"name": "ROI策略", "value": "中心区域检测", "color": "#eef3f4"}
                     ]
 
                     Row {
                         width: parent.width
-                        height: 20
+                        height: 18
                         spacing: 8
 
                         Rectangle {
@@ -6131,6 +6497,45 @@ Rectangle {
                         }
                     }
                 }
+            }
+
+            Rectangle {
+                width: 86
+                height: 26
+                radius: 7
+                anchors.right: parent.right
+                anchors.rightMargin: 14
+                y: 132
+                color: settingsVisionDetailMouse.pressed ? "#30413a" : "#1f332b"
+                border.color: root.accentGreen
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "查看详情"
+                    color: "#eafff2"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: settingsVisionDetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.openSettingsDetail("vision")
+                    }
+                }
+            }
+
+            Text {
+                x: 14
+                y: 132
+                width: parent.width - 120
+                text: "配置状态：尚未写JSON"
+                color: "#8f9aa1"
+                font.pixelSize: 11
+                elide: Text.ElideRight
             }
         }
 
@@ -6167,23 +6572,23 @@ Rectangle {
             }
 
             Column {
+                id: settingsMotionSummaryColumn
                 x: 14
                 y: 38
                 width: parent.width - 28
-                spacing: 7
+                spacing: 4
 
                 Repeater {
                     model: [
                         {"name": "运动控制", "value": "由F4固件执行", "color": "#9fdcff"},
                         {"name": "分拣动作", "value": "依赖F4联锁", "color": "#9fdcff"},
                         {"name": "参数通道", "value": "串口协议预留", "color": root.accentAmber},
-                        {"name": "页面作用", "value": "只展示目标值", "color": "#eef3f4"},
-                        {"name": "生效状态", "value": "尚未下发F4", "color": root.accentAmber}
+                        {"name": "页面作用", "value": "只展示目标值", "color": "#eef3f4"}
                     ]
 
                     Row {
                         width: parent.width
-                        height: 20
+                        height: 18
                         spacing: 8
 
                         Rectangle {
@@ -6217,14 +6622,61 @@ Rectangle {
                 }
             }
 
-            Text {
+            Rectangle {
                 x: 14
                 y: 132
-                width: parent.width - 28
-                text: "Qt不直接控制运动/分拣"
-                color: "#8f9aa1"
-                font.pixelSize: 11
-                elide: Text.ElideRight
+                width: 92
+                height: 26
+                radius: 7
+                color: calibrationOpenMouse.pressed ? "#273940" : "#1d3036"
+                border.color: "#5aa7ff"
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "称重标定"
+                    color: "#e8f5ff"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: calibrationOpenMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.openCalibrationPopup()
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 86
+                height: 26
+                radius: 7
+                anchors.right: parent.right
+                anchors.rightMargin: 14
+                y: 132
+                color: settingsF4DetailMouse.pressed ? "#3c3322" : "#33291b"
+                border.color: root.accentAmber
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "查看详情"
+                    color: "#fff3d5"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: settingsF4DetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.openSettingsDetail("f4")
+                    }
+                }
             }
         }
 
@@ -6262,7 +6714,6 @@ Rectangle {
                         {"name": "采集参数", "value": root.captureWidth + "x" + root.captureHeight + "@" + root.captureFps + "fps", "color": "#eef3f4"},
                         {"name": "视频后端", "value": root.videoBackend, "color": root.usingKmsOverlay ? root.accentGreen : root.accentAmber},
                         {"name": "背光", "value": "常亮", "color": root.accentGreen},
-                        {"name": "补光", "value": root.manualLightLevel + " 档", "color": root.accentAmber},
                         {"name": "SD目录", "value": "/mnt/sdcard/images", "color": "#eef3f4"},
                         {"name": "COS上传", "value": root.settingsAutoUpload ? "自动上传" : "本地保存", "color": root.settingsAutoUpload ? root.accentGreen : root.accentAmber}
                     ]
@@ -6428,6 +6879,431 @@ Rectangle {
                                 root.settingsApplyAction(modelData.action)
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: settingsDetailOverlay
+        anchors.fill: parent
+        z: 890
+        visible: root.settingsDetailVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.settingsDetailVisible = false
+            }
+        }
+
+        Rectangle {
+            width: 640
+            height: 438
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: root.accentGreen
+            border.width: 1
+            clip: true
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 126
+                text: root.settingsDetailTitle
+                color: "#f1f4f5"
+                font.pixelSize: 18
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 7
+                color: closeSettingsDetailMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeSettingsDetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.settingsDetailVisible = false
+                    }
+                }
+            }
+
+            Flickable {
+                id: settingsDetailFlickable
+                x: 18
+                y: 56
+                width: parent.width - 36
+                height: parent.height - 74
+                contentWidth: width
+                contentHeight: fullSettingsDetailText.height
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                Text {
+                    id: fullSettingsDetailText
+                    width: settingsDetailFlickable.width
+                    text: root.settingsDetailText
+                    color: "#d7dee2"
+                    font.pixelSize: 15
+                    lineHeightMode: Text.ProportionalHeight
+                    lineHeight: 1.26
+                    wrapMode: Text.Wrap
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: calibrationPopup
+        anchors.fill: parent
+        z: 895
+        visible: root.calibrationPopupVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                if (!root.calibrationSending) {
+                    root.calibrationPopupVisible = false
+                }
+            }
+        }
+
+        Rectangle {
+            width: 572
+            height: 560
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: "#5aa7ff"
+            border.width: 1
+            clip: true
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 122
+                text: "称重标定"
+                color: "#f1f4f5"
+                font.pixelSize: 20
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 7
+                color: closeCalibrationMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+                opacity: root.calibrationSending ? 0.45 : 1.0
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeCalibrationMouse
+                    anchors.fill: parent
+                    enabled: !root.calibrationSending
+
+                    onClicked: {
+                        root.calibrationPopupVisible = false
+                    }
+                }
+            }
+
+            Text {
+                x: 18
+                y: 54
+                width: parent.width - 36
+                height: 42
+                text: "F4状态：" + deviceHealth.f4StatusText + "；串口 /dev/ttySTM2 115200；发送格式 CAL <克重>"
+                color: "#cfd7db"
+                font.pixelSize: 13
+                font.bold: true
+                wrapMode: Text.Wrap
+            }
+
+            Rectangle {
+                x: 18
+                y: 104
+                width: parent.width - 36
+                height: 58
+                radius: 8
+                color: "#171b1e"
+                border.color: "#344149"
+                border.width: 1
+
+                Text {
+                    x: 14
+                    y: 9
+                    text: "标定克重(g)"
+                    color: "#9aa5ab"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                TextInput {
+                    id: calibrationWeightInput
+                    x: 128
+                    y: 8
+                    width: 168
+                    height: 42
+                    text: root.calibrationWeightText
+                    color: "#ffffff"
+                    selectionColor: root.accentGreen
+                    selectedTextColor: "#101214"
+                    font.pixelSize: 24
+                    font.bold: true
+                    horizontalAlignment: TextInput.AlignHCenter
+                    verticalAlignment: TextInput.AlignVCenter
+                    inputMethodHints: Qt.ImhDigitsOnly
+                    validator: IntValidator {
+                        bottom: 1
+                        top: 5000
+                    }
+
+                    onTextChanged: {
+                        root.calibrationWeightText = text
+                    }
+                }
+
+                Text {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 14
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 190
+                    text: "范围 1~5000g，推荐先空载 TARE，再放砝码标定"
+                    color: "#8f9aa1"
+                    font.pixelSize: 11
+                    wrapMode: Text.Wrap
+                }
+            }
+
+            Grid {
+                id: calibrationQuickGrid
+                x: 18
+                y: 178
+                width: parent.width - 36
+                columns: 4
+                rowSpacing: 8
+                columnSpacing: 8
+
+                Repeater {
+                    model: [100, 500, 1000, 2000]
+
+                    Rectangle {
+                        width: (calibrationQuickGrid.width - 24) / 4
+                        height: 36
+                        radius: 7
+                        color: quickWeightMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData + " g"
+                            color: "#eafff2"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: quickWeightMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.selectCalibrationWeight(modelData)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 426
+                width: parent.width - 36
+                height: 74
+                radius: 7
+                color: "#141719"
+                border.color: root.calibrationResultText.indexOf("失败") >= 0
+                              || root.calibrationResultText.indexOf("必须") >= 0
+                              ? root.accentRed : "#344149"
+                border.width: 1
+
+                Flickable {
+                    id: calibrationResultFlickable
+                    anchors.left: parent.left
+                    anchors.leftMargin: 12
+                    anchors.right: parent.right
+                    anchors.rightMargin: 12
+                    anchors.top: parent.top
+                    anchors.topMargin: 8
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 8
+                    clip: true
+                    contentWidth: width
+                    contentHeight: calibrationResultTextItem.height
+                    flickableDirection: Flickable.VerticalFlick
+
+                    Text {
+                        id: calibrationResultTextItem
+                        width: calibrationResultFlickable.width
+                        text: root.calibrationResultText
+                        color: root.calibrationResultText.indexOf("失败") >= 0
+                               || root.calibrationResultText.indexOf("必须") >= 0
+                               ? "#ffd6dc" : "#dce3e6"
+                        font.pixelSize: 12
+                        font.bold: true
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+
+            Grid {
+                id: calibrationKeypadGrid
+                x: 18
+                y: 226
+                width: parent.width - 36
+                columns: 3
+                rowSpacing: 8
+                columnSpacing: 8
+
+                Repeater {
+                    model: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "清空", "0", "退格"]
+
+                    Rectangle {
+                        width: (calibrationKeypadGrid.width - 16) / 3
+                        height: 44
+                        radius: 7
+                        color: keypadMouse.pressed ? "#26323a" : "#1a2024"
+                        border.color: modelData === "清空" || modelData === "退格" ? "#5aa7ff" : "#344149"
+                        border.width: 1
+                        opacity: root.calibrationSending ? 0.45 : 1.0
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData
+                            color: modelData === "清空" || modelData === "退格" ? "#d9ecff" : "#f1f4f5"
+                            font.pixelSize: 15
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: keypadMouse
+                            anchors.fill: parent
+                            enabled: !root.calibrationSending
+
+                            onClicked: {
+                                if (modelData === "清空") {
+                                    root.clearCalibrationWeight()
+                                } else if (modelData === "退格") {
+                                    root.backspaceCalibrationDigit()
+                                } else {
+                                    root.appendCalibrationDigit(modelData)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 508
+                width: 168
+                height: 40
+                radius: 8
+                color: refreshF4ForCalMouse.pressed ? "#3c3322" : "#33291b"
+                border.color: root.accentAmber
+                border.width: 1
+                opacity: root.calibrationSending ? 0.45 : 1.0
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "刷新F4状态"
+                    color: "#fff3d5"
+                    font.pixelSize: 13
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: refreshF4ForCalMouse
+                    anchors.fill: parent
+                    enabled: !root.calibrationSending
+
+                    onClicked: {
+                        deviceHealth.refreshF4StatusNow()
+                        root.calibrationResultText = "已发送 STATUS，等待F4状态刷新"
+                    }
+                }
+            }
+
+            Rectangle {
+                x: parent.width - 198
+                y: 508
+                width: 180
+                height: 40
+                radius: 8
+                color: sendCalibrationMouse.pressed ? "#30413a" : "#1f332b"
+                border.color: root.accentGreen
+                border.width: 1
+                opacity: root.calibrationSending ? 0.55 : 1.0
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.calibrationSending ? "发送中..." : "发送CAL"
+                    color: "#eafff2"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: sendCalibrationMouse
+                    anchors.fill: parent
+                    enabled: !root.calibrationSending
+
+                    onClicked: {
+                        root.sendCalibrationCommand()
                     }
                 }
             }
@@ -6682,7 +7558,7 @@ Rectangle {
                         {"name": "云端", "value": deviceHealth.cloudStatusText, "color": deviceHealth.cloudStatusColor},
                         {"name": "KMS视频", "value": root.usingKmsOverlay ? deviceHealth.cameraStatusText : "预览/桥接", "color": root.usingKmsOverlay ? deviceHealth.cameraStatusColor : root.accentAmber},
                         {"name": "背光", "value": "常亮", "color": root.accentGreen},
-                        {"name": "配置", "value": root.settingsPartType, "color": "#5aa7ff"}
+                        {"name": "4G", "value": deviceHealth.networkStatusText, "color": deviceHealth.networkStatusColor}
                     ]
 
                     Rectangle {
@@ -6938,11 +7814,132 @@ Rectangle {
                 x: 14
                 anchors.bottom: parent.bottom
                 anchors.bottomMargin: 12
-                width: parent.width - 28
+                width: parent.width - 128
                 text: "确认不等于解除联锁，最终以 F4 状态为准。"
                 color: "#8f9aa1"
                 font.pixelSize: 11
                 elide: Text.ElideRight
+            }
+
+            Rectangle {
+                width: 96
+                height: 28
+                radius: 7
+                anchors.right: parent.right
+                anchors.rightMargin: 14
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 10
+                color: alarmAdviceDetailMouse.pressed ? "#30413a" : "#1f332b"
+                border.color: root.accentGreen
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "查看全部"
+                    color: "#eafff2"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: alarmAdviceDetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.alarmAdviceDetailVisible = true
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: alarmAdviceDetailOverlay
+        anchors.fill: parent
+        z: 900
+        visible: root.alarmAdviceDetailVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.alarmAdviceDetailVisible = false
+            }
+        }
+
+        Rectangle {
+            width: 640
+            height: 438
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: root.accentAmber
+            border.width: 1
+            clip: true
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                text: "处理建议完整说明"
+                color: "#f1f4f5"
+                font.pixelSize: 18
+                font.bold: true
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 7
+                color: closeAlarmAdviceDetailMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeAlarmAdviceDetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.alarmAdviceDetailVisible = false
+                    }
+                }
+            }
+
+            Flickable {
+                id: alarmAdviceDetailFlickable
+                x: 18
+                y: 56
+                width: parent.width - 36
+                height: parent.height - 74
+                contentWidth: width
+                contentHeight: fullAlarmAdviceText.height
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                Text {
+                    id: fullAlarmAdviceText
+                    width: alarmAdviceDetailFlickable.width
+                    text: root.alarmFullAdviceText()
+                    color: "#d7dee2"
+                    font.pixelSize: 15
+                    lineHeightMode: Text.ProportionalHeight
+                    lineHeight: 1.26
+                    wrapMode: Text.Wrap
+                }
             }
         }
     }

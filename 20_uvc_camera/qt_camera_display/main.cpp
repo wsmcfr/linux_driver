@@ -41,7 +41,7 @@
 #include <QDateTime>            /* QDateTime 用于记录每次上传完成时的本地时间。 */
 #include <QDebug>               /* QDebug/qWarning 用于输出 GStreamer 初始化失败原因。 */
 #include <QDir>                 /* QDir 用于创建 SD 卡图片保存目录和历史记录目录。 */
-#include <QElapsedTimer>        /* QElapsedTimer 用于统计双模型串行检测总耗时。 */
+#include <QElapsedTimer>        /* QElapsedTimer 用于统计双模型串行检测总耗时，也用于限制 F4 心跳发送周期。 */
 #include <QFile>                /* QFile 用于读写上传历史 JSON 文件。 */
 #include <QFileInfo>            /* QFileInfo 用于判断 COS 上传脚本、图片文件和历史文件状态。 */
 #include <QGuiApplication>      /* QGuiApplication 是 Qt Quick 图形程序的应用对象。 */
@@ -143,7 +143,7 @@ static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-c
 static const char *DEFAULT_4G_PPP_SCRIPT = "4g-ppp";
 
 /* 默认云端健康地址；与 defect-cos-upload 的默认后端保持一致。 */
-static const char *DEFAULT_CLOUD_HEALTH_URL = "http://119.91.65.122/health";
+static const char *DEFAULT_CLOUD_HEALTH_URL = "http://139.9.35.72/health";
 
 /* 默认 F4 串口节点；真实接入时只有握手成功才显示接入。 */
 static const char *DEFAULT_F4_SERIAL_DEVICE = "/dev/ttySTM2";
@@ -153,6 +153,9 @@ static const int DEFAULT_F4_SERIAL_BAUD = 115200;
 
 /* 默认 F4 握手命令；用户已确认没有现成协议时先按 STATUS 查询实现。 */
 static const char *DEFAULT_F4_HEALTH_QUERY = "STATUS\r\n";
+
+/* F4 心跳发送间隔，单位毫秒；120000ms 等于 2 分钟，避免 Qt 每 8 秒健康刷新都占用 RS485 串口。 */
+static const int F4_HEARTBEAT_INTERVAL_MS = 120000;
 
 /* 板端缺陷分类推理程序默认路径，首页“检测”按钮会通过 QProcess 调用它。 */
 static const char *DEFAULT_DEFECT_CLASSIFY_BIN = "/root/qt_camera_display/defect-classify";
@@ -4500,10 +4503,17 @@ public:
           m_networkProbeRunning(false),
           m_cloudProbeRunning(false),
           m_f4ProbeRunning(false),
+          m_f4CommandRunning(false),
           m_overlayProbeRunning(false),
           m_networkProbeTimedOut(false),
           m_cloudProbeTimedOut(false)
     {
+        /*
+         * m_f4HeartbeatElapsed 只用于控制周期心跳节奏。
+         * invalidate() 让第一次 startF4Probe(false) 不受 2 分钟间隔限制，程序启动后能立即确认 F4 是否在线。
+         */
+        m_f4HeartbeatElapsed.invalidate();
+
         /* 主健康定时器只调度后台刷新，间隔放慢到 8 秒，避免顶部状态频繁跳动或频繁跑外设测试。 */
         m_healthTimer.setInterval(8000);
         m_healthTimer.setSingleShot(false);
@@ -4591,7 +4601,102 @@ public:
         refreshOverlayCameraStatus();
         startNetworkProbe();
         startCloudProbe();
-        startF4Probe();
+        startF4Probe(false);
+    }
+
+    /*
+     * refreshF4StatusNow 的作用：
+     *   供 QML 或人工操作立即触发一次 F4 STATUS 握手。
+     *
+     * 主要流程：
+     *   1. 不改变 4G、相机、云端和 SD 卡状态，只操作 F4 串口。
+     *   2. 使用 forceNow=true 绕过 2 分钟心跳节流，便于用户刚接好线后立刻验证。
+     *
+     * 返回值：
+     *   无返回值；握手完成后通过 f4StatusChanged 和 detailTextChanged 通知 QML。
+     */
+    Q_INVOKABLE void refreshF4StatusNow()
+    {
+        startF4Probe(true);
+    }
+
+    /*
+     * sendF4Command 的作用：
+     *   从 QML 发送一条 F4 文本命令，例如称重标定 `CAL 1000`。
+     *
+     * 主要流程：
+     *   1. 拒绝空命令和非 CAL 命令，避免参数页误变成任意运动控制串口终端。
+     *   2. 自动补齐 `\r\n`，保证与 F407 文本命令解析入口一致。
+     *   3. 在后台线程打开 `/dev/ttySTM2` 发送命令并短暂等待 F4 文本回复。
+     *
+     * 参数：
+     *   commandText 是 QML 传入的命令正文，不要求自带行结束符。
+     *
+     * 返回值：
+     *   true 表示后台发送任务已启动；false 表示参数非法或已有命令正在发送。
+     */
+    Q_INVOKABLE bool sendF4Command(const QString &commandText)
+    {
+        QString command = commandText.trimmed();
+
+        if (command.isEmpty()) {
+            emit f4CommandFinished(false, QStringLiteral("F4命令为空"));
+            return false;
+        }
+
+        /*
+         * 目前界面只开放称重标定命令。
+         * 传送带、机械臂和联锁类命令仍由 F4 固件和后续 MotionController 接管，避免在参数页绕开安全边界。
+         */
+        if (!command.startsWith(QStringLiteral("CAL "))) {
+            emit f4CommandFinished(false, QStringLiteral("当前界面只允许发送 CAL <克重> 标定命令"));
+            return false;
+        }
+
+        if (m_f4CommandRunning) {
+            emit f4CommandFinished(false, QStringLiteral("上一条F4命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4CommandFinished(false, QStringLiteral("F4状态刷新仍在进行，请稍后再发送CAL"));
+            return false;
+        }
+
+        if (!command.endsWith(QStringLiteral("\r\n"))) {
+            command += QStringLiteral("\r\n");
+        }
+
+        m_f4CommandRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+
+        QThread *workerThread = QThread::create([self, dev, command, baud]() {
+            QString detail;
+            const bool ok = sendF4SerialCommand(dev, command, baud, &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4CommandFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            emit f4CommandFinished(false, QStringLiteral("F4命令线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
     }
 
 signals:
@@ -4612,6 +4717,9 @@ signals:
 
     /* detailTextChanged 通知 QML 最近检测详情已更新。 */
     void detailTextChanged();
+
+    /* f4CommandFinished 通知 QML 手动 F4 命令发送完成，并带回成功/失败详情。 */
+    void f4CommandFinished(bool ok, const QString &detail);
 
 private slots:
     /*
@@ -4772,6 +4880,31 @@ private slots:
             setF4Status(QStringLiteral("待接入"), QStringLiteral("#f4b942"));
             setDetailText(QStringLiteral("F4 待接入：") + detail);
         }
+    }
+
+    /*
+     * handleF4CommandFinished 的作用：
+     *   接收后台 F4 命令发送结果，并把结果同步给 QML 标定弹窗和顶部健康详情。
+     *
+     * 参数：
+     *   ok 为 true 表示命令已写入串口且回复中包含成功关键字。
+     *   detail 是串口回复文本或失败原因。
+     *
+     * 返回值：
+     *   无返回值；函数会释放发送忙标志并发出 f4CommandFinished 信号。
+     */
+    void handleF4CommandFinished(bool ok, const QString &detail)
+    {
+        m_f4CommandRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4 命令完成：") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4 命令失败：") + detail);
+        }
+
+        emit f4CommandFinished(ok, detail);
     }
 
 private:
@@ -4984,14 +5117,28 @@ private:
     /*
      * startF4Probe 的作用：
      *   在后台线程里执行 F4 串口握手，避免串口等待阻塞 QML。
+     *
+     * 参数：
+     *   forceNow 为 true 时立即发送 STATUS，适合人工点击刷新或标定前检查；
+     *   forceNow 为 false 时按 2 分钟间隔发送心跳，避免 8 秒健康刷新频繁占用 RS485。
+     *
+     * 返回值：
+     *   无返回值；后台线程完成后调用 handleF4ProbeFinished() 回写状态。
      */
-    void startF4Probe()
+    void startF4Probe(bool forceNow)
     {
-        if (m_f4ProbeRunning) {
+        if (m_f4ProbeRunning || m_f4CommandRunning) {
+            return;
+        }
+
+        if (!forceNow
+                && m_f4HeartbeatElapsed.isValid()
+                && m_f4HeartbeatElapsed.elapsed() < F4_HEARTBEAT_INTERVAL_MS) {
             return;
         }
 
         m_f4ProbeRunning = true;
+        m_f4HeartbeatElapsed.restart();
         QPointer<DeviceHealthController> self(this);
         const QString dev = m_f4Device;
         const QString query = m_f4Query;
@@ -5193,19 +5340,98 @@ private:
     }
 
     /*
-     * probeF4Serial 的作用：
-     *   打开串口、发送 STATUS 查询并等待短回复，判断 F4 是否真实接入。
+     * sendF4SerialCommand 的作用：
+     *   打开 MP157 到 F4 的 RS485/USART 串口，发送一条文本命令并等待短回复。
+     *
+     * 参数：
+     *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
+     *   command 是要发送的完整命令，调用方应保证已经包含 `\r\n`。
+     *   baud 是串口波特率，当前默认 115200。
+     *   detail 用于返回 F4 回复内容或失败原因，可为 NULL。
+     *
+     * 返回值：
+     *   回复中包含 ACK、OK、F4 或 READY 时返回 true；
+     *   回复中包含 ERROR、打开失败、配置失败、写入失败或等待超时时返回 false。
      */
-    static bool probeF4Serial(const QString &device, const QString &query, int baud, QString *detail)
+    static QString readF4ReplyText(int fd, QString *errorText)
+    {
+        QByteArray reply;                /* reply 保存本次串口命令收到的原始字节，最多保留 512 字节用于界面展示。 */
+        char buffer[128];                /* buffer 是单次 read 的临时缓冲，避免一次性栈空间过大。 */
+        QElapsedTimer elapsed;           /* elapsed 用于限制总等待时间，防止 F4 回包不带换行时线程长时间阻塞。 */
+
+        elapsed.start();
+        while (elapsed.elapsed() < 450 && reply.size() < 512) {
+            fd_set rfds;                 /* rfds 是 select 监听集合，只等待当前串口 fd 可读。 */
+            struct timeval tv;           /* tv 是每轮短等待时间，既能拼接多段回包，也不会卡住后台线程太久。 */
+
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 80000;
+
+            const int selected = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (selected < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errorText) {
+                    *errorText = QStringLiteral("读取 F4 回复失败");
+                }
+                return QString();
+            }
+
+            if (selected == 0) {
+                if (!reply.isEmpty()) {
+                    break;
+                }
+                continue;
+            }
+
+            const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
+            if (nread > 0) {
+                reply.append(buffer, static_cast<int>(nread));
+                if (reply.contains('\n')) {
+                    break;
+                }
+                continue;
+            }
+
+            if (nread == 0) {
+                break;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                continue;
+            }
+
+            if (errorText) {
+                *errorText = QStringLiteral("读取 F4 回复失败");
+            }
+            return QString();
+        }
+
+        if (reply.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("未收到 F4 回复");
+            }
+            return QString();
+        }
+
+        return QString::fromLocal8Bit(reply).trimmed();
+    }
+
+    static bool sendF4SerialCommand(const QString &device,
+                                    const QString &command,
+                                    int baud,
+                                    QString *detail)
     {
         const QByteArray devBytes = device.toLocal8Bit();
-        const QByteArray queryBytes = query.toLocal8Bit();
+        const QByteArray commandBytes = command.toLocal8Bit();
         int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
         struct termios tio;
-        fd_set rfds;
-        struct timeval tv;
-        char buffer[128];
-        QByteArray reply;
+        QString replyText;
+        QString readErrorText;
+        QByteArray replyUpper;
 
         if (fd < 0) {
             if (detail) {
@@ -5241,46 +5467,64 @@ private:
         }
 
         tcflush(fd, TCIOFLUSH);
-        if (!writeAllToFd(fd, queryBytes)) {
+        if (!writeAllToFd(fd, commandBytes)) {
             if (detail) {
-                *detail = QStringLiteral("写入 STATUS 查询失败");
+                *detail = QStringLiteral("写入 F4 命令失败");
             }
             ::close(fd);
             return false;
         }
         tcdrain(fd);
 
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 250000;
-
-        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
-            if (detail) {
-                *detail = QStringLiteral("未收到 STATUS 回复");
-            }
-            ::close(fd);
-            return false;
-        }
-
-        const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
+        replyText = readF4ReplyText(fd, &readErrorText);
         ::close(fd);
-        if (nread <= 0) {
+        if (replyText.isEmpty()) {
             if (detail) {
-                *detail = QStringLiteral("串口回复为空");
+                *detail = readErrorText.isEmpty() ? QStringLiteral("串口回复为空") : readErrorText;
             }
             return false;
         }
 
-        reply = QByteArray(buffer, static_cast<int>(nread)).toUpper();
-        if (reply.contains("ACK") || reply.contains("OK") || reply.contains("F4") || reply.contains("READY")) {
+        replyUpper = replyText.toLocal8Bit().toUpper();
+        if (replyUpper.contains("ERROR")) {
+            if (detail) {
+                *detail = QStringLiteral("F4返回错误：") + replyText;
+            }
+            return false;
+        }
+
+        if (replyUpper.contains("ACK")
+                || replyUpper.contains("OK")
+                || replyUpper.contains("F4")
+                || replyUpper.contains("READY")) {
+            if (detail) {
+                *detail = replyText;
+            }
             return true;
         }
 
         if (detail) {
-            *detail = QStringLiteral("回复不匹配：") + QString::fromLocal8Bit(reply.left(48));
+            *detail = QStringLiteral("回复不匹配：") + replyText;
         }
         return false;
+    }
+
+    /*
+     * probeF4Serial 的作用：
+     *   发送 STATUS 查询并复用通用串口命令等待逻辑，判断 F4 是否真实接入。
+     *
+     * 参数：
+     *   device 是 Linux TTY 节点。
+     *   query 是心跳查询命令，当前为 `STATUS\r\n`。
+     *   baud 是串口波特率。
+     *   detail 返回 F4 回复内容或失败原因。
+     *
+     * 返回值：
+     *   收到成功关键字返回 true；否则返回 false。
+     */
+    static bool probeF4Serial(const QString &device, const QString &query, int baud, QString *detail)
+    {
+        return sendF4SerialCommand(device, query, baud, detail);
     }
 
     /*
@@ -5393,6 +5637,7 @@ private:
     QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
     QString m_f4Query;                  /* m_f4Query 保存发给 F4 的握手查询。 */
     int m_f4Baud;                       /* m_f4Baud 保存 F4 串口波特率。 */
+    QElapsedTimer m_f4HeartbeatElapsed;  /* m_f4HeartbeatElapsed 记录上一次 STATUS 心跳发送时间，用于把周期心跳限制为 2 分钟一次。 */
     QString m_networkStatusText;        /* m_networkStatusText 保存网络状态文本。 */
     QString m_networkStatusColor;       /* m_networkStatusColor 保存网络状态颜色。 */
     QString m_cameraStatusText;         /* m_cameraStatusText 保存摄像头状态文本。 */
@@ -5410,6 +5655,7 @@ private:
     bool m_networkProbeRunning;         /* m_networkProbeRunning 防止网络检测任务堆积。 */
     bool m_cloudProbeRunning;           /* m_cloudProbeRunning 防止云端检测任务堆积。 */
     bool m_f4ProbeRunning;              /* m_f4ProbeRunning 防止串口检测线程堆积。 */
+    bool m_f4CommandRunning;            /* m_f4CommandRunning 防止 CAL 标定等手动命令并发写同一个 RS485 串口。 */
     bool m_overlayProbeRunning;         /* m_overlayProbeRunning 防止 overlay socket 查询重入。 */
     bool m_networkProbeTimedOut;        /* m_networkProbeTimedOut 标记当前 4G 进程已超时，finished 时不再覆盖超时状态。 */
     bool m_cloudProbeTimedOut;          /* m_cloudProbeTimedOut 标记当前云端进程已超时，finished 时不再覆盖超时状态。 */

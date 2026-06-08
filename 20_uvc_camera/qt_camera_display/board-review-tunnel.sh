@@ -21,7 +21,7 @@ set -u
 CLOUD_USER="${CLOUD_USER:-ubuntu}"
 
 # CLOUD_HOST 是云服务器公网 IP 或域名；板端主动连接它。
-CLOUD_HOST="${CLOUD_HOST:-119.91.65.122}"
+CLOUD_HOST="${CLOUD_HOST:-139.9.35.72}"
 
 # REMOTE_PORT 是云端本机回环监听端口，云端后端设备配置应访问 127.0.0.1:18081。
 REMOTE_PORT="${REMOTE_PORT:-18081}"

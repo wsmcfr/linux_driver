@@ -834,7 +834,7 @@ apply_runtime_overrides()
 apply_runtime_overrides
 
 # CLOUD_BASE_URL 是云端后端地址，默认使用当前项目已验证的轻量服务器地址。
-CLOUD_BASE_URL="${CLOUD_BASE_URL:-http://119.91.65.122}"
+CLOUD_BASE_URL="${CLOUD_BASE_URL:-http://139.9.35.72}"
 
 # CLOUD_COOKIE_FILE 保存后端登录态 Cookie，避免每次点击按钮都重复登录。
 CLOUD_COOKIE_FILE="${CLOUD_COOKIE_FILE:-/tmp/cloud_cookie.txt}"

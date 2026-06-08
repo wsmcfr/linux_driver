@@ -14,8 +14,15 @@
 | 早期静态首帧 | `fb_boot_splash` 在 Qt/GPU 启动前直接写 `/dev/fb0`，显示与 Qt 启动画面第一帧风格一致的静态启动图，减少纯黑屏空窗。 |
 | Qt 检测交互 | Qt 首页只保留 `检测` 和 `安全卸载`；`检测` 在后台线程保存当前帧、运行分类模型、运行 UNet、上传 COS 并写历史。分类模型完成后立即显示零件类型和类别，UNet 完成后立即显示双模型耗时，上传完成后才写入云端状态和历史记录。 |
 | 云端记录零件类型 | 检测上传时，板端把分类 `class=gasket_good/gasket_bad` 统一归一为零件类型 `gasket` 后优先映射云端 `part_id`；好坏只写入 `records.result`，不创建 `gasket_good/gasket_bad` 两种零件。若云端没有匹配零件，板端会发送 `part_code/part_name/part_category/auto_create_part=true`，由云端自动创建零件；`gasket` 是历史训练编码，业务显示为 `波形垫圈 / 垫圈类`，`washer` 显示为 `平垫圈 / 垫圈类`，`splitwasher` 显示为 `弹性垫圈 / 垫圈类`。 |
-| Qt 真实健康状态 | 顶部状态栏和告警设备健康矩阵由 `DeviceHealthController` 真实探测：4G 必须 `4g-ppp test` 通过才在线，KMS 相机必须 overlay `STATUS` 已出帧才在线，F4 必须串口 STATUS 握手成功才接入，云端必须 health 请求成功才已连接；健康检测每 8 秒后台刷新一次，网络/云端保留上一轮稳定状态，不在每轮刷新时闪回“检测中”。 |
+| Qt 真实健康状态 | 顶部状态栏和告警设备健康矩阵由 `DeviceHealthController` 真实探测：4G 必须 `4g-ppp test` 通过才在线，KMS 相机必须 overlay `STATUS` 已出帧才在线，F4 必须串口 STATUS 握手成功才接入，云端必须 health 请求成功才已连接；健康检测每 8 秒后台调度一次，F4 `STATUS\r\n` 心跳按 120 秒节流发送，网络/云端保留上一轮稳定状态，不在每轮刷新时闪回“检测中”。 |
 | 云端复核回写 | 最终运行时由板端开机自启 `S91board-review-tunnel` 主动建立并守护 `ssh -R 127.0.0.1:18081:127.0.0.1:18080`；云端后端访问本机 `127.0.0.1:18081` 回写板端，云端 systemd timer 只负责周期检查和记录，不负责主动连回 NAT 后面的板端。 |
+
+## 2026-05-21 本次经验总结
+
+| 主题 | 做了什么 | 怎么测试 |
+|---|---|---|
+| F4 RS485 心跳节流 | Qt 仍然每 8 秒刷新整机健康状态，但 F4 `STATUS\r\n` 不再每轮都发；第一次启动或人工刷新会立即发送，常规后台心跳按 120 秒一次发送，避免长期占用 RS485。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" 20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`；板端用 `/root/uartapp /dev/ttySTM2 115200 send "STATUS\r\n"` 或 Qt 状态栏确认 F4 回复。 |
+| 称重标定弹窗 | 参数设置页 `F4接入边界` 卡片新增 `称重标定` 入口；弹窗内置屏幕数字键盘，可输入 1~5000g，也可选 100/500/1000/2000g，发送时由 C++ 后台线程向 `/dev/ttySTM2` 写 `CAL <克重>\r\n` 并等待 F4 回复；较长 F4 回包会在弹窗结果区多行滚动显示。 | 板端先放稳砝码，点击 `参数设置` -> `称重标定`，用 `清空`、数字键和 `退格` 输入 `750` 后点击 `发送CAL`；也可执行 `/root/uartapp /dev/ttySTM2 115200 send "CAL 750\r\n"` 对照。 |
 
 ## 2026-05-20 本次经验总结
 
@@ -51,8 +58,8 @@
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S90uvc-camera` | 板端开机自启入口，开发板重启后由 Buildroot `rcS` 调用。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/etc/init.d/S91board-review-tunnel` | 板端云端复核回写反向隧道自启入口，在 Qt 18080 回写服务启动后守护 `ssh -R`。 |
 | NFS rootfs：`/home/cfr/linux/nfs/rootfs/root/qt_camera_display/board-review-tunnel.sh` | 板端反向隧道 watchdog 脚本，断线后自动重连云端 `127.0.0.1:18081`。 |
-| `20_uvc_camera/qt_camera_display/main.cpp` | Qt 控制器保留旧后台保存自检入口，同时正式检测入口在后台完成当前帧保存、分类、UNet、COS 上传和历史记录写入，避免阻塞主界面触摸；新增 `DeviceHealthController`，异步探测 4G、相机、F4、云端和 SD 卡真实状态；4G 和云端进程启动失败通过 Qt 信号异步回写，不在状态刷新路径等待启动；相机离线后只重启 overlay 视频进程，不重启 Qt 界面。 |
-| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 首页不再暴露独立 `保存图片` 按钮；`检测` 按钮改为分阶段刷新结果，分类完成先显示零件/类别，UNet 完成再显示双模型耗时；顶部状态栏、手动页安全状态和告警页健康矩阵改为绑定真实 `deviceHealth` 状态；相机重新在线时必须等 Qt splash 完全淡出并停留在首页，才自动恢复 KMS 视频层可见性，避免摄像头画面早于 Qt 界面出现；统计页 `分布概览` 使用左右两列显示五项分布指标，避免上传失败条超出面板。 |
+| `20_uvc_camera/qt_camera_display/main.cpp` | Qt 控制器保留旧后台保存自检入口，同时正式检测入口在后台完成当前帧保存、分类、UNet、COS 上传和历史记录写入，避免阻塞主界面触摸；新增 `DeviceHealthController`，异步探测 4G、相机、F4、云端和 SD 卡真实状态；4G 和云端进程启动失败通过 Qt 信号异步回写，不在状态刷新路径等待启动；相机离线后只重启 overlay 视频进程，不重启 Qt 界面；F4 `STATUS\r\n` 心跳按 120 秒节流，新增 `sendF4Command()` 后台发送 `CAL <克重>\r\n` 标定命令。 |
+| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 首页不再暴露独立 `保存图片` 按钮；`检测` 按钮改为分阶段刷新结果，分类完成先显示零件/类别，UNet 完成再显示双模型耗时；顶部状态栏、手动页安全状态和告警页健康矩阵改为绑定真实 `deviceHealth` 状态；相机重新在线时必须等 Qt splash 完全淡出并停留在首页，才自动恢复 KMS 视频层可见性，避免摄像头画面早于 Qt 界面出现；统计页 `分布概览` 使用左右两列显示五项分布指标，避免上传失败条超出面板；参数设置页新增 `称重标定` 弹窗，支持输入克重后发送 `CAL <克重>`。 |
 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c` | 新增 overlay 控制命令 `STATUS`，返回 `has_frame/serial/visible/width/height`，供 Qt 判断 USB 摄像头是否真实出帧。 |
 | `20_uvc_camera/qt_camera_display/run_qt_kms_overlay_display.sh` | 新增 `restart-overlay`，只重启 `uvc_kms_overlay` 且保持视频层隐藏，用于 USB 摄像头热拔插恢复，不杀 Qt 界面；画面是否恢复显示由 QML 在首页状态下发送 `VISIBLE 1` 决定。 |
 | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 增加静态契约，禁止 QML 主线程直接同步调用 `saveCurrentFrameToSdCard()`，并检查真实设备健康控制器、overlay `STATUS`、`restart-overlay`、统计分布两列布局和健康检测不等待 `waitForStarted()` 的非阻塞契约。 |
@@ -90,6 +97,7 @@
 | 2026-05-20 | 增加板端独立反向隧道守护 | 新增 `S91board-review-tunnel` 和 `board-review-tunnel.sh`，板端开机后主动连接云端并守护 `ssh -R`；云端新增 systemd timer 周期检查 `127.0.0.1:18081`，最终运行不依赖 Windows 或虚拟机。 |
 | 2026-05-18 | 顶部和健康矩阵改为真实设备状态 | 4G、相机、F4、云端和 SD 卡均由异步探测更新；4G 测试失败不显示在线，F4 串口握手失败不显示接入，相机必须 `has_frame=1` 且帧序号持续变化才显示在线，相机拔掉后显示离线并通过 `restart-overlay` 尝试恢复；4G/云端启动失败也走异步错误信号，健康检测过程不阻塞界面触摸；周期刷新改为 8 秒且后台静默刷新，网络/云端不再在“检测中”和“在线/已连接”之间来回闪烁。 |
 | 2026-05-18 | 收紧启动阶段摄像头显示顺序 | 相机健康检测可以提前确认在线，但 QML 只有在 Qt splash 完全淡出、`bootOverlayRestoreFinished` 已置位且当前在首页时才发送 `VISIBLE 1`，避免实时摄像头层早于 Qt 界面出现。 |
+| 2026-05-21 | 增加 F4 心跳节流和称重标定入口 | `DeviceHealthController` 的 F4 `STATUS\r\n` 周期心跳改为 120 秒节流，人工刷新和标定前检查可立即触发；参数设置页新增称重标定弹窗，发送 `CAL <克重>\r\n` 给 F407 的 HX711 服务。 |
 
 ## 硬件资源
 
@@ -102,8 +110,8 @@
 | DRM/KMS plane | Qt + KMS overlay 正式路线的视频平面 | 具体 overlay 参数在 `qt_camera_display/run_qt_kms_overlay_display.sh` 中维护。 |
 | `/tmp/uvc-kms-overlay-control.sock` | Qt 和 overlay 的控制 socket | 新增 `STATUS` 读路径，返回 `has_frame=1 serial>0` 才代表相机真实在线。 |
 | `4g-ppp` | 4G 网络健康探测 | `4g-ppp test` 退出码为 0 才显示网络在线。 |
-| `/dev/ttySTM2` | MP157 到 F4 串口健康探测 | 115200 8N1 发送 `STATUS\r\n`，收到 `ACK/OK/F4/READY` 才显示 F4 接入。 |
-| `http://119.91.65.122/health` | 云端健康探测 | `curl -fsS --max-time 2` 成功才显示云端已连接。 |
+| `/dev/ttySTM2` | MP157 到 F4 RS485 串口健康探测和称重标定 | 115200 8N1；后台心跳发送 `STATUS\r\n`，收到 `ACK/OK/F4/READY` 才显示 F4 接入；标定弹窗发送 `CAL <克重>\r\n`，F407 回复 `[OK][WEIGHT]` 或 `[ERROR][WEIGHT]`。 |
+| `http://139.9.35.72/health` | 云端健康探测 | `curl -fsS --max-time 2` 成功才显示云端已连接。 |
 | 云端复核反向隧道 `127.0.0.1:18081 -> 127.0.0.1:18080` | 云端详情页把复核结果回写板端本地历史 | 板端主动建立和守护隧道；云端只能检查本机端口和 HTTP 转发状态，不能主动重连 NAT 后面的板端。 |
 
 ## 验证证据
@@ -134,8 +142,9 @@
 | overlay STATUS 相机状态 | 开发板 | `printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock; sleep 3; printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock` | 输出 `OK STATUS has_frame=1 serial=<递增序号> visible=<0/1> width=640 height=480`，第二次 `serial` 大于第一次。 | 若 `has_frame=0`、没有 socket或 `serial` 不增长，查 USB 摄像头枚举、overlay 日志和 `/dev/video0` 占用。 |
 | USB 摄像头热拔插 | 开发板屏幕和 SSH | 首页运行时拔掉 USB 摄像头，等待 6 秒；再插回并执行 `/root/qt_camera_display/run_qt_kms_overlay_display.sh status` | 拔掉后相机状态显示离线，Qt 界面仍响应触摸；插回后 overlay 重新初始化，`STATUS` 恢复 `has_frame=1 serial>0`；如果当前在首页，QML 再发送 `VISIBLE 1` 恢复画面。 | 若 Qt PID 变化，说明误用了整栈 `restart`；若插回不恢复，手动执行 `restart-overlay` 并查 `/tmp/uvc-kms-overlay.log`。 |
 | 4G 网络真实状态 | 开发板 | `4g-ppp test; echo "exit=$?"` | 退出码为 0 时 Qt 网络显示在线；非 0 或超时不能显示在线。 | 若显示不一致，确认运行的是新版 Qt 二进制。 |
-| F4 接入真实状态 | 开发板 | `test -e /dev/ttySTM2 && stty -F /dev/ttySTM2 115200 raw -echo -crtscts; printf 'STATUS\r\n' > /dev/ttySTM2; timeout 1 cat /dev/ttySTM2 | head -c 80` | 回复包含 `ACK/OK/F4/READY` 时显示接入，否则显示待接入。 | 若没有回复，查 F4 固件、串口线、波特率和设备树串口节点。 |
-| 云端 health 状态 | 开发板 | `curl -fsS --max-time 2 http://119.91.65.122/health >/tmp/cloud-health.txt; echo "exit=$?"; cat /tmp/cloud-health.txt` | curl 退出码为 0 时显示已连接；失败或超时不显示已连接。 | 若 curl 缺失，先补 rootfs；若接口改路径，同步修改 Qt 常量和文档。 |
+| F4 接入真实状态 | 开发板 | `test -e /dev/ttySTM2 && stty -F /dev/ttySTM2 115200 raw -echo -crtscts min 0 time 10; exec 3<>/dev/ttySTM2; printf 'STATUS\r\n' >&3; dd bs=80 count=1 <&3 2>/dev/null; exec 3>&-` | 回复包含 `ACK/OK/F4/READY` 时显示接入，否则显示待接入；该命令不依赖 `timeout`，适合当前 BusyBox 根文件系统。 | 若没有回复，先确认 F407 已烧录包含 `STATUS` 回复的新固件，再查串口线、TX/RX 交叉、共地、波特率和设备树串口节点。 |
+| F4 称重标定命令 | 开发板屏幕或 SSH | 屏幕点击 `参数设置` -> `称重标定`，用内置数字键盘输入 `750` 后点击 `发送CAL`；SSH 可执行 `/root/uartapp /dev/ttySTM2 115200 send "CAL 750\r\n"` | F407 回复 `[OK][WEIGHT] Calibration success...` 或明确 `[ERROR][WEIGHT]` 拒绝原因；Qt 弹窗可滚动结果区显示较完整回包，底部提示条显示短结果。 | 若提示去皮未完成，先在 F407 上执行或确认启动去皮成功；若无回复，先用上一条 STATUS 测试确认 RS485 链路；若克重超限，输入 1~5000g；若系统软键盘不出现，直接使用弹窗数字键盘；若回包过长，在弹窗结果框内上下滑动查看。 |
+| 云端 health 状态 | 开发板 | `curl -fsS --max-time 2 http://139.9.35.72/health >/tmp/cloud-health.txt; echo "exit=$?"; cat /tmp/cloud-health.txt` | curl 退出码为 0 时显示已连接；失败或超时不显示已连接。 | 若 curl 缺失，先补 rootfs；若接口改路径，同步修改 Qt 常量和文档。 |
 | 云端复核反向隧道 | 开发板和云服务器 | 开发板执行 `/etc/init.d/S91board-review-tunnel status`；云服务器执行 `ss -ltnp | grep 127.0.0.1:18081; curl -i --max-time 5 http://127.0.0.1:18081/api/v1/review-result` | 开发板显示 monitor 和 ssh_tunnel 都 running；云端 `ss` 看到 `sshd` 监听，curl 返回板端 404 JSON。 | 若开发板 ssh_tunnel 停止，查 `/tmp/board-review-tunnel.log`、4G 和私钥；若云端无监听，等待板端重连；若云端 curl 连接拒绝，查板端 Qt 18080 服务。 |
 | 检测阶段显示响应 | 开发板屏幕 | 点击 `检测` 后观察右侧结果面板，同时点击左侧 `历史记录`、`统计分析`、`手动控制`、`参数设置` 或 `告警维护` | 页面应立即响应触摸；分类完成后零件类型/类别先显示，UNet 完成后双模型耗时显示，不能等 COS 上传完成才一起显示；重复 `检测` 和 `安全卸载` 暂时不可点。 | 若页面切换卡住，查 `Main.qml` 是否又直接同步调用检测函数；若零件/类别仍等上传后显示，确认 Qt 二进制包含 `detectClassificationReady` 和 `detectModelsReady`。 |
 | CPU 占用对照 | 开发板 | `top -b -n 2 | grep -E "uvc_fb_preview|uvc_kms_overlay|qt_camera_display"` | 能看到对应进程 CPU 样本，用于对比路线。 | 若没有进程，说明显示链路未运行，先回到 status 和日志。 |
@@ -149,8 +158,9 @@
 | framebuffer 兜底输出 | `fbset` 或观察 LCD 当前画面 | `/root/uvc_fb_preview ... -f /dev/fb0` | LCD 出现实时画面，程序退出后无崩溃日志。 |
 | GStreamer 显示链路 | `gst-inspect-1.0 v4l2src fbdevsink` | `/root/uvc-rootfs/run_gst_fbdev.sh raw ...` | pipeline 能运行并把视频写到显示设备。 |
 | Qt + KMS overlay | `run_qt_kms_overlay_display.sh status` | `run_qt_kms_overlay_display.sh restart` | Qt UI 进程和 overlay 视频进程同时存在。 |
-| 设备健康状态 | `4g-ppp test; printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock; curl -fsS --max-time 2 http://119.91.65.122/health; mount | grep ' /mnt/sdcard '` | Qt 后台异步调用对应检测，不在 QML 主线程等待 | 每个状态只在对应真实检测通过后显示在线/接入/已连接；检测失败不冒充在线。 |
-| F4 串口状态 | `ls -l /dev/ttySTM2` | Qt 后台线程写 `STATUS\r\n` 并等待短回复 | 只有收到 `ACK/OK/F4/READY` 才显示接入；无串口或无回复显示待接入。 |
+| 设备健康状态 | `4g-ppp test; printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock; curl -fsS --max-time 2 http://139.9.35.72/health; mount | grep ' /mnt/sdcard '` | Qt 后台异步调用对应检测，不在 QML 主线程等待 | 每个状态只在对应真实检测通过后显示在线/接入/已连接；检测失败不冒充在线。 |
+| F4 串口状态 | `ls -l /dev/ttySTM2`；`/root/uartapp /dev/ttySTM2 115200 send "STATUS\r\n"` | Qt 后台线程按 120 秒节流写 `STATUS\r\n`，人工刷新可立即写入 | 只有收到 `ACK/OK/F4/READY` 才显示接入；无串口或无回复显示待接入。 |
+| F4 称重标定 | 屏幕观察标定弹窗；SSH 可执行 `/root/uartapp /dev/ttySTM2 115200 send "CAL 1000\r\n"` | Qt 标定弹窗调用 `sendF4Command("CAL <克重>")`，C++ 后台线程自动补 `\r\n` 并等待 F407 回复 | 回复含 `OK` 时标定成功；回复含 `ERROR` 或超时会显示失败详情，不会阻塞 QML 主线程。 |
 | Qt 检测 UI 响应 | 屏幕观察 `检测中...`、分类结果和双模型耗时并切换左侧页面 | `检测` 调用后台检测任务，分类完成、UNet 完成和上传完成分别通过信号回到 QML | 检测和上传期间主界面仍响应触摸；零件类型/类别不等待上传，双模型耗时不等待上传；只有重复检测和安全卸载临时禁用。 |
 | 图片/日志落盘 | `stat -c %s <file>` 连续两次一致 | 实际拍照/日志程序写入 `/mnt/sdcard/...` 后 `sync` | 文件存在、大小稳定，再执行 `sdcard-safe-remove`。 |
 | 告警诊断快照 | `test -s /mnt/sdcard/logs/qt_alarm_snapshot.txt; tail -n 30 /mnt/sdcard/logs/qt_alarm_snapshot.txt` | Qt 告警维护页点击 `保存诊断`，或执行 `/root/qt_camera_display/qt_camera_display --alarm-snapshot-self-test` | 文件非空，内容包含 `alarm_code=`、`camera_status=` 和 `[recent_alarm_history]`；写入由 Qt 控制器执行 `fsync`。 |

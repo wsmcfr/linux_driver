@@ -351,6 +351,23 @@ require_grep "id: settingsVisionPanel" "qml/Main.qml"
 require_grep "id: settingsMotionPanel" "qml/Main.qml"
 require_grep "id: settingsStoragePanel" "qml/Main.qml"
 require_grep "id: settingsActionPanel" "qml/Main.qml"
+require_grep "settingsDetailVisible" "qml/Main.qml"
+require_grep "settingsDetailTitle" "qml/Main.qml"
+require_grep "settingsDetailText" "qml/Main.qml"
+require_grep "openSettingsDetail" "qml/Main.qml"
+require_grep "settingsVisionDetailText" "qml/Main.qml"
+require_grep "settingsF4DetailText" "qml/Main.qml"
+require_grep "id: settingsDetailOverlay" "qml/Main.qml"
+require_grep "id: settingsDetailFlickable" "qml/Main.qml"
+require_grep "settingsDetailFlickable.contentY = 0" "qml/Main.qml"
+require_grep "查看详情" "qml/Main.qml"
+require_grep "record_no" "qml/Main.qml"
+require_grep "source/annotated" "qml/Main.qml"
+require_grep "断网补传" "qml/Main.qml"
+require_grep "/dev/ttySTM1" "qml/Main.qml"
+require_grep "LDC1614" "qml/Main.qml"
+require_grep "HX711" "qml/Main.qml"
+require_grep "Emm42_V5.0" "qml/Main.qml"
 require_grep "settingsSupportedPartTypes" "qml/Main.qml"
 require_grep "零件与模型判定" "qml/Main.qml"
 require_grep "波形垫圈" "qml/Main.qml"
@@ -370,6 +387,34 @@ fi
 if grep -Eq '低速档|分拣超时|脉冲标定|settingsBeltSpeed|settingsSortTimeoutMs|settingsPulsePerPx' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "参数设置页不能继续把运动、分拣或脉冲标定作为当前可调参数，避免暗示 Qt 已接管 F4"
 fi
+settings_storage_block="$(sed -n '/id: settingsStoragePanel/,/id: settingsActionPanel/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$settings_storage_block" | grep -q '"name": "补光"'; then
+    fail "相机、光源与存储卡片当前不能显示补光项，避免暗示现场已有补光计划"
+fi
+settings_vision_block="$(sed -n '/id: settingsVisionPanel/,/id: settingsMotionPanel/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$settings_vision_block" | grep -q 'settingsVisionDetailMouse'; then
+    fail "视觉检测策略卡片必须在卡片内部提供查看详情入口"
+fi
+if ! printf '%s\n' "$settings_vision_block" | grep -q 'id: settingsVisionSummaryColumn'; then
+    fail "视觉检测策略卡片必须给详情按钮预留布局空间，不能让内容列占到按钮区域"
+fi
+if ! printf '%s\n' "$settings_vision_block" | grep -q 'y: 132'; then
+    fail "视觉检测策略查看详情按钮必须位于底部右侧预留区域，不能覆盖摘要列表"
+fi
+settings_motion_block="$(sed -n '/id: settingsMotionPanel/,/id: settingsStoragePanel/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$settings_motion_block" | grep -q 'id: settingsMotionSummaryColumn'; then
+    fail "F4接入边界卡片必须给详情按钮预留布局空间，不能让内容列占到按钮区域"
+fi
+if ! printf '%s\n' "$settings_motion_block" | grep -q 'y: 132'; then
+    fail "F4接入边界查看详情按钮必须位于底部右侧预留区域，不能覆盖摘要列表"
+fi
+if printf '%s\n' "$settings_motion_block" | grep -q '"name": "生效状态"'; then
+    fail "F4接入边界列表不能再把生效状态作为第 5 行，避免与查看详情按钮重叠"
+fi
+alarm_advice_block="$(sed -n '/id: alarmAdvicePanel/,/id: alarmAdviceDetailOverlay/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$alarm_advice_block" | grep -q 'settingsVisionDetailMouse'; then
+    fail "参数设置详情入口不能误插入告警处理建议卡片"
+fi
 require_grep "alarmHistoryModel" "qml/Main.qml"
 require_grep "handleAlarmAction" "qml/Main.qml"
 require_grep "id: alarmPage" "qml/Main.qml"
@@ -377,6 +422,16 @@ require_grep "id: alarmCurrentPanel" "qml/Main.qml"
 require_grep "id: alarmHealthPanel" "qml/Main.qml"
 require_grep "id: alarmHistoryPanel" "qml/Main.qml"
 require_grep "id: alarmAdvicePanel" "qml/Main.qml"
+require_grep "alarmAdviceDetailVisible" "qml/Main.qml"
+require_grep "alarmFullAdviceText" "qml/Main.qml"
+require_grep "id: alarmAdviceDetailOverlay" "qml/Main.qml"
+require_grep "id: alarmAdviceDetailFlickable" "qml/Main.qml"
+require_grep "查看全部" "qml/Main.qml"
+require_grep '"name": "4G", "value": deviceHealth.networkStatusText' "qml/Main.qml"
+alarm_health_block="$(sed -n '/id: alarmHealthGrid/,/id: alarmRefreshMouse/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$alarm_health_block" | grep -q '"name": "配置"'; then
+    fail "告警页设备健康矩阵不能继续显示配置占位，最后一格必须改为真实 4G 在线状态"
+fi
 require_grep "ALM-CAM-001" "qml/Main.qml"
 require_grep "ALM-SD-001" "qml/Main.qml"
 require_grep "ALM-NET-001" "qml/Main.qml"
@@ -404,6 +459,18 @@ require_grep "camera-kms-no-frame" "qml/Main.qml"
 require_grep "sdcard-not-writable" "qml/Main.qml"
 require_grep "cloud-offline" "qml/Main.qml"
 require_grep "f4-heartbeat-lost" "qml/Main.qml"
+require_grep "calibrationPopup" "qml/Main.qml"
+require_grep "称重标定" "qml/Main.qml"
+require_grep "calibrationWeightText" "qml/Main.qml"
+require_grep "calibrationKeypadGrid" "qml/Main.qml"
+require_grep "appendCalibrationDigit" "qml/Main.qml"
+require_grep "backspaceCalibrationDigit" "qml/Main.qml"
+require_grep "clearCalibrationWeight" "qml/Main.qml"
+require_grep "退格" "qml/Main.qml"
+require_grep "calibrationResultFlickable" "qml/Main.qml"
+require_grep "contentHeight: calibrationResultTextItem.height" "qml/Main.qml"
+require_grep "sendCalibrationCommand" "qml/Main.qml"
+require_grep "CAL " "qml/Main.qml"
 require_grep "model-detect-failed" "qml/Main.qml"
 if grep -Eq "/mnt/sdcard/logs/qt_alarm_snapshot\\.txt" "$SCRIPT_DIR/qml/Main.qml"; then
     fail "qml/Main.qml 不应继续提示固定 qt_alarm_snapshot.txt，保存诊断必须由 C++ 返回时间戳文件路径"
@@ -426,6 +493,15 @@ require_grep "applyOverlayStatusReply" "main.cpp"
 require_grep "相机画面停滞" "main.cpp"
 require_grep "restart-overlay" "main.cpp"
 require_grep "startF4Probe" "main.cpp"
+require_grep "F4_HEARTBEAT_INTERVAL_MS" "main.cpp"
+require_grep "120000" "main.cpp"
+require_grep "sendF4Command" "main.cpp"
+require_grep "CAL " "main.cpp"
+require_grep "readF4ReplyText" "main.cpp"
+if grep -Eq 'reply\.left\(96\)|reply\.left\(48\)' "$SCRIPT_DIR/main.cpp"; then
+    fail "F4 标定回包不能只截取 96/48 字节，否则 [OK][WEIGHT] Calibration success 详情可能在弹窗中显示不完整"
+fi
+require_grep "f4CommandFinished" "main.cpp"
 require_grep "startDetachedOverlay" "main.cpp"
 require_grep "saveCurrentFrameToSdCard" "main.cpp"
 require_grep "requestSaveCurrentFrameToSdCard" "main.cpp"
