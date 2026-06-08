@@ -1,0 +1,323 @@
+#!/bin/sh
+
+# STM32MP157 板端网络校时脚本。
+# 这个脚本由 4G PPP 联网成功后调用，也可以人工执行 `/usr/bin/board-time-sync once`。
+# 设计目标是：开机后优先从网络获取真实 UTC 时间，设置系统时区为北京时间，再把校准后的系统时间写回 RTC。
+
+# 保存北京时间时区字符串。
+# POSIX TZ 中 `CST-8` 表示 UTC+8，不是 UTC-8；写入 /etc/TZ 后 BusyBox date 会按北京时间显示。
+TIME_ZONE="${TIME_ZONE:-CST-8}"
+
+# 保存时区配置文件路径。
+# Buildroot/BusyBox 环境通常通过 /etc/TZ 提供默认时区。
+TZ_FILE="${TZ_FILE:-/etc/TZ}"
+
+# 保存校时日志路径。
+# 开机自启动时 stdout 可能被 init 脚本吞掉，所以所有关键步骤都追加到日志文件。
+LOG_FILE="${TIME_SYNC_LOG_FILE:-/var/log/board-time-sync.log}"
+
+# 保存 NTP 服务器列表。
+# 如果后续 Buildroot 启用 BusyBox ntpd 或独立 ntpd，脚本会优先使用这些服务器。
+NTP_SERVERS="${NTP_SERVERS:-ntp.aliyun.com ntp.tencent.com pool.ntp.org}"
+
+# 保存 RFC868 rdate 服务器列表。
+# rdate 不是所有网络都开放，所以只作为 ntpd 和 HTTP Date 之间的备选方案。
+RDATE_SERVERS="${RDATE_SERVERS:-time.nist.gov time-a.nist.gov}"
+
+# 保存 HTTP/HTTPS 时间源列表。
+# HTTP Date 头使用 GMT/UTC，适合作为没有 ntpd 时的轻量兜底；本地后端 HTTP 不依赖 TLS 时间校验。
+HTTP_TIME_URLS="${HTTP_TIME_URLS:-http://139.9.35.72/health https://cloud.tencent.com}"
+
+log_msg()
+{
+	# 函数作用：
+	#   统一输出校时日志，既打印到终端，也写入日志文件。
+	#
+	# 主要流程：
+	#   1. 尽量用当前 date 生成日志时间前缀。
+	#   2. 将调用者传入的消息追加到日志文件。
+	#
+	# 参数：
+	#   $*：需要记录的日志正文。
+	#
+	# 返回值：
+	#   始终返回 tee 的结果；调用方不依赖该返回值。
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'time-unknown')" "$*" | tee -a "$LOG_FILE"
+}
+
+run_with_timeout()
+{
+	# 函数作用：
+	#   给可能阻塞的网络校时命令加超时保护。
+	#
+	# 主要流程：
+	#   1. 如果系统存在 timeout 命令，就用 timeout 限制执行时间。
+	#   2. 如果系统没有 timeout，就直接执行原命令，保留最低兼容性。
+	#
+	# 参数：
+	#   $1：超时时间，单位为秒。
+	#   $2...：需要执行的命令及其参数。
+	#
+	# 返回值：
+	#   返回被执行命令或 timeout 的退出码。
+	limit_seconds="$1"
+	shift
+
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$limit_seconds" "$@"
+	else
+		"$@"
+	fi
+}
+
+set_beijing_timezone()
+{
+	# 函数作用：
+	#   配置系统默认时区为北京时间，避免网络校时后 date 仍按 UTC 显示。
+	#
+	# 主要流程：
+	#   1. 确认 /etc/TZ 是否已经存在且内容为 CST-8。
+	#   2. 不一致时写入 CST-8。
+	#   3. 导出 TZ，让当前脚本后续 date 调用立即使用北京时间显示。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   0 表示时区可用；非 0 表示 /etc/TZ 写入失败。
+	if [ ! -f "$TZ_FILE" ] || [ "$(cat "$TZ_FILE" 2>/dev/null)" != "$TIME_ZONE" ]; then
+		if ! printf '%s\n' "$TIME_ZONE" > "$TZ_FILE"; then
+			log_msg "写入时区文件失败：$TZ_FILE"
+			return 1
+		fi
+		log_msg "已设置系统时区：$TZ_FILE=$TIME_ZONE"
+	fi
+
+	export TZ="$TIME_ZONE"
+	return 0
+}
+
+sync_with_ntpd()
+{
+	# 函数作用：
+	#   优先使用 ntpd 进行一次性网络校时。
+	#
+	# 主要流程：
+	#   1. 检查系统是否存在 ntpd 命令。
+	#   2. 依次尝试 NTP 服务器。
+	#   3. 任一服务器成功则立即返回成功。
+	#
+	# 参数：
+	#   无，服务器列表来自 NTP_SERVERS。
+	#
+	# 返回值：
+	#   0 表示 ntpd 校时成功；1 表示 ntpd 不存在或所有服务器失败。
+	if ! command -v ntpd >/dev/null 2>&1; then
+		log_msg "未找到 ntpd，跳过 NTP 校时"
+		return 1
+	fi
+
+	for server in $NTP_SERVERS; do
+		log_msg "尝试 NTP 校时：$server"
+		if run_with_timeout 20 ntpd -n -q -p "$server" >>"$LOG_FILE" 2>&1; then
+			log_msg "NTP 校时成功：$server"
+			return 0
+		fi
+		log_msg "NTP 校时失败：$server"
+	done
+
+	return 1
+}
+
+sync_with_rdate()
+{
+	# 函数作用：
+	#   使用 BusyBox rdate 从 RFC868 时间服务器设置系统时间。
+	#
+	# 主要流程：
+	#   1. 检查系统是否存在 rdate 命令。
+	#   2. 依次尝试 rdate 服务器。
+	#   3. 任一服务器成功则立即返回成功。
+	#
+	# 参数：
+	#   无，服务器列表来自 RDATE_SERVERS。
+	#
+	# 返回值：
+	#   0 表示 rdate 校时成功；1 表示 rdate 不存在或所有服务器失败。
+	if ! command -v rdate >/dev/null 2>&1; then
+		log_msg "未找到 rdate，跳过 RFC868 校时"
+		return 1
+	fi
+
+	for server in $RDATE_SERVERS; do
+		log_msg "尝试 rdate 校时：$server"
+		if run_with_timeout 10 rdate -s "$server" >>"$LOG_FILE" 2>&1; then
+			log_msg "rdate 校时成功：$server"
+			return 0
+		fi
+		log_msg "rdate 校时失败：$server"
+	done
+
+	return 1
+}
+
+sync_with_http_date()
+{
+	# 函数作用：
+	#   使用 HTTP 响应头中的 Date 字段设置系统 UTC 时间。
+	#
+	# 主要流程：
+	#   1. 通过 curl 获取每个 URL 的响应头。
+	#   2. 提取 RFC1123 格式的 Date 头。
+	#   3. 用 BusyBox date -D 解析 GMT 时间。
+	#   4. 通过 date -u -s 写入系统 UTC 时间。
+	#
+	# 参数：
+	#   无，URL 列表来自 HTTP_TIME_URLS。
+	#
+	# 返回值：
+	#   0 表示 HTTP Date 校时成功；1 表示 curl 不存在、无 Date 头或解析失败。
+	if ! command -v curl >/dev/null 2>&1; then
+		log_msg "未找到 curl，跳过 HTTP Date 校时"
+		return 1
+	fi
+
+	for url in $HTTP_TIME_URLS; do
+		log_msg "尝试 HTTP Date 校时：$url"
+
+		# -k 用于时间严重错误时绕过 TLS 有效期校验；HTTP 源不受该参数影响。
+		http_date="$(curl -k -fsSI --max-time 10 "$url" 2>>"$LOG_FILE" | awk '
+			BEGIN { IGNORECASE = 1 }
+			/^Date:/ {
+				sub(/^[Dd]ate:[ \t]*/, "", $0);
+				sub(/\r$/, "", $0);
+				print $0;
+				exit;
+			}
+		')"
+
+		if [ -z "$http_date" ]; then
+			log_msg "HTTP Date 头为空：$url"
+			continue
+		fi
+
+		utc_time="$(date -u -D '%a, %d %b %Y %H:%M:%S GMT' -d "$http_date" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+		if [ -z "$utc_time" ]; then
+			log_msg "HTTP Date 解析失败：$http_date"
+			continue
+		fi
+
+		if date -u -s "$utc_time" >>"$LOG_FILE" 2>&1; then
+			log_msg "HTTP Date 校时成功：$http_date"
+			return 0
+		fi
+
+		log_msg "HTTP Date 写入系统时间失败：$utc_time"
+	done
+
+	return 1
+}
+
+write_rtc_from_system()
+{
+	# 函数作用：
+	#   将已经校准的系统时间写回 RTC，让纽扣电池继续保持校准后的时间基准。
+	#
+	# 主要流程：
+	#   1. 检查 hwclock 命令是否存在。
+	#   2. 使用 -w -u 按 UTC 语义把系统时间写入 RTC。
+	#   3. 读取 RTC 当前值用于日志确认。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   0 表示 RTC 写回成功；1 表示 hwclock 不存在或写入失败。
+	if ! command -v hwclock >/dev/null 2>&1; then
+		log_msg "未找到 hwclock，无法写回 RTC"
+		return 1
+	fi
+
+	if ! hwclock -w -u >>"$LOG_FILE" 2>&1; then
+		log_msg "写回 RTC 失败：hwclock -w -u"
+		return 1
+	fi
+
+	log_msg "RTC 写回成功：$(hwclock -r 2>/dev/null || echo '读取 RTC 失败')"
+	return 0
+}
+
+sync_once()
+{
+	# 函数作用：
+	#   执行一次完整校时：设置时区、网络取时、写回 RTC。
+	#
+	# 主要流程：
+	#   1. 确保 /etc/TZ 使用北京时间。
+	#   2. 依次尝试 ntpd、rdate、HTTP Date。
+	#   3. 校时成功后写回 RTC。
+	#   4. 输出系统本地时间和 UTC 时间，方便排障。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   0 表示系统时间和 RTC 都处理完成；非 0 表示校时或 RTC 写回失败。
+	set_beijing_timezone || return 1
+
+	log_msg "开始板端网络校时"
+	if sync_with_ntpd || sync_with_rdate || sync_with_http_date; then
+		log_msg "系统时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+		log_msg "UTC 时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+		write_rtc_from_system || return 1
+		log_msg "板端网络校时完成"
+		return 0
+	fi
+
+	log_msg "所有网络校时方式均失败"
+	return 1
+}
+
+show_status()
+{
+	# 函数作用：
+	#   输出当前系统时间、UTC 时间、RTC 时间和最近校时日志。
+	#
+	# 主要流程：
+	#   1. 设置当前进程时区为北京时间。
+	#   2. 打印 /etc/TZ、date、date -u 和 hwclock -r。
+	#   3. 打印最近 20 行校时日志。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   始终返回 0，便于排障时查看尽可能多的信息。
+	set_beijing_timezone >/dev/null 2>&1 || true
+
+	echo "---- timezone ----"
+	printf 'TZ_FILE=%s\n' "$TZ_FILE"
+	printf 'TZ_VALUE=%s\n' "$(cat "$TZ_FILE" 2>/dev/null || echo 'missing')"
+	echo "---- date ----"
+	date '+%Y-%m-%d %H:%M:%S %Z'
+	echo "---- date -u ----"
+	date -u '+%Y-%m-%d %H:%M:%S UTC'
+	echo "---- hwclock ----"
+	hwclock -r 2>/dev/null || echo "hwclock unavailable"
+	echo "---- log tail ----"
+	tail -n 20 "$LOG_FILE" 2>/dev/null || echo "no log yet"
+	return 0
+}
+
+case "$1" in
+	once|"")
+		sync_once
+		;;
+	status)
+		show_status
+		;;
+	*)
+		echo "Usage: $0 {once|status}"
+		exit 1
+		;;
+esac
