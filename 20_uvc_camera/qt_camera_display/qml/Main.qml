@@ -1778,6 +1778,8 @@ Rectangle {
                 + "；4G=" + deviceHealth.networkStatusText
                 + "；云端=" + deviceHealth.cloudStatusText
                 + "；F4=" + deviceHealth.f4StatusText
+                + "；位置=" + deviceHealth.locationDisplayText
+                + "；定位=" + deviceHealth.locationStatusText
                 + "；详情=" + deviceHealth.detailText
     }
 
@@ -3392,6 +3394,14 @@ Rectangle {
         }
 
         /*
+         * onLocationStatusChanged 的作用：
+         *   4G IP 省份定位状态变化后刷新设备摘要；定位失败暂不作为产线告警，只进入诊断文本。
+         */
+        onLocationStatusChanged: {
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
          * onF4StatusChanged 的作用：
          *   F4 串口握手状态变化后检查心跳类告警，避免只在顶部状态栏显示待接入。
          */
@@ -3607,7 +3617,7 @@ Rectangle {
                     {"name": "网络", "value": deviceHealth.networkStatusText, "dot": deviceHealth.networkStatusColor},
                     {"name": "相机", "value": root.cameraStatusText(), "dot": root.cameraDotColor()},
                     {"name": "F4", "value": deviceHealth.f4StatusText, "dot": deviceHealth.f4StatusColor},
-                    {"name": "机械臂", "value": "待命", "dot": root.accentGreen},
+                    {"name": "位置", "value": deviceHealth.locationShortText, "dot": deviceHealth.locationStatusColor},
                     {"name": "背光", "value": "常亮", "dot": root.accentGreen},
                     {"name": "云端", "value": deviceHealth.cloudStatusText, "dot": deviceHealth.cloudStatusColor}
                 ]
@@ -7557,7 +7567,7 @@ Rectangle {
                         {"name": "SD卡", "value": deviceHealth.sdcardStatusText, "color": deviceHealth.sdcardStatusColor},
                         {"name": "云端", "value": deviceHealth.cloudStatusText, "color": deviceHealth.cloudStatusColor},
                         {"name": "KMS视频", "value": root.usingKmsOverlay ? deviceHealth.cameraStatusText : "预览/桥接", "color": root.usingKmsOverlay ? deviceHealth.cameraStatusColor : root.accentAmber},
-                        {"name": "背光", "value": "常亮", "color": root.accentGreen},
+                        {"name": "定位", "value": deviceHealth.locationStatusText, "color": deviceHealth.locationStatusColor},
                         {"name": "4G", "value": deviceHealth.networkStatusText, "color": deviceHealth.networkStatusColor}
                     ]
 

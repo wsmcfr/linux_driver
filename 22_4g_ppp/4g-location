@@ -1,0 +1,381 @@
+#!/bin/sh
+
+# STM32MP157 4G 高德 IP 省份定位脚本。
+# 这个脚本只通过高德 IP 定位接口判断 4G 出口 IP 所在省份，不再打开 GPS，也不再访问模块 AT 串口。
+# 这样室内比赛环境下不会等待 GNSS 卫星，不会和 4g-ppp monitor 抢 AT 管理口，界面只显示“河南省”这类省份文本。
+
+# STATE_FILE 保存定位状态缓存，Qt 周期刷新时通过 `4g-location status` 读取它。
+STATE_FILE="${STATE_FILE:-/var/run/4g-location.state}"
+
+# AMAP_KEY_FILE 保存板端本地高德 Web 服务 Key，权限应为 600，不能提交到 Git。
+AMAP_KEY_FILE="${AMAP_KEY_FILE:-/etc/4g-location/amap-web-key}"
+
+# AMAP_IP_URL 是高德 IP 定位接口；不传 ip 参数时，高德会按当前 4G 出口公网 IP 判断位置。
+AMAP_IP_URL="${AMAP_IP_URL:-https://restapi.amap.com/v3/ip}"
+
+# BOARD_TIME_ZONE 让 updated_at 按北京时间写入状态文件，和 Qt 顶部时间口径一致。
+BOARD_TIME_ZONE="${BOARD_TIME_ZONE:-CST-8}"
+
+# LOG_FILE 保存 IP 定位请求和解析日志，便于 SSH 排查 Key、网络或配额问题。
+LOG_FILE="${LOG_FILE:-/var/log/4g-location.log}"
+
+# 导出 TZ，保证 BusyBox date 在当前脚本内直接输出北京时间。
+export TZ="$BOARD_TIME_ZONE"
+
+log_msg()
+{
+	# 函数作用：
+	#   统一记录定位脚本日志，方便 SSH 排查高德 IP 定位请求失败原因。
+	#
+	# 主要流程：
+	#   1. 使用 date 生成北京时间日志前缀。
+	#   2. 把调用者传入的日志正文追加到 LOG_FILE。
+	#
+	# 参数：
+	#   $* 表示需要写入日志的文本。
+	#
+	# 返回值：
+	#   始终返回 0；日志写入失败不能阻断状态文件输出。
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+url_encode()
+{
+	# 函数作用：
+	#   对 URL 查询参数做最小百分号编码，避免 Key 中的特殊字符破坏 HTTP 查询字符串。
+	#
+	# 主要流程：
+	#   1. 逐字符读取输入字符串。
+	#   2. 字母、数字和 URL 安全字符原样输出。
+	#   3. 其它字符输出为 %XX。
+	#
+	# 参数：
+	#   $1 表示需要编码的字符串。
+	#
+	# 返回值：
+	#   stdout 输出编码后的字符串。
+	input="$1"
+	output=""
+	i=1
+	length=${#input}
+
+	while [ "$i" -le "$length" ]; do
+		char="$(printf '%s' "$input" | cut -c "$i")"
+		case "$char" in
+			[a-zA-Z0-9.~_-])
+				output="${output}${char}"
+				;;
+			*)
+				hex="$(printf '%s' "$char" | od -An -tx1 | tr -d ' \n')"
+				output="${output}%${hex}"
+				;;
+		esac
+		i=$((i + 1))
+	done
+
+	printf '%s' "$output"
+}
+
+write_state()
+{
+	# 函数作用：
+	#   把定位结果写成 key=value 状态文件，同时把同样内容输出到 stdout 给 Qt 直接解析。
+	#
+	# 主要流程：
+	#   1. 接收状态名、省份显示文本、行政区字段和详情。
+	#   2. 用临时文件先完整写入，再 mv 覆盖正式状态文件。
+	#   3. 写入完成后 cat 状态文件，让 `4g-location once` 的调用者能直接拿到完整结果。
+	#
+	# 参数：
+	#   $1 state：状态名，例如 ip_ok/no_key/ip_failed/unknown。
+	#   $2 display：完整显示文本；当前只显示省份，例如 河南省。
+	#   $3 short_display：顶部短文本；当前同样只显示省份。
+	#   $4 province：省份。
+	#   $5 city：城市；IP 省份定位模式下固定为空。
+	#   $6 district：区县；IP 省份定位模式下固定为空。
+	#   $7 longitude：经度；IP 定位不是 GPS 坐标，固定为空。
+	#   $8 latitude：纬度；IP 定位不是 GPS 坐标，固定为空。
+	#   $9 satellites：卫星数；IP 定位不使用 GPS，固定为空。
+	#   $10 detail：排障详情。
+	#
+	# 返回值：
+	#   0 表示状态文件写入或 stdout 输出完成；非 0 表示 /var/run 不可写。
+	state_name="$1"
+	display_text="$2"
+	short_text="$3"
+	province_text="$4"
+	city_text="$5"
+	district_text="$6"
+	longitude_text="$7"
+	latitude_text="$8"
+	satellites_text="$9"
+	shift 9
+	detail_text="$*"
+	state_tmp="$STATE_FILE.$$"
+	state_dir="$(dirname "$STATE_FILE")"
+
+	mkdir -p "$state_dir" 2>/dev/null || true
+
+	{
+		printf 'state=%s\n' "$state_name"
+		printf 'display=%s\n' "$display_text"
+		printf 'short_display=%s\n' "$short_text"
+		printf 'province=%s\n' "$province_text"
+		printf 'city=%s\n' "$city_text"
+		printf 'district=%s\n' "$district_text"
+		printf 'longitude=%s\n' "$longitude_text"
+		printf 'latitude=%s\n' "$latitude_text"
+		printf 'satellites=%s\n' "$satellites_text"
+		printf 'updated_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+		printf 'at_tty=\n'
+		printf 'detail=%s\n' "$detail_text"
+	} > "$state_tmp" 2>/dev/null && mv -f "$state_tmp" "$STATE_FILE"
+	state_write_rc="$?"
+
+	if [ "$state_write_rc" -eq 0 ]; then
+		cat "$STATE_FILE" 2>/dev/null && return 0
+	fi
+
+	rm -f "$state_tmp" 2>/dev/null || true
+	{
+		printf 'state=%s\n' "$state_name"
+		printf 'display=%s\n' "$display_text"
+		printf 'short_display=%s\n' "$short_text"
+		printf 'province=%s\n' "$province_text"
+		printf 'city=%s\n' "$city_text"
+		printf 'district=%s\n' "$district_text"
+		printf 'longitude=%s\n' "$longitude_text"
+		printf 'latitude=%s\n' "$latitude_text"
+		printf 'satellites=%s\n' "$satellites_text"
+		printf 'updated_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+		printf 'at_tty=\n'
+		printf 'detail=%s\n' "$detail_text"
+	}
+	return "$state_write_rc"
+}
+
+read_amap_key()
+{
+	# 函数作用：
+	#   读取高德 Web 服务 Key，优先环境变量，次选板端本地配置文件。
+	#
+	# 主要流程：
+	#   1. 如果 AMAP_WEB_KEY 非空，直接输出环境变量。
+	#   2. 如果 AMAP_KEY_FILE 存在，读取第一行非注释非空内容。
+	#   3. 都没有时输出空字符串，让调用方写 no_key 状态。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   stdout 输出 Key；没有 Key 时输出空。
+	if [ -n "${AMAP_WEB_KEY:-}" ]; then
+		printf '%s' "$AMAP_WEB_KEY"
+		return 0
+	fi
+
+	if [ -f "$AMAP_KEY_FILE" ]; then
+		sed -n 's/[[:space:]]//g; /^[^#].*/p' "$AMAP_KEY_FILE" 2>/dev/null | head -n 1
+		return 0
+	fi
+
+	return 0
+}
+
+json_get_string()
+{
+	# 函数作用：
+	#   从高德返回的单行 JSON 中提取简单字符串字段。
+	#
+	# 主要流程：
+	#   1. 接收 JSON 文本和字段名。
+	#   2. 使用 sed 匹配 `"字段":"值"` 形态。
+	#   3. 只取第一个匹配值，满足 status/province/city/adcode/rectangle 这类简单字段需求。
+	#
+	# 参数：
+	#   $1 表示 JSON 文本。
+	#   $2 表示字段名。
+	#
+	# 返回值：
+	#   stdout 输出字段值；找不到时输出空。
+	json_text="$1"
+	field_name="$2"
+	printf '%s' "$json_text" |
+		sed -n 's/.*"'"$field_name"'":"\([^"]*\)".*/\1/p' |
+		head -n 1
+}
+
+build_ip_location_display()
+{
+	# 函数作用：
+	#   根据高德 IP 定位返回的 province 字段组装 Qt 可直接显示的省份文本。
+	#
+	# 主要流程：
+	#   1. 接收 province/city/adcode/rectangle，其中 city 只用于日志细节，不参与界面显示。
+	#   2. 只显示省份，避免运营商公网出口城市误导现场位置判断。
+	#   3. city、district、longitude、latitude 和 satellites 由调用方写为空。
+	#
+	# 参数：
+	#   $1 表示省份或直辖市名称。
+	#   $2 表示城市名称，可能为空或为 []，只进入 detail。
+	#   $3 表示行政区划编码。
+	#   $4 表示高德返回的城市矩形范围，仅用于 detail 排障。
+	#
+	# 返回值：
+	#   stdout 输出 `province|city|district|display|short_display|detail`；字段不足时返回非 0。
+	ip_province_text="$1"
+	ip_city_text="$2"
+	ip_adcode_text="$3"
+	ip_rectangle_text="$4"
+
+	if [ "$ip_city_text" = "[]" ]; then
+		ip_city_text=""
+	fi
+
+	if [ -z "$ip_province_text" ]; then
+		return 1
+	fi
+
+	ip_display_text="$ip_province_text"
+	ip_short_text="$ip_province_text"
+	ip_detail_text="高德 IP 定位成功；只显示省份"
+	printf '%s|%s|%s|%s|%s|%s\n' "$ip_province_text" "" "" "$ip_display_text" "$ip_short_text" "$ip_detail_text"
+}
+
+query_amap_ip_location()
+{
+	# 函数作用：
+	#   调用高德 IP 定位接口，按当前 4G 出口公网 IP 获取省份。
+	#
+	# 主要流程：
+	#   1. 读取高德 Web 服务 Key。
+	#   2. 调用 `AMAP_IP_URL`，不传 ip 参数，让高德按板端 4G 出口公网 IP 判断位置。
+	#   3. 解析 status/province/city/adcode/rectangle。
+	#   4. 组装 state=ip_ok 所需的省份显示字段。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   stdout 输出 `province|city|district|display|short_display|detail`；
+	#   返回 2 表示缺少 Key，返回 1 表示接口失败或结果为空。
+	amap_key="$(read_amap_key)"
+
+	if [ -z "$amap_key" ]; then
+		return 2
+	fi
+
+	ip_request_url="${AMAP_IP_URL}?key=$(url_encode "$amap_key")&output=json"
+	ip_json="$(curl -fsS --max-time 6 "$ip_request_url" 2>/dev/null)"
+	ip_rc="$?"
+	log_msg "amap ip rc=$ip_rc"
+
+	if [ "$ip_rc" -ne 0 ] || [ -z "$ip_json" ]; then
+		return 1
+	fi
+
+	status_text="$(json_get_string "$ip_json" "status")"
+	info_text="$(json_get_string "$ip_json" "info")"
+	if [ "$status_text" != "1" ]; then
+		log_msg "amap ip failed: $info_text"
+		return 1
+	fi
+
+	ip_province_text="$(json_get_string "$ip_json" "province")"
+	ip_city_text="$(json_get_string "$ip_json" "city")"
+	ip_adcode_text="$(json_get_string "$ip_json" "adcode")"
+	ip_rectangle_text="$(json_get_string "$ip_json" "rectangle")"
+
+	build_ip_location_display "$ip_province_text" "$ip_city_text" "$ip_adcode_text" "$ip_rectangle_text"
+}
+
+run_once()
+{
+	# 函数作用：
+	#   执行一次高德 IP 省份定位，并写入 `/var/run/4g-location.state`。
+	#
+	# 主要流程：
+	#   1. 调用高德 IP 定位接口获取省份。
+	#   2. 成功时写 `state=ip_ok`，display 和 short_display 都只显示省份。
+	#   3. 缺少 Key 或接口失败时写明确失败状态，供 Qt 和 SSH 排障。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   0 表示 IP 省份定位成功；非 0 表示缺少 Key、网络失败或高德接口失败。
+	ip_result="$(query_amap_ip_location)"
+	ip_rc="$?"
+
+	if [ "$ip_rc" -eq 0 ]; then
+		province_text="$(printf '%s' "$ip_result" | cut -d'|' -f1)"
+		city_text="$(printf '%s' "$ip_result" | cut -d'|' -f2)"
+		district_text="$(printf '%s' "$ip_result" | cut -d'|' -f3)"
+		display_text="$(printf '%s' "$ip_result" | cut -d'|' -f4)"
+		short_text="$(printf '%s' "$ip_result" | cut -d'|' -f5)"
+		detail_text="$(printf '%s' "$ip_result" | cut -d'|' -f6-)"
+		write_state "ip_ok" "$display_text" "$short_text" "$province_text" "$city_text" "$district_text" "" "" "" "$detail_text"
+		return 0
+	fi
+
+	if [ "$ip_rc" -eq 2 ]; then
+		write_state "no_key" "缺少高德Key" "缺少Key" "" "" "" "" "" "" "请设置 AMAP_WEB_KEY 或写入 $AMAP_KEY_FILE"
+		return 2
+	fi
+
+	write_state "ip_failed" "未定位" "未定位" "" "" "" "" "" "" "高德 IP 定位失败，请检查 4G 网络、高德 Web 服务 Key 权限和配额"
+	return 1
+}
+
+print_status()
+{
+	# 函数作用：
+	#   输出最近一次定位状态，供 SSH 和 Qt 快速读取缓存结果。
+	#
+	# 主要流程：
+	#   1. 如果状态文件存在，直接输出。
+	#   2. 如果状态文件不存在，输出未定位状态，不主动访问网络。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   状态文件存在返回 0；不存在返回 1。
+	if [ -f "$STATE_FILE" ]; then
+		cat "$STATE_FILE"
+		return 0
+	fi
+
+	write_state "unknown" "未定位" "未定位" "" "" "" "" "" "" "尚未执行 4g-location once"
+	return 1
+}
+
+usage()
+{
+	# 函数作用：
+	#   打印命令用法，便于板端 SSH 直接查看可用子命令。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   始终返回 0。
+	echo "Usage: $0 {once|status|location-status}"
+	echo "Env: AMAP_WEB_KEY=<高德Web服务Key>, AMAP_KEY_FILE=$AMAP_KEY_FILE, STATE_FILE=$STATE_FILE"
+}
+
+case "$1" in
+	once)
+		run_once
+		;;
+	status)
+		print_status
+		;;
+	location-status)
+		print_status
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac

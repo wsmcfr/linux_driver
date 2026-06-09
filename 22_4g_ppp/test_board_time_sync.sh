@@ -26,6 +26,9 @@ TIME_SYNC_SCRIPT="$SCRIPT_DIR/board-time-sync"
 # 保存待测 4G 管理脚本路径；后续部署到板端时应安装到 /usr/bin/4g-ppp。
 PPP_SCRIPT="$SCRIPT_DIR/4g-ppp"
 
+# 保存待测 4G 定位脚本路径；后续部署到板端时应安装到 /usr/bin/4g-location。
+LOCATION_SCRIPT="$SCRIPT_DIR/4g-location"
+
 # 保存待测登录时区脚本路径；后续部署到板端时应安装到 /etc/profile.d/board-timezone.sh。
 PROFILE_TZ_SCRIPT="$SCRIPT_DIR/board-timezone.sh"
 
@@ -54,6 +57,7 @@ require_text()
 
 require_file "$TIME_SYNC_SCRIPT"
 require_file "$PPP_SCRIPT"
+require_file "$LOCATION_SCRIPT"
 require_file "$PROFILE_TZ_SCRIPT"
 require_file "$README_FILE"
 
@@ -79,6 +83,9 @@ require_text "$PPP_SCRIPT" 'echo on > "$control"'
 require_text "$PPP_SCRIPT" 'STATE_FILE="${STATE_FILE:-/var/run/4g-ppp.state}"'
 require_text "$PPP_SCRIPT" 'MONITOR_PID_FILE="${MONITOR_PID_FILE:-/var/run/4g-ppp-monitor.pid}"'
 require_text "$PPP_SCRIPT" 'AT_TTY_CANDIDATES="${AT_TTY_CANDIDATES:-$PPP_TTY /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/ttyUSB3}"'
+require_text "$PPP_SCRIPT" 'AT_LOCK_DIR="${AT_LOCK_DIR:-/var/run/4g-at.lock}"'
+require_text "$PPP_SCRIPT" 'AT_LOCK_WAIT_SECONDS="${AT_LOCK_WAIT_SECONDS:-12}"'
+require_text "$PPP_SCRIPT" 'AT_LOCK_STALE_SECONDS="${AT_LOCK_STALE_SECONDS:-60}"'
 require_text "$PPP_SCRIPT" 'SIM_RECENT_NO_CARD_INTERVAL="${SIM_RECENT_NO_CARD_INTERVAL:-5}"'
 require_text "$PPP_SCRIPT" 'SIM_RECENT_NO_CARD_WINDOW_SECONDS="${SIM_RECENT_NO_CARD_WINDOW_SECONDS:-8}"'
 require_text "$PPP_SCRIPT" 'SIM_LONG_NO_CARD_INTERVAL="${SIM_LONG_NO_CARD_INTERVAL:-8}"'
@@ -94,6 +101,8 @@ require_text "$PPP_SCRIPT" 'SIM_AFTER_CFUN_READY_WAIT_SECONDS="${SIM_AFTER_CFUN_
 require_text "$PPP_SCRIPT" 'SIM_PRESENT_WIRED="${SIM_PRESENT_WIRED:-0}"'
 require_text "$PPP_SCRIPT" 'write_state'
 require_text "$PPP_SCRIPT" 'find_at_tty'
+require_text "$PPP_SCRIPT" 'acquire_at_lock'
+require_text "$PPP_SCRIPT" 'release_at_lock'
 require_text "$PPP_SCRIPT" 'at_exchange_on_tty'
 require_text "$PPP_SCRIPT" 'at_tty=%s'
 require_text "$PPP_SCRIPT" 'query_sim_status'
@@ -113,6 +122,33 @@ require_text "$PPP_SCRIPT" 'AT+CPIN?'
 require_text "$PPP_SCRIPT" 'AT+QSIMSTAT=1'
 require_text "$PPP_SCRIPT" 'AT+QSIMDET=1,0'
 
+# 定位脚本必须独立于 PPP 状态机，只使用高德 IP 定位显示省份，避免室内 GPS、AT 串口或地图逆地理编码影响拨号和 SIM 热插拔恢复。
+require_text "$LOCATION_SCRIPT" 'STATE_FILE="${STATE_FILE:-/var/run/4g-location.state}"'
+require_text "$LOCATION_SCRIPT" 'AMAP_KEY_FILE="${AMAP_KEY_FILE:-/etc/4g-location/amap-web-key}"'
+require_text "$LOCATION_SCRIPT" 'AMAP_IP_URL="${AMAP_IP_URL:-https://restapi.amap.com/v3/ip}"'
+require_text "$LOCATION_SCRIPT" 'query_amap_ip_location'
+require_text "$LOCATION_SCRIPT" 'build_ip_location_display'
+require_text "$LOCATION_SCRIPT" 'state=ip_ok'
+require_text "$LOCATION_SCRIPT" 'AMAP_IP_URL'
+require_text "$LOCATION_SCRIPT" 'AMAP_WEB_KEY'
+require_text "$LOCATION_SCRIPT" '只显示省份'
+require_text "$LOCATION_SCRIPT" 'province='
+require_text "$LOCATION_SCRIPT" 'city='
+require_text "$LOCATION_SCRIPT" 'district='
+require_text "$LOCATION_SCRIPT" 'display='
+require_text "$LOCATION_SCRIPT" 'short_display='
+require_text "$LOCATION_SCRIPT" 'longitude='
+require_text "$LOCATION_SCRIPT" 'latitude='
+require_text "$LOCATION_SCRIPT" 'satellites='
+require_text "$LOCATION_SCRIPT" 'updated_at='
+require_text "$LOCATION_SCRIPT" 'location-status)'
+require_text "$LOCATION_SCRIPT" 'once)'
+require_text "$LOCATION_SCRIPT" 'status)'
+if grep -Eq 'AT\+QGPS|AT\+QGPSLOC|AT_TTY|ttyUSB|coordsys=gps|geocode/regeo|assistant/coordinate/convert' "$LOCATION_SCRIPT"; then
+	printf 'FAIL: 4g-location must use IP province only and must not access GPS/AT paths\n' >&2
+	exit 1
+fi
+
 # 登录环境必须显式导出 TZ，否则 root 登录后裸 date 仍会显示 UTC。
 require_text "$PROFILE_TZ_SCRIPT" 'BOARD_TIME_ZONE="${BOARD_TIME_ZONE:-CST-8}"'
 require_text "$PROFILE_TZ_SCRIPT" 'export TZ="$BOARD_TIME_ZONE"'
@@ -131,5 +167,13 @@ require_text "$README_FILE" '4g-ppp sim-status'
 require_text "$README_FILE" 'S80ppp-4g start'
 require_text "$README_FILE" 'SIM_LONG_NO_CARD_INTERVAL'
 require_text "$README_FILE" '无卡低频轮询'
+require_text "$README_FILE" '4g-location once'
+require_text "$README_FILE" 'AMAP_WEB_KEY'
+require_text "$README_FILE" 'AMAP_IP_URL'
+require_text "$README_FILE" '/var/run/4g-location.state'
+require_text "$README_FILE" '高德 IP 定位'
+require_text "$README_FILE" 'state=ip_ok'
+require_text "$README_FILE" '只显示省份'
+require_text "$README_FILE" '河南省'
 
 printf 'PASS: 4G PPP board time sync contract\n'

@@ -55,6 +55,7 @@
 #include <QHostAddress>         /* QHostAddress 用于指定云端复核回写 HTTP 服务监听地址。 */
 #include <QProcess>             /* QProcess 用于调用现有 sdcard-safe-remove 命令。 */
 #include <QProcessEnvironment>  /* QProcessEnvironment 用于给 sdcard-safe-remove 传入短等待环境变量。 */
+#include <QRegExp>              /* QRegExp 用于按换行解析 4g-location 的 key=value 输出。 */
 #include <QMetaObject>          /* QMetaObject 用于把后台线程的检测阶段进度安全投递回 Qt 主线程。 */
 #include <QPointer>             /* QPointer 用于后台线程投递进度前判断控制器对象是否仍然存在。 */
 #include <QQmlEngine>           /* qmlRegisterType 需要 Qt QML 类型系统声明。 */
@@ -141,6 +142,12 @@ static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-c
 
 /* 默认 4G PPP 管理脚本；健康检测只调用 test，不在界面线程里执行 start/restart。 */
 static const char *DEFAULT_4G_PPP_SCRIPT = "4g-ppp";
+
+/* 默认 4G IP 省份定位脚本；Qt 只调用 once/status，不直接访问模块串口或高德 Key。 */
+static const char *DEFAULT_4G_LOCATION_SCRIPT = "4g-location";
+
+/* 4G IP 定位探测超时时间：覆盖高德 HTTPS 请求，避免网络异常时定位进程拖住健康刷新。 */
+static const int LOCATION_PROBE_TIMEOUT_MS = 40000;
 
 /* 默认云端健康地址；与 defect-cos-upload 的默认后端保持一致。 */
 static const char *DEFAULT_CLOUD_HEALTH_URL = "http://139.9.35.72/health";
@@ -4460,6 +4467,10 @@ class DeviceHealthController : public QObject
     Q_PROPERTY(QString cloudStatusColor READ cloudStatusColor NOTIFY cloudStatusChanged)
     Q_PROPERTY(QString sdcardStatusText READ sdcardStatusText NOTIFY sdcardStatusChanged)
     Q_PROPERTY(QString sdcardStatusColor READ sdcardStatusColor NOTIFY sdcardStatusChanged)
+    Q_PROPERTY(QString locationStatusText READ locationStatusText NOTIFY locationStatusChanged)
+    Q_PROPERTY(QString locationDisplayText READ locationDisplayText NOTIFY locationStatusChanged)
+    Q_PROPERTY(QString locationShortText READ locationShortText NOTIFY locationStatusChanged)
+    Q_PROPERTY(QString locationStatusColor READ locationStatusColor NOTIFY locationStatusChanged)
     Q_PROPERTY(QString detailText READ detailText NOTIFY detailTextChanged)
 
 public:
@@ -4481,6 +4492,7 @@ public:
           m_overlaySocket(QString::fromLatin1(DEFAULT_OVERLAY_CONTROL_SOCKET)),
           m_overlayRestartScript(QString::fromLatin1(DEFAULT_OVERLAY_RESTART_SCRIPT)),
           m_networkScript(QString::fromLatin1(DEFAULT_4G_PPP_SCRIPT)),
+          m_locationScript(QString::fromLatin1(DEFAULT_4G_LOCATION_SCRIPT)),
           m_cloudHealthUrl(QString::fromLatin1(DEFAULT_CLOUD_HEALTH_URL)),
           m_sdcardMount(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
           m_f4Device(QString::fromLatin1(DEFAULT_F4_SERIAL_DEVICE)),
@@ -4496,16 +4508,23 @@ public:
           m_cloudStatusColor(QStringLiteral("#f4b942")),
           m_sdcardStatusText(QStringLiteral("检测中")),
           m_sdcardStatusColor(QStringLiteral("#f4b942")),
+          m_locationStatusText(QStringLiteral("未定位")),
+          m_locationDisplayText(QStringLiteral("未定位")),
+          m_locationShortText(QStringLiteral("未定位")),
+          m_locationStatusColor(QStringLiteral("#f4b942")),
           m_detailText(QStringLiteral("设备健康检测启动")),
           m_lastOverlaySerial(0),
           m_cameraOfflineCount(0),
           m_overlayRestartCooldown(0),
           m_networkProbeRunning(false),
+          m_locationProbeRunning(false),
           m_cloudProbeRunning(false),
           m_f4ProbeRunning(false),
           m_f4CommandRunning(false),
           m_overlayProbeRunning(false),
           m_networkProbeTimedOut(false),
+          m_locationProbeTimedOut(false),
+          m_locationBootProbeDone(false),
           m_cloudProbeTimedOut(false)
     {
         /*
@@ -4531,6 +4550,18 @@ public:
                 &DeviceHealthController::handleNetworkProcessError);
         connect(&m_networkTimeout, &QTimer::timeout, this, &DeviceHealthController::handleNetworkProbeTimeout);
         m_networkTimeout.setSingleShot(true);
+
+        m_locationProcess.setProcessChannelMode(QProcess::MergedChannels);
+        connect(&m_locationProcess,
+                static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this,
+                &DeviceHealthController::handleLocationProcessFinished);
+        connect(&m_locationProcess,
+                static_cast<void (QProcess::*)(QProcess::ProcessError)>(&QProcess::errorOccurred),
+                this,
+                &DeviceHealthController::handleLocationProcessError);
+        connect(&m_locationTimeout, &QTimer::timeout, this, &DeviceHealthController::handleLocationProbeTimeout);
+        m_locationTimeout.setSingleShot(true);
 
         m_cloudProcess.setProcessChannelMode(QProcess::MergedChannels);
         connect(&m_cloudProcess,
@@ -4575,6 +4606,18 @@ public:
     /* sdcardStatusColor 返回 SD 卡挂载状态颜色。 */
     QString sdcardStatusColor() const { return m_sdcardStatusColor; }
 
+    /* locationStatusText 返回定位状态，例如 已定位、定位中、缺少Key 或失败。 */
+    QString locationStatusText() const { return m_locationStatusText; }
+
+    /* locationDisplayText 返回完整位置文本；当前 IP 省份定位模式下只返回省份，例如 河南省。 */
+    QString locationDisplayText() const { return m_locationDisplayText; }
+
+    /* locationShortText 返回顶部栏短文本；当前 IP 省份定位模式下只返回省份，例如 河南省。 */
+    QString locationShortText() const { return m_locationShortText; }
+
+    /* locationStatusColor 返回定位状态颜色，绿色已定位、黄色等待、红色失败。 */
+    QString locationStatusColor() const { return m_locationStatusColor; }
+
     /* detailText 返回最近一次健康检测详情，用于告警页和日志排查。 */
     QString detailText() const { return m_detailText; }
 
@@ -4600,6 +4643,11 @@ public:
         refreshSdcardStatus();
         refreshOverlayCameraStatus();
         startNetworkProbe();
+        if (!m_locationBootProbeDone) {
+            startLocationProbe(true);
+        } else {
+            startLocationProbe(false);
+        }
         startCloudProbe();
         startF4Probe(false);
     }
@@ -4715,6 +4763,9 @@ signals:
     /* sdcardStatusChanged 通知 QML SD 卡状态和颜色已更新。 */
     void sdcardStatusChanged();
 
+    /* locationStatusChanged 通知 QML 高德 IP 省份定位状态已更新。 */
+    void locationStatusChanged();
+
     /* detailTextChanged 通知 QML 最近检测详情已更新。 */
     void detailTextChanged();
 
@@ -4782,6 +4833,112 @@ private slots:
         m_networkProbeTimedOut = false;
         setNetworkStatus(QStringLiteral("未安装"), QStringLiteral("#f4b942"));
         setDetailText(QStringLiteral("无法启动 4G 测试命令：") + m_networkProcess.errorString());
+    }
+
+    /*
+     * handleLocationProcessFinished 的作用：
+     *   接收 `4g-location once` 输出的 key=value 状态，并更新 Qt 位置显示。
+     *
+     * 主要流程：
+     *   1. 停止定位超时定时器并释放忙标志。
+     *   2. 解析脚本输出中的 state/display/short_display/detail 字段。
+     *   3. 根据 state 映射成操作员可读状态文本和颜色。
+     *
+     * 参数：
+     *   exitCode 是 4g-location 退出码。
+     *   exitStatus 表示进程是否正常退出。
+     *
+     * 返回值：
+     *   无返回值；结果通过 locationStatusChanged 通知 QML。
+     */
+    void handleLocationProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+    {
+        const QString output = QString::fromUtf8(m_locationProcess.readAll()).trimmed();
+
+        m_locationTimeout.stop();
+        m_locationProbeRunning = false;
+
+        if (m_locationProbeTimedOut) {
+            m_locationProbeTimedOut = false;
+            return;
+        }
+
+        const QMap<QString, QString> values = parseKeyValueOutput(output);
+        const QString state = values.value(QStringLiteral("state"));
+        const QString display = values.value(QStringLiteral("display"), QStringLiteral("未定位"));
+        const QString shortDisplay = values.value(QStringLiteral("short_display"), display);
+        const QString detail = values.value(QStringLiteral("detail"), compactText(output, 96));
+
+        if (exitStatus == QProcess::NormalExit && exitCode == 0 && state == QStringLiteral("ip_ok")) {
+            /*
+             * state=ip_ok 表示 4g-location 已用高德 IP 定位拿到省份。
+             * 这个状态只用于比赛现场稳定显示省份，不显示城市和区县，所以状态文字明确写成“IP定位”。
+             */
+            setLocationStatus(QStringLiteral("IP定位"),
+                              QStringLiteral("#35d07f"),
+                              display,
+                              shortDisplay);
+            setDetailText(QStringLiteral("IP定位：") + display);
+            return;
+        }
+
+        if (state == QStringLiteral("no_key")) {
+            setLocationStatus(QStringLiteral("缺少Key"),
+                              QStringLiteral("#f4b942"),
+                              display,
+                              shortDisplay);
+        } else if (state == QStringLiteral("ip_failed")) {
+            setLocationStatus(QStringLiteral("定位失败"),
+                              QStringLiteral("#ef5b5b"),
+                              display,
+                              shortDisplay);
+        } else {
+            setLocationStatus(QStringLiteral("未定位"),
+                              QStringLiteral("#f4b942"),
+                              display,
+                              shortDisplay);
+        }
+
+        setDetailText(QStringLiteral("定位未完成：") + detail);
+    }
+
+    /*
+     * handleLocationProbeTimeout 的作用：
+     *   定位脚本超过短超时后主动结束，避免高德 IP 定位请求拖住健康刷新。
+     */
+    void handleLocationProbeTimeout()
+    {
+        if (m_locationProcess.state() != QProcess::NotRunning) {
+            m_locationProbeTimedOut = true;
+            m_locationProcess.kill();
+        } else {
+            m_locationProbeRunning = false;
+        }
+        setLocationStatus(QStringLiteral("超时"),
+                          QStringLiteral("#ef5b5b"),
+                          m_locationDisplayText,
+                          m_locationShortText);
+        setDetailText(QStringLiteral("4G IP 定位超时"));
+    }
+
+    /*
+     * handleLocationProcessError 的作用：
+     *   异步接收 4G 定位脚本启动失败错误，避免 startLocationProbe() 阻塞 QML 主线程。
+     */
+    void handleLocationProcessError(QProcess::ProcessError error)
+    {
+        if (error != QProcess::FailedToStart) {
+            return;
+        }
+
+        m_locationTimeout.stop();
+        m_locationProbeRunning = false;
+        m_locationProbeTimedOut = false;
+        setLocationStatus(QStringLiteral("未安装"),
+                          QStringLiteral("#f4b942"),
+                          QStringLiteral("未定位"),
+                          QStringLiteral("未定位"));
+        setDetailText(QStringLiteral("无法启动 4G 定位命令：") + m_locationProcess.errorString());
     }
 
     /*
@@ -4926,6 +5083,44 @@ private:
     }
 
     /*
+     * parseKeyValueOutput 的作用：
+     *   解析 4g-location 输出的 key=value 状态文本。
+     *
+     * 主要流程：
+     *   1. 按行切分外部命令输出。
+     *   2. 查找每行第一个等号，左边作为键，右边作为值。
+     *   3. 跳过空键，保留值中的中文、空格和坐标字符。
+     *
+     * 参数：
+     *   output 是外部脚本 stdout/stderr 合并后的文本。
+     *
+     * 返回值：
+     *   返回键值映射；找不到字段时由调用方使用默认值。
+     */
+    QMap<QString, QString> parseKeyValueOutput(const QString &output) const
+    {
+        QMap<QString, QString> values;
+        const QStringList lines = output.split(QRegExp(QStringLiteral("[\r\n]+")), QString::SkipEmptyParts);
+
+        for (const QString &line : lines) {
+            const int equalsIndex = line.indexOf(QLatin1Char('='));
+            if (equalsIndex <= 0) {
+                continue;
+            }
+
+            const QString key = line.left(equalsIndex).trimmed();
+            const QString value = line.mid(equalsIndex + 1).trimmed();
+            if (key.isEmpty()) {
+                continue;
+            }
+
+            values.insert(key, value);
+        }
+
+        return values;
+    }
+
+    /*
      * startNetworkProbe 的作用：
      *   异步启动 4G 联网测试，忙时跳过本轮，防止弱网下任务堆积。
      *
@@ -4944,6 +5139,33 @@ private:
         m_networkProcess.start(m_networkScript, QStringList() << QStringLiteral("test"));
         if (m_networkProbeRunning) {
             m_networkTimeout.start(7000);
+        }
+    }
+
+    /*
+     * startLocationProbe 的作用：
+     *   异步调用 4G IP 定位脚本，刷新板端所在省份。
+     *
+     * 关键说明：
+     *   这个函数不直接访问 `/dev/ttyUSB*`，也不读取高德 Key；这些细节由 4g-location 管理。
+     *   Qt 只在开机第一轮执行 `once`，后续周期只执行 `status` 读取缓存，避免运行中重复调用高德接口。
+     */
+    void startLocationProbe(bool activeProbe)
+    {
+        if (m_locationProbeRunning) {
+            return;
+        }
+
+        m_locationProbeRunning = true;
+        m_locationProbeTimedOut = false;
+        if (activeProbe) {
+            m_locationBootProbeDone = true;
+        }
+        m_locationProcess.start(m_locationScript,
+                                QStringList()
+                                << (activeProbe ? QStringLiteral("once") : QStringLiteral("status")));
+        if (m_locationProbeRunning) {
+            m_locationTimeout.start(LOCATION_PROBE_TIMEOUT_MS);
         }
     }
 
@@ -5618,6 +5840,24 @@ private:
         emit sdcardStatusChanged();
     }
 
+    void setLocationStatus(const QString &text,
+                           const QString &color,
+                           const QString &display,
+                           const QString &shortDisplay)
+    {
+        if (m_locationStatusText == text
+                && m_locationStatusColor == color
+                && m_locationDisplayText == display
+                && m_locationShortText == shortDisplay) {
+            return;
+        }
+        m_locationStatusText = text;
+        m_locationStatusColor = color;
+        m_locationDisplayText = display;
+        m_locationShortText = shortDisplay;
+        emit locationStatusChanged();
+    }
+
     void setDetailText(const QString &text)
     {
         if (m_detailText == text) {
@@ -5632,6 +5872,7 @@ private:
     QString m_overlaySocket;            /* m_overlaySocket 保存 overlay 控制 socket 路径。 */
     QString m_overlayRestartScript;     /* m_overlayRestartScript 保存相机重连时要后台执行的控制脚本。 */
     QString m_networkScript;            /* m_networkScript 保存 4G PPP 管理命令。 */
+    QString m_locationScript;           /* m_locationScript 保存 4G IP 省份定位命令。 */
     QString m_cloudHealthUrl;           /* m_cloudHealthUrl 保存云端 health 地址。 */
     QString m_sdcardMount;              /* m_sdcardMount 保存 SD 卡挂载点。 */
     QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
@@ -5648,21 +5889,31 @@ private:
     QString m_cloudStatusColor;         /* m_cloudStatusColor 保存云端状态颜色。 */
     QString m_sdcardStatusText;         /* m_sdcardStatusText 保存 SD 卡状态文本。 */
     QString m_sdcardStatusColor;        /* m_sdcardStatusColor 保存 SD 卡状态颜色。 */
+    QString m_locationStatusText;       /* m_locationStatusText 保存 4G IP 定位状态文本。 */
+    QString m_locationDisplayText;      /* m_locationDisplayText 保存完整省市区显示文本。 */
+    QString m_locationShortText;        /* m_locationShortText 保存顶部状态栏短位置文本。 */
+    QString m_locationStatusColor;      /* m_locationStatusColor 保存定位状态颜色。 */
     QString m_detailText;               /* m_detailText 保存最近一次健康检测详情。 */
     unsigned int m_lastOverlaySerial;   /* m_lastOverlaySerial 保存上一次 overlay 帧序号，后续可用于卡帧判断。 */
     int m_cameraOfflineCount;           /* m_cameraOfflineCount 记录相机连续离线次数。 */
     int m_overlayRestartCooldown;       /* m_overlayRestartCooldown 防止相机离线时反复高频重启 overlay。 */
     bool m_networkProbeRunning;         /* m_networkProbeRunning 防止网络检测任务堆积。 */
+    bool m_locationProbeRunning;        /* m_locationProbeRunning 防止 IP 定位脚本任务堆积。 */
     bool m_cloudProbeRunning;           /* m_cloudProbeRunning 防止云端检测任务堆积。 */
     bool m_f4ProbeRunning;              /* m_f4ProbeRunning 防止串口检测线程堆积。 */
     bool m_f4CommandRunning;            /* m_f4CommandRunning 防止 CAL 标定等手动命令并发写同一个 RS485 串口。 */
     bool m_overlayProbeRunning;         /* m_overlayProbeRunning 防止 overlay socket 查询重入。 */
     bool m_networkProbeTimedOut;        /* m_networkProbeTimedOut 标记当前 4G 进程已超时，finished 时不再覆盖超时状态。 */
+    bool m_locationProbeTimedOut;       /* m_locationProbeTimedOut 标记当前定位进程已超时，finished 时不再覆盖超时状态。 */
+
+    bool m_locationBootProbeDone;       /* m_locationBootProbeDone 标记本次开机是否已经主动执行过一次 4g-location once。 */
     bool m_cloudProbeTimedOut;          /* m_cloudProbeTimedOut 标记当前云端进程已超时，finished 时不再覆盖超时状态。 */
     QTimer m_healthTimer;               /* m_healthTimer 周期性调度整轮健康检测。 */
     QTimer m_networkTimeout;            /* m_networkTimeout 是 4G 测试短超时。 */
+    QTimer m_locationTimeout;           /* m_locationTimeout 是 4G IP 定位短超时。 */
     QTimer m_cloudTimeout;              /* m_cloudTimeout 是云端测试短超时。 */
     QProcess m_networkProcess;          /* m_networkProcess 异步执行 4g-ppp test。 */
+    QProcess m_locationProcess;         /* m_locationProcess 异步执行 4g-location once。 */
     QProcess m_cloudProcess;            /* m_cloudProcess 异步执行 curl health。 */
 };
 

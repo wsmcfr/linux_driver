@@ -29,6 +29,9 @@ BOARD_TIME_ZONE="${BOARD_TIME_ZONE:-CST-8}"
 USB_POWER_CONTROLS="${USB_POWER_CONTROLS:-/sys/bus/usb/devices/2-1/power/control /sys/bus/usb/devices/2-1.7/power/control}"
 AT_RESPONSE_SECONDS="${AT_RESPONSE_SECONDS:-2}"
 AT_PROBE_SECONDS="${AT_PROBE_SECONDS:-1}"
+AT_LOCK_DIR="${AT_LOCK_DIR:-/var/run/4g-at.lock}"
+AT_LOCK_WAIT_SECONDS="${AT_LOCK_WAIT_SECONDS:-12}"
+AT_LOCK_STALE_SECONDS="${AT_LOCK_STALE_SECONDS:-60}"
 SIM_PRESENT_WIRED="${SIM_PRESENT_WIRED:-0}"
 SIM_RECENT_NO_CARD_INTERVAL="${SIM_RECENT_NO_CARD_INTERVAL:-5}"
 SIM_RECENT_NO_CARD_WINDOW_SECONDS="${SIM_RECENT_NO_CARD_WINDOW_SECONDS:-8}"
@@ -263,6 +266,107 @@ wait_for_tty()
 	return 1
 }
 
+remove_at_lock_dir()
+{
+	# 函数作用：
+	#   安全删除共享 AT 锁目录，避免 AT_LOCK_DIR 被误配置时删除非锁路径。
+	#
+	# 主要流程：
+	#   1. 只允许删除路径末尾为 `4g-at.lock` 的锁目录。
+	#   2. 路径为空、根目录、`/var/run` 这类非锁目录时拒绝删除并写日志。
+	#
+	# 参数：
+	#   无；使用全局 AT_LOCK_DIR。
+	#
+	# 返回值：
+	#   0 表示删除完成或路径不存在；1 表示路径不符合安全约束。
+	case "$AT_LOCK_DIR" in
+		*/4g-at.lock)
+			rm -rf "$AT_LOCK_DIR" 2>/dev/null || true
+			return 0
+			;;
+		*)
+			log_msg "拒绝删除非 4G AT 锁目录：$AT_LOCK_DIR" >/dev/null
+			return 1
+			;;
+	esac
+}
+
+acquire_at_lock()
+{
+	# 函数作用：
+	#   获取 4G 模块 AT 管理口的跨脚本互斥锁，避免 4g-ppp monitor 和 4g-location 同时读写同一个 ttyUSB。
+	#
+	# 主要流程：
+	#   1. 使用 `mkdir` 创建锁目录；BusyBox 环境中目录创建具备原子性，不依赖 flock。
+	#   2. 成功后写入 owner、pid、created_at 和 reason，方便板端 SSH 排查锁归属。
+	#   3. 如果锁已存在，检查 created_at；超过 AT_LOCK_STALE_SECONDS 的陈旧锁会被清理。
+	#   4. 最多等待 AT_LOCK_WAIT_SECONDS，超时后返回失败，让 monitor 下轮继续观察。
+	#
+	# 参数：
+	#   $1：锁用途说明，例如 `AT+CPIN? on /dev/ttyUSB3`。
+	#
+	# 返回值：
+	#   0 表示成功持有锁；1 表示等待超时未拿到锁。
+	lock_reason="$1"
+	lock_start="$(now_seconds)"
+
+	while :; do
+		if mkdir "$AT_LOCK_DIR" 2>/dev/null; then
+			{
+				printf 'owner=4g-ppp\n'
+				printf 'pid=%s\n' "$$"
+				printf 'created_at=%s\n' "$(now_seconds)"
+				printf 'reason=%s\n' "$lock_reason"
+			} > "$AT_LOCK_DIR/info" 2>/dev/null || true
+			return 0
+		fi
+
+		lock_now="$(now_seconds)"
+		lock_created="$(sed -n 's/^created_at=//p' "$AT_LOCK_DIR/info" 2>/dev/null | head -n 1)"
+		case "$lock_created" in
+			''|*[!0-9]*)
+				lock_created=0
+				;;
+		esac
+
+		if [ "$lock_created" -gt 0 ] &&
+				[ $((lock_now - lock_created)) -ge "$AT_LOCK_STALE_SECONDS" ]; then
+			log_msg "清理陈旧 AT 串口锁：$AT_LOCK_DIR" >/dev/null
+			remove_at_lock_dir || return 1
+			continue
+		fi
+
+		if [ $((lock_now - lock_start)) -ge "$AT_LOCK_WAIT_SECONDS" ]; then
+			log_msg "等待 AT 串口锁超时：$AT_LOCK_DIR，reason=$lock_reason" >/dev/null
+			return 1
+		fi
+
+		sleep 1
+	done
+}
+
+release_at_lock()
+{
+	# 函数作用：
+	#   释放当前 4g-ppp 进程持有的 AT 串口锁。
+	#
+	# 主要流程：
+	#   1. 读取锁目录中的 pid。
+	#   2. 只有 pid 等于当前脚本 PID 时才删除，避免误删其它进程刚获得的新锁。
+	#
+	# 参数：
+	#   无。
+	#
+	# 返回值：
+	#   始终返回 0；释放失败不影响 PPP 主状态机继续运行。
+	lock_pid="$(sed -n 's/^pid=//p' "$AT_LOCK_DIR/info" 2>/dev/null | head -n 1)"
+	if [ "$lock_pid" = "$$" ]; then
+		remove_at_lock_dir || true
+	fi
+	return 0
+}
+
 at_exchange_on_tty()
 {
 	# 函数作用：
@@ -297,6 +401,10 @@ at_exchange_on_tty()
 		return 2
 	fi
 
+	if ! acquire_at_lock "$at_cmd on $at_device"; then
+		return 1
+	fi
+
 	old_stty="$(stty -F "$at_device" -g 2>/dev/null || true)"
 	stty -F "$at_device" "$PPP_BAUD" raw -echo -crtscts 2>/dev/null || true
 	rm -f "$at_tmp"
@@ -312,6 +420,7 @@ at_exchange_on_tty()
 			stty -F "$at_device" "$old_stty" 2>/dev/null || true
 		fi
 		rm -f "$at_tmp"
+		release_at_lock
 		return 1
 	fi
 
@@ -325,6 +434,7 @@ at_exchange_on_tty()
 
 	cat "$at_tmp" 2>/dev/null || true
 	rm -f "$at_tmp"
+	release_at_lock
 	return 0
 }
 
@@ -783,6 +893,10 @@ wait_for_sim_urc_or_timeout()
 		return 1
 	fi
 
+	if ! acquire_at_lock "SIM URC listen on $AT_TTY"; then
+		return 1
+	fi
+
 	old_stty="$(stty -F "$AT_TTY" -g 2>/dev/null || true)"
 	stty -F "$AT_TTY" "$PPP_BAUD" raw -echo -crtscts 2>/dev/null || true
 
@@ -811,6 +925,7 @@ wait_for_sim_urc_or_timeout()
 	if [ -n "$old_stty" ]; then
 		stty -F "$AT_TTY" "$old_stty" 2>/dev/null || true
 	fi
+	release_at_lock
 
 	if [ "$urc_rc" -eq 0 ]; then
 		log_msg "监听到 SIM 插入/READY URC，进入快速确认"
@@ -1401,7 +1516,8 @@ monitor_start()
 	# 对“环境变量导入后再次赋值是否保留导出属性”的处理差异。
 	export PPP_IF PPP_DIR PPP_ON PPP_TTY AT_TTY AT_TTY_CANDIDATES PPP_BAUD LOG_FILE PID_FILE STATE_FILE MONITOR_PID_FILE CFUN_STAMP_FILE SIM_ERROR_FAST_STAMP_FILE
 	export WAIT_TTY_SECONDS WAIT_PPP_SECONDS PING_HOST TIME_SYNC_CMD BOARD_TIME_ZONE USB_POWER_CONTROLS
-	export AT_RESPONSE_SECONDS AT_PROBE_SECONDS SIM_PRESENT_WIRED SIM_RECENT_NO_CARD_INTERVAL SIM_RECENT_NO_CARD_WINDOW_SECONDS
+	export AT_RESPONSE_SECONDS AT_PROBE_SECONDS AT_LOCK_DIR AT_LOCK_WAIT_SECONDS AT_LOCK_STALE_SECONDS
+	export SIM_PRESENT_WIRED SIM_RECENT_NO_CARD_INTERVAL SIM_RECENT_NO_CARD_WINDOW_SECONDS
 	export SIM_LONG_NO_CARD_INTERVAL SIM_FAST_RETRY_SECONDS SIM_FAST_WAIT_SECONDS SIM_ONLINE_CHECK_INTERVAL SIM_ONLINE_SIM_CHECK_INTERVAL SIM_ONLINE_PING_TIMEOUT SIM_UNKNOWN_INTERVAL
 	export SIM_CFUN_RECOVERY SIM_CFUN_ON_SIM_ERROR SIM_ERROR_FAST_WAIT_SECONDS SIM_ERROR_FAST_COOLDOWN_SECONDS SIM_CFUN_SIM_ERROR_COOLDOWN_SECONDS SIM_CFUN_AFTER_NO_CARD_SECONDS SIM_CFUN_COOLDOWN_SECONDS SIM_AFTER_CFUN_WAIT_SECONDS SIM_AFTER_CFUN_READY_WAIT_SECONDS
 
