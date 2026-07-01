@@ -103,6 +103,9 @@ Rectangle {
     /* alarmPageVisible 给告警维护页面做显隐判断；告警页打开时隐藏首页视频层，突出故障处理信息。 */
     property bool alarmPageVisible: activePage === "alarm"
 
+    /* logPageVisible 给日志查看页面做显隐判断；日志页打开时隐藏首页视频层，避免 KMS plane 遮挡列表和弹窗。 */
+    property bool logPageVisible: activePage === "logs"
+
     /* manualMode 表示当前是否允许调试级手动动作；第一版由界面模拟，后续由 F4 状态覆盖。 */
     property bool manualMode: false
 
@@ -204,6 +207,18 @@ Rectangle {
 
     /* alarmAdviceDetailVisible 表示是否打开告警处理建议完整说明浮层，解决右下角建议面板文字显示不全。 */
     property bool alarmAdviceDetailVisible: false
+
+    /* logDetailVisible 表示是否打开日志全文弹窗，用于在固定 1024x600 屏幕中滚动查看完整日志。 */
+    property bool logDetailVisible: false
+
+    /* selectedLogIndex 保存当前点击的日志行号；-1 表示尚未选择日志。 */
+    property int selectedLogIndex: -1
+
+    /* selectedLogEntry 保存当前选中日志的文件名、路径、大小和修改时间，弹窗标题区直接读取它。 */
+    property var selectedLogEntry: logFileModel.entryAt(selectedLogIndex)
+
+    /* selectedLogContent 保存当前日志全文；日志较长时交给 logDetailFlickable 垂直滚动阅读。 */
+    property string selectedLogContent: ""
 
     /* historyDetailVisible 表示历史页是否进入“查看详情”二级页面；false 时只显示第一层检测记录列表。 */
     property bool historyDetailVisible: false
@@ -2060,14 +2075,15 @@ Rectangle {
      *   3. KMS overlay 模式下，非首页需要隐藏视频 plane，返回首页时也必须等 Qt 启动遮罩结束后再恢复。
      *
      * 参数：
-     *   pageName 是目标页面名称，目前支持 home、history、stats、manual、settings 和 alarm。
+     *   pageName 是目标页面名称，目前支持 home、history、stats、manual、settings、alarm 和 logs。
      *
      * 返回值：
      *   无返回值；函数负责更新页面状态和 overlay 可见性。
      */
     function switchPage(pageName) {
         if (pageName !== "home" && pageName !== "history" && pageName !== "stats"
-                && pageName !== "manual" && pageName !== "settings" && pageName !== "alarm") {
+                && pageName !== "manual" && pageName !== "settings"
+                && pageName !== "alarm" && pageName !== "logs") {
             return
         }
 
@@ -2075,9 +2091,15 @@ Rectangle {
         alarmAdviceDetailVisible = false
         settingsDetailVisible = false
         calibrationPopupVisible = false
+        logDetailVisible = false
 
         if (pageName === "history") {
             focusLatestHistoryListRecord()
+        } else if (pageName === "logs") {
+            refreshLogFileList()
+            historyDetailVisible = false
+            historyAnalysisDetailVisible = false
+            selectedHistoryRecord = uploadHistory.entryAt(selectedHistoryIndex)
         } else {
             historyDetailVisible = false
             historyAnalysisDetailVisible = false
@@ -2147,6 +2169,68 @@ Rectangle {
         historyDetailVisible = false
         historyAnalysisDetailVisible = false
         positionHistoryListAtSelected()
+    }
+
+    /*
+     * refreshLogFileList 的作用：
+     *   刷新日志查看页面中的 SD 卡日志文件列表。
+     *
+     * 主要流程：
+     *   1. 调用 C++ LogFileModel::refresh() 重新扫描 /mnt/sdcard/logs。
+     *   2. 如果刷新后没有日志，清空选中状态和弹窗内容。
+     *   3. 如果已有选中索引但日志数量变少，把索引压回有效范围，避免 QML 读越界。
+     *
+     * 返回值：
+     *   无返回值；列表内容由 logFileModel 模型自动通知 QML 刷新。
+     */
+    function refreshLogFileList() {
+        logFileModel.refresh()
+
+        if (logFileModel.count <= 0) {
+            selectedLogIndex = -1
+            selectedLogEntry = logFileModel.entryAt(selectedLogIndex)
+            selectedLogContent = ""
+            logDetailVisible = false
+            return
+        }
+
+        if (selectedLogIndex >= logFileModel.count) {
+            selectedLogIndex = 0
+            selectedLogEntry = logFileModel.entryAt(selectedLogIndex)
+        }
+    }
+
+    /*
+     * openLogDetail 的作用：
+     *   打开某个日志文件的全文弹窗。
+     *
+     * 主要流程：
+     *   1. 校验 row，避免列表刷新后点击到无效索引。
+     *   2. 保存当前日志摘要，读取完整日志内容。
+     *   3. 显示弹窗后把 logDetailFlickable.contentY 归零，避免上一条日志的滚动位置泄漏到下一条。
+     *
+     * 参数：
+     *   row 是 logFileModel 中的日志索引。
+     *
+     * 返回值：
+     *   无返回值；函数会更新 selectedLogEntry、selectedLogContent 和 logDetailVisible。
+     */
+    function openLogDetail(row) {
+        if (row < 0 || row >= logFileModel.count) {
+            selectedLogIndex = -1
+            selectedLogEntry = logFileModel.entryAt(selectedLogIndex)
+            selectedLogContent = "日志读取失败：记录不存在"
+            logDetailVisible = true
+            return
+        }
+
+        selectedLogIndex = row
+        selectedLogEntry = logFileModel.entryAt(row)
+        selectedLogContent = logFileModel.readLogContent(row)
+        logDetailVisible = true
+        Qt.callLater(function() {
+            logDetailFlickable.contentY = 0
+        })
     }
 
     /*
@@ -3658,7 +3742,8 @@ Rectangle {
                     {"text": "统计分析", "page": "stats"},
                     {"text": "手动控制", "page": "manual"},
                     {"text": "参数设置", "page": "settings"},
-                    {"text": "告警维护", "page": "alarm"}
+                    {"text": "告警维护", "page": "alarm"},
+                    {"text": "日志查看", "page": "logs"}
                 ]
 
                 Rectangle {
@@ -3712,7 +3797,7 @@ Rectangle {
         border.width: 1
         clip: true
         visible: !root.historyPageVisible && !root.statsPageVisible && !root.manualPageVisible
-                 && !root.settingsPageVisible && !root.alarmPageVisible
+                 && !root.settingsPageVisible && !root.alarmPageVisible && !root.logPageVisible
 
         V4L2VideoItem {
             id: cameraView
@@ -3850,7 +3935,7 @@ Rectangle {
         border.color: root.borderColor
         border.width: 1
         visible: !root.historyPageVisible && !root.statsPageVisible && !root.manualPageVisible
-                 && !root.settingsPageVisible && !root.alarmPageVisible
+                 && !root.settingsPageVisible && !root.alarmPageVisible && !root.logPageVisible
 
         Text {
             x: 16
@@ -7944,6 +8029,408 @@ Rectangle {
         }
     }
 
+    /* logPage 是日志查看界面：读取 /mnt/sdcard/logs 下的 .log/.txt 文件，点击文件名后弹窗查看全文。 */
+    Rectangle {
+        id: logPage
+        x: 176
+        y: 72
+        width: root.width - 192
+        height: root.height - 88
+        radius: 8
+        color: "#171a1d"
+        border.color: root.borderColor
+        border.width: 1
+        visible: root.logPageVisible
+        clip: true
+
+        /* logHeader 显示页面标题、扫描状态、日志数量、刷新入口和返回首页入口。 */
+        Rectangle {
+            id: logHeader
+            x: 16
+            y: 12
+            width: parent.width - 32
+            height: 38
+            color: "transparent"
+
+            Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "日志查看"
+                color: "#f1f4f5"
+                font.pixelSize: 20
+                font.bold: true
+            }
+
+            Text {
+                anchors.left: parent.left
+                anchors.leftMargin: 100
+                anchors.right: logHeaderActions.left
+                anchors.rightMargin: 12
+                anchors.verticalCenter: parent.verticalCenter
+                text: logFileModel.statusText
+                color: logFileModel.count > 0 ? "#aeb9bf" : root.accentAmber
+                font.pixelSize: 13
+                elide: Text.ElideRight
+            }
+
+            Row {
+                id: logHeaderActions
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 10
+
+                Rectangle {
+                    width: 96
+                    height: 28
+                    radius: 6
+                    color: "#20332a"
+                    border.color: root.accentGreen
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "日志 " + logFileModel.count
+                        color: "#d9ffe8"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+                }
+
+                Rectangle {
+                    width: 82
+                    height: 28
+                    radius: 6
+                    color: refreshLogMouse.pressed ? "#30413a" : "#1f332b"
+                    border.color: root.accentGreen
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "刷新"
+                        color: "#eafff2"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    MouseArea {
+                        id: refreshLogMouse
+                        anchors.fill: parent
+
+                        onClicked: {
+                            root.refreshLogFileList()
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 86
+                    height: 28
+                    radius: 6
+                    color: "#22272b"
+                    border.color: "#3c444a"
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "返回首页"
+                        color: "#eef3f4"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+
+                        onClicked: {
+                            root.switchPage("home")
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            id: logListPanel
+            x: 16
+            y: 58
+            width: parent.width - 32
+            height: parent.height - 74
+            radius: 8
+            color: root.panelColor
+            border.color: root.borderColor
+            border.width: 1
+            clip: true
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 36
+                text: "点击日志文件名查看完整内容，长日志可在弹窗内上下滑动"
+                color: "#aeb9bf"
+                font.pixelSize: 14
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            ListView {
+                id: logListView
+                x: 18
+                y: 48
+                width: parent.width - 36
+                height: parent.height - 66
+                model: logFileModel
+                spacing: 10
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: logFileModel.count > 0
+                cacheBuffer: height
+                flickDeceleration: 1800
+                maximumFlickVelocity: 1200
+
+                delegate: Rectangle {
+                    width: logListView.width
+                    height: 78
+                    radius: 8
+                    color: root.selectedLogIndex === index ? "#20362f" : "#20262a"
+                    border.color: root.selectedLogIndex === index ? root.accentGreen : "#343c42"
+                    border.width: 1
+                    clip: true
+
+                    Rectangle {
+                        x: 14
+                        y: 14
+                        width: 82
+                        height: 50
+                        radius: 7
+                        color: suffix === "log" ? "#3a1f24" : "#1d2d3d"
+                        border.color: suffix === "log" ? root.accentRed : "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: typeText
+                            color: "#ffffff"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+                    }
+
+                    Text {
+                        x: 112
+                        y: 12
+                        width: parent.width - 250
+                        text: fileName
+                        color: "#f4f7f8"
+                        font.pixelSize: 17
+                        font.bold: true
+                        elide: Text.ElideMiddle
+                    }
+
+                    Text {
+                        x: 112
+                        y: 40
+                        width: parent.width - 250
+                        text: filePath
+                        color: "#8f9aa1"
+                        font.pixelSize: 11
+                        elide: Text.ElideMiddle
+                    }
+
+                    Column {
+                        x: parent.width - 126
+                        y: 13
+                        width: 104
+                        spacing: 6
+
+                        Text {
+                            width: parent.width
+                            text: sizeText
+                            color: "#dce3e6"
+                            font.pixelSize: 13
+                            font.bold: true
+                            horizontalAlignment: Text.AlignRight
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: modifiedText
+                            color: "#aeb9bf"
+                            font.pixelSize: 11
+                            horizontalAlignment: Text.AlignRight
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 2
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+
+                        onClicked: {
+                            root.openLogDetail(index)
+                        }
+                    }
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    color: "#141719"
+                    border.color: "#30363b"
+                    border.width: 1
+                    visible: logFileModel.count <= 0
+
+                    Column {
+                        anchors.centerIn: parent
+                        width: parent.width - 80
+                        spacing: 10
+
+                        Text {
+                            width: parent.width
+                            text: "暂无可查看日志"
+                            color: "#dce3e6"
+                            font.pixelSize: 22
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: logFileModel.statusText
+                            color: "#909aa0"
+                            font.pixelSize: 14
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: logDetailOverlay
+        anchors.fill: parent
+        z: 910
+        visible: root.logDetailVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.logDetailVisible = false
+            }
+        }
+
+        Rectangle {
+            width: 720
+            height: 486
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: root.accentGreen
+            border.width: 1
+            clip: true
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 126
+                text: selectedLogEntry.fileName && selectedLogEntry.fileName.length > 0
+                      ? selectedLogEntry.fileName
+                      : "日志详情"
+                color: "#f1f4f5"
+                font.pixelSize: 18
+                font.bold: true
+                elide: Text.ElideMiddle
+            }
+
+            Text {
+                x: 18
+                y: 40
+                width: parent.width - 126
+                text: (selectedLogEntry.typeText && selectedLogEntry.typeText.length > 0
+                       ? selectedLogEntry.typeText : "日志文件")
+                      + " · "
+                      + (selectedLogEntry.sizeText && selectedLogEntry.sizeText.length > 0
+                         ? selectedLogEntry.sizeText : "--")
+                      + " · "
+                      + (selectedLogEntry.modifiedText && selectedLogEntry.modifiedText.length > 0
+                         ? selectedLogEntry.modifiedText : "--")
+                color: "#aeb9bf"
+                font.pixelSize: 12
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 14
+                width: 72
+                height: 32
+                radius: 7
+                color: closeLogDetailMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeLogDetailMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.logDetailVisible = false
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 66
+                width: parent.width - 36
+                height: parent.height - 84
+                radius: 8
+                color: "#141719"
+                border.color: "#30363b"
+                border.width: 1
+                clip: true
+
+                Flickable {
+                    id: logDetailFlickable
+                    anchors.fill: parent
+                    anchors.margins: 14
+                    contentWidth: width
+                    contentHeight: logDetailTextItem.height
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+
+                    Text {
+                        id: logDetailTextItem
+                        width: logDetailFlickable.width
+                        text: root.selectedLogContent
+                        color: "#d7dee2"
+                        font.family: "monospace"
+                        font.pixelSize: 13
+                        lineHeightMode: Text.ProportionalHeight
+                        lineHeight: 1.22
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
+        }
+    }
+
     /* 底部统计区：显示节拍、良率、最近记录和操作按钮。 */
     Rectangle {
         id: statsPanel
@@ -7956,7 +8443,8 @@ Rectangle {
         border.color: root.borderColor
         border.width: 1
         visible: !root.usingKmsOverlay && !root.historyPageVisible && !root.statsPageVisible
-                 && !root.manualPageVisible && !root.settingsPageVisible && !root.alarmPageVisible
+                 && !root.manualPageVisible && !root.settingsPageVisible
+                 && !root.alarmPageVisible && !root.logPageVisible
 
         Row {
             x: 18

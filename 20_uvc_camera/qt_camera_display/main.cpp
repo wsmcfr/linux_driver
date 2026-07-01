@@ -1934,6 +1934,429 @@ private:
 };
 
 /*
+ * LogFileEntry 的作用：
+ *   保存日志查看页面中一条日志文件的摘要信息。
+ *
+ * 字段说明：
+ *   fileName 是日志文件名，只用于列表和弹窗标题显示。
+ *   filePath 是日志文件完整路径，点击详情时按它读取全文。
+ *   suffix 是文件扩展名，用于区分 .log 告警日志和 .txt 诊断快照。
+ *   typeText 是面向操作员的日志类型文案。
+ *   modifiedTime/modifiedText 保存最后修改时间，列表按该时间倒序排列。
+ *   sizeBytes/sizeText 保存文件大小，列表用 sizeText 避免 QML 重复格式化。
+ */
+struct LogFileEntry
+{
+    QString fileName;
+    QString filePath;
+    QString suffix;
+    QString typeText;
+    QDateTime modifiedTime;
+    QString modifiedText;
+    qint64 sizeBytes = 0;
+    QString sizeText;
+};
+
+/*
+ * LogFileModel 的作用：
+ *   把 `/mnt/sdcard/logs` 下的日志文件提供给 QML 日志查看页面。
+ *
+ * 主要流程：
+ *   1. refresh() 扫描日志目录中的 .log 和 .txt 文件。
+ *   2. 按最后修改时间倒序保存到 m_entries，方便最新日志显示在最上方。
+ *   3. QML 列表通过 roleNames() 读取文件名、路径、大小、时间和类型。
+ *   4. 点击某条日志时，QML 调用 readLogContent() 读取完整 UTF-8 内容放进滚动弹窗。
+ *
+ * 关键说明：
+ *   这个模型只读日志，不删除、不改名、不截断，避免界面操作破坏现场诊断证据。
+ */
+class LogFileModel : public QAbstractListModel
+{
+    Q_OBJECT
+    Q_PROPERTY(int count READ count NOTIFY countChanged)
+    Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
+
+public:
+    /*
+     * LogRole 枚举定义 QML 可读取的日志字段。
+     * Qt::UserRole 之后的值只在模型内部使用，QML 通过 roleNames() 暴露的字段名访问。
+     */
+    enum LogRole {
+        FileNameRole = Qt::UserRole + 1,
+        FilePathRole,
+        SuffixRole,
+        TypeTextRole,
+        ModifiedTextRole,
+        SizeBytesRole,
+        SizeTextRole
+    };
+
+    /*
+     * 构造函数的作用：
+     *   保存日志目录路径，并立即执行一次扫描，让页面首次打开时已有数据。
+     *
+     * 参数：
+     *   logDirPath 是板端日志目录，默认 `/mnt/sdcard/logs`。
+     *   parent 是 Qt 对象树父对象。
+     */
+    explicit LogFileModel(const QString &logDirPath, QObject *parent = nullptr)
+        : QAbstractListModel(parent),
+          m_logDirPath(logDirPath),
+          m_statusText(QStringLiteral("尚未扫描日志目录"))
+    {
+        refresh();
+    }
+
+    /*
+     * rowCount 的作用：
+     *   返回当前可展示的日志文件数量。
+     *
+     * 参数：
+     *   parent 是 Qt 模型树父索引，列表模型不使用它。
+     *
+     * 返回值：
+     *   顶层返回日志数量；非根索引返回 0。
+     */
+    int rowCount(const QModelIndex &parent = QModelIndex()) const override
+    {
+        if (parent.isValid()) {
+            return 0;
+        }
+
+        return m_entries.size();
+    }
+
+    /*
+     * data 的作用：
+     *   按 QML 请求的角色返回日志文件摘要字段。
+     *
+     * 参数：
+     *   index 是日志行号。
+     *   role 是 QML 请求的字段角色。
+     *
+     * 返回值：
+     *   索引有效时返回对应字段；索引无效时返回空 QVariant。
+     */
+    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override
+    {
+        if (!index.isValid() || index.row() < 0 || index.row() >= m_entries.size()) {
+            return QVariant();
+        }
+
+        const LogFileEntry &entry = m_entries.at(index.row());
+
+        switch (role) {
+        case FileNameRole:
+            return entry.fileName;
+        case FilePathRole:
+            return entry.filePath;
+        case SuffixRole:
+            return entry.suffix;
+        case TypeTextRole:
+            return entry.typeText;
+        case ModifiedTextRole:
+            return entry.modifiedText;
+        case SizeBytesRole:
+            return entry.sizeBytes;
+        case SizeTextRole:
+            return entry.sizeText;
+        default:
+            return QVariant();
+        }
+    }
+
+    /*
+     * roleNames 的作用：
+     *   把 C++ 角色枚举映射成 QML 中可直接使用的字段名。
+     *
+     * 返回值：
+     *   返回 role -> name 的映射，例如 QML 中可写 `model.fileName`。
+     */
+    QHash<int, QByteArray> roleNames() const override
+    {
+        QHash<int, QByteArray> roles;
+
+        roles.insert(FileNameRole, "fileName");
+        roles.insert(FilePathRole, "filePath");
+        roles.insert(SuffixRole, "suffix");
+        roles.insert(TypeTextRole, "typeText");
+        roles.insert(ModifiedTextRole, "modifiedText");
+        roles.insert(SizeBytesRole, "sizeBytes");
+        roles.insert(SizeTextRole, "sizeText");
+
+        return roles;
+    }
+
+    /*
+     * count 的作用：
+     *   给 QML 提供日志数量属性，避免页面直接调用 rowCount()。
+     *
+     * 返回值：
+     *   返回当前日志文件数量。
+     */
+    Q_INVOKABLE int count() const
+    {
+        return m_entries.size();
+    }
+
+    /*
+     * statusText 的作用：
+     *   返回最近一次扫描日志目录的状态。
+     *
+     * 返回值：
+     *   返回“已加载 N 个日志文件”、目录不存在或暂无日志等中文提示。
+     */
+    QString statusText() const
+    {
+        return m_statusText;
+    }
+
+    /*
+     * entryAt 的作用：
+     *   按索引返回一条日志文件摘要，弹窗标题和空状态都复用它。
+     *
+     * 参数：
+     *   row 是日志列表索引。
+     *
+     * 返回值：
+     *   返回 QVariantMap；索引非法时返回空字段。
+     */
+    Q_INVOKABLE QVariantMap entryAt(int row) const
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            return entryToVariantMap(LogFileEntry());
+        }
+
+        return entryToVariantMap(m_entries.at(row));
+    }
+
+    /*
+     * refresh 的作用：
+     *   重新扫描板端日志目录，并通知 QML 列表刷新。
+     *
+     * 主要流程：
+     *   1. 检查日志目录是否存在，目录缺失通常代表 SD 卡未挂载或部署路径异常。
+     *   2. 只收集 .log 和 .txt 文件，避免把临时文件、图片或其它资源误当日志展示。
+     *   3. 按最后修改时间倒序排序，让最新告警和快照显示在最前面。
+     *   4. 用 beginResetModel/endResetModel 一次性刷新模型，避免多次插入导致 QML 跳动。
+     *
+     * 返回值：
+     *   无返回值；扫描结果通过模型和 statusText 暴露给 QML。
+     */
+    Q_INVOKABLE void refresh()
+    {
+        const int oldCount = m_entries.size();
+        QVector<LogFileEntry> refreshedEntries;
+        QDir logDir(m_logDirPath);
+
+        if (!logDir.exists()) {
+            beginResetModel();
+            m_entries.clear();
+            endResetModel();
+
+            if (oldCount != m_entries.size()) {
+                emit countChanged();
+            }
+            setStatusText(m_logDirPath + QStringLiteral(" 不存在，请确认 SD 卡已挂载"));
+            return;
+        }
+
+        const QFileInfoList fileInfos = logDir.entryInfoList(QStringList()
+                                                             << QStringLiteral("*.log")
+                                                             << QStringLiteral("*.txt"),
+                                                             QDir::Files | QDir::NoSymLinks,
+                                                             QDir::NoSort);
+
+        for (const QFileInfo &fileInfo : fileInfos) {
+            LogFileEntry entry;
+
+            entry.fileName = fileInfo.fileName();
+            entry.filePath = fileInfo.absoluteFilePath();
+            entry.suffix = fileInfo.suffix().toLower();
+            entry.typeText = typeTextForSuffix(entry.suffix);
+            entry.modifiedTime = fileInfo.lastModified();
+            entry.modifiedText = entry.modifiedTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            entry.sizeBytes = fileInfo.size();
+            entry.sizeText = formatSizeText(entry.sizeBytes);
+
+            refreshedEntries.append(entry);
+        }
+
+        std::sort(refreshedEntries.begin(), refreshedEntries.end(),
+                  [](const LogFileEntry &left, const LogFileEntry &right) {
+            if (left.modifiedTime == right.modifiedTime) {
+                return left.fileName < right.fileName;
+            }
+            return left.modifiedTime > right.modifiedTime;
+        });
+
+        beginResetModel();
+        m_entries = refreshedEntries;
+        endResetModel();
+
+        if (oldCount != m_entries.size()) {
+            emit countChanged();
+        }
+
+        if (m_entries.isEmpty()) {
+            setStatusText(m_logDirPath + QStringLiteral(" 暂无 .log 或 .txt 日志文件"));
+        } else {
+            setStatusText(QStringLiteral("已加载 %1 个日志文件").arg(m_entries.size()));
+        }
+    }
+
+    /*
+     * readLogContent 的作用：
+     *   读取指定日志文件的完整内容，供 QML 详情弹窗显示。
+     *
+     * 主要流程：
+     *   1. 校验 row，避免 QML 使用过期索引。
+     *   2. 按 entry.filePath 打开文件，只读不写。
+     *   3. 使用 readAll() 读取完整内容，满足“点击日志看全部内容”的页面需求。
+     *   4. 优先按 UTF-8 解码；日志为空时返回明确占位，避免弹窗空白像读取失败。
+     *
+     * 参数：
+     *   row 是日志列表索引。
+     *
+     * 返回值：
+     *   成功返回日志全文；失败返回“日志读取失败：...”中文原因。
+     */
+    Q_INVOKABLE QString readLogContent(int row) const
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            return QStringLiteral("日志读取失败：记录不存在");
+        }
+
+        const LogFileEntry &entry = m_entries.at(row);
+        QFile file(entry.filePath);
+
+        if (!file.exists()) {
+            return QStringLiteral("日志读取失败：文件不存在\n路径：") + entry.filePath;
+        }
+
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            return QStringLiteral("日志读取失败：无法打开 ")
+                + entry.filePath
+                + QStringLiteral("：")
+                + file.errorString();
+        }
+
+        const QByteArray contentBytes = file.readAll();
+        if (file.error() != QFile::NoError) {
+            return QStringLiteral("日志读取失败：读取 ")
+                + entry.filePath
+                + QStringLiteral(" 时出错：")
+                + file.errorString();
+        }
+
+        if (contentBytes.isEmpty()) {
+            return QStringLiteral("（空日志文件）");
+        }
+
+        return QString::fromUtf8(contentBytes);
+    }
+
+signals:
+    /* countChanged 在刷新后日志数量变化时通知 QML 更新计数。 */
+    void countChanged();
+
+    /* statusTextChanged 在刷新状态变化时通知 QML 更新顶部提示。 */
+    void statusTextChanged();
+
+private:
+    /*
+     * setStatusText 的作用：
+     *   统一更新扫描状态，并避免相同文本重复发信号。
+     *
+     * 参数：
+     *   text 是新的中文状态文本。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setStatusText(const QString &text)
+    {
+        if (m_statusText == text) {
+            return;
+        }
+
+        m_statusText = text;
+        emit statusTextChanged();
+    }
+
+    /*
+     * typeTextForSuffix 的作用：
+     *   根据扩展名生成面向操作员的日志类型。
+     *
+     * 参数：
+     *   suffix 是小写扩展名，不包含点号。
+     *
+     * 返回值：
+     *   .log 返回“告警日志”，.txt 返回“诊断快照”，其它返回“日志文件”。
+     */
+    QString typeTextForSuffix(const QString &suffix) const
+    {
+        if (suffix == QStringLiteral("log")) {
+            return QStringLiteral("告警日志");
+        }
+        if (suffix == QStringLiteral("txt")) {
+            return QStringLiteral("诊断快照");
+        }
+        return QStringLiteral("日志文件");
+    }
+
+    /*
+     * formatSizeText 的作用：
+     *   把字节数格式化成适合 1024x600 列表卡片展示的短文本。
+     *
+     * 参数：
+     *   sizeBytes 是文件大小，单位为字节。
+     *
+     * 返回值：
+     *   小文件返回 B，中等文件返回 KB，大文件返回 MB。
+     */
+    QString formatSizeText(qint64 sizeBytes) const
+    {
+        if (sizeBytes < 1024) {
+            return QStringLiteral("%1 B").arg(sizeBytes);
+        }
+        if (sizeBytes < 1024 * 1024) {
+            return QStringLiteral("%1 KB").arg(QString::number(sizeBytes / 1024.0, 'f', 1));
+        }
+        return QStringLiteral("%1 MB").arg(QString::number(sizeBytes / 1024.0 / 1024.0, 'f', 2));
+    }
+
+    /*
+     * entryToVariantMap 的作用：
+     *   把 C++ 日志条目转换成 QML 容易读取的 QVariantMap。
+     *
+     * 参数：
+     *   entry 是日志条目；默认构造的空条目会生成空字段。
+     *
+     * 返回值：
+     *   返回包含 fileName、filePath、typeText、modifiedText、sizeText 等字段的 map。
+     */
+    QVariantMap entryToVariantMap(const LogFileEntry &entry) const
+    {
+        QVariantMap map;
+
+        map.insert(QStringLiteral("fileName"), entry.fileName);
+        map.insert(QStringLiteral("filePath"), entry.filePath);
+        map.insert(QStringLiteral("suffix"), entry.suffix);
+        map.insert(QStringLiteral("typeText"), entry.typeText);
+        map.insert(QStringLiteral("modifiedText"), entry.modifiedText);
+        map.insert(QStringLiteral("sizeBytes"), entry.sizeBytes);
+        map.insert(QStringLiteral("sizeText"), entry.sizeText);
+
+        return map;
+    }
+
+    QVector<LogFileEntry> m_entries; /* m_entries 保存扫描到的日志文件摘要，顺序就是 QML 列表顺序。 */
+    QString m_logDirPath;            /* m_logDirPath 保存板端日志目录，默认 /mnt/sdcard/logs。 */
+    QString m_statusText;            /* m_statusText 保存最近一次扫描状态，顶部状态栏直接显示它。 */
+};
+
+/*
  * CloudReviewServer 的作用：
  *   提供一个板端 HTTP 小服务，接收云端“修正板端结果”按钮下发的复核结论。
  *
@@ -6774,6 +7197,9 @@ int main(int argc, char *argv[])
     /* uploadHistory 保存每次保存/上传动作的本地历史记录，QML 历史页直接读取它。 */
     UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
 
+    /* logFileModel 保存 SD 卡日志目录的只读文件列表，QML 日志查看页直接读取它。 */
+    LogFileModel logFileModel(QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR));
+
     /* cloudReviewServer 接收云端按钮回写的最终复核结论，并更新每日 upload_history_YYYYMMDD.json。 */
     CloudReviewServer cloudReviewServer(&uploadHistory);
 
@@ -6808,6 +7234,9 @@ int main(int argc, char *argv[])
 
     /* 把上传历史模型暴露给 QML，历史记录页面用它生成横向滑动卡片和详情页。 */
     view.rootContext()->setContextProperty(QStringLiteral("uploadHistory"), &uploadHistory);
+
+    /* 把日志文件模型暴露给 QML，日志查看页面用它生成日志列表和详情弹窗。 */
+    view.rootContext()->setContextProperty(QStringLiteral("logFileModel"), &logFileModel);
 
     /* 把云端复核回写服务暴露给 QML，后续状态栏或告警页可展示监听状态。 */
     view.rootContext()->setContextProperty(QStringLiteral("cloudReviewServer"), &cloudReviewServer);
