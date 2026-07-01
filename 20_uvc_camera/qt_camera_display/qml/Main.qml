@@ -1778,8 +1778,6 @@ Rectangle {
                 + "；4G=" + deviceHealth.networkStatusText
                 + "；云端=" + deviceHealth.cloudStatusText
                 + "；F4=" + deviceHealth.f4StatusText
-                + "；位置=" + deviceHealth.locationDisplayText
-                + "；定位=" + deviceHealth.locationStatusText
                 + "；详情=" + deviceHealth.detailText
     }
 
@@ -1828,7 +1826,7 @@ Rectangle {
      * 主要流程：
      *   1. activeAlarmKeys 对同一来源做未恢复期间去重，避免健康检测周期性重复写日志。
      *   2. 更新当前告警字段，让告警维护页立即显示真实问题。
-     *   3. 调用 recordAlarmIssueToSdCard()，按发生时间创建独立 qt_alarm_*.log 文件。
+     *   3. 调用 recordAlarmIssueToSdCard()，追加到当天 qt_alarm_YYYYMMDD.log 文件。
      *
      * 参数：
      *   sourceKey 是告警来源标识。
@@ -1957,7 +1955,7 @@ Rectangle {
      *   3. 写入最近告警历史，便于现场复盘按钮点击前后的处理轨迹。
      *
      * 返回值：
-     *   返回多行 UTF-8 文本，由 C++ 控制器落盘到 /mnt/sdcard/logs/qt_alarm_snapshot_*.txt。
+     *   返回多行 UTF-8 文本，由 C++ 控制器落盘到当天 /mnt/sdcard/logs/qt_alarm_snapshot_YYYYMMDD.txt。
      */
     function alarmSnapshotText() {
         var summary = statsSummary()
@@ -2006,7 +2004,7 @@ Rectangle {
      * 主要流程：
      *   1. 确认告警只改变操作员确认状态，不代表 F4 已释放联锁。
      *   2. 清故障会同步释放手动页模拟急停状态，保持两个页面状态一致。
-     *   3. 保存诊断调用 C++ 控制器写入新的 /mnt/sdcard/logs/qt_alarm_snapshot_*.txt。
+     *   3. 保存诊断调用 C++ 控制器追加当天 /mnt/sdcard/logs/qt_alarm_snapshot_YYYYMMDD.txt。
      *
      * 参数：
      *   action 是 ack、clear、refresh 或 snapshot。
@@ -3394,14 +3392,6 @@ Rectangle {
         }
 
         /*
-         * onLocationStatusChanged 的作用：
-         *   4G IP 省份定位状态变化后刷新设备摘要；定位失败暂不作为产线告警，只进入诊断文本。
-         */
-        onLocationStatusChanged: {
-            root.evaluateRuntimeAlarms()
-        }
-
-        /*
          * onF4StatusChanged 的作用：
          *   F4 串口握手状态变化后检查心跳类告警，避免只在顶部状态栏显示待接入。
          */
@@ -3617,7 +3607,7 @@ Rectangle {
                     {"name": "网络", "value": deviceHealth.networkStatusText, "dot": deviceHealth.networkStatusColor},
                     {"name": "相机", "value": root.cameraStatusText(), "dot": root.cameraDotColor()},
                     {"name": "F4", "value": deviceHealth.f4StatusText, "dot": deviceHealth.f4StatusColor},
-                    {"name": "位置", "value": deviceHealth.locationShortText, "dot": deviceHealth.locationStatusColor},
+                    {"name": "机械臂", "value": "待命", "dot": root.accentGreen},
                     {"name": "背光", "value": "常亮", "dot": root.accentGreen},
                     {"name": "云端", "value": deviceHealth.cloudStatusText, "dot": deviceHealth.cloudStatusColor}
                 ]
@@ -7567,7 +7557,7 @@ Rectangle {
                         {"name": "SD卡", "value": deviceHealth.sdcardStatusText, "color": deviceHealth.sdcardStatusColor},
                         {"name": "云端", "value": deviceHealth.cloudStatusText, "color": deviceHealth.cloudStatusColor},
                         {"name": "KMS视频", "value": root.usingKmsOverlay ? deviceHealth.cameraStatusText : "预览/桥接", "color": root.usingKmsOverlay ? deviceHealth.cameraStatusColor : root.accentAmber},
-                        {"name": "定位", "value": deviceHealth.locationStatusText, "color": deviceHealth.locationStatusColor},
+                        {"name": "背光", "value": "常亮", "color": root.accentGreen},
                         {"name": "4G", "value": deviceHealth.networkStatusText, "color": deviceHealth.networkStatusColor}
                     ]
 

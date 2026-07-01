@@ -24,8 +24,8 @@
  *   --gst-io-mode mmap    指定 gst-qml 后端的 v4l2src io-mode，默认 mmap。
  *   --storage-self-test   不启动 QML，只走 Qt 保存控制器保存一张 SD 卡图片，便于 SSH 验证按钮同路径逻辑。
  *   --detect-self-test    不启动 QML，只走双模型检测链路，便于 SSH 验证分类、UNet、上传和历史记录。
- *   --alarm-snapshot-self-test  不启动 QML，只写一份告警诊断快照，便于 SSH 验证日志落盘逻辑。
- *   --alarm-log-self-test  不启动 QML，只写一份自动告警日志，便于 SSH 验证每问题一文件逻辑。
+ *   --alarm-snapshot-self-test  不启动 QML，只向当天告警诊断快照文件追加一段内容，便于 SSH 验证日志落盘逻辑。
+ *   --alarm-log-self-test  不启动 QML，只向当天自动告警日志文件追加一段内容，便于 SSH 验证按日归档逻辑。
  *   --windowed            使用 1024x600 窗口模式，便于桌面或远程调试。
  *
  * 返回值：
@@ -35,6 +35,7 @@
 #include "v4l2_video_item.h"  /* V4L2VideoItem 提供不依赖 QtMultimedia 的 UVC 预览控件。 */
 
 #include <QAbstractListModel>   /* QAbstractListModel 用于把上传历史记录以模型形式暴露给 QML ListView。 */
+#include <QDate>                /* QDate 用于把日志、告警和历史记录归档到当天日期文件。 */
 #include <QCommandLineOption>   /* QCommandLineOption 用于定义 --camera 等命令行选项。 */
 #include <QCommandLineParser>   /* QCommandLineParser 负责解析用户传入的调试参数。 */
 #include <QCoreApplication>     /* QCoreApplication 提供 qputenv 和应用元信息接口。 */
@@ -55,7 +56,7 @@
 #include <QHostAddress>         /* QHostAddress 用于指定云端复核回写 HTTP 服务监听地址。 */
 #include <QProcess>             /* QProcess 用于调用现有 sdcard-safe-remove 命令。 */
 #include <QProcessEnvironment>  /* QProcessEnvironment 用于给 sdcard-safe-remove 传入短等待环境变量。 */
-#include <QRegExp>              /* QRegExp 用于按换行解析 4g-location 的 key=value 输出。 */
+#include <QSet>                 /* QSet 用于检测多天历史 JSON 中的重复记录，避免旧文件兼容读取时重复显示。 */
 #include <QMetaObject>          /* QMetaObject 用于把后台线程的检测阶段进度安全投递回 Qt 主线程。 */
 #include <QPointer>             /* QPointer 用于后台线程投递进度前判断控制器对象是否仍然存在。 */
 #include <QQmlEngine>           /* qmlRegisterType 需要 Qt QML 类型系统声明。 */
@@ -75,6 +76,7 @@
 #include <QVariantList>         /* QVariantList 用于把多张历史图片作为数组返回给 QML。 */
 #include <QVariantMap>          /* QVariantMap 用于向 QML 返回当前选中历史记录详情。 */
 #include <QVector>              /* QVector 用于保存内存中的上传历史记录列表。 */
+#include <algorithm>            /* std::stable_sort 用于把跨日期历史记录按上传时间重新排成时间顺序。 */
 #include <cstdlib>              /* EXIT_SUCCESS/EXIT_FAILURE 是 main 返回值语义。 */
 #include <ctime>                /* tzset 用于让运行时立刻重新读取 TZ 时区变量。 */
 #include <functional>           /* std::function 用于给检测同步流程注入“分类完成/双模型完成”进度回调。 */
@@ -131,10 +133,10 @@ static const char *DEFAULT_SDCARD_IMAGE_DIR = "/mnt/sdcard/images";
 /* SD 卡诊断日志目录，告警维护页保存诊断和自动告警日志时会把文本写到这里。 */
 static const char *DEFAULT_SDCARD_LOG_DIR = "/mnt/sdcard/logs";
 
-/* ALARM_SNAPSHOT_PREFIX 是诊断快照文件名前缀，实际文件名会追加当前时间戳，避免重复点击覆盖旧文件。 */
+/* ALARM_SNAPSHOT_PREFIX 是诊断快照文件名前缀，实际文件名会追加当天日期，同一天追加到同一个文件。 */
 static const char *ALARM_SNAPSHOT_PREFIX = "qt_alarm_snapshot";
 
-/* ALARM_LOG_PREFIX 是自动告警日志文件名前缀，实际文件名会追加发生时间和告警来源。 */
+/* ALARM_LOG_PREFIX 是自动告警日志文件名前缀，实际文件名会追加当天日期，同一天所有告警追加到同一个文件。 */
 static const char *ALARM_LOG_PREFIX = "qt_alarm";
 
 /* 板端 COS 上传脚本默认部署路径，保存按钮会在本地 JPG/PNG 落盘后调用它。 */
@@ -142,12 +144,6 @@ static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-c
 
 /* 默认 4G PPP 管理脚本；健康检测只调用 test，不在界面线程里执行 start/restart。 */
 static const char *DEFAULT_4G_PPP_SCRIPT = "4g-ppp";
-
-/* 默认 4G IP 省份定位脚本；Qt 只调用 once/status，不直接访问模块串口或高德 Key。 */
-static const char *DEFAULT_4G_LOCATION_SCRIPT = "4g-location";
-
-/* 4G IP 定位探测超时时间：覆盖高德 HTTPS 请求，避免网络异常时定位进程拖住健康刷新。 */
-static const int LOCATION_PROBE_TIMEOUT_MS = 40000;
 
 /* 默认云端健康地址；与 defect-cos-upload 的默认后端保持一致。 */
 static const char *DEFAULT_CLOUD_HEALTH_URL = "http://139.9.35.72/health";
@@ -182,8 +178,14 @@ static const char *DEFAULT_DEFECT_SEGMENT_BIN = "/root/qt_camera_display/defect-
 static const char *DEFAULT_DEFECT_SEGMENT_MODEL =
     "/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx";
 
-/* 上传历史默认文件：放在 SD 卡图片目录内，随图片一起保留，重启 Qt 后仍能恢复历史界面。 */
+/* 上传历史默认文件：保留旧版固定文件路径作为兼容读取入口，新写入使用 upload_history_YYYYMMDD.json。 */
 static const char *DEFAULT_UPLOAD_HISTORY_FILE = "/mnt/sdcard/images/upload_history.json";
+
+/* 上传历史每日文件名前缀：检测历史按自然日归档为 upload_history_YYYYMMDD.json。 */
+static const char *UPLOAD_HISTORY_DAILY_PREFIX = "upload_history";
+
+/* 上传历史每日文件扩展名：和旧版 upload_history.json 一样仍然保存 JSON 数组。 */
+static const char *UPLOAD_HISTORY_DAILY_SUFFIX = ".json";
 
 /* 云端复核回写默认监听地址；0.0.0.0 便于云端通过板端 IP 访问，现场可用 BOARD_REVIEW_LISTEN 收紧。 */
 static const char *DEFAULT_BOARD_REVIEW_LISTEN = "0.0.0.0";
@@ -196,6 +198,110 @@ static const char *DEFAULT_BOARD_REVIEW_SOURCE = "cloud";
 
 /* Qt 界面默认业务时区：POSIX TZ 中 CST-8 表示 UTC+8，也就是北京时间。 */
 static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
+
+/*
+ * dateStampString 的作用：
+ *   把 QDate 转成文件名中使用的 YYYYMMDD 日期段。
+ *
+ * 主要流程：
+ *   1. 优先使用调用者传入的有效日期。
+ *   2. 如果日期无效，回退到当前板端本地日期，避免生成空文件名。
+ *
+ * 参数：
+ *   date 是要写入文件名的自然日。
+ *
+ * 返回值：
+ *   返回 8 位日期字符串，例如 20260701。
+ */
+static QString dateStampString(const QDate &date)
+{
+    /* validDate 保存最终参与格式化的日期，无效输入说明调用方没有明确日期。 */
+    const QDate validDate = date.isValid() ? date : QDate::currentDate();
+
+    return validDate.toString(QStringLiteral("yyyyMMdd"));
+}
+
+/*
+ * currentDateStampString 的作用：
+ *   返回当前板端本地日期的 YYYYMMDD 字符串，统一日志和历史的每日文件命名。
+ *
+ * 返回值：
+ *   返回 8 位日期字符串，例如 20260701。
+ */
+static QString currentDateStampString()
+{
+    return dateStampString(QDate::currentDate());
+}
+
+/*
+ * dailyFilePathFromLegacyPath 的作用：
+ *   根据旧版固定文件路径生成每日归档文件路径。
+ *
+ * 主要流程：
+ *   1. 取出旧路径所在目录，例如 /mnt/sdcard/images。
+ *   2. 用传入前缀、日期和后缀拼出 `<prefix>_YYYYMMDD<suffix>`。
+ *   3. 返回位于原目录下的新每日文件路径。
+ *
+ * 参数：
+ *   legacyPath 是旧版固定文件路径，例如 /mnt/sdcard/images/upload_history.json。
+ *   prefix 是每日文件名前缀，例如 upload_history。
+ *   dateStamp 是 YYYYMMDD 日期字符串。
+ *   suffix 是扩展名，例如 .json。
+ *
+ * 返回值：
+ *   返回每日文件完整路径。
+ */
+static QString dailyFilePathFromLegacyPath(const QString &legacyPath,
+                                           const QString &prefix,
+                                           const QString &dateStamp,
+                                           const QString &suffix)
+{
+    /* baseInfo 只用来取得旧文件所在目录，不直接复用旧文件名。 */
+    const QFileInfo baseInfo(legacyPath);
+
+    /* fileName 保存按日期归档后的文件名。 */
+    const QString fileName = prefix
+        + QLatin1Char('_')
+        + dateStamp
+        + suffix;
+
+    return QDir(baseInfo.absolutePath()).filePath(fileName);
+}
+
+/*
+ * uploadHistoryDateStampFromText 的作用：
+ *   从历史记录的 upload_time 文本推导该记录应该归档到哪一天。
+ *
+ * 主要流程：
+ *   1. 解析当前程序写入的 `yyyy-MM-dd HH:mm:ss` 时间格式。
+ *   2. 兼容只包含日期的 `yyyy-MM-dd` 文本。
+ *   3. 解析失败时回退到今天，保证新记录不会因为异常时间写到空路径。
+ *
+ * 参数：
+ *   uploadTime 是历史记录里的上传时间。
+ *
+ * 返回值：
+ *   返回 YYYYMMDD 日期字符串。
+ */
+static QString uploadHistoryDateStampFromText(const QString &uploadTime)
+{
+    /* normalizedTime 保存去掉首尾空格后的时间文本，避免 JSON 中偶发空格影响解析。 */
+    const QString normalizedTime = uploadTime.trimmed();
+
+    /* dateTime 优先按完整日期时间解析，这是 Qt 写入历史记录的默认格式。 */
+    const QDateTime dateTime = QDateTime::fromString(normalizedTime, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    if (dateTime.isValid()) {
+        return dateStampString(dateTime.date());
+    }
+
+    /* date 兼容只有日期的旧记录或人工修正记录。 */
+    const QDate date = QDate::fromString(normalizedTime.left(10), QStringLiteral("yyyy-MM-dd"));
+    if (date.isValid()) {
+        return dateStampString(date);
+    }
+
+    return currentDateStampString();
+}
 
 /*
  * SetGstPipelineStateJob 的作用：
@@ -294,8 +400,8 @@ struct UploadHistoryEntry
  *   把上传历史记录提供给 QML 的 ListView、Repeater 和详情页。
  *
  * 主要流程：
- *   1. 启动时从 `/mnt/sdcard/images/upload_history.json` 读取历史记录。
- *   2. 每次保存/上传完成后追加一条新记录，并立即写回 JSON 文件。
+ *   1. 启动时从 `/mnt/sdcard/images/upload_history_YYYYMMDD.json` 多日文件读取历史记录。
+ *   2. 每次保存/上传完成后追加一条新记录，并立即写回当天 JSON 文件。
  *   3. QML 通过角色名读取时间、图片路径、检测结果、云端记录号等字段。
  *   4. 用户删除某条历史记录时，模型同步删除 JSON 记录和该记录指向的 JPG/PNG 图片文件。
  *
@@ -341,7 +447,7 @@ public:
      *   保存历史文件路径，并在对象创建时加载已有历史记录。
      *
      * 参数：
-     *   historyFilePath 是 JSON 历史文件路径。
+     *   historyFilePath 是旧版固定 JSON 历史文件路径，用于推导每日文件目录并兼容读取旧数据。
      *   parent 是 Qt 对象树父对象。
      */
     explicit UploadHistoryModel(const QString &historyFilePath, QObject *parent = nullptr)
@@ -533,7 +639,7 @@ public:
          * 如果程序启动时 SD 卡尚未挂载，loadFromDisk() 会得到空列表。
          * 第一次保存前若历史文件已经随着 SD 卡出现，这里重新加载一次，避免覆盖旧历史。
          */
-        if (m_entries.isEmpty() && QFileInfo::exists(m_historyFilePath)) {
+        if (m_entries.isEmpty() && anyHistoryFileExists()) {
             loadFromDisk();
         }
 
@@ -556,7 +662,7 @@ public:
      *
      * 主要流程：
      *   1. 先校验 row，避免 QML 传入过期索引导致越界访问。
-     *   2. 从模型内存中移除记录并写回 upload_history.json。
+     *   2. 从模型内存中移除记录并写回所属日期的 upload_history_YYYYMMDD.json。
      *   3. 只有历史 JSON 写回成功后，才删除记录里保存的 JPG/PNG 实体文件，避免历史仍在但图片先丢失。
      *   4. 如果 JSON 写回失败，把记录插回原位置，让界面和磁盘状态尽量保持一致。
      *
@@ -671,7 +777,7 @@ public:
      *   1. 校验 row，避免后台上传期间用户删除记录后越界写入。
      *   2. 备份旧记录，先更新内存中的 upload_status、record_id、record_no 和流程状态。
      *   3. 如果重发上传成功，把本地 upload_time 改成本次重发完成时间，并移动到历史末尾。
-     *   4. 写回 upload_history.json；若写入失败，回滚旧记录并通知 QML 刷新。
+     *   4. 写回所属日期的 upload_history_YYYYMMDD.json；若写入失败，回滚旧记录并通知 QML 刷新。
      *   5. 写入成功后发送 dataChanged，让列表卡片和详情页都能读到最新云端状态。
      *
      * 参数：
@@ -763,7 +869,7 @@ public:
      *   2. 校验 cloudResult 只能是 good/bad/review，避免云端字段漂移污染本地 JSON。
      *   3. 首次回写时把板端原始 resultText 保存到 boardResultText，后续重复回写不覆盖原始依据。
      *   4. 把 resultText 改成云端最终中文结果，让历史列表和统计优先展示修正后的业务结论。
-     *   5. 写回 upload_history.json，成功后通知 QML 刷新对应历史卡片和详情页。
+     *   5. 写回所属日期的 upload_history_YYYYMMDD.json，成功后通知 QML 刷新对应历史卡片和详情页。
      *
      * 参数：
      *   recordId 是云端记录 ID，优先用于匹配。
@@ -1383,7 +1489,7 @@ private:
      *   删除一张历史图片，并把删除、缺失、失败数量累加到调用者提供的计数器中。
      *
      * 主要流程：
-     *   1. 使用历史文件所在目录作为允许删除的根目录。
+     *   1. 使用历史文件目录作为允许删除的根目录，每日 JSON 文件和图片都在 `/mnt/sdcard/images` 下。
      *   2. 清理待删图片的绝对路径，确认它仍在允许目录下。
      *   3. 只删除普通文件，不删除目录或其他特殊节点。
      *   4. 调用 QFile::remove 删除图片，并把结果写入 Qt 日志，方便板端排查。
@@ -1406,12 +1512,10 @@ private:
             return;
         }
 
-        const QFileInfo historyFileInfo(m_historyFilePath);
-        const QDir historyDir(historyFileInfo.absolutePath());
-        const QString historyDirPath = QDir::cleanPath(historyDir.absolutePath());
-        const QString historyDirPrefix = historyDirPath.endsWith(QLatin1Char('/'))
-            ? historyDirPath
-            : historyDirPath + QLatin1Char('/');
+        const QString historyRootPath = historyDirectoryPath();
+        const QString historyDirPrefix = historyRootPath.endsWith(QLatin1Char('/'))
+            ? historyRootPath
+            : historyRootPath + QLatin1Char('/');
 
         const QFileInfo imageFileInfo(filePath);
         const QString imagePath = QDir::cleanPath(imageFileInfo.absoluteFilePath());
@@ -1420,7 +1524,7 @@ private:
             (*failedCount)++;
             qWarning() << "upload history image remove skipped outside history dir"
                        << "image" << imagePath
-                       << "historyDir" << historyDirPath;
+                       << "historyDir" << historyRootPath;
             return;
         }
 
@@ -1447,27 +1551,193 @@ private:
     }
 
     /*
-     * loadFromDisk 的作用：
-     *   程序启动时从 SD 卡历史文件恢复记录列表。
+     * historyDirectoryPath 的作用：
+     *   返回历史 JSON 和检测图片共同所在的目录。
      *
      * 主要流程：
-     *   1. 如果文件不存在，保留空列表，这不是错误。
-     *   2. 如果文件存在，读取并解析为 JSON 数组。
-     *   3. 只追加包含上传时间或图片路径的记录，避免损坏项污染界面。
+     *   1. 从旧版固定历史路径取目录，保持和既有 `/mnt/sdcard/images` 契约一致。
+     *   2. 清理路径中的 `.`、`..` 片段，便于后续越界判断和日志输出。
      *
      * 返回值：
-     *   加载成功或文件不存在返回 true；文件读取/解析失败返回 false。
+     *   返回清理后的历史根目录路径。
      */
-    bool loadFromDisk()
+    QString historyDirectoryPath() const
     {
-        QFile file(m_historyFilePath);
+        /* historyFileInfo 用旧版路径推导目录，不代表新版本仍然写这个固定文件。 */
+        const QFileInfo historyFileInfo(m_historyFilePath);
+
+        return QDir::cleanPath(historyFileInfo.absolutePath());
+    }
+
+    /*
+     * dailyHistoryFilePath 的作用：
+     *   根据日期生成当天检测历史 JSON 路径。
+     *
+     * 参数：
+     *   dateStamp 是 YYYYMMDD 日期字符串。
+     *
+     * 返回值：
+     *   返回 `/mnt/sdcard/images/upload_history_YYYYMMDD.json` 形式的路径。
+     */
+    QString dailyHistoryFilePath(const QString &dateStamp) const
+    {
+        return dailyFilePathFromLegacyPath(m_historyFilePath,
+                                           QString::fromLatin1(UPLOAD_HISTORY_DAILY_PREFIX),
+                                           dateStamp,
+                                           QString::fromLatin1(UPLOAD_HISTORY_DAILY_SUFFIX));
+    }
+
+    /*
+     * dailyHistoryFilePathForEntry 的作用：
+     *   根据历史记录自身的 uploadTime 计算它应该写回哪个日期文件。
+     *
+     * 参数：
+     *   entry 是需要持久化的一条检测历史记录。
+     *
+     * 返回值：
+     *   返回该记录所属自然日的每日 JSON 路径。
+     */
+    QString dailyHistoryFilePathForEntry(const UploadHistoryEntry &entry) const
+    {
+        return dailyHistoryFilePath(uploadHistoryDateStampFromText(entry.uploadTime));
+    }
+
+    /*
+     * currentDailyHistoryFilePath 的作用：
+     *   返回今天的检测历史 JSON 路径，用于 SD 卡后挂载时检查是否已有当天文件。
+     *
+     * 返回值：
+     *   返回今天的 `/mnt/sdcard/images/upload_history_YYYYMMDD.json` 路径。
+     */
+    QString currentDailyHistoryFilePath() const
+    {
+        return dailyHistoryFilePath(currentDateStampString());
+    }
+
+    /*
+     * allHistoryFilePaths 的作用：
+     *   枚举旧版固定历史文件和新版每日历史文件。
+     *
+     * 主要流程：
+     *   1. 先枚举 `upload_history_*.json`，按文件名排序，保证新版每日文件优先。
+     *   2. 如果旧版 `/mnt/sdcard/images/upload_history.json` 存在，再加入兼容读取列表。
+     *
+     * 返回值：
+     *   返回可能存在的历史 JSON 路径列表；文件不存在时不会加入。
+     */
+    QStringList allHistoryFilePaths() const
+    {
+        QStringList paths;
+
+        const QDir historyDir(historyDirectoryPath());
+        const QFileInfoList dailyFiles = historyDir.entryInfoList(
+            QStringList() << QString::fromLatin1(UPLOAD_HISTORY_DAILY_PREFIX) + QStringLiteral("_????????")
+                                + QString::fromLatin1(UPLOAD_HISTORY_DAILY_SUFFIX),
+            QDir::Files,
+            QDir::Name);
+
+        for (const QFileInfo &fileInfo : dailyFiles) {
+            const QString dailyPath = fileInfo.absoluteFilePath();
+            if (!paths.contains(dailyPath)) {
+                paths.append(dailyPath);
+            }
+        }
+
+        if (QFileInfo::exists(m_historyFilePath) && !paths.contains(m_historyFilePath)) {
+            paths.append(m_historyFilePath);
+        }
+
+        return paths;
+    }
+
+    /*
+     * anyHistoryFileExists 的作用：
+     *   判断 SD 卡上是否已经存在旧版或新版检测历史文件。
+     *
+     * 返回值：
+     *   有任一历史文件返回 true；没有历史文件返回 false。
+     */
+    bool anyHistoryFileExists() const
+    {
+        return QFileInfo::exists(m_historyFilePath)
+            || QFileInfo::exists(currentDailyHistoryFilePath())
+            || !allHistoryFilePaths().isEmpty();
+    }
+
+    /*
+     * historyEntryDedupKey 的作用：
+     *   为跨多日历史加载生成去重键，避免旧版固定文件和新版每日文件中同一记录重复显示。
+     *
+     * 参数：
+     *   entry 是待去重的历史记录。
+     *
+     * 返回值：
+     *   返回优先级最高的稳定身份字段。
+     */
+    QString historyEntryDedupKey(const UploadHistoryEntry &entry) const
+    {
+        if (!entry.recordId.trimmed().isEmpty()) {
+            return QStringLiteral("record-id:") + entry.recordId.trimmed();
+        }
+        if (!entry.recordNo.trimmed().isEmpty()) {
+            return QStringLiteral("record-no:") + entry.recordNo.trimmed();
+        }
+        if (!normalizedSourcePath(entry).isEmpty()) {
+            return QStringLiteral("source:") + normalizedSourcePath(entry);
+        }
+        return entry.uploadTime
+            + QLatin1Char('|')
+            + entry.resultText
+            + QLatin1Char('|')
+            + entry.uploadStatus;
+    }
+
+    /*
+     * isMeaningfulHistoryEntry 的作用：
+     *   判断一条 JSON 记录是否包含足够信息，避免损坏项污染历史页。
+     *
+     * 参数：
+     *   entry 是从 JSON 解析出的历史记录。
+     *
+     * 返回值：
+     *   有上传时间、source 图片或 annotated 图片时返回 true。
+     */
+    bool isMeaningfulHistoryEntry(const UploadHistoryEntry &entry) const
+    {
+        return !entry.uploadTime.isEmpty()
+            || !normalizedSourcePath(entry).isEmpty()
+            || !normalizedAnnotatedPaths(entry).isEmpty();
+    }
+
+    /*
+     * loadHistoryEntriesFromFile 的作用：
+     *   从单个历史 JSON 文件读取记录，并追加到调用者提供的数组。
+     *
+     * 主要流程：
+     *   1. 文件不存在直接返回 true，便于首次启动。
+     *   2. 文件存在时解析 JSON 数组。
+     *   3. 对每条有效记录生成去重键，旧固定文件和每日文件重复时只保留第一条。
+     *
+     * 参数：
+     *   filePath 是要读取的历史 JSON 路径。
+     *   loadedEntries 用于追加解析成功的记录。
+     *   seenKeys 保存已经加载过的记录身份。
+     *
+     * 返回值：
+     *   读取成功或文件不存在返回 true；打开或解析失败返回 false。
+     */
+    bool loadHistoryEntriesFromFile(const QString &filePath,
+                                    QVector<UploadHistoryEntry> *loadedEntries,
+                                    QSet<QString> *seenKeys) const
+    {
+        QFile file(filePath);
 
         if (!file.exists()) {
             return true;
         }
 
         if (!file.open(QIODevice::ReadOnly)) {
-            qWarning() << "upload history open failed" << m_historyFilePath << file.errorString();
+            qWarning() << "upload history open failed" << filePath << file.errorString();
             return false;
         }
 
@@ -1475,12 +1745,9 @@ private:
         const QJsonDocument document = QJsonDocument::fromJson(payload);
 
         if (!document.isArray()) {
-            qWarning() << "upload history json is not array" << m_historyFilePath;
+            qWarning() << "upload history json is not array" << filePath;
             return false;
         }
-
-        beginResetModel();
-        m_entries.clear();
 
         const QJsonArray array = document.array();
         for (const QJsonValue &value : array) {
@@ -1489,35 +1756,86 @@ private:
             }
 
             const UploadHistoryEntry entry = entryFromJson(value.toObject());
-            if (!entry.uploadTime.isEmpty()
-                    || !normalizedSourcePath(entry).isEmpty()
-                    || !normalizedAnnotatedPaths(entry).isEmpty()) {
-                m_entries.append(entry);
+            if (!isMeaningfulHistoryEntry(entry)) {
+                continue;
+            }
+
+            const QString dedupKey = historyEntryDedupKey(entry);
+            if (seenKeys && seenKeys->contains(dedupKey)) {
+                qInfo() << "upload history duplicate skipped" << filePath << dedupKey;
+                continue;
+            }
+
+            if (seenKeys) {
+                seenKeys->insert(dedupKey);
+            }
+            if (loadedEntries) {
+                loadedEntries->append(entry);
             }
         }
 
-        endResetModel();
-        emit countChanged();
         return true;
     }
 
     /*
-     * saveToDisk 的作用：
-     *   把当前内存历史记录写回 SD 卡 JSON 文件。
+     * loadFromDisk 的作用：
+     *   程序启动时从 SD 卡每日历史文件恢复记录列表。
+     *
+     * 主要流程：
+     *   1. 同时兼容旧版 `upload_history.json` 和新版 `upload_history_YYYYMMDD.json`。
+     *   2. 多文件加载后按 upload_time 稳定排序，界面仍保持从旧到新的横向记录顺序。
+     *   3. 只追加包含上传时间或图片路径的记录，避免损坏项污染界面。
+     *
+     * 返回值：
+     *   全部加载成功或文件不存在返回 true；任一存在文件读取/解析失败返回 false。
+     */
+    bool loadFromDisk()
+    {
+        QVector<UploadHistoryEntry> loadedEntries;
+        QSet<QString> seenKeys;
+        bool ok = true;
+
+        for (const QString &filePath : allHistoryFilePaths()) {
+            if (!loadHistoryEntriesFromFile(filePath, &loadedEntries, &seenKeys)) {
+                ok = false;
+            }
+        }
+
+        std::stable_sort(loadedEntries.begin(), loadedEntries.end(),
+                         [](const UploadHistoryEntry &left, const UploadHistoryEntry &right) {
+            return left.uploadTime < right.uploadTime;
+        });
+
+        beginResetModel();
+        m_entries = loadedEntries;
+        endResetModel();
+        emit countChanged();
+        return ok;
+    }
+
+    /*
+     * writeHistoryArrayToFile 的作用：
+     *   把一组历史记录可靠写入指定 JSON 文件。
      *
      * 主要流程：
      *   1. 确保历史文件所在目录存在。
      *   2. 先写入 `.tmp` 临时文件并 flush。
-     *   3. 再用 rename/replace 变成正式文件，降低断电时留下半截 JSON 的概率。
+     *   3. 再调用 fsync 把数据推到内核文件系统。
+     *   4. 用 rename 替换正式文件，降低断电时留下半截 JSON 的概率。
+     *
+     * 参数：
+     *   filePath 是目标每日历史 JSON 路径。
+     *   entries 是属于该日期的历史记录数组。
      *
      * 返回值：
      *   写入成功返回 true；任一步失败返回 false。
      */
-    bool saveToDisk() const
+    bool writeHistoryArrayToFile(const QString &filePath,
+                                 const QVector<UploadHistoryEntry> &entries) const
     {
-        QFileInfo fileInfo(m_historyFilePath);
+        const QFileInfo fileInfo(filePath);
         const QString dirPath = fileInfo.absolutePath();
-        const QString tempPath = m_historyFilePath + QStringLiteral(".tmp");
+        const QString tempPath = filePath + QStringLiteral(".tmp");
         QJsonArray array;
 
         if (!QDir().mkpath(dirPath)) {
@@ -1525,7 +1843,7 @@ private:
             return false;
         }
 
-        for (const UploadHistoryEntry &entry : m_entries) {
+        for (const UploadHistoryEntry &entry : entries) {
             array.append(entryToJson(entry));
         }
 
@@ -1553,14 +1871,62 @@ private:
         }
         tempFile.close();
 
-        QFile::remove(m_historyFilePath);
-        if (!QFile::rename(tempPath, m_historyFilePath)) {
-            qWarning() << "upload history rename failed" << tempPath << m_historyFilePath;
+        QFile::remove(filePath);
+        if (!QFile::rename(tempPath, filePath)) {
+            qWarning() << "upload history rename failed" << tempPath << filePath;
             QFile::remove(tempPath);
             return false;
         }
 
         return true;
+    }
+
+    /*
+     * saveToDisk 的作用：
+     *   把当前内存历史记录按自然日写回多个 SD 卡 JSON 文件。
+     *
+     * 主要流程：
+     *   1. 按每条记录的 upload_time 分组成 `upload_history_YYYYMMDD.json`。
+     *   2. 逐个写回每日文件，保证同一天所有检测记录保存在当天文件里。
+     *   3. 保留旧版 `upload_history.json` 不再写入，仅作为兼容读取来源。
+     *
+     * 返回值：
+     *   所有每日文件写入成功返回 true；任一文件失败返回 false。
+     */
+    bool saveToDisk() const
+    {
+        QMap<QString, QVector<UploadHistoryEntry>> entriesByFile;
+        QStringList pathsToWrite = allHistoryFilePaths();
+        const bool legacyHistoryFileExists = QFileInfo::exists(m_historyFilePath);
+        bool ok = true;
+
+        for (const UploadHistoryEntry &entry : m_entries) {
+            const QString filePath = dailyHistoryFilePathForEntry(entry);
+            entriesByFile[filePath].append(entry);
+            if (!pathsToWrite.contains(filePath)) {
+                pathsToWrite.append(filePath);
+            }
+        }
+
+        pathsToWrite.removeDuplicates();
+        pathsToWrite.sort();
+        pathsToWrite.removeAll(m_historyFilePath);
+
+        for (const QString &filePath : pathsToWrite) {
+            if (!writeHistoryArrayToFile(filePath, entriesByFile.value(filePath))) {
+                ok = false;
+            }
+        }
+
+        /*
+         * 旧版固定文件只作为兼容读取来源；必须等每日文件全部写成功后再清空旧文件，
+         * 防止迁移过程中旧文件先被清空、每日文件又写失败导致历史记录丢失。
+         */
+        if (ok && legacyHistoryFileExists) {
+            ok = writeHistoryArrayToFile(m_historyFilePath, QVector<UploadHistoryEntry>());
+        }
+
+        return ok;
     }
 
     QVector<UploadHistoryEntry> m_entries; /* m_entries 保存内存中的历史记录，顺序就是界面横向叠加顺序。 */
@@ -1576,7 +1942,7 @@ private:
  *   2. 监听 `/api/v1/review-result`，只接受 POST JSON 请求。
  *   3. 校验 `X-Board-Token` 或 `Authorization: Bearer <token>`，防止任意内网客户端改写历史。
  *   4. 解析 record_id、record_no、cloud_result、cloud_reason、operator、review_time。
- *   5. 调用 UploadHistoryModel::applyCloudReviewResult() 更新本地 upload_history.json。
+ *   5. 调用 UploadHistoryModel::applyCloudReviewResult() 更新本地每日 upload_history_YYYYMMDD.json。
  *
  * 关键说明：
  *   这个类只做本机历史回写，不访问云端数据库。云端自己的复核记录和同步状态必须由云端后端保存。
@@ -2619,18 +2985,18 @@ public:
 
     /*
      * saveAlarmSnapshotToSdCard 的作用：
-     *   响应告警维护页“保存诊断”按钮，把 QML 汇总的告警状态写入独立时间戳快照文件。
+     *   响应告警维护页“保存诊断”按钮，把 QML 汇总的告警状态追加到当天诊断快照文件。
      *
      * 主要流程：
      *   1. 通过 saveAlarmTextToSdCard() 复用挂载点检查、目录创建、可写校验和 fsync 写入逻辑。
-     *   2. 每次调用都按当前时间生成 qt_alarm_snapshot_YYYYMMDD_HHMMSS_zzz.txt。
-     *   3. 把真实文件路径返回给 QML，现场人员可直接 SSH 打开该次点击生成的快照。
+     *   2. 每次调用都写入 qt_alarm_snapshot_YYYYMMDD.txt，当天多次点击追加到同一个文件。
+     *   3. 把真实文件路径返回给 QML，现场人员可直接 SSH 打开当天快照集合。
      *
      * 参数：
      *   snapshotText 是 QML 组装的告警码、处理状态、设备健康和参数摘要。
      *
      * 返回值：
-     *   成功返回“诊断已保存：/mnt/sdcard/logs/qt_alarm_snapshot_*.txt”；
+     *   成功返回“诊断已保存：/mnt/sdcard/logs/qt_alarm_snapshot_YYYYMMDD.txt”；
      *   失败返回“诊断保存失败：<中文原因>”。
      */
     Q_INVOKABLE QString saveAlarmSnapshotToSdCard(const QString &snapshotText)
@@ -2645,19 +3011,19 @@ public:
 
     /*
      * recordAlarmIssueToSdCard 的作用：
-     *   响应 QML 自动告警触发，把每一次新出现的真实问题写成独立告警日志。
+     *   响应 QML 自动告警触发，把新出现的真实问题追加到当天告警日志。
      *
      * 主要流程：
      *   1. QML 在健康状态、保存/上传/模型结果变化时判定是否出现新问题。
-     *   2. C++ 按告警来源生成 qt_alarm_YYYYMMDD_HHMMSS_zzz_<source>.log。
-     *   3. 复用 writeTextFileWithFsync() 完成 UTF-8 写入、flush 和 fsync。
+     *   2. C++ 按当天日期写入 qt_alarm_YYYYMMDD.log，并在每段中记录告警来源。
+     *   3. 复用 appendTextFileWithFsync() 完成 UTF-8 追加、flush 和 fsync。
      *
      * 参数：
      *   sourceKey 是告警来源标识，例如 camera-kms-no-frame、cloud-offline。
      *   alarmText 是 QML 组装的发生时间、问题、状态和排查建议。
      *
      * 返回值：
-     *   成功返回“告警日志已保存：/mnt/sdcard/logs/qt_alarm_*.log”；
+     *   成功返回“告警日志已保存：/mnt/sdcard/logs/qt_alarm_YYYYMMDD.log”；
      *   失败返回“告警日志保存失败：<中文原因>”。
      */
     Q_INVOKABLE QString recordAlarmIssueToSdCard(const QString &sourceKey, const QString &alarmText)
@@ -2969,62 +3335,63 @@ private:
     }
 
     /*
-     * timestampedLogFilePath 的作用：
-     *   为告警日志和诊断快照生成带毫秒时间戳的完整路径，避免不同点击或不同问题互相覆盖。
+     * dailyLogFilePath 的作用：
+     *   为告警日志和诊断快照生成当天文件路径。
      *
      * 主要流程：
-     *   1. 读取当前板端本地时间，格式化成 YYYYMMDD_HHMMSS_zzz。
-     *   2. 可选追加 sourceKey，告警日志能从文件名看出问题来源。
+     *   1. 使用当前板端本地日期，格式化成 YYYYMMDD。
+     *   2. 拼出 `<prefix>_YYYYMMDD<suffix>` 文件名。
      *   3. 返回位于 /mnt/sdcard/logs 下的完整文件路径。
      *
      * 参数：
      *   prefix 是文件名前缀，例如 qt_alarm_snapshot 或 qt_alarm。
-     *   sourceKey 是可选来源标识，诊断快照可以为空。
      *   suffix 是扩展名，例如 .txt 或 .log。
      *
      * 返回值：
-     *   返回可直接交给 QFile 打开的完整路径。
+     *   返回可直接交给 QFile 打开的当天完整路径。
      */
-    QString timestampedLogFilePath(const QString &prefix,
-                                   const QString &sourceKey,
-                                   const QString &suffix) const
+    QString dailyLogFilePath(const QString &prefix,
+                             const QString &suffix) const
     {
-        const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
         const QString safePrefix = sanitizeLogFileToken(prefix, QStringLiteral("qt_alarm"));
-        QString fileName = safePrefix + QLatin1Char('_') + timestamp;
+        const QString fileName = safePrefix
+            + QLatin1Char('_')
+            + currentDateStampString()
+            + suffix;
 
-        if (!sourceKey.trimmed().isEmpty()) {
-            fileName += QLatin1Char('_') + sanitizeLogFileToken(sourceKey, QStringLiteral("runtime"));
-        }
-
-        fileName += suffix;
         return QDir(m_logDir).filePath(fileName);
     }
 
     /*
-     * writeTextFileWithFsync 的作用：
-     *   把 UTF-8 文本可靠写入一个新文件，并在成功返回前完成 flush 和 fsync。
+     * appendTextFileWithFsync 的作用：
+     *   把 UTF-8 文本可靠追加到当天日志文件，并在成功返回前完成 flush 和 fsync。
      *
      * 主要流程：
-     *   1. 使用 WriteOnly|NewOnly 打开文件，避免极小概率下同名时间戳覆盖已有文件。
-     *   2. 通过 QTextStream 写入 UTF-8 文本，必要时补一个换行，方便 tail/cat 阅读。
-     *   3. 先 flush Qt 缓冲，再 fsync 文件描述符，最后关闭文件。
+     *   1. 使用 WriteOnly|Append 打开文件，不存在时自动创建当天文件。
+     *   2. 如果文件已有内容，先写一个空行和分隔线，让同一天多段日志容易阅读。
+     *   3. 写入本次记录头和正文，必要时补一个换行。
+     *   4. 先 flush Qt 缓冲，再 fsync 文件描述符，最后关闭文件。
      *
      * 参数：
      *   filePath 是目标完整路径。
+     *   actionName 是动作名，例如 alarm-snapshot 或 alarm-log，会写入分隔头。
+     *   sourceKey 是告警来源，诊断快照可为空。
      *   text 是要写入的 UTF-8 文本。
      *   errorText 用于带出中文失败原因。
      *
      * 返回值：
-     *   true 表示文件写入、flush 和 fsync 都成功；false 表示失败，errorText 保存原因。
+     *   true 表示文件追加、flush 和 fsync 都成功；false 表示失败，errorText 保存原因。
      */
-    bool writeTextFileWithFsync(const QString &filePath,
-                                const QString &text,
-                                QString *errorText) const
+    bool appendTextFileWithFsync(const QString &filePath,
+                                 const QString &actionName,
+                                 const QString &sourceKey,
+                                 const QString &text,
+                                 QString *errorText) const
     {
         QFile file(filePath);
+        const bool hadContent = QFileInfo::exists(filePath) && QFileInfo(filePath).size() > 0;
 
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::NewOnly)) {
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
             if (errorText) {
                 *errorText = QStringLiteral("无法打开 ")
                     + filePath
@@ -3036,6 +3403,22 @@ private:
 
         QTextStream stream(&file);
         stream.setCodec("UTF-8");
+
+        if (hadContent) {
+            stream << '\n';
+        }
+        stream << QStringLiteral("========== ")
+               << actionName
+               << QStringLiteral(" ")
+               << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
+               << QStringLiteral(" ==========\n");
+
+        if (!sourceKey.trimmed().isEmpty()) {
+            stream << QStringLiteral("log_source=")
+                   << sanitizeLogFileToken(sourceKey, QStringLiteral("runtime"))
+                   << '\n';
+        }
+
         stream << text;
         if (!text.endsWith(QLatin1Char('\n'))) {
             stream << '\n';
@@ -3078,7 +3461,7 @@ private:
      * 主要流程：
      *   1. 先确认 /mnt/sdcard 已挂载，防止 SD 卡异常时误写 rootfs。
      *   2. 创建 /mnt/sdcard/logs 并检查目录可写，失败时返回明确中文原因。
-     *   3. 生成时间戳文件名并调用 writeTextFileWithFsync() 写入文本。
+     *   3. 生成当天文件名并调用 appendTextFileWithFsync() 追加文本。
      *
      * 参数：
      *   actionName 是日志里的动作名，例如 alarm-snapshot 或 alarm-log。
@@ -3131,8 +3514,8 @@ private:
             return result;
         }
 
-        const QString filePath = timestampedLogFilePath(filePrefix, sourceKey, suffix);
-        if (!writeTextFileWithFsync(filePath, text, &writeError)) {
+        const QString filePath = dailyLogFilePath(filePrefix, suffix);
+        if (!appendTextFileWithFsync(filePath, actionName, sourceKey, text, &writeError)) {
             result = successLabel + QStringLiteral("保存失败：") + writeError;
             qWarning() << "storage action" << actionName << "result" << result;
             return result;
@@ -3514,7 +3897,7 @@ private:
      *   uploadResult 是 uploadSavedImagesToCos 返回的完整状态文本。
      *
      * 返回值：
-     *   返回用于 upload_history.json 的短状态文本。
+     *   返回用于 upload_history_YYYYMMDD.json 的短状态文本。
      */
     QString compactUploadStatus(const QString &uploadResult) const
     {
@@ -3550,7 +3933,7 @@ private:
      *   1. 读取 JPG/PNG 文件大小，详情页可直接显示。
      *   2. 从上传脚本输出中提取云端 record_id 和 record_no。
      *   3. 生成当前本地时间作为第一层历史卡片的时间标题。
-     *   4. 调用模型追加并持久化到 `upload_history.json`。
+     *   4. 调用模型追加并持久化到当天 `upload_history_YYYYMMDD.json`。
      *
      * 参数：
      *   pair 是本地 JPG/PNG 路径。
@@ -4467,10 +4850,6 @@ class DeviceHealthController : public QObject
     Q_PROPERTY(QString cloudStatusColor READ cloudStatusColor NOTIFY cloudStatusChanged)
     Q_PROPERTY(QString sdcardStatusText READ sdcardStatusText NOTIFY sdcardStatusChanged)
     Q_PROPERTY(QString sdcardStatusColor READ sdcardStatusColor NOTIFY sdcardStatusChanged)
-    Q_PROPERTY(QString locationStatusText READ locationStatusText NOTIFY locationStatusChanged)
-    Q_PROPERTY(QString locationDisplayText READ locationDisplayText NOTIFY locationStatusChanged)
-    Q_PROPERTY(QString locationShortText READ locationShortText NOTIFY locationStatusChanged)
-    Q_PROPERTY(QString locationStatusColor READ locationStatusColor NOTIFY locationStatusChanged)
     Q_PROPERTY(QString detailText READ detailText NOTIFY detailTextChanged)
 
 public:
@@ -4492,7 +4871,6 @@ public:
           m_overlaySocket(QString::fromLatin1(DEFAULT_OVERLAY_CONTROL_SOCKET)),
           m_overlayRestartScript(QString::fromLatin1(DEFAULT_OVERLAY_RESTART_SCRIPT)),
           m_networkScript(QString::fromLatin1(DEFAULT_4G_PPP_SCRIPT)),
-          m_locationScript(QString::fromLatin1(DEFAULT_4G_LOCATION_SCRIPT)),
           m_cloudHealthUrl(QString::fromLatin1(DEFAULT_CLOUD_HEALTH_URL)),
           m_sdcardMount(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
           m_f4Device(QString::fromLatin1(DEFAULT_F4_SERIAL_DEVICE)),
@@ -4508,23 +4886,16 @@ public:
           m_cloudStatusColor(QStringLiteral("#f4b942")),
           m_sdcardStatusText(QStringLiteral("检测中")),
           m_sdcardStatusColor(QStringLiteral("#f4b942")),
-          m_locationStatusText(QStringLiteral("未定位")),
-          m_locationDisplayText(QStringLiteral("未定位")),
-          m_locationShortText(QStringLiteral("未定位")),
-          m_locationStatusColor(QStringLiteral("#f4b942")),
           m_detailText(QStringLiteral("设备健康检测启动")),
           m_lastOverlaySerial(0),
           m_cameraOfflineCount(0),
           m_overlayRestartCooldown(0),
           m_networkProbeRunning(false),
-          m_locationProbeRunning(false),
           m_cloudProbeRunning(false),
           m_f4ProbeRunning(false),
           m_f4CommandRunning(false),
           m_overlayProbeRunning(false),
           m_networkProbeTimedOut(false),
-          m_locationProbeTimedOut(false),
-          m_locationBootProbeDone(false),
           m_cloudProbeTimedOut(false)
     {
         /*
@@ -4550,18 +4921,6 @@ public:
                 &DeviceHealthController::handleNetworkProcessError);
         connect(&m_networkTimeout, &QTimer::timeout, this, &DeviceHealthController::handleNetworkProbeTimeout);
         m_networkTimeout.setSingleShot(true);
-
-        m_locationProcess.setProcessChannelMode(QProcess::MergedChannels);
-        connect(&m_locationProcess,
-                static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
-                this,
-                &DeviceHealthController::handleLocationProcessFinished);
-        connect(&m_locationProcess,
-                static_cast<void (QProcess::*)(QProcess::ProcessError)>(&QProcess::errorOccurred),
-                this,
-                &DeviceHealthController::handleLocationProcessError);
-        connect(&m_locationTimeout, &QTimer::timeout, this, &DeviceHealthController::handleLocationProbeTimeout);
-        m_locationTimeout.setSingleShot(true);
 
         m_cloudProcess.setProcessChannelMode(QProcess::MergedChannels);
         connect(&m_cloudProcess,
@@ -4606,18 +4965,6 @@ public:
     /* sdcardStatusColor 返回 SD 卡挂载状态颜色。 */
     QString sdcardStatusColor() const { return m_sdcardStatusColor; }
 
-    /* locationStatusText 返回定位状态，例如 已定位、定位中、缺少Key 或失败。 */
-    QString locationStatusText() const { return m_locationStatusText; }
-
-    /* locationDisplayText 返回完整位置文本；当前 IP 省份定位模式下只返回省份，例如 河南省。 */
-    QString locationDisplayText() const { return m_locationDisplayText; }
-
-    /* locationShortText 返回顶部栏短文本；当前 IP 省份定位模式下只返回省份，例如 河南省。 */
-    QString locationShortText() const { return m_locationShortText; }
-
-    /* locationStatusColor 返回定位状态颜色，绿色已定位、黄色等待、红色失败。 */
-    QString locationStatusColor() const { return m_locationStatusColor; }
-
     /* detailText 返回最近一次健康检测详情，用于告警页和日志排查。 */
     QString detailText() const { return m_detailText; }
 
@@ -4643,11 +4990,6 @@ public:
         refreshSdcardStatus();
         refreshOverlayCameraStatus();
         startNetworkProbe();
-        if (!m_locationBootProbeDone) {
-            startLocationProbe(true);
-        } else {
-            startLocationProbe(false);
-        }
         startCloudProbe();
         startF4Probe(false);
     }
@@ -4763,9 +5105,6 @@ signals:
     /* sdcardStatusChanged 通知 QML SD 卡状态和颜色已更新。 */
     void sdcardStatusChanged();
 
-    /* locationStatusChanged 通知 QML 高德 IP 省份定位状态已更新。 */
-    void locationStatusChanged();
-
     /* detailTextChanged 通知 QML 最近检测详情已更新。 */
     void detailTextChanged();
 
@@ -4833,112 +5172,6 @@ private slots:
         m_networkProbeTimedOut = false;
         setNetworkStatus(QStringLiteral("未安装"), QStringLiteral("#f4b942"));
         setDetailText(QStringLiteral("无法启动 4G 测试命令：") + m_networkProcess.errorString());
-    }
-
-    /*
-     * handleLocationProcessFinished 的作用：
-     *   接收 `4g-location once` 输出的 key=value 状态，并更新 Qt 位置显示。
-     *
-     * 主要流程：
-     *   1. 停止定位超时定时器并释放忙标志。
-     *   2. 解析脚本输出中的 state/display/short_display/detail 字段。
-     *   3. 根据 state 映射成操作员可读状态文本和颜色。
-     *
-     * 参数：
-     *   exitCode 是 4g-location 退出码。
-     *   exitStatus 表示进程是否正常退出。
-     *
-     * 返回值：
-     *   无返回值；结果通过 locationStatusChanged 通知 QML。
-     */
-    void handleLocationProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
-    {
-        const QString output = QString::fromUtf8(m_locationProcess.readAll()).trimmed();
-
-        m_locationTimeout.stop();
-        m_locationProbeRunning = false;
-
-        if (m_locationProbeTimedOut) {
-            m_locationProbeTimedOut = false;
-            return;
-        }
-
-        const QMap<QString, QString> values = parseKeyValueOutput(output);
-        const QString state = values.value(QStringLiteral("state"));
-        const QString display = values.value(QStringLiteral("display"), QStringLiteral("未定位"));
-        const QString shortDisplay = values.value(QStringLiteral("short_display"), display);
-        const QString detail = values.value(QStringLiteral("detail"), compactText(output, 96));
-
-        if (exitStatus == QProcess::NormalExit && exitCode == 0 && state == QStringLiteral("ip_ok")) {
-            /*
-             * state=ip_ok 表示 4g-location 已用高德 IP 定位拿到省份。
-             * 这个状态只用于比赛现场稳定显示省份，不显示城市和区县，所以状态文字明确写成“IP定位”。
-             */
-            setLocationStatus(QStringLiteral("IP定位"),
-                              QStringLiteral("#35d07f"),
-                              display,
-                              shortDisplay);
-            setDetailText(QStringLiteral("IP定位：") + display);
-            return;
-        }
-
-        if (state == QStringLiteral("no_key")) {
-            setLocationStatus(QStringLiteral("缺少Key"),
-                              QStringLiteral("#f4b942"),
-                              display,
-                              shortDisplay);
-        } else if (state == QStringLiteral("ip_failed")) {
-            setLocationStatus(QStringLiteral("定位失败"),
-                              QStringLiteral("#ef5b5b"),
-                              display,
-                              shortDisplay);
-        } else {
-            setLocationStatus(QStringLiteral("未定位"),
-                              QStringLiteral("#f4b942"),
-                              display,
-                              shortDisplay);
-        }
-
-        setDetailText(QStringLiteral("定位未完成：") + detail);
-    }
-
-    /*
-     * handleLocationProbeTimeout 的作用：
-     *   定位脚本超过短超时后主动结束，避免高德 IP 定位请求拖住健康刷新。
-     */
-    void handleLocationProbeTimeout()
-    {
-        if (m_locationProcess.state() != QProcess::NotRunning) {
-            m_locationProbeTimedOut = true;
-            m_locationProcess.kill();
-        } else {
-            m_locationProbeRunning = false;
-        }
-        setLocationStatus(QStringLiteral("超时"),
-                          QStringLiteral("#ef5b5b"),
-                          m_locationDisplayText,
-                          m_locationShortText);
-        setDetailText(QStringLiteral("4G IP 定位超时"));
-    }
-
-    /*
-     * handleLocationProcessError 的作用：
-     *   异步接收 4G 定位脚本启动失败错误，避免 startLocationProbe() 阻塞 QML 主线程。
-     */
-    void handleLocationProcessError(QProcess::ProcessError error)
-    {
-        if (error != QProcess::FailedToStart) {
-            return;
-        }
-
-        m_locationTimeout.stop();
-        m_locationProbeRunning = false;
-        m_locationProbeTimedOut = false;
-        setLocationStatus(QStringLiteral("未安装"),
-                          QStringLiteral("#f4b942"),
-                          QStringLiteral("未定位"),
-                          QStringLiteral("未定位"));
-        setDetailText(QStringLiteral("无法启动 4G 定位命令：") + m_locationProcess.errorString());
     }
 
     /*
@@ -5083,44 +5316,6 @@ private:
     }
 
     /*
-     * parseKeyValueOutput 的作用：
-     *   解析 4g-location 输出的 key=value 状态文本。
-     *
-     * 主要流程：
-     *   1. 按行切分外部命令输出。
-     *   2. 查找每行第一个等号，左边作为键，右边作为值。
-     *   3. 跳过空键，保留值中的中文、空格和坐标字符。
-     *
-     * 参数：
-     *   output 是外部脚本 stdout/stderr 合并后的文本。
-     *
-     * 返回值：
-     *   返回键值映射；找不到字段时由调用方使用默认值。
-     */
-    QMap<QString, QString> parseKeyValueOutput(const QString &output) const
-    {
-        QMap<QString, QString> values;
-        const QStringList lines = output.split(QRegExp(QStringLiteral("[\r\n]+")), QString::SkipEmptyParts);
-
-        for (const QString &line : lines) {
-            const int equalsIndex = line.indexOf(QLatin1Char('='));
-            if (equalsIndex <= 0) {
-                continue;
-            }
-
-            const QString key = line.left(equalsIndex).trimmed();
-            const QString value = line.mid(equalsIndex + 1).trimmed();
-            if (key.isEmpty()) {
-                continue;
-            }
-
-            values.insert(key, value);
-        }
-
-        return values;
-    }
-
-    /*
      * startNetworkProbe 的作用：
      *   异步启动 4G 联网测试，忙时跳过本轮，防止弱网下任务堆积。
      *
@@ -5139,33 +5334,6 @@ private:
         m_networkProcess.start(m_networkScript, QStringList() << QStringLiteral("test"));
         if (m_networkProbeRunning) {
             m_networkTimeout.start(7000);
-        }
-    }
-
-    /*
-     * startLocationProbe 的作用：
-     *   异步调用 4G IP 定位脚本，刷新板端所在省份。
-     *
-     * 关键说明：
-     *   这个函数不直接访问 `/dev/ttyUSB*`，也不读取高德 Key；这些细节由 4g-location 管理。
-     *   Qt 只在开机第一轮执行 `once`，后续周期只执行 `status` 读取缓存，避免运行中重复调用高德接口。
-     */
-    void startLocationProbe(bool activeProbe)
-    {
-        if (m_locationProbeRunning) {
-            return;
-        }
-
-        m_locationProbeRunning = true;
-        m_locationProbeTimedOut = false;
-        if (activeProbe) {
-            m_locationBootProbeDone = true;
-        }
-        m_locationProcess.start(m_locationScript,
-                                QStringList()
-                                << (activeProbe ? QStringLiteral("once") : QStringLiteral("status")));
-        if (m_locationProbeRunning) {
-            m_locationTimeout.start(LOCATION_PROBE_TIMEOUT_MS);
         }
     }
 
@@ -5840,24 +6008,6 @@ private:
         emit sdcardStatusChanged();
     }
 
-    void setLocationStatus(const QString &text,
-                           const QString &color,
-                           const QString &display,
-                           const QString &shortDisplay)
-    {
-        if (m_locationStatusText == text
-                && m_locationStatusColor == color
-                && m_locationDisplayText == display
-                && m_locationShortText == shortDisplay) {
-            return;
-        }
-        m_locationStatusText = text;
-        m_locationStatusColor = color;
-        m_locationDisplayText = display;
-        m_locationShortText = shortDisplay;
-        emit locationStatusChanged();
-    }
-
     void setDetailText(const QString &text)
     {
         if (m_detailText == text) {
@@ -5872,7 +6022,6 @@ private:
     QString m_overlaySocket;            /* m_overlaySocket 保存 overlay 控制 socket 路径。 */
     QString m_overlayRestartScript;     /* m_overlayRestartScript 保存相机重连时要后台执行的控制脚本。 */
     QString m_networkScript;            /* m_networkScript 保存 4G PPP 管理命令。 */
-    QString m_locationScript;           /* m_locationScript 保存 4G IP 省份定位命令。 */
     QString m_cloudHealthUrl;           /* m_cloudHealthUrl 保存云端 health 地址。 */
     QString m_sdcardMount;              /* m_sdcardMount 保存 SD 卡挂载点。 */
     QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
@@ -5889,31 +6038,21 @@ private:
     QString m_cloudStatusColor;         /* m_cloudStatusColor 保存云端状态颜色。 */
     QString m_sdcardStatusText;         /* m_sdcardStatusText 保存 SD 卡状态文本。 */
     QString m_sdcardStatusColor;        /* m_sdcardStatusColor 保存 SD 卡状态颜色。 */
-    QString m_locationStatusText;       /* m_locationStatusText 保存 4G IP 定位状态文本。 */
-    QString m_locationDisplayText;      /* m_locationDisplayText 保存完整省市区显示文本。 */
-    QString m_locationShortText;        /* m_locationShortText 保存顶部状态栏短位置文本。 */
-    QString m_locationStatusColor;      /* m_locationStatusColor 保存定位状态颜色。 */
     QString m_detailText;               /* m_detailText 保存最近一次健康检测详情。 */
     unsigned int m_lastOverlaySerial;   /* m_lastOverlaySerial 保存上一次 overlay 帧序号，后续可用于卡帧判断。 */
     int m_cameraOfflineCount;           /* m_cameraOfflineCount 记录相机连续离线次数。 */
     int m_overlayRestartCooldown;       /* m_overlayRestartCooldown 防止相机离线时反复高频重启 overlay。 */
     bool m_networkProbeRunning;         /* m_networkProbeRunning 防止网络检测任务堆积。 */
-    bool m_locationProbeRunning;        /* m_locationProbeRunning 防止 IP 定位脚本任务堆积。 */
     bool m_cloudProbeRunning;           /* m_cloudProbeRunning 防止云端检测任务堆积。 */
     bool m_f4ProbeRunning;              /* m_f4ProbeRunning 防止串口检测线程堆积。 */
     bool m_f4CommandRunning;            /* m_f4CommandRunning 防止 CAL 标定等手动命令并发写同一个 RS485 串口。 */
     bool m_overlayProbeRunning;         /* m_overlayProbeRunning 防止 overlay socket 查询重入。 */
     bool m_networkProbeTimedOut;        /* m_networkProbeTimedOut 标记当前 4G 进程已超时，finished 时不再覆盖超时状态。 */
-    bool m_locationProbeTimedOut;       /* m_locationProbeTimedOut 标记当前定位进程已超时，finished 时不再覆盖超时状态。 */
-
-    bool m_locationBootProbeDone;       /* m_locationBootProbeDone 标记本次开机是否已经主动执行过一次 4g-location once。 */
     bool m_cloudProbeTimedOut;          /* m_cloudProbeTimedOut 标记当前云端进程已超时，finished 时不再覆盖超时状态。 */
     QTimer m_healthTimer;               /* m_healthTimer 周期性调度整轮健康检测。 */
     QTimer m_networkTimeout;            /* m_networkTimeout 是 4G 测试短超时。 */
-    QTimer m_locationTimeout;           /* m_locationTimeout 是 4G IP 定位短超时。 */
     QTimer m_cloudTimeout;              /* m_cloudTimeout 是云端测试短超时。 */
     QProcess m_networkProcess;          /* m_networkProcess 异步执行 4g-ppp test。 */
-    QProcess m_locationProcess;         /* m_locationProcess 异步执行 4g-location once。 */
     QProcess m_cloudProcess;            /* m_cloudProcess 异步执行 curl health。 */
 };
 
@@ -6221,7 +6360,7 @@ static int run_storage_self_test(int argc, char *argv[])
  *
  * 主要流程：
  *   1. 创建 QCoreApplication，保证 Qt 文本、环境变量、QProcess 和文件接口可用。
- *   2. 创建 UploadHistoryModel，检测成功后和屏幕点击一样追加 upload_history.json。
+ *   2. 创建 UploadHistoryModel，检测成功后和屏幕点击一样追加当天 upload_history_YYYYMMDD.json。
  *   3. 调用 detectCurrentFrameOnce()，串行执行 SAVE_DETECT、defect-classify、defect-segment 和 COS 上传。
  *   4. 把最终 RESULT 或失败原因打印到 stdout，便于 SSH 自动化判断。
  *
@@ -6255,7 +6394,7 @@ static int run_detect_self_test(int argc, char *argv[])
  * 主要流程：
  *   1. 创建 QCoreApplication，保证 Qt 文本编码、时区和文件接口可用。
  *   2. 构造一份包含告警码、相机状态、存储状态和历史段落的最小诊断文本。
- *   3. 调用 saveAlarmSnapshotToSdCard() 写入 /mnt/sdcard/logs/qt_alarm_snapshot_*.txt。
+ *   3. 调用 saveAlarmSnapshotToSdCard() 追加 /mnt/sdcard/logs/qt_alarm_snapshot_YYYYMMDD.txt。
  *   4. 把返回结果打印到 stdout，便于 SSH 自动化判断文件落盘是否成功。
  *
  * 参数：
@@ -6299,7 +6438,7 @@ static int run_alarm_snapshot_self_test(int argc, char *argv[])
  * 主要流程：
  *   1. 创建 QCoreApplication，保证 Qt 文本编码、时区和文件接口可用。
  *   2. 构造一份模拟“模型检测失败”的告警文本，字段与 QML buildAlarmLogText() 保持一致。
- *   3. 调用 recordAlarmIssueToSdCard() 写入 /mnt/sdcard/logs/qt_alarm_*.log。
+ *   3. 调用 recordAlarmIssueToSdCard() 追加 /mnt/sdcard/logs/qt_alarm_YYYYMMDD.log。
  *   4. 把返回结果打印到 stdout，便于 SSH 自动化判断文件落盘是否成功。
  *
  * 参数：
@@ -6635,7 +6774,7 @@ int main(int argc, char *argv[])
     /* uploadHistory 保存每次保存/上传动作的本地历史记录，QML 历史页直接读取它。 */
     UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
 
-    /* cloudReviewServer 接收云端按钮回写的最终复核结论，并更新 upload_history.json。 */
+    /* cloudReviewServer 接收云端按钮回写的最终复核结论，并更新每日 upload_history_YYYYMMDD.json。 */
     CloudReviewServer cloudReviewServer(&uploadHistory);
 
     /* 保存控制器拿到历史模型后，保存/上传完成时可以立即追加一条记录。 */
