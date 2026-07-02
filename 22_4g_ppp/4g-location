@@ -1,10 +1,10 @@
 #!/bin/sh
 
 # STM32MP157 4G 高德 IP 省份定位脚本。
-# 这个脚本只通过高德 IP 定位接口判断 4G 出口 IP 所在省份，不再打开 GPS，也不再访问模块 AT 串口。
-# 这样室内比赛环境下不会等待 GNSS 卫星，不会和 4g-ppp monitor 抢 AT 管理口，界面只显示“河南省”这类省份文本。
+# 这个脚本只通过高德 IP 定位接口判断 4G 出口 IP 所在省份，不打开 GPS，也不访问模块 AT 串口。
+# 室内比赛环境不等待 GNSS 卫星，不和 4g-ppp monitor 抢 AT 管理口，界面只显示“河南省”这类省份文本。
 
-# STATE_FILE 保存定位状态缓存，Qt 周期刷新时通过 `4g-location status` 读取它。
+# STATE_FILE 保存定位状态缓存；Qt 开机只执行一次 `4g-location once`，`status` 仅供 SSH 人工排查读取。
 STATE_FILE="${STATE_FILE:-/var/run/4g-location.state}"
 
 # AMAP_KEY_FILE 保存板端本地高德 Web 服务 Key，权限应为 600，不能提交到 Git。

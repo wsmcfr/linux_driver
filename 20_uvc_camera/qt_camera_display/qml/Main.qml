@@ -106,59 +106,56 @@ Rectangle {
     /* logPageVisible 给日志查看页面做显隐判断；日志页打开时隐藏首页视频层，避免 KMS plane 遮挡列表和弹窗。 */
     property bool logPageVisible: activePage === "logs"
 
-    /* manualMode 表示当前是否允许调试级手动动作；第一版由界面模拟，后续由 F4 状态覆盖。 */
+    /* manualMode 表示当前是否允许调试级手动动作；当前只保护已接入的传送带和检测辅助动作。 */
     property bool manualMode: false
 
-    /* manualBeltState 保存传送带模拟状态，便于按钮点击后立即给现场人员反馈。 */
+    /* manualBeltState 保存传送带最近一次真实控制意图和 F4 回执状态。 */
     property string manualBeltState: "停止"
 
-    /* manualBeltSpeed 保存传送带速度档位，第一版只作为界面显示和后续串口命令参数占位。 */
-    property string manualBeltSpeed: "低速"
-
-    /* manualArmState 保存机械臂模拟状态，后续会替换为 F4 ACK 或状态帧。 */
-    property string manualArmState: "待机"
-
-    /* manualLightState 保存光源组合状态，默认背光常亮符合当前检测演示流程。 */
-    property string manualLightState: "背光常亮"
-
-    /* manualActuatorState 保存夹爪模拟状态，第一版不直接驱动真实执行器。 */
-    property string manualActuatorState: "夹爪关闭"
+    /* manualBeltCommandText 保存传送带当前使用的 F407 ASCII 命令，便于现场确认 MP157 没有直接发送 Emm42 二进制帧。 */
+    property string manualBeltCommandText: "BELTSTOP"
 
     /* manualReviewMark 保存人工复核标记，第一版只写界面状态，不回写检测记录。 */
     property string manualReviewMark: "未标记"
 
-    /* manualLastAckText 保存最近一次手动命令响应文字，后续由 motionController 的 ACK 信号更新。 */
+    /* manualLastAckText 保存最近一次手动命令响应文字，传送带命令由 F4 串口真实回执更新。 */
     property string manualLastAckText: "F4控制器待接入"
+
+    /* manualPendingF4Command 保存正在等待 F4 回复的手动命令名，空字符串表示当前没有手动串口命令在途。 */
+    property string manualPendingF4Command: ""
 
     /* manualEmergencyStop 表示急停模拟状态；为 true 时禁止除停止、刷新和清故障外的手动动作。 */
     property bool manualEmergencyStop: false
 
-    /* manualArmHomeOk 表示机械臂是否已完成回零；抓取和放置动作会依赖这个安全前提。 */
-    property bool manualArmHomeOk: false
-
-    /* manualTopLightEnabled 表示上方补光是否开启，第一版只改变界面状态。 */
-    property bool manualTopLightEnabled: false
-
-    /* manualLightLevel 表示补光亮度档位，后续可作为串口命令中的亮度参数。 */
-    property int manualLightLevel: 2
-
     /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
     property var settingsSupportedPartTypes: ["波形垫圈", "平垫圈", "弹性垫圈"]
 
-    /* settingsPartType 保存当前参数页选中的真实零件类型；当前只影响 QML 摘要，不写入配置文件。 */
-    property string settingsPartType: "波形垫圈"
+    /* settingsConfigPath 保存真实检测配置 JSON 路径，来自 C++ DetectSettingsController。 */
+    property string settingsConfigPath: detectSettings.configPath
 
-    /* settingsDecisionThreshold 保存良坏分类置信度阈值，单位为千分比，便于和串口协议定点数保持一致。 */
-    property int settingsDecisionThreshold: 850
+    /* settingsPartType 保存当前参数页选中的真实零件类型，来自 C++ DetectSettingsController。 */
+    property string settingsPartType: detectSettings.partType
 
-    /* settingsReviewThreshold 保存低于该值时进入待复核的阈值，避免低置信度样本被强行分拣。 */
-    property int settingsReviewThreshold: 650
+    /* settingsDecisionThreshold 保存分类模型判坏阈值的千分比显示值，真实值来自 detectSettings.modelThreshold。 */
+    property int settingsDecisionThreshold: Math.round(detectSettings.modelThreshold * 1000)
 
-    /* settingsAutoUpload 表示检测结果是否自动触发 COS 上传，当前只作为 QML 本地目标值。 */
-    property bool settingsAutoUpload: true
+    /* settingsReviewThreshold 保存低可信复核阈值的千分比显示值，真实值来自 detectSettings.reviewThreshold。 */
+    property int settingsReviewThreshold: Math.round(detectSettings.reviewThreshold * 1000)
 
-    /* settingsLastActionText 保存参数页最近一次应用、保存或恢复默认的结果提示。 */
-    property string settingsLastActionText: "UI目标值：尚未写JSON，尚未下发F4"
+    /* settingsRoiSize 保存分类和 UNet 共用的中心 ROI 边长，真实值来自 detectSettings.roiSize。 */
+    property int settingsRoiSize: detectSettings.roiSize
+
+    /* settingsSegmentMinPixels 保存 UNet 判 NG 的最小缺陷像素数，真实值来自 detectSettings.segmentMinPixels。 */
+    property int settingsSegmentMinPixels: detectSettings.segmentMinPixels
+
+    /* settingsOverlayAlpha 保存 UNet overlay 结果图透明度，真实值来自 detectSettings.overlayAlpha。 */
+    property real settingsOverlayAlpha: detectSettings.overlayAlpha
+
+    /* settingsUploadEnabled 表示检测完成后是否自动触发 COS 上传，真实值来自 detectSettings.autoUploadEnabled。 */
+    property bool settingsUploadEnabled: detectSettings.autoUploadEnabled
+
+    /* settingsLastActionText 保存参数页最近一次加载、保存或恢复默认的结果提示。 */
+    property string settingsLastActionText: detectSettings.lastStatusText
 
     /* settingsDetailVisible 表示参数设置页是否打开策略详情浮层，用于承载小卡片放不下的完整说明。 */
     property bool settingsDetailVisible: false
@@ -971,6 +968,53 @@ Rectangle {
     }
 
     /*
+     * sendManualBeltCommand 的作用：
+     *   把手动页传送带按钮转换为 F407 已实现的 BELT ASCII 命令，并通过 MP157 的 `/dev/ttySTM2` 真实下发。
+     *
+     * 主要流程：
+     *   1. 记录正在等待的命令，防止同一时间重复点击多个传送带动作。
+     *   2. 调用 C++ `DeviceHealthController::sendF4BeltCommand()`，由 C++ 负责补 `\r\n`、串口互斥和回包读取。
+     *   3. 如果 C++ 立即拒绝启动线程，则清空在途命令并把失败写入命令日志。
+     *
+     * 参数：
+     *   commandText 是要发送给 F407 的文本命令，例如 BELTSCAN、BELTSTOP、BELTINFO。
+     *   label 是界面按钮文本，用于写入手动命令日志。
+     *   pendingState 是命令发出后界面先显示的等待状态。
+     *
+     * 返回值：
+     *   true 表示命令线程已启动；false 表示命令没有被送入 C++ 串口层。
+     */
+    function sendManualBeltCommand(commandText, label, pendingState) {
+        if (manualPendingF4Command !== "") {
+            manualLastAckText = "F4命令发送中：" + manualPendingF4Command
+            storageState = manualLastAckText
+            appendManualCommandLog(label, "传送带", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        manualPendingF4Command = commandText
+        manualBeltCommandText = commandText
+        manualBeltState = pendingState
+        manualLastAckText = "正在下发 " + commandText + " 到 F407"
+        storageState = manualLastAckText
+        appendManualCommandLog(label, "传送带", manualLastAckText)
+        showStorageToast()
+
+        if (!deviceHealth.sendF4BeltCommand(commandText)) {
+            manualPendingF4Command = ""
+            manualBeltState = "发送失败"
+            manualLastAckText = "F4拒绝启动传送带命令：" + commandText
+            storageState = manualLastAckText
+            appendManualCommandLog(label, "传送带", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
      * manualActionAllowed 的作用：
      *   集中判断某个手动动作当前是否允许执行，让按钮置灰条件和点击保护分支使用同一套安全规则。
      *
@@ -978,7 +1022,7 @@ Rectangle {
      *   1. 检测当前帧、刷新状态、进入手动、停止和清故障属于安全动作，可以在未进入手动模式时执行。
      *   2. 其它运动或执行器动作必须先进入手动模式。
      *   3. 急停状态下只允许停止、刷新状态和清故障。
-     *   4. 抓取和放置类动作要求机械臂已经回零。
+     *   4. 未接入的相机运动轴不在界面显示，也不保留假按钮，避免操作员误认为可以控制。
      *
      * 参数：
      *   action 是手动控制动作标识。
@@ -1000,24 +1044,20 @@ Rectangle {
             return false
         }
 
-        if ((action === "arm-pick" || action === "arm-good" || action === "arm-bad") && !manualArmHomeOk) {
-            return false
-        }
-
         return true
     }
 
     /*
      * handleManualAction 的作用：
-     *   统一处理手动控制页所有按钮点击；第一版只更新 QML 模拟状态、日志和提示，不直接控制真实硬件。
+     *   统一处理手动控制页所有按钮点击；传送带会真实下发 F407 BELT 命令，其它入口只保留检测和标记辅助。
      *
      * 主要流程：
      *   1. 先执行手动模式、急停和回零等安全保护判断。
      *   2. 检测当前帧动作复用首页双模型检测链路，避免只保存无检测结果的图片。
-     *   3. 其它动作只改变模拟状态和命令日志，后续会在这里替换为 motionController.sendManualCommand(action)。
+     *   3. 传送带动作通过 sendManualBeltCommand() 走 `/dev/ttySTM2`；未接入运动轴不在本页出现。
      *
      * 参数：
-     *   action 是动作标识，例如 belt-forward、arm-home、detect-frame。
+     *   action 是动作标识，例如 belt-scan、belt-info、detect-frame。
      *   label 是界面显示的按钮文字，用于日志和提示。
      *
      * 返回值：
@@ -1043,14 +1083,6 @@ Rectangle {
             return
         }
 
-        if ((action === "arm-pick" || action === "arm-good" || action === "arm-bad") && !manualArmHomeOk) {
-            manualLastAckText = "机械臂未回零，禁止抓取和放置"
-            storageState = manualLastAckText
-            appendManualCommandLog(label, "回零联锁", manualLastAckText)
-            showStorageToast()
-            return
-        }
-
         if (action === "detect-frame") {
             handleDetectAction()
             manualLastAckText = "已请求双模型检测当前帧"
@@ -1063,8 +1095,6 @@ Rectangle {
             manualLastAckText = manualMode ? "已进入手动模式" : "已返回自动模式"
             if (!manualMode) {
                 manualBeltState = "停止"
-                manualArmState = "待机"
-                manualActuatorState = "夹爪关闭"
             }
             storageState = manualLastAckText
             appendManualCommandLog(label, "模式切换", manualLastAckText)
@@ -1072,64 +1102,16 @@ Rectangle {
             return
         }
 
-        if (action === "belt-forward") {
-            manualBeltState = "正向点动"
-            manualLastAckText = "模拟ACK：传送带正向点动 " + manualBeltSpeed
-        } else if (action === "belt-reverse") {
-            manualBeltState = "反向点动"
-            manualLastAckText = "模拟ACK：传送带反向点动 " + manualBeltSpeed
-        } else if (action === "belt-speed-low") {
-            manualBeltSpeed = "低速"
-            manualLastAckText = "模拟ACK：速度档位低速"
-        } else if (action === "belt-speed-mid") {
-            manualBeltSpeed = "中速"
-            manualLastAckText = "模拟ACK：速度档位中速"
-        } else if (action === "belt-speed-high") {
-            manualBeltSpeed = "高速"
-            manualLastAckText = "模拟ACK：速度档位高速"
+        if (action === "belt-scan") {
+            sendManualBeltCommand("BELTSCAN", label, "巡航下发中")
+            return
+        } else if (action === "belt-info") {
+            sendManualBeltCommand("BELTINFO", label, "查询中")
+            return
         } else if (action === "stop") {
             manualBeltState = "停止"
-            manualArmState = "待机"
-            manualActuatorState = "夹爪关闭"
-            manualLastAckText = "模拟ACK：全部手动动作停止"
-        } else if (action === "arm-home") {
-            manualArmHomeOk = true
-            manualArmState = "已回零"
-            manualLastAckText = "模拟ACK：机械臂回零完成"
-        } else if (action === "arm-standby") {
-            manualArmState = "待机位"
-            manualLastAckText = "模拟ACK：机械臂到待机位"
-        } else if (action === "arm-pick") {
-            manualArmState = "抓取测试"
-            manualActuatorState = "夹爪闭合"
-            manualLastAckText = "模拟ACK：抓取测试完成"
-        } else if (action === "arm-good") {
-            manualArmState = "放良品位"
-            manualActuatorState = "夹爪打开"
-            manualLastAckText = "模拟ACK：已放置到良品位"
-        } else if (action === "arm-bad") {
-            manualArmState = "放坏品位"
-            manualActuatorState = "夹爪打开"
-            manualLastAckText = "模拟ACK：已放置到坏品位"
-        } else if (action === "actuator-on") {
-            manualActuatorState = "夹爪闭合"
-            manualLastAckText = "模拟ACK：夹爪已闭合"
-        } else if (action === "actuator-off") {
-            manualActuatorState = "夹爪打开"
-            manualLastAckText = "模拟ACK：夹爪已打开"
-        } else if (action === "toplight-toggle") {
-            manualTopLightEnabled = !manualTopLightEnabled
-            manualLightState = manualTopLightEnabled ? "背光常亮 + 补光开启" : "背光常亮"
-            manualLastAckText = manualTopLightEnabled ? "模拟ACK：补光已开启" : "模拟ACK：补光已关闭"
-        } else if (action === "light-low") {
-            manualLightLevel = 1
-            manualLastAckText = "模拟ACK：亮度 1 档"
-        } else if (action === "light-mid") {
-            manualLightLevel = 2
-            manualLastAckText = "模拟ACK：亮度 2 档"
-        } else if (action === "light-high") {
-            manualLightLevel = 3
-            manualLastAckText = "模拟ACK：亮度 3 档"
+            sendManualBeltCommand("BELTSTOP", label, "停止下发中")
+            return
         } else if (action === "mark-good") {
             manualReviewMark = "GOOD"
             manualLastAckText = "人工标记：GOOD"
@@ -1143,15 +1125,13 @@ Rectangle {
             manualEmergencyStop = !manualEmergencyStop
             if (manualEmergencyStop) {
                 manualBeltState = "停止"
-                manualArmState = "急停保持"
-                manualActuatorState = "夹爪关闭"
             }
             manualLastAckText = manualEmergencyStop ? "急停已按下，运动禁止" : "急停已释放，等待清故障"
         } else if (action === "clear-alarm") {
             manualEmergencyStop = false
-            manualLastAckText = "模拟ACK：故障已清除"
+            manualLastAckText = "界面故障标志已清除，真实联锁仍以 F4 为准"
         } else if (action === "refresh") {
-            manualLastAckText = "模拟状态刷新完成"
+            manualLastAckText = "已刷新界面状态，真实F4状态请看传送带查询或健康心跳"
         } else {
             manualLastAckText = "未知手动动作"
         }
@@ -1186,7 +1166,46 @@ Rectangle {
         return settingsPartType
                 + "  模型" + settingsThresholdText(settingsDecisionThreshold)
                 + "  复核" + settingsThresholdText(settingsReviewThreshold)
-                + "  上传" + (settingsAutoUpload ? "自动" : "手动")
+                + "  ROI" + settingsRoiSize
+                + "  UNet>" + settingsSegmentMinPixels + "px"
+                + "  上传" + (settingsUploadEnabled ? "自动" : "手动")
+    }
+
+    /*
+     * settingsLogText 的作用：
+     *   生成可写入 /mnt/sdcard/logs/qt_settings_YYYYMMDD.log 的完整参数日志正文。
+     *
+     * 主要流程：
+     *   1. 记录本次动作名称、时间、JSON 路径和 C++ 保存结果。
+     *   2. 逐项写出零件、模型阈值、复核阈值、ROI、UNet 像素阈值、overlay 透明度和上传策略。
+     *   3. 写出下一次检测会使用的命令行参数，方便日志查看页直接确认真实生效范围。
+     *
+     * 参数：
+     *   actionLabel 是“保存配置”或“导出摘要”等中文动作名。
+     *   actionResult 是刚执行完动作后返回给界面的状态文本。
+     *
+     * 返回值：
+     *   返回多行中文文本，由 C++ 追加到每日参数日志。
+     */
+    function settingsLogText(actionLabel, actionResult) {
+        var lines = [
+            "STM32MP157 Qt Settings Summary",
+            "action=" + actionLabel,
+            "time=" + currentTimeText,
+            "config_path=" + settingsConfigPath,
+            "action_result=" + actionResult,
+            "part_type=" + settingsPartType,
+            "model_threshold=" + (settingsDecisionThreshold / 1000.0).toFixed(3) + " (" + settingsThresholdText(settingsDecisionThreshold) + ")",
+            "review_threshold=" + (settingsReviewThreshold / 1000.0).toFixed(3) + " (" + settingsThresholdText(settingsReviewThreshold) + ")",
+            "roi_size=" + settingsRoiSize,
+            "segment_min_pixels=" + settingsSegmentMinPixels,
+            "overlay_alpha=" + settingsOverlayAlpha.toFixed(2),
+            "auto_upload_enabled=" + (settingsUploadEnabled ? "true" : "false"),
+            "classify_args=--roi " + settingsRoiSize + " --bad-threshold " + (settingsDecisionThreshold / 1000.0).toFixed(3),
+            "segment_args=--roi " + settingsRoiSize + " --alpha " + settingsOverlayAlpha.toFixed(2) + " --min-defect-pixels " + settingsSegmentMinPixels,
+            "summary=" + settingsSummaryText()
+        ]
+        return lines.join("\n")
     }
 
     /*
@@ -1211,7 +1230,7 @@ Rectangle {
      * 主要流程：
      *   1. 按检测流水线说明原图保存、MobileNetV3-Small 分类、UNet 分割和综合判定。
      *   2. 按云端契约说明 record_no、part_code、source/annotated 图片和断网补传的关系。
-     *   3. 明确当前参数页仍是 UI 目标值，尚未写 JSON，也不会直接改变模型文件。
+     *   3. 明确当前参数页会写 JSON，并直接影响下一次检测的模型命令行参数。
      *
      * 返回值：
      *   返回多行中文说明，供 settingsDetailFlickable 滚动显示。
@@ -1224,6 +1243,9 @@ Rectangle {
             "3. UNet INT8 再输出缺陷 mask、overlay 和 raw 结果图，这些结果图作为 annotated 图片登记。",
             "4. 综合规则保持保守：分类判坏或 UNet 检出缺陷像素时，最终结果不能直接判为良品。",
             "5. 低于复核阈值的样本进入人工复核，不在本页伪装成自动分拣参数。",
+            "6. 当前 ROI=" + settingsRoiSize + "px，会传给 defect-classify 和 defect-segment 的 --roi。",
+            "7. 当前 UNet 像素阈值=" + settingsSegmentMinPixels + "px，会传给 defect-segment 的 --min-defect-pixels。",
+            "8. 当前 overlay 透明度=" + settingsOverlayAlpha.toFixed(2) + "，会传给 defect-segment 的 --alpha。",
             "",
             "[云端记录契约]",
             "1. 每次检测必须生成稳定 record_no，断网补传继续复用同一个 record_no，避免云端重复记录。",
@@ -1233,9 +1255,11 @@ Rectangle {
             "5. source/annotated 上传成功后，历史详情才能完整展示原图、标注图、模型输出和云端记录号。",
             "",
             "[当前参数边界]",
-            "1. 本页模型阈值和复核阈值目前只是 UI 目标值：尚未写JSON，尚未下发F4。",
-            "2. 真正模型版本以板端部署的 ONNX Runtime、UNet 和 MobileNetV3-Small 模型文件为准。",
-            "3. COS 上传策略只影响界面目标值；断网时仍要保留 /mnt/sdcard/images 本地缓存，网络恢复后从历史记录重发。"
+            "1. 本页配置会保存到 " + settingsConfigPath + "，下一次启动自动读取。",
+            "2. 模型阈值会传给 defect-classify --bad-threshold；复核阈值由 Qt 综合判定阶段使用。",
+            "3. ROI、UNet像素阈值和overlay透明度会传给 defect-segment，对本地结果图和 NG 判定真实生效。",
+            "4. 自动上传关闭时仍保存 source/annotated 和本地历史，但最终返回 upload_status=SKIP。",
+            "5. 真正模型版本以板端部署的 ONNX Runtime、UNet 和 MobileNetV3-Small 模型文件为准。"
         ]
         return lines.join("\n")
     }
@@ -1255,21 +1279,24 @@ Rectangle {
     function settingsF4DetailText() {
         var lines = [
             "[串口接入]",
-            "1. 云端契约建议 MP157 通过 /dev/ttySTM1、115200 波特率接收 STM32F4 状态。",
-            "2. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
-            "3. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
+            "1. MP157 当前通过 /dev/ttySTM2、115200 波特率访问传送带/称重 F407 USART1。",
+            "2. 相机上下轴和前后轴后续应由 F407 另一路文本服务接入；MP157 侧预留串口标记为 /dev/ttySTM1，实际设备节点以设备树和接线复核为准。",
+            "3. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
+            "4. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
             "",
             "[F4 上下文字段]",
             "1. f4_io 记录 photoelectric_triggered、limit_switch_in、limit_switch_out 和 emergency_stop。",
             "2. LDC1614 作为涡流/电感检测模块，建议上报 I2C 总线、地址、通道、原始码值、基线和判定。",
             "3. HX711 作为称重模块，建议上报 DOUT/SCK 引脚、增益、原始 ADC、净重、稳定状态和过载状态。",
-            "4. Emm42_V5.0 闭环步进驱动由 F4 侧串口控制，记录目标速度、实际速度、位置误差、驱动故障和最近命令。",
+            "4. 张大头 Emm42 闭环步进驱动由 F4 侧串口控制，记录目标速度、实际速度、位置误差、驱动故障和最近命令。",
             "",
             "[控制边界]",
             "1. MP157 负责视觉推理、图片保存、COS 上传、历史补传和云端记录创建。",
             "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
-            "3. 本页面不提供速度、位置、剔除动作、急停解除或联锁时序参数，避免绕过 F4 固件安全边界。",
-            "4. 后续若接入真实参数下发，需要先定义串口协议、ACK/NAK、CRC、状态回读和失败回滚流程。"
+            "3. 当前传送带只开放 BELTSCAN/BELTSTOP/BELTINFO 三条 F407 已实现高层命令。",
+            "4. 相机上下轴和前后轴暂不在 Qt 页面提供按钮，必须等 F407 固件给出固定命令、状态回读和失败码后再接入。",
+            "5. 本页面不提供速度、位置、剔除动作、急停解除或联锁时序参数，避免绕过 F4 固件安全边界。",
+            "6. 后续若接入相机轴真实参数下发，需要先在 F407 定义回零、移动、停止、查询、ACK/NAK、状态回读和失败回滚流程。"
         ]
         return lines.join("\n")
     }
@@ -1453,7 +1480,7 @@ Rectangle {
 
     /*
      * changeSettingValue 的作用：
-     *   统一处理参数页的加减按钮，保证每个参数都按固定步长变化并被限制在安全范围内。
+     *   统一处理参数页的加减按钮，直接写入 C++ DetectSettingsController 的真实检测配置。
      *
      * 参数：
      *   key 是参数名，delta 是本次变化量。
@@ -1463,11 +1490,20 @@ Rectangle {
      */
     function changeSettingValue(key, delta) {
         if (key === "decision") {
-            settingsDecisionThreshold = Math.max(500, Math.min(990, settingsDecisionThreshold + delta))
-            settingsLastActionText = "已调整良坏阈值：" + settingsThresholdText(settingsDecisionThreshold)
+            detectSettings.modelThreshold = Math.max(500, Math.min(990, settingsDecisionThreshold + delta)) / 1000.0
+            settingsLastActionText = "真实检测配置：模型阈值 " + settingsThresholdText(settingsDecisionThreshold)
         } else if (key === "review") {
-            settingsReviewThreshold = Math.max(300, Math.min(settingsDecisionThreshold - 50, settingsReviewThreshold + delta))
-            settingsLastActionText = "已调整复核阈值：" + settingsThresholdText(settingsReviewThreshold)
+            detectSettings.reviewThreshold = Math.max(300, Math.min(settingsDecisionThreshold, settingsReviewThreshold + delta)) / 1000.0
+            settingsLastActionText = "真实检测配置：复核阈值 " + settingsThresholdText(settingsReviewThreshold)
+        } else if (key === "roi") {
+            detectSettings.roiSize = Math.max(160, Math.min(640, settingsRoiSize + delta))
+            settingsLastActionText = "真实检测配置：ROI " + settingsRoiSize + "px"
+        } else if (key === "segment") {
+            detectSettings.segmentMinPixels = Math.max(0, Math.min(50000, settingsSegmentMinPixels + delta))
+            settingsLastActionText = "真实检测配置：UNet像素阈值 " + settingsSegmentMinPixels + "px"
+        } else if (key === "alpha") {
+            detectSettings.overlayAlpha = Math.max(0.0, Math.min(1.0, settingsOverlayAlpha + delta))
+            settingsLastActionText = "真实检测配置：overlay透明度 " + settingsOverlayAlpha.toFixed(2)
         }
 
         storageState = settingsLastActionText
@@ -1479,9 +1515,9 @@ Rectangle {
      *   统一处理参数页“应用、保存、恢复默认、导出摘要”等操作。
      *
      * 主要流程：
-     *   1. 应用参数只更新界面状态，当前不会写 JSON，也不会通过串口下发 F4。
-     *   2. 保存配置只提示后续目标路径，真实持久化后续放到 C++ 控制器。
-     *   3. 恢复默认会把关键参数回到比赛演示推荐值。
+     *   1. 应用参数提示当前内存配置已进入下一次检测，不需要额外下发。
+     *   2. 保存配置调用 C++ saveSettingsToDisk() 原子写入 JSON。
+     *   3. 恢复默认调用 C++ resetToDefaults()，用户可再保存到 JSON。
      *
      * 参数：
      *   action 是 apply、save、reset 或 export。
@@ -1491,23 +1527,29 @@ Rectangle {
      */
     function settingsApplyAction(action) {
         if (action === "apply") {
-            settingsLastActionText = "仅更新UI目标值：尚未写JSON，尚未下发F4"
+            settingsLastActionText = "真实检测配置：下一次检测将使用当前内存参数"
         } else if (action === "save") {
-            settingsLastActionText = "后续目标：/mnt/sdcard/config/defect_ui_config.json"
+            var saveResult = detectSettings.saveSettingsToDisk()
+            var saveLogResult = storageController.recordSettingsSummaryToSdCard(
+                        "settings-save",
+                        settingsLogText("保存配置", saveResult))
+            settingsLastActionText = saveResult + "；" + saveLogResult
+            refreshLogFileList()
         } else if (action === "reset") {
-            settingsPartType = "波形垫圈"
-            settingsDecisionThreshold = 850
-            settingsReviewThreshold = 650
-            settingsAutoUpload = true
-            settingsLastActionText = "已恢复三类垫圈默认UI目标值"
+            settingsLastActionText = detectSettings.resetToDefaults()
         } else if (action === "export") {
-            settingsLastActionText = "诊断摘要：" + settingsSummaryText()
+            var exportText = "诊断摘要：" + settingsSummaryText()
+            var exportLogResult = storageController.recordSettingsSummaryToSdCard(
+                        "settings-export",
+                        settingsLogText("导出摘要", exportText))
+            settingsLastActionText = exportText + "；" + exportLogResult
+            refreshLogFileList()
         } else if (action === "upload-toggle") {
-            settingsAutoUpload = !settingsAutoUpload
-            settingsLastActionText = settingsAutoUpload ? "UI目标值：COS自动上传" : "UI目标值：仅本地保存"
+            detectSettings.autoUploadEnabled = !settingsUploadEnabled
+            settingsLastActionText = settingsUploadEnabled ? "真实检测配置：COS自动上传" : "真实检测配置：仅本地保存"
         } else if (action === "part-next") {
-            settingsPartType = settingsNextPartType()
-            settingsLastActionText = "已切换零件类型：" + settingsPartType
+            detectSettings.partType = settingsNextPartType()
+            settingsLastActionText = "真实检测配置：零件 " + settingsPartType
         }
 
         storageState = settingsLastActionText
@@ -1791,6 +1833,8 @@ Rectangle {
                 + "；KMS=" + (usingKmsOverlay ? deviceHealth.cameraStatusText : "非KMS后端")
                 + "；SD卡=" + deviceHealth.sdcardStatusText
                 + "；4G=" + deviceHealth.networkStatusText
+                + "；位置=" + deviceHealth.locationShortText
+                + "；定位=" + deviceHealth.locationStatusText
                 + "；云端=" + deviceHealth.cloudStatusText
                 + "；F4=" + deviceHealth.f4StatusText
                 + "；详情=" + deviceHealth.detailText
@@ -1991,7 +2035,7 @@ Rectangle {
             "kms_overlay=" + (usingKmsOverlay ? "true" : "false"),
             "manual_mode=" + (manualMode ? "true" : "false"),
             "manual_emergency_stop=" + (manualEmergencyStop ? "true" : "false"),
-            "manual_arm_home_ok=" + (manualArmHomeOk ? "true" : "false"),
+            "manual_camera_axis_ready=false",
             "storage_state=" + storageState,
             "settings_summary=" + settingsSummaryText(),
             "upload_total=" + summary.total,
@@ -3484,6 +3528,15 @@ Rectangle {
         }
 
         /*
+         * onLocationStatusChanged 的作用：
+         *   开机单次高德 IP 省份定位完成后刷新设备健康摘要。
+         *   定位失败只影响顶部位置显示和日志摘要，不作为产线停机告警。
+         */
+        onLocationStatusChanged: {
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
          * onF4CommandFinished 的作用：
          *   接收 C++ 后台串口命令结果，更新称重标定弹窗和底部提示条。
          *
@@ -3501,6 +3554,39 @@ Rectangle {
                 root.settingsLastActionText = root.calibrationResultText
             }
             root.storageState = root.calibrationResultText
+            root.showStorageToast()
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4ManualCommandFinished 的作用：
+         *   接收 C++ 后台传送带手动命令结果，把 F407 回包写回手动页状态和命令日志。
+         *
+         * 参数：
+         *   ok 表示 F4 回复是否被 C++ 判定为成功。
+         *   command 是刚下发的 BELT 命令。
+         *   detail 是 F4 返回文本或 C++ 侧失败原因。
+         */
+        onF4ManualCommandFinished: {
+            root.manualPendingF4Command = ""
+            root.manualBeltCommandText = command
+
+            if (ok) {
+                if (command === "BELTSCAN") {
+                    root.manualBeltState = "巡航中"
+                } else if (command === "BELTSTOP") {
+                    root.manualBeltState = "停止"
+                } else if (command === "BELTINFO") {
+                    root.manualBeltState = "状态已返回"
+                }
+                root.manualLastAckText = "F4回执：" + detail
+            } else {
+                root.manualBeltState = "命令失败"
+                root.manualLastAckText = "F4命令失败：" + detail
+            }
+
+            root.storageState = root.manualLastAckText
+            root.appendManualCommandLog(command, "传送带", root.manualLastAckText)
             root.showStorageToast()
             root.evaluateRuntimeAlarms()
         }
@@ -3584,7 +3670,7 @@ Rectangle {
             if (updateDetectClassificationFields(resultText)) {
                 updateDetectFusedFields(resultText)
                 updateDetectModelTimeFields(resultText)
-                storageState = "综合判定完成，正在上传..."
+                storageState = root.settingsUploadEnabled ? "综合判定完成，正在上传..." : "综合判定完成，自动上传已关闭"
                 showStorageToast()
             }
         }
@@ -3649,7 +3735,7 @@ Rectangle {
         }
     }
 
-    /* 顶部状态栏：显示系统时间、通信状态、相机状态、背光常亮和云端状态。 */
+    /* 顶部状态栏：显示系统时间、通信状态、相机状态、F4状态、高德 IP 省份位置和云端状态。 */
     Rectangle {
         id: topBar
         x: 0
@@ -3691,8 +3777,7 @@ Rectangle {
                     {"name": "网络", "value": deviceHealth.networkStatusText, "dot": deviceHealth.networkStatusColor},
                     {"name": "相机", "value": root.cameraStatusText(), "dot": root.cameraDotColor()},
                     {"name": "F4", "value": deviceHealth.f4StatusText, "dot": deviceHealth.f4StatusColor},
-                    {"name": "机械臂", "value": "待命", "dot": root.accentGreen},
-                    {"name": "背光", "value": "常亮", "dot": root.accentGreen},
+                    {"name": "位置", "value": deviceHealth.locationShortText, "dot": deviceHealth.locationStatusColor},
                     {"name": "云端", "value": deviceHealth.cloudStatusText, "dot": deviceHealth.cloudStatusColor}
                 ]
 
@@ -5675,7 +5760,7 @@ Rectangle {
             }
         }
 
-        /* manualBeltPanel 负责传送带点动、停止和速度档位模拟，真实 PWM 仍由 F4 负责。 */
+        /* manualBeltPanel 负责把 MP157 手动按钮映射成 F407 已实现的 BELTSCAN/BELTSTOP/BELTINFO 命令。 */
         Rectangle {
             id: manualBeltPanel
             x: 16
@@ -5700,10 +5785,11 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.rightMargin: 14
                 y: 13
-                text: root.manualBeltState + " / " + root.manualBeltSpeed
+                text: root.manualBeltState + " / " + root.manualBeltCommandText
                 color: root.manualBeltState === "停止" ? root.accentGreen : root.accentAmber
                 font.pixelSize: 12
                 font.bold: true
+                elide: Text.ElideRight
             }
 
             Grid {
@@ -5719,8 +5805,8 @@ Rectangle {
                     model: [
                         {"text": "进入手动", "action": "enter-manual", "color": root.manualMode ? root.accentAmber : root.accentGreen},
                         {"text": "停止", "action": "stop", "color": root.accentRed},
-                        {"text": "正向点动", "action": "belt-forward", "color": root.accentGreen},
-                        {"text": "反向点动", "action": "belt-reverse", "color": "#5aa7ff"}
+                        {"text": "巡航启动", "action": "belt-scan", "color": root.accentGreen},
+                        {"text": "查询状态", "action": "belt-info", "color": "#5aa7ff"}
                     ]
 
                     Rectangle {
@@ -5755,57 +5841,35 @@ Rectangle {
                 }
             }
 
-            Row {
+            Rectangle {
                 x: 14
                 y: 128
-                spacing: 8
+                width: parent.width - 28
+                height: 26
+                radius: 6
+                color: "#171b1e"
+                border.color: "#30363b"
+                border.width: 1
 
-                Repeater {
-                    model: [
-                        {"text": "低", "action": "belt-speed-low", "value": "低速"},
-                        {"text": "中", "action": "belt-speed-mid", "value": "中速"},
-                        {"text": "高", "action": "belt-speed-high", "value": "高速"}
-                    ]
-
-                    Rectangle {
-                        property bool actionAllowed: root.manualActionAllowed(modelData.action)
-                        property bool selectedSpeed: root.manualBeltSpeed === modelData.value
-
-                        width: 68
-                        height: 26
-                        radius: 6
-                        color: selectedSpeed ? "#24483a" : (actionAllowed ? "#22272b" : "#171b1e")
-                        border.color: selectedSpeed ? root.accentGreen : (actionAllowed ? "#3a444b" : "#30363b")
-                        border.width: 1
-                        opacity: actionAllowed ? 1.0 : 0.48
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: modelData.text
-                            color: "#eef3f4"
-                            font.pixelSize: 12
-                            font.bold: true
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: parent.actionAllowed
-
-                            onClicked: {
-                                root.handleManualAction(modelData.action, "速度" + modelData.text)
-                            }
-                        }
-                    }
+                Text {
+                    anchors.fill: parent
+                    anchors.leftMargin: 8
+                    anchors.rightMargin: 8
+                    verticalAlignment: Text.AlignVCenter
+                    text: "协议：MP157->F4 USART1；F4->Emm42 USART6"
+                    color: "#9aa5ab"
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
                 }
             }
         }
 
-        /* manualArmPanel 负责机械臂回零、待机、夹取和分拣位置模拟，夹取类动作受回零状态保护。 */
+        /* manualAssistPanel 只保留检测辅助和人工标记入口，不再显示现场未接入的硬件控制项。 */
         Rectangle {
-            id: manualArmPanel
-            x: 282
+            id: manualAssistPanel
+            x: 332
             y: 62
-            width: 294
+            width: 484
             height: 164
             radius: 8
             color: root.panelColor
@@ -5815,7 +5879,7 @@ Rectangle {
             Text {
                 x: 14
                 y: 10
-                text: "机械臂"
+                text: "检测辅助"
                 color: "#f1f4f5"
                 font.pixelSize: 18
                 font.bold: true
@@ -5825,14 +5889,14 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.rightMargin: 14
                 y: 13
-                text: root.manualArmState + " / " + root.manualActuatorState
-                color: root.manualArmHomeOk ? root.accentGreen : root.accentAmber
+                text: "本地标记"
+                color: root.accentAmber
                 font.pixelSize: 12
                 font.bold: true
             }
 
             Grid {
-                id: manualArmButtonGrid
+                id: manualAssistButtonGrid
                 x: 14
                 y: 42
                 width: parent.width - 28
@@ -5842,105 +5906,20 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"text": "回零", "action": "arm-home", "color": root.accentGreen},
-                        {"text": "待机位", "action": "arm-standby", "color": "#5aa7ff"},
-                        {"text": "抓取测试", "action": "arm-pick", "color": root.accentAmber},
-                        {"text": "放良品", "action": "arm-good", "color": root.accentGreen},
-                        {"text": "放坏品", "action": "arm-bad", "color": root.accentRed},
-                        {"text": "夹爪关", "action": "actuator-on", "color": root.accentAmber},
-                        {"text": "夹爪开", "action": "actuator-off", "color": "#9aa6ad"}
+                        {"text": "检测当前帧", "action": "detect-frame", "color": root.accentGreen},
+                        {"text": "刷新状态", "action": "refresh", "color": "#5aa7ff"},
+                        {"text": "标记GOOD", "action": "mark-good", "color": root.accentGreen},
+                        {"text": "标记BAD", "action": "mark-bad", "color": root.accentRed},
+                        {"text": "待复核", "action": "mark-uncertain", "color": root.accentAmber}
                     ]
 
                     Rectangle {
                         property bool actionAllowed: root.manualActionAllowed(modelData.action)
 
-                        width: (manualArmButtonGrid.width - manualArmButtonGrid.columnSpacing * 2) / 3
+                        width: (manualAssistButtonGrid.width - manualAssistButtonGrid.columnSpacing * 2) / 3
                         height: 34
                         radius: 6
-                        color: actionAllowed ? (manualArmMouse.pressed ? "#2d3338" : "#22272b") : "#171b1e"
-                        border.color: actionAllowed ? modelData.color : "#3a4147"
-                        border.width: 1
-                        opacity: actionAllowed ? 1.0 : 0.48
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: modelData.text
-                            color: "#ffffff"
-                            font.pixelSize: 12
-                            font.bold: true
-                        }
-
-                        MouseArea {
-                            id: manualArmMouse
-                            anchors.fill: parent
-                            enabled: parent.actionAllowed
-
-                            onClicked: {
-                                root.handleManualAction(modelData.action, modelData.text)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /* manualLightPanel 负责显示背光常亮状态、补光和检测辅助动作，当前帧检测复用首页双模型链路。 */
-        Rectangle {
-            id: manualLightPanel
-            x: 592
-            y: 62
-            width: 224
-            height: 164
-            radius: 8
-            color: root.panelColor
-            border.color: root.borderColor
-            border.width: 1
-
-            Text {
-                x: 14
-                y: 10
-                text: "光源与辅助"
-                color: "#f1f4f5"
-                font.pixelSize: 18
-                font.bold: true
-            }
-
-            Text {
-                anchors.right: parent.right
-                anchors.rightMargin: 14
-                y: 13
-                text: "背光常亮 / 亮度 " + root.manualLightLevel
-                color: root.accentGreen
-                font.pixelSize: 12
-                font.bold: true
-            }
-
-            Grid {
-                id: manualLightButtonGrid
-                x: 14
-                y: 42
-                width: parent.width - 28
-                columns: 2
-                rowSpacing: 8
-                columnSpacing: 8
-
-                Repeater {
-                    model: [
-                        {"text": root.manualTopLightEnabled ? "补光关" : "补光开", "action": "toplight-toggle", "color": "#5aa7ff"},
-                        {"text": "亮度低", "action": "light-low", "color": "#9aa6ad"},
-                        {"text": "亮度中", "action": "light-mid", "color": root.accentAmber},
-                        {"text": "亮度高", "action": "light-high", "color": root.accentGreen},
-                        {"text": "检测当前帧", "action": "detect-frame", "color": root.accentGreen},
-                        {"text": "背光常亮", "action": "refresh", "color": root.accentGreen}
-                    ]
-
-                    Rectangle {
-                        property bool actionAllowed: root.manualActionAllowed(modelData.action)
-
-                        width: (manualLightButtonGrid.width - manualLightButtonGrid.columnSpacing) / 2
-                        height: 30
-                        radius: 6
-                        color: actionAllowed ? (manualLightMouse.pressed ? "#2d3338" : "#22272b") : "#171b1e"
+                        color: actionAllowed ? (manualAssistMouse.pressed ? "#2d3338" : "#22272b") : "#171b1e"
                         border.color: actionAllowed ? modelData.color : "#3a4147"
                         border.width: 1
                         opacity: actionAllowed ? 1.0 : 0.48
@@ -5954,7 +5933,7 @@ Rectangle {
                         }
 
                         MouseArea {
-                            id: manualLightMouse
+                            id: manualAssistMouse
                             anchors.fill: parent
                             enabled: parent.actionAllowed
 
@@ -6000,7 +5979,7 @@ Rectangle {
                         {"name": "手动模式", "value": root.manualMode ? "允许" : "未进入", "color": root.manualMode ? root.accentAmber : root.accentGreen},
                         {"name": "急停", "value": root.manualEmergencyStop ? "已按下" : "释放", "color": root.manualEmergencyStop ? root.accentRed : root.accentGreen},
                         {"name": "限位", "value": "未触发", "color": root.accentGreen},
-                        {"name": "机械臂回零", "value": root.manualArmHomeOk ? "完成" : "未完成", "color": root.manualArmHomeOk ? root.accentGreen : root.accentAmber},
+                        {"name": "传送带", "value": root.manualBeltState, "color": root.manualBeltState === "停止" ? root.accentGreen : root.accentAmber},
                         {"name": "复核标记", "value": root.manualReviewMark, "color": "#dce3e6"}
                     ]
 
@@ -6241,7 +6220,7 @@ Rectangle {
         }
     }
 
-    /* settingsPage 是参数设置界面：第一版做现场可调参数和配置摘要，真实持久化/串口同步后续接 C++ 控制器。 */
+    /* settingsPage 是参数设置界面：参数值直接绑定 C++ DetectSettingsController，并保存到 SD 卡 JSON。 */
     Rectangle {
         id: settingsPage
         x: 176
@@ -6332,7 +6311,7 @@ Rectangle {
             x: 16
             y: 62
             width: 252
-            height: 170
+            height: 190
             radius: 8
             color: root.panelColor
             border.color: root.borderColor
@@ -6400,7 +6379,8 @@ Rectangle {
                 Repeater {
                     model: [
                         {"label": "模型阈值", "value": root.settingsThresholdText(root.settingsDecisionThreshold), "key": "decision", "step": 10, "note": "好坏线"},
-                        {"label": "复核阈值", "value": root.settingsThresholdText(root.settingsReviewThreshold), "key": "review", "step": 10, "note": "低可信"}
+                        {"label": "复核阈值", "value": root.settingsThresholdText(root.settingsReviewThreshold), "key": "review", "step": 10, "note": "低可信"},
+                        {"label": "ROI大小", "value": root.settingsRoiSize + "px", "key": "roi", "step": 20, "note": "中心裁剪"}
                     ]
 
                     Row {
@@ -6507,7 +6487,7 @@ Rectangle {
             x: 284
             y: 62
             width: 252
-            height: 170
+            height: 190
             radius: 8
             color: root.panelColor
             border.color: root.borderColor
@@ -6527,33 +6507,39 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.rightMargin: 14
                 y: 14
-                text: "UI目标值"
+                text: "真实检测配置"
                 color: "#9fdcff"
                 font.pixelSize: 12
                 font.bold: true
             }
 
-            Column {
+            Grid {
                 id: settingsVisionSummaryColumn
                 x: 14
                 y: 38
                 width: parent.width - 28
-                spacing: 4
+                columns: 2
+                rowSpacing: 6
+                columnSpacing: 8
 
                 Repeater {
                     model: [
-                        {"name": "分类模型", "value": "MobileNetV3 INT8", "color": root.accentGreen},
-                        {"name": "分割复核", "value": "UNet 低频复核", "color": "#9fdcff"},
-                        {"name": "低可信度", "value": "进入人工复核", "color": root.accentAmber},
-                        {"name": "ROI策略", "value": "中心区域检测", "color": "#eef3f4"}
+                        {"name": "分类阈值", "value": root.settingsThresholdText(root.settingsDecisionThreshold), "color": root.accentGreen},
+                        {"name": "复核阈值", "value": root.settingsThresholdText(root.settingsReviewThreshold), "color": root.accentAmber},
+                        {"name": "UNet像素", "value": root.settingsSegmentMinPixels + "px", "color": "#9fdcff"},
+                        {"name": "叠加透明", "value": root.settingsOverlayAlpha.toFixed(2), "color": "#eef3f4"}
                     ]
 
-                    Row {
-                        width: parent.width
-                        height: 18
-                        spacing: 8
+                    Rectangle {
+                        width: (settingsVisionSummaryColumn.width - settingsVisionSummaryColumn.columnSpacing) / 2
+                        height: 24
+                        radius: 5
+                        color: "#20262a"
+                        border.color: "#2f3840"
+                        border.width: 1
 
                         Rectangle {
+                            x: 8
                             width: 8
                             height: 8
                             radius: 4
@@ -6562,21 +6548,23 @@ Rectangle {
                         }
 
                         Text {
-                            width: 70
-                            anchors.verticalCenter: parent.verticalCenter
+                            x: 22
+                            y: 3
+                            width: parent.width - 30
                             text: modelData.name
                             color: "#9aa5ab"
-                            font.pixelSize: 11
+                            font.pixelSize: 9
                             font.bold: true
                             elide: Text.ElideRight
                         }
 
                         Text {
-                            width: parent.width - 94
-                            anchors.verticalCenter: parent.verticalCenter
+                            x: 22
+                            y: 12
+                            width: parent.width - 30
                             text: modelData.value
                             color: modelData.color
-                            font.pixelSize: 12
+                            font.pixelSize: 10
                             font.bold: true
                             elide: Text.ElideRight
                         }
@@ -6617,10 +6605,54 @@ Rectangle {
                 x: 14
                 y: 132
                 width: parent.width - 120
-                text: "配置状态：尚未写JSON"
+                text: "配置：" + root.settingsConfigPath
                 color: "#8f9aa1"
                 font.pixelSize: 11
                 elide: Text.ElideRight
+            }
+
+            Row {
+                id: settingsVisionStepperRow
+                x: 14
+                y: 98
+                width: parent.width - 28
+                height: 28
+                spacing: 6
+
+                Repeater {
+                    model: [
+                        {"text": "UNet-", "key": "segment", "delta": -10, "color": "#5aa7ff"},
+                        {"text": "UNet+", "key": "segment", "delta": 10, "color": "#5aa7ff"},
+                        {"text": "透明-", "key": "alpha", "delta": -0.05, "color": root.accentGreen},
+                        {"text": "透明+", "key": "alpha", "delta": 0.05, "color": root.accentGreen}
+                    ]
+
+                    Rectangle {
+                        width: (settingsVisionStepperRow.width - 18) / 4
+                        height: 28
+                        radius: 6
+                        color: settingsVisionStepMouse.pressed ? "#2d3338" : "#22272b"
+                        border.color: modelData.color
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.text
+                            color: "#ffffff"
+                            font.pixelSize: 11
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: settingsVisionStepMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeSettingValue(modelData.key, modelData.delta)
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -6630,7 +6662,7 @@ Rectangle {
             x: 552
             y: 62
             width: 264
-            height: 170
+            height: 190
             radius: 8
             color: root.panelColor
             border.color: root.borderColor
@@ -6650,7 +6682,7 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.rightMargin: 14
                 y: 14
-                text: "尚未下发F4"
+                text: "F4管运动"
                 color: root.accentAmber
                 font.pixelSize: 12
                 font.bold: true
@@ -6665,10 +6697,10 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"name": "运动控制", "value": "由F4固件执行", "color": "#9fdcff"},
-                        {"name": "分拣动作", "value": "依赖F4联锁", "color": "#9fdcff"},
-                        {"name": "参数通道", "value": "串口协议预留", "color": root.accentAmber},
-                        {"name": "页面作用", "value": "只展示目标值", "color": "#eef3f4"}
+                        {"name": "传送带", "value": "BELT命令已接", "color": root.accentGreen},
+                        {"name": "称重", "value": "CAL命令保留", "color": root.accentAmber},
+                        {"name": "串口边界", "value": "MP157只发高层命令", "color": "#9fdcff"},
+                        {"name": "安全联锁", "value": "仍由F407执行", "color": "#eef3f4"}
                     ]
 
                     Row {
@@ -6765,13 +6797,13 @@ Rectangle {
             }
         }
 
-        /* settingsStoragePanel 汇总相机、光源、SD 卡和 COS 上传策略，贴合当前已打通的数据路径。 */
+        /* settingsStoragePanel 汇总相机、SD 卡和 COS 上传策略，贴合当前已打通的数据路径。 */
         Rectangle {
             id: settingsStoragePanel
             x: 16
-            y: 246
+            y: 266
             width: 398
-            height: 246
+            height: 226
             radius: 8
             color: root.panelColor
             border.color: root.borderColor
@@ -6781,7 +6813,7 @@ Rectangle {
             Text {
                 x: 14
                 y: 10
-                text: "相机、光源与存储"
+                text: "相机、存储与上传"
                 color: "#f1f4f5"
                 font.pixelSize: 16
                 font.bold: true
@@ -6798,9 +6830,8 @@ Rectangle {
                         {"name": "相机节点", "value": root.cameraDeviceName, "color": "#eef3f4"},
                         {"name": "采集参数", "value": root.captureWidth + "x" + root.captureHeight + "@" + root.captureFps + "fps", "color": "#eef3f4"},
                         {"name": "视频后端", "value": root.videoBackend, "color": root.usingKmsOverlay ? root.accentGreen : root.accentAmber},
-                        {"name": "背光", "value": "常亮", "color": root.accentGreen},
                         {"name": "SD目录", "value": "/mnt/sdcard/images", "color": "#eef3f4"},
-                        {"name": "COS上传", "value": root.settingsAutoUpload ? "自动上传" : "本地保存", "color": root.settingsAutoUpload ? root.accentGreen : root.accentAmber}
+                        {"name": "COS上传", "value": root.settingsUploadEnabled ? "自动上传" : "本地保存", "color": root.settingsUploadEnabled ? root.accentGreen : root.accentAmber}
                     ]
 
                     Row {
@@ -6840,17 +6871,17 @@ Rectangle {
 
             Rectangle {
                 x: 14
-                y: 204
+                y: 184
                 width: parent.width - 28
                 height: 28
                 radius: 6
                 color: uploadToggleMouse.pressed ? "#2d3338" : "#22272b"
-                border.color: root.settingsAutoUpload ? root.accentGreen : root.accentAmber
+                border.color: root.settingsUploadEnabled ? root.accentGreen : root.accentAmber
                 border.width: 1
 
                 Text {
                     anchors.centerIn: parent
-                    text: root.settingsAutoUpload ? "切换为手动上传" : "切换为自动上传"
+                    text: root.settingsUploadEnabled ? "切换为手动上传" : "切换为自动上传"
                     color: "#ffffff"
                     font.pixelSize: 13
                     font.bold: true
@@ -6871,9 +6902,9 @@ Rectangle {
         Rectangle {
             id: settingsActionPanel
             x: 430
-            y: 246
+            y: 266
             width: 386
-            height: 246
+            height: 226
             radius: 8
             color: root.panelColor
             border.color: root.borderColor
@@ -6934,8 +6965,8 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"text": "应用到UI", "action": "apply", "color": root.accentGreen},
-                        {"text": "保存预留", "action": "save", "color": "#5aa7ff"},
+                        {"text": "应用检测", "action": "apply", "color": root.accentGreen},
+                        {"text": "保存配置", "action": "save", "color": "#5aa7ff"},
                         {"text": "恢复默认", "action": "reset", "color": root.accentAmber},
                         {"text": "导出摘要", "action": "export", "color": "#9aa6ad"}
                     ]
@@ -7637,12 +7668,11 @@ Rectangle {
                     model: [
                         {"name": "相机", "value": root.cameraStatusText(), "color": root.cameraDotColor()},
                         {"name": "F4心跳", "value": deviceHealth.f4StatusText, "color": deviceHealth.f4StatusColor},
-                        {"name": "机械臂", "value": root.manualArmHomeOk ? "已回零" : "未回零", "color": root.manualArmHomeOk ? root.accentGreen : root.accentAmber},
+                        {"name": "定位", "value": deviceHealth.locationStatusText, "color": deviceHealth.locationStatusColor},
                         {"name": "当前告警", "value": root.alarmCleared ? "无未处理" : root.alarmCurrentLevel, "color": root.alarmCleared ? root.accentGreen : root.alarmLevelColor()},
                         {"name": "SD卡", "value": deviceHealth.sdcardStatusText, "color": deviceHealth.sdcardStatusColor},
                         {"name": "云端", "value": deviceHealth.cloudStatusText, "color": deviceHealth.cloudStatusColor},
                         {"name": "KMS视频", "value": root.usingKmsOverlay ? deviceHealth.cameraStatusText : "预览/桥接", "color": root.usingKmsOverlay ? deviceHealth.cameraStatusColor : root.accentAmber},
-                        {"name": "背光", "value": "常亮", "color": root.accentGreen},
                         {"name": "4G", "value": deviceHealth.networkStatusText, "color": deviceHealth.networkStatusColor}
                     ]
 
@@ -8305,6 +8335,28 @@ Rectangle {
                     }
                 }
             }
+        }
+    }
+
+    Connections {
+        target: detectSettings
+
+        /*
+         * onSettingsChanged 的作用：
+         *   C++ 参数控制器清洗或恢复默认后，QML 的摘要属性会自动重新绑定；
+         *   这里同步最近操作提示，保证底部状态栏能显示真实配置变化。
+         */
+        onSettingsChanged: {
+            root.settingsLastActionText = detectSettings.lastStatusText
+            root.storageState = root.settingsLastActionText
+        }
+
+        /*
+         * onLastStatusTextChanged 的作用：
+         *   保存 JSON、读取 JSON 或恢复默认后刷新参数页提示文本。
+         */
+        onLastStatusTextChanged: {
+            root.settingsLastActionText = detectSettings.lastStatusText
         }
     }
 

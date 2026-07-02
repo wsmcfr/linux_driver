@@ -65,6 +65,9 @@ static const int MODEL_CLASS_COUNT = 6;
 /* 默认叠加透明度：与 PC 端脚本 alpha=0.45 保持一致。 */
 static const float DEFAULT_OVERLAY_ALPHA = 0.45f;
 
+/* 默认 UNet 判 NG 的最小缺陷像素数；1 表示只要出现非背景缺陷像素就判 NG。 */
+static const int DEFAULT_MIN_DEFECT_PIXELS = 1;
+
 /* ImageNet RGB 均值：训练、PC 推理和板端推理必须一致。 */
 static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f};
 
@@ -95,6 +98,7 @@ struct ImageBuffer {
  *   output_dir 是 raw/overlay/mask 三张结果图输出目录。
  *   roi_size 是中心裁剪边长，0 表示不裁剪整图缩放。
  *   alpha 是 overlay 中缺陷颜色的叠加强度。
+ *   min_defect_pixels 是判定 NG 所需的最小缺陷像素数。
  */
 struct ProgramOptions {
     std::string image_path;                         /* 待分割输入图片路径，必须由 --image 提供。 */
@@ -102,6 +106,7 @@ struct ProgramOptions {
     std::string output_dir = DEFAULT_OUTPUT_DIR;    /* 输出目录，默认写入 SD 卡历史图片目录。 */
     int roi_size = DEFAULT_ROI_SIZE;                /* ROI 边长，默认 300。 */
     float alpha = DEFAULT_OVERLAY_ALPHA;            /* 叠加透明度，默认 0.45。 */
+    int min_defect_pixels = DEFAULT_MIN_DEFECT_PIXELS; /* 最小缺陷像素阈值，默认 1。 */
 };
 
 /*
@@ -135,7 +140,7 @@ struct PngErrorManager {
 static void print_usage(const char *program)
 {
     std::cout
-        << "用法: " << program << " --image <jpg> [--model <onnx>] [--output-dir <dir>] [--roi 300] [--alpha 0.45]\n"
+        << "用法: " << program << " --image <jpg> [--model <onnx>] [--output-dir <dir>] [--roi 300] [--alpha 0.45] [--min-defect-pixels 1]\n"
         << "输出: RESULT_SEG status=OK|NG defect_pixels=<n> time_ms=<ms> raw_path=<jpg> overlay_path=<jpg> mask_path=<png>\n";
 }
 
@@ -198,7 +203,7 @@ static float parse_float(const char *text, const char *name)
  *   解析命令行参数并返回 ProgramOptions。
  *
  * 主要流程：
- *   1. 支持 --image、--model、--output-dir、--roi、--alpha 和 --help。
+ *   1. 支持 --image、--model、--output-dir、--roi、--alpha、--min-defect-pixels 和 --help。
  *   2. 对缺少参数值、未知参数和缺少 --image 做明确报错。
  *
  * 参数：
@@ -256,6 +261,14 @@ static ProgramOptions parse_args(int argc, char **argv)
                 throw std::runtime_error("--alpha 缺少数值");
             }
             options.alpha = parse_float(argv[i], "--alpha");
+            continue;
+        }
+
+        if (std::strcmp(arg, "--min-defect-pixels") == 0) {
+            if (++i >= argc) {
+                throw std::runtime_error("--min-defect-pixels 缺少数值");
+            }
+            options.min_defect_pixels = parse_int(argv[i], "--min-defect-pixels");
             continue;
         }
 
@@ -1093,6 +1106,7 @@ int main(int argc, char **argv)
         const size_t logits_count = tensor_element_count(outputs.front());    /* logits_count 保存输出元素总数。 */
         const std::vector<uint8_t> mask = logits_to_mask(logits, logits_count);
         const int defect_pixels = count_defect_pixels(mask);
+        const bool is_ng = defect_pixels >= options.min_defect_pixels && defect_pixels > 0;
         const std::vector<uint8_t> palette = build_palette();
         const ImageBuffer color_mask = mask_to_color(mask, MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, palette);
         const ImageBuffer overlay = overlay_mask(roi, mask, palette, options.alpha);
@@ -1111,8 +1125,9 @@ int main(int argc, char **argv)
         std::cout.precision(4);
         std::cout
             << "RESULT_SEG"
-            << " status=" << (defect_pixels > 0 ? "NG" : "OK")
+            << " status=" << (is_ng ? "NG" : "OK")
             << " defect_pixels=" << defect_pixels
+            << " min_defect_pixels=" << options.min_defect_pixels
             << " classes=" << MODEL_CLASS_COUNT
             << " time_ms=" << time_ms
             << " raw_path=" << raw_path

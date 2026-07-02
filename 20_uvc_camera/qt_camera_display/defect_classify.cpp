@@ -58,8 +58,8 @@ static const int MODEL_INPUT_HEIGHT = 224;
 /* 当前模型类别数：gasket/splitwasher/washer 各 good/bad，共 6 类。 */
 static const int MODEL_CLASS_COUNT = 6;
 
-/* bad 总概率超过该阈值时判为 BAD，和 PC 端 infer_classify.py 的 BAD_THRESHOLD 保持一致。 */
-static const float BAD_THRESHOLD = 0.5f;
+/* 默认 bad 总概率阈值；实际运行时可由 Qt 参数页通过 --bad-threshold 覆盖。 */
+static const float DEFAULT_BAD_THRESHOLD = 0.5f;
 
 /* ImageNet RGB 均值：训练、导出、PC 推理和板端推理必须一致。 */
 static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f};
@@ -90,12 +90,14 @@ struct ImageBuffer {
  *   labels_path 是 labels JSON 路径。
  *   image_path 是待检测 JPG 图片路径。
  *   roi_size 是中心裁剪边长，0 表示不裁剪整图缩放。
+ *   bad_threshold 是 bad 类别总概率判坏阈值，由 Qt 参数页真实下发。
  */
 struct ProgramOptions {
     std::string model_path = DEFAULT_MODEL_PATH;
     std::string labels_path = DEFAULT_LABELS_PATH;
     std::string image_path;
     int roi_size = DEFAULT_ROI_SIZE;
+    float bad_threshold = DEFAULT_BAD_THRESHOLD;
 };
 
 /*
@@ -121,7 +123,7 @@ struct JpegErrorManager {
 static void print_usage(const char *program)
 {
     std::cout
-        << "用法: " << program << " --image <jpg> [--model <onnx>] [--labels <json>] [--roi 300]\n"
+        << "用法: " << program << " --image <jpg> [--model <onnx>] [--labels <json>] [--roi 300] [--bad-threshold 0.85]\n"
         << "输出: RESULT status=GOOD|BAD class=<label> confidence=<0-1> bad_total=<0-1> good_total=<0-1> time_ms=<ms>\n";
 }
 
@@ -153,11 +155,42 @@ static int parse_int(const char *text, const char *name)
 }
 
 /*
+ * parse_float_range 的作用：
+ *   把命令行字符串解析为指定范围内的 float，并在失败时抛出可读错误。
+ *
+ * 参数：
+ *   text 是待解析字符串。
+ *   name 是参数名，用于错误信息。
+ *   min_value/max_value 是允许范围。
+ *
+ * 返回值：
+ *   返回解析并校验后的 float。
+ */
+static float parse_float_range(const char *text,
+                               const char *name,
+                               float min_value,
+                               float max_value)
+{
+    char *end = nullptr;
+    const float value = std::strtof(text, &end);
+
+    if (text == nullptr || *text == '\0' || end == text || *end != '\0') {
+        throw std::runtime_error(std::string("参数不是小数: ") + name);
+    }
+
+    if (value < min_value || value > max_value) {
+        throw std::runtime_error(std::string("参数超出范围: ") + name);
+    }
+
+    return value;
+}
+
+/*
  * parse_args 的作用：
  *   解析命令行参数并返回 ProgramOptions。
  *
  * 主要流程：
- *   1. 支持 --image、--model、--labels、--roi 和 --help。
+ *   1. 支持 --image、--model、--labels、--roi、--bad-threshold 和 --help。
  *   2. 对缺少参数值、未知参数和缺少 --image 做明确报错。
  *
  * 参数：
@@ -207,6 +240,14 @@ static ProgramOptions parse_args(int argc, char **argv)
                 throw std::runtime_error("--roi 缺少数值");
             }
             options.roi_size = parse_int(argv[i], "--roi");
+            continue;
+        }
+
+        if (std::strcmp(arg, "--bad-threshold") == 0) {
+            if (++i >= argc) {
+                throw std::runtime_error("--bad-threshold 缺少数值");
+            }
+            options.bad_threshold = parse_float_range(argv[i], "--bad-threshold", 0.0f, 1.0f);
             continue;
         }
 
@@ -652,7 +693,7 @@ int main(int argc, char **argv)
         }
 
         int pred_index = argmax_index;
-        if (best_bad_index >= 0 && bad_total >= BAD_THRESHOLD) {
+        if (best_bad_index >= 0 && bad_total >= options.bad_threshold) {
             pred_index = best_bad_index;
         }
 

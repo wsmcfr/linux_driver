@@ -26,6 +26,7 @@
  *   --detect-self-test    不启动 QML，只走双模型检测链路，便于 SSH 验证分类、UNet、上传和历史记录。
  *   --alarm-snapshot-self-test  不启动 QML，只向当天告警诊断快照文件追加一段内容，便于 SSH 验证日志落盘逻辑。
  *   --alarm-log-self-test  不启动 QML，只向当天自动告警日志文件追加一段内容，便于 SSH 验证按日归档逻辑。
+ *   --settings-log-self-test  不启动 QML，只写参数日志并验证日志查看模型能扫描到该文件。
  *   --windowed            使用 1024x600 窗口模式，便于桌面或远程调试。
  *
  * 返回值：
@@ -52,10 +53,13 @@
 #include <QJsonArray>           /* QJsonArray 用于把历史记录数组保存到 JSON。 */
 #include <QJsonDocument>        /* QJsonDocument 用于解析和生成上传历史 JSON 文档。 */
 #include <QJsonObject>          /* QJsonObject 用于保存单条上传历史记录字段。 */
+#include <QJsonParseError>      /* QJsonParseError 用于把参数 JSON 解析错误转换成界面可读文本。 */
 #include <QJsonValue>           /* QJsonValue 用于读取历史 JSON 中的字符串或数字字段。 */
 #include <QHostAddress>         /* QHostAddress 用于指定云端复核回写 HTTP 服务监听地址。 */
 #include <QProcess>             /* QProcess 用于调用现有 sdcard-safe-remove 命令。 */
 #include <QProcessEnvironment>  /* QProcessEnvironment 用于给 sdcard-safe-remove 传入短等待环境变量。 */
+#include <QRegExp>              /* QRegExp 用于按换行解析 4g-location 的 key=value 输出。 */
+#include <QSaveFile>            /* QSaveFile 用于原子写入检测参数 JSON，避免断电留下半截配置。 */
 #include <QSet>                 /* QSet 用于检测多天历史 JSON 中的重复记录，避免旧文件兼容读取时重复显示。 */
 #include <QMetaObject>          /* QMetaObject 用于把后台线程的检测阶段进度安全投递回 Qt 主线程。 */
 #include <QPointer>             /* QPointer 用于后台线程投递进度前判断控制器对象是否仍然存在。 */
@@ -133,17 +137,29 @@ static const char *DEFAULT_SDCARD_IMAGE_DIR = "/mnt/sdcard/images";
 /* SD 卡诊断日志目录，告警维护页保存诊断和自动告警日志时会把文本写到这里。 */
 static const char *DEFAULT_SDCARD_LOG_DIR = "/mnt/sdcard/logs";
 
+/* 检测参数默认保存文件；参数页保存后，下一次启动会从这里恢复真实检测配置。 */
+static const char *DEFAULT_DETECT_SETTINGS_FILE = "/mnt/sdcard/config/defect_ui_config.json";
+
 /* ALARM_SNAPSHOT_PREFIX 是诊断快照文件名前缀，实际文件名会追加当天日期，同一天追加到同一个文件。 */
 static const char *ALARM_SNAPSHOT_PREFIX = "qt_alarm_snapshot";
 
 /* ALARM_LOG_PREFIX 是自动告警日志文件名前缀，实际文件名会追加当天日期，同一天所有告警追加到同一个文件。 */
 static const char *ALARM_LOG_PREFIX = "qt_alarm";
 
+/* SETTINGS_LOG_PREFIX 是参数设置日志文件名前缀，保存配置和导出摘要都会追加到同一天日志。 */
+static const char *SETTINGS_LOG_PREFIX = "qt_settings";
+
 /* 板端 COS 上传脚本默认部署路径，保存按钮会在本地 JPG/PNG 落盘后调用它。 */
 static const char *DEFAULT_COS_UPLOAD_SCRIPT = "/root/qt_camera_display/defect-cos-upload";
 
 /* 默认 4G PPP 管理脚本；健康检测只调用 test，不在界面线程里执行 start/restart。 */
 static const char *DEFAULT_4G_PPP_SCRIPT = "4g-ppp";
+
+/* 默认 4G IP 省份定位脚本；脚本内部只调用高德 IP 定位接口，不访问 GPS 或 AT 串口。 */
+static const char *DEFAULT_4G_LOCATION_SCRIPT = "4g-location";
+
+/* 高德 IP 定位短超时，单位毫秒；首次开机定位允许 HTTPS 请求和 4G 弱网有更长等待。 */
+static const int LOCATION_PROBE_TIMEOUT_MS = 40000;
 
 /* 默认云端健康地址；与 defect-cos-upload 的默认后端保持一致。 */
 static const char *DEFAULT_CLOUD_HEALTH_URL = "http://139.9.35.72/health";
@@ -198,6 +214,86 @@ static const char *DEFAULT_BOARD_REVIEW_SOURCE = "cloud";
 
 /* Qt 界面默认业务时区：POSIX TZ 中 CST-8 表示 UTC+8，也就是北京时间。 */
 static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
+
+/*
+ * DetectSettingsSnapshot 的作用：
+ *   保存参数设置页真正参与检测链路的配置快照。
+ *
+ * 字段说明：
+ *   partType 是界面选择的真实零件中文名，当前用于摘要和历史诊断，不直接改模型类别顺序。
+ *   modelThreshold 是分类模型 bad_total 判坏阈值，传给 defect-classify 的 --bad-threshold。
+ *   reviewThreshold 是综合判定的复核阈值，分类置信度低于该值时进入 REVIEW。
+ *   roiSize 是分类和 UNet 使用的中心 ROI 边长，传给两个模型程序的 --roi。
+ *   segmentMinPixels 是 UNet 判 NG 的最小缺陷像素数，传给 defect-segment 的 --min-defect-pixels。
+ *   overlayAlpha 是 UNet 叠加图透明度，传给 defect-segment 的 --alpha。
+ *   autoUploadEnabled 为 false 时检测仍写本地历史，但跳过 COS 上传并返回 upload_status=SKIP。
+ */
+struct DetectSettingsSnapshot
+{
+    QString partType = QStringLiteral("波形垫圈");
+    double modelThreshold = 0.85;
+    double reviewThreshold = 0.65;
+    int roiSize = 300;
+    int segmentMinPixels = 1;
+    double overlayAlpha = 0.45;
+    bool autoUploadEnabled = true;
+};
+
+/*
+ * clampedDouble 的作用：
+ *   把 JSON 或 QML 传入的小数限制在指定闭区间，避免坏配置进入模型命令行。
+ *
+ * 参数：
+ *   value 是待限制的输入值。
+ *   low/high 是允许的最小值和最大值。
+ *
+ * 返回值：
+ *   返回已经限制到 [low, high] 的 double。
+ */
+static double clampedDouble(double value, double low, double high)
+{
+    return std::max(low, std::min(high, value));
+}
+
+/*
+ * clampedInt 的作用：
+ *   把 JSON 或 QML 传入的整数限制在指定闭区间，避免 ROI 或像素阈值越界。
+ *
+ * 参数：
+ *   value 是待限制的输入值。
+ *   low/high 是允许的最小值和最大值。
+ *
+ * 返回值：
+ *   返回已经限制到 [low, high] 的 int。
+ */
+static int clampedInt(int value, int low, int high)
+{
+    return std::max(low, std::min(high, value));
+}
+
+/*
+ * detectSettingsToVariantMap 的作用：
+ *   把检测配置快照转换成 QML 可直接读取的 QVariantMap。
+ *
+ * 参数：
+ *   settings 是要转换的检测配置快照。
+ *
+ * 返回值：
+ *   返回包含 partType/modelThreshold/reviewThreshold/roiSize/segmentMinPixels/overlayAlpha/autoUploadEnabled 的 map。
+ */
+static QVariantMap detectSettingsToVariantMap(const DetectSettingsSnapshot &settings)
+{
+    QVariantMap map;
+
+    map.insert(QStringLiteral("partType"), settings.partType);
+    map.insert(QStringLiteral("modelThreshold"), settings.modelThreshold);
+    map.insert(QStringLiteral("reviewThreshold"), settings.reviewThreshold);
+    map.insert(QStringLiteral("roiSize"), settings.roiSize);
+    map.insert(QStringLiteral("segmentMinPixels"), settings.segmentMinPixels);
+    map.insert(QStringLiteral("overlayAlpha"), settings.overlayAlpha);
+    map.insert(QStringLiteral("autoUploadEnabled"), settings.autoUploadEnabled);
+    return map;
+}
 
 /*
  * dateStampString 的作用：
@@ -2871,6 +2967,541 @@ private:
 };
 
 /*
+ * DetectSettingsController 的作用：
+ *   管理参数设置页的真实检测配置，并把配置持久化到 SD 卡 JSON 文件。
+ *
+ * 主要流程：
+ *   1. 程序启动时尝试读取 /mnt/sdcard/config/defect_ui_config.json。
+ *   2. QML 调整阈值、ROI、UNet 像素阈值、叠加透明度和上传开关时直接写入本对象属性。
+ *   3. 用户点击保存时用 QSaveFile 原子写 JSON，避免断电或拔卡留下半截配置。
+ *   4. CameraStorageController 检测前只读取 settingsSnapshot()，保证后台线程使用稳定快照。
+ */
+class DetectSettingsController : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QVariantMap currentSettings READ currentSettings NOTIFY settingsChanged)
+    Q_PROPERTY(QString configPath READ configPath CONSTANT)
+    Q_PROPERTY(QString partType READ partType WRITE setPartType NOTIFY settingsChanged)
+    Q_PROPERTY(double modelThreshold READ modelThreshold WRITE setModelThreshold NOTIFY settingsChanged)
+    Q_PROPERTY(double reviewThreshold READ reviewThreshold WRITE setReviewThreshold NOTIFY settingsChanged)
+    Q_PROPERTY(int roiSize READ roiSize WRITE setRoiSize NOTIFY settingsChanged)
+    Q_PROPERTY(int segmentMinPixels READ segmentMinPixels WRITE setSegmentMinPixels NOTIFY settingsChanged)
+    Q_PROPERTY(double overlayAlpha READ overlayAlpha WRITE setOverlayAlpha NOTIFY settingsChanged)
+    Q_PROPERTY(bool autoUploadEnabled READ autoUploadEnabled WRITE setAutoUploadEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(QString lastStatusText READ lastStatusText NOTIFY lastStatusTextChanged)
+
+public:
+    /*
+     * 构造函数的作用：
+     *   初始化配置文件路径，并在对象创建时尝试读取已有 JSON。
+     *
+     * 参数：
+     *   parent 是 Qt 对象树父对象。
+     */
+    explicit DetectSettingsController(QObject *parent = nullptr)
+        : QObject(parent),
+          m_configPath(QString::fromLatin1(DEFAULT_DETECT_SETTINGS_FILE)),
+          m_lastStatusText(QStringLiteral("真实检测配置：使用默认值"))
+    {
+        loadSettingsFromDisk();
+    }
+
+    /*
+     * currentSettings 的作用：
+     *   把当前配置一次性返回给 QML，便于调试和摘要展示。
+     *
+     * 返回值：
+     *   返回 QVariantMap 形式的完整配置。
+     */
+    QVariantMap currentSettings() const
+    {
+        return detectSettingsToVariantMap(m_settings);
+    }
+
+    /*
+     * settingsSnapshot 的作用：
+     *   给 C++ 后台检测线程读取当前配置快照。
+     *
+     * 返回值：
+     *   返回 DetectSettingsSnapshot 值对象，后续线程使用不依赖 QObject 生命周期。
+     */
+    DetectSettingsSnapshot settingsSnapshot() const
+    {
+        return m_settings;
+    }
+
+    /*
+     * configPath 的作用：
+     *   返回参数 JSON 的绝对路径，QML 会显示给现场人员确认保存位置。
+     *
+     * 返回值：
+     *   返回 /mnt/sdcard/config/defect_ui_config.json。
+     */
+    QString configPath() const
+    {
+        return m_configPath;
+    }
+
+    /*
+     * partType 的作用：
+     *   返回参数页当前选择的零件中文名。
+     */
+    QString partType() const
+    {
+        return m_settings.partType;
+    }
+
+    /*
+     * modelThreshold 的作用：
+     *   返回分类模型 bad_total 判坏阈值，范围 0.50~0.99。
+     */
+    double modelThreshold() const
+    {
+        return m_settings.modelThreshold;
+    }
+
+    /*
+     * reviewThreshold 的作用：
+     *   返回低可信度复核阈值，低于该值时综合结果进入 REVIEW。
+     */
+    double reviewThreshold() const
+    {
+        return m_settings.reviewThreshold;
+    }
+
+    /*
+     * roiSize 的作用：
+     *   返回分类和分割模型共同使用的中心 ROI 边长。
+     */
+    int roiSize() const
+    {
+        return m_settings.roiSize;
+    }
+
+    /*
+     * segmentMinPixels 的作用：
+     *   返回 UNet 判定 NG 所需的最小缺陷像素数。
+     */
+    int segmentMinPixels() const
+    {
+        return m_settings.segmentMinPixels;
+    }
+
+    /*
+     * overlayAlpha 的作用：
+     *   返回 UNet overlay 结果图缺陷颜色叠加强度。
+     */
+    double overlayAlpha() const
+    {
+        return m_settings.overlayAlpha;
+    }
+
+    /*
+     * autoUploadEnabled 的作用：
+     *   返回检测完成后是否自动调用 COS 上传。
+     */
+    bool autoUploadEnabled() const
+    {
+        return m_settings.autoUploadEnabled;
+    }
+
+    /*
+     * lastStatusText 的作用：
+     *   返回最近一次加载、保存或恢复默认的中文状态。
+     */
+    QString lastStatusText() const
+    {
+        return m_lastStatusText;
+    }
+
+    /*
+     * setPartType 的作用：
+     *   设置零件中文名，只允许三类真实垫圈名称。
+     *
+     * 参数：
+     *   value 是 QML 传入的零件名称。
+     */
+    void setPartType(const QString &value)
+    {
+        QString normalized = value.trimmed();
+        const QStringList allowed = supportedPartTypes();
+
+        if (!allowed.contains(normalized)) {
+            normalized = allowed.constFirst();
+        }
+
+        if (m_settings.partType == normalized) {
+            return;
+        }
+
+        m_settings.partType = normalized;
+        setLastStatusText(QStringLiteral("真实检测配置：零件已切换为 ") + normalized);
+        emit settingsChanged();
+    }
+
+    /*
+     * setModelThreshold 的作用：
+     *   设置分类模型 bad_total 判坏阈值，并保证复核阈值不会高于模型阈值。
+     *
+     * 参数：
+     *   value 是 0~1 小数阈值。
+     */
+    void setModelThreshold(double value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.modelThreshold = clampedDouble(value, 0.50, 0.99);
+        next.reviewThreshold = clampedDouble(next.reviewThreshold, 0.30, next.modelThreshold);
+        applySettings(next, QStringLiteral("真实检测配置：模型阈值已调整"));
+    }
+
+    /*
+     * setReviewThreshold 的作用：
+     *   设置低可信度复核阈值，避免低置信度 GOOD/BAD 直接成为最终结果。
+     *
+     * 参数：
+     *   value 是 0~1 小数阈值。
+     */
+    void setReviewThreshold(double value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.reviewThreshold = clampedDouble(value, 0.30, next.modelThreshold);
+        applySettings(next, QStringLiteral("真实检测配置：复核阈值已调整"));
+    }
+
+    /*
+     * setRoiSize 的作用：
+     *   设置模型中心 ROI 边长，并限制到板端当前模型可接受范围。
+     *
+     * 参数：
+     *   value 是 ROI 像素边长。
+     */
+    void setRoiSize(int value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.roiSize = clampedInt(value, 160, 640);
+        applySettings(next, QStringLiteral("真实检测配置：ROI大小已调整"));
+    }
+
+    /*
+     * setSegmentMinPixels 的作用：
+     *   设置 UNet 判 NG 所需的最小缺陷像素数。
+     *
+     * 参数：
+     *   value 是像素数量，0 表示只要有缺陷类像素就判 NG。
+     */
+    void setSegmentMinPixels(int value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.segmentMinPixels = clampedInt(value, 0, 50000);
+        applySettings(next, QStringLiteral("真实检测配置：UNet像素阈值已调整"));
+    }
+
+    /*
+     * setOverlayAlpha 的作用：
+     *   设置 UNet overlay 图片的叠加透明度。
+     *
+     * 参数：
+     *   value 是 0~1 小数。
+     */
+    void setOverlayAlpha(double value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.overlayAlpha = clampedDouble(value, 0.0, 1.0);
+        applySettings(next, QStringLiteral("真实检测配置：overlay透明度已调整"));
+    }
+
+    /*
+     * setAutoUploadEnabled 的作用：
+     *   设置检测完成后是否自动上传 COS。
+     *
+     * 参数：
+     *   enabled 为 true 时检测后自动上传；false 时只保存本地历史。
+     */
+    void setAutoUploadEnabled(bool enabled)
+    {
+        if (m_settings.autoUploadEnabled == enabled) {
+            return;
+        }
+
+        m_settings.autoUploadEnabled = enabled;
+        setLastStatusText(enabled
+            ? QStringLiteral("真实检测配置：已启用自动上传")
+            : QStringLiteral("真实检测配置：已关闭自动上传"));
+        emit settingsChanged();
+    }
+
+    /*
+     * loadSettingsFromDisk 的作用：
+     *   从 /mnt/sdcard/config/defect_ui_config.json 读取检测配置。
+     *
+     * 返回值：
+     *   成功读取或文件不存在使用默认值时返回 true；JSON 无法解析时返回 false。
+     */
+    Q_INVOKABLE bool loadSettingsFromDisk()
+    {
+        QFile file(m_configPath);
+
+        if (!file.exists()) {
+            setLastStatusText(QStringLiteral("真实检测配置：未找到JSON，使用默认值"));
+            return true;
+        }
+
+        if (!file.open(QIODevice::ReadOnly)) {
+            setLastStatusText(QStringLiteral("读取失败：") + file.errorString());
+            return false;
+        }
+
+        QJsonParseError parseError;
+        const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+        file.close();
+
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            setLastStatusText(QStringLiteral("读取失败：JSON格式错误 ") + parseError.errorString());
+            return false;
+        }
+
+        DetectSettingsSnapshot next = m_settings;
+        const QJsonObject object = doc.object();
+
+        next.partType = object.value(QStringLiteral("part_type")).toString(
+            object.value(QStringLiteral("partType")).toString(next.partType));
+        next.modelThreshold = object.value(QStringLiteral("model_threshold")).toDouble(
+            object.value(QStringLiteral("modelThreshold")).toDouble(next.modelThreshold));
+        next.reviewThreshold = object.value(QStringLiteral("review_threshold")).toDouble(
+            object.value(QStringLiteral("reviewThreshold")).toDouble(next.reviewThreshold));
+        next.roiSize = object.value(QStringLiteral("roi_size")).toInt(
+            object.value(QStringLiteral("roiSize")).toInt(next.roiSize));
+        next.segmentMinPixels = object.value(QStringLiteral("segment_min_pixels")).toInt(
+            object.value(QStringLiteral("segmentMinPixels")).toInt(next.segmentMinPixels));
+        next.overlayAlpha = object.value(QStringLiteral("overlay_alpha")).toDouble(
+            object.value(QStringLiteral("overlayAlpha")).toDouble(next.overlayAlpha));
+        next.autoUploadEnabled = object.value(QStringLiteral("auto_upload_enabled")).toBool(
+            object.value(QStringLiteral("autoUploadEnabled")).toBool(next.autoUploadEnabled));
+
+        applySettings(normalizedSettings(next), QStringLiteral("真实检测配置：已读取 ") + m_configPath);
+        return true;
+    }
+
+    /*
+     * saveSettingsToDisk 的作用：
+     *   把当前检测配置写入 /mnt/sdcard/config/defect_ui_config.json。
+     *
+     * 返回值：
+     *   返回可直接显示在 QML 底部提示条的中文结果。
+     */
+    Q_INVOKABLE QString saveSettingsToDisk()
+    {
+        QJsonObject object;
+        const QFileInfo fileInfo(m_configPath);
+        const QString dirPath = fileInfo.absolutePath();
+        QString mountError;
+
+        if (!isConfigMountReady(&mountError)) {
+            const QString result = QStringLiteral("保存失败：") + mountError;
+            setLastStatusText(result);
+            return result;
+        }
+
+        if (!QDir().mkpath(dirPath)) {
+            const QString result = QStringLiteral("保存失败：无法创建 ") + dirPath;
+            setLastStatusText(result);
+            return result;
+        }
+
+        object.insert(QStringLiteral("schema_version"), 1);
+        object.insert(QStringLiteral("part_type"), m_settings.partType);
+        object.insert(QStringLiteral("model_threshold"), m_settings.modelThreshold);
+        object.insert(QStringLiteral("review_threshold"), m_settings.reviewThreshold);
+        object.insert(QStringLiteral("roi_size"), m_settings.roiSize);
+        object.insert(QStringLiteral("segment_min_pixels"), m_settings.segmentMinPixels);
+        object.insert(QStringLiteral("overlay_alpha"), m_settings.overlayAlpha);
+        object.insert(QStringLiteral("auto_upload_enabled"), m_settings.autoUploadEnabled);
+        object.insert(QStringLiteral("saved_at"), QDateTime::currentDateTime().toString(Qt::ISODate));
+
+        QSaveFile file(m_configPath);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            const QString result = QStringLiteral("保存失败：") + file.errorString();
+            setLastStatusText(result);
+            return result;
+        }
+
+        file.write(QJsonDocument(object).toJson(QJsonDocument::Indented));
+        if (!file.commit()) {
+            const QString result = QStringLiteral("保存失败：") + file.errorString();
+            setLastStatusText(result);
+            return result;
+        }
+
+        const QString result = QStringLiteral("保存成功：") + m_configPath;
+        setLastStatusText(result);
+        return result;
+    }
+
+    /*
+     * resetToDefaults 的作用：
+     *   恢复比赛演示推荐检测配置，但不自动写盘，用户仍需点击保存。
+     *
+     * 返回值：
+     *   返回中文结果，供 QML 提示。
+     */
+    Q_INVOKABLE QString resetToDefaults()
+    {
+        applySettings(DetectSettingsSnapshot(), QStringLiteral("真实检测配置：已恢复默认，保存后写入JSON"));
+        return m_lastStatusText;
+    }
+
+signals:
+    /* settingsChanged 在任一检测参数变化后通知 QML 刷新显示，并通知 C++ 后续检测读取新快照。 */
+    void settingsChanged();
+
+    /* lastStatusTextChanged 在加载、保存或恢复默认结果变化后通知 QML 刷新提示。 */
+    void lastStatusTextChanged();
+
+private:
+    /*
+     * supportedPartTypes 的作用：
+     *   返回参数页允许保存的真实零件名称列表。
+     */
+    QStringList supportedPartTypes() const
+    {
+        return QStringList()
+            << QStringLiteral("波形垫圈")
+            << QStringLiteral("平垫圈")
+            << QStringLiteral("弹性垫圈");
+    }
+
+    /*
+     * isConfigMountReady 的作用：
+     *   保存配置前确认 /mnt/sdcard 已真实挂载，防止 SD 卡缺失时误写 rootfs。
+     *
+     * 参数：
+     *   errorText 用于返回中文失败原因。
+     *
+     * 返回值：
+     *   true 表示可以写配置；false 表示挂载点不可用。
+     */
+    bool isConfigMountReady(QString *errorText) const
+    {
+        FILE *mounts = std::fopen("/proc/mounts", "r");
+        char device[256];
+        char path[4096];
+
+        if (!m_configPath.startsWith(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT))) {
+            return true;
+        }
+
+        if (mounts == nullptr) {
+            if (errorText) {
+                *errorText = QStringLiteral("无法读取 /proc/mounts：")
+                    + QString::fromLocal8Bit(strerror(errno));
+            }
+            return false;
+        }
+
+        while (std::fscanf(mounts, "%255s %4095s %*s %*s %*d %*d\n", device, path) == 2) {
+            if (std::strcmp(path, DEFAULT_SDCARD_MOUNT_POINT) == 0) {
+                std::fclose(mounts);
+                return true;
+            }
+        }
+
+        std::fclose(mounts);
+        if (errorText) {
+            *errorText = QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)
+                + QStringLiteral(" 未挂载，参数JSON未写入");
+        }
+        return false;
+    }
+
+    /*
+     * normalizedSettings 的作用：
+     *   统一清洗配置值，保证 JSON、QML 和默认值都落在同一合法范围内。
+     *
+     * 参数：
+     *   input 是待清洗配置。
+     *
+     * 返回值：
+     *   返回清洗后的配置。
+     */
+    DetectSettingsSnapshot normalizedSettings(const DetectSettingsSnapshot &input) const
+    {
+        DetectSettingsSnapshot next = input;
+        const QStringList allowed = supportedPartTypes();
+
+        if (!allowed.contains(next.partType)) {
+            next.partType = allowed.constFirst();
+        }
+
+        next.modelThreshold = clampedDouble(next.modelThreshold, 0.50, 0.99);
+        next.reviewThreshold = clampedDouble(next.reviewThreshold, 0.30, next.modelThreshold);
+        next.roiSize = clampedInt(next.roiSize, 160, 640);
+        next.segmentMinPixels = clampedInt(next.segmentMinPixels, 0, 50000);
+        next.overlayAlpha = clampedDouble(next.overlayAlpha, 0.0, 1.0);
+        return next;
+    }
+
+    /*
+     * settingsEqual 的作用：
+     *   判断两份配置是否完全一致，避免无意义 signal 抖动。
+     */
+    bool settingsEqual(const DetectSettingsSnapshot &left,
+                       const DetectSettingsSnapshot &right) const
+    {
+        return left.partType == right.partType
+            && qFuzzyCompare(left.modelThreshold + 1.0, right.modelThreshold + 1.0)
+            && qFuzzyCompare(left.reviewThreshold + 1.0, right.reviewThreshold + 1.0)
+            && left.roiSize == right.roiSize
+            && left.segmentMinPixels == right.segmentMinPixels
+            && qFuzzyCompare(left.overlayAlpha + 1.0, right.overlayAlpha + 1.0)
+            && left.autoUploadEnabled == right.autoUploadEnabled;
+    }
+
+    /*
+     * applySettings 的作用：
+     *   应用一份新配置，并在有变化时发出 settingsChanged。
+     *
+     * 参数：
+     *   next 是待应用配置。
+     *   statusText 是要显示给 QML 的结果说明。
+     */
+    void applySettings(const DetectSettingsSnapshot &next,
+                       const QString &statusText)
+    {
+        const DetectSettingsSnapshot normalized = normalizedSettings(next);
+        const bool changed = !settingsEqual(m_settings, normalized);
+
+        m_settings = normalized;
+        setLastStatusText(statusText);
+        if (changed) {
+            emit settingsChanged();
+        }
+    }
+
+    /*
+     * setLastStatusText 的作用：
+     *   集中更新最近状态文本，避免 QML 状态提示与 C++ 结果不一致。
+     */
+    void setLastStatusText(const QString &text)
+    {
+        if (m_lastStatusText == text) {
+            return;
+        }
+
+        m_lastStatusText = text;
+        emit lastStatusTextChanged();
+    }
+
+    QString m_configPath;               /* m_configPath 保存检测参数 JSON 绝对路径。 */
+    DetectSettingsSnapshot m_settings;  /* m_settings 保存当前已加载或已修改的检测配置。 */
+    QString m_lastStatusText;           /* m_lastStatusText 保存最近一次配置操作结果。 */
+};
+
+/*
  * CameraStorageController 的作用：
  *   给 QML 提供真实的 SD 卡图片保存和安全卸载操作。
  *
@@ -2919,6 +3550,7 @@ public:
           m_imageDir(QString::fromLatin1(DEFAULT_SDCARD_IMAGE_DIR)),
           m_logDir(QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR)),
           m_historyModel(nullptr),
+          m_detectSettingsController(nullptr),
           m_appendHistoryInSave(true),
           m_saveInProgress(false),
           m_detectInProgress(false),
@@ -2992,6 +3624,67 @@ public:
     void setHistoryModel(UploadHistoryModel *model)
     {
         m_historyModel = model;
+    }
+
+    /*
+     * setDetectSettingsController 的作用：
+     *   把参数设置控制器交给检测控制器，后续每次检测前读取最新配置快照。
+     *
+     * 参数：
+     *   controller 是 main 中创建的 DetectSettingsController，生命周期长于 CameraStorageController。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setDetectSettingsController(DetectSettingsController *controller)
+    {
+        m_detectSettingsController = controller;
+        if (m_detectSettingsController != nullptr) {
+            m_detectSettingsSnapshot = m_detectSettingsController->settingsSnapshot();
+        }
+    }
+
+    /*
+     * detectSettingsController 的作用：
+     *   返回当前绑定的参数控制器指针，主要用于静态契约和必要调试。
+     *
+     * 返回值：
+     *   返回 DetectSettingsController 指针；未绑定时返回 nullptr。
+     */
+    DetectSettingsController *detectSettingsController() const
+    {
+        return m_detectSettingsController;
+    }
+
+    /*
+     * setDetectSettingsSnapshot 的作用：
+     *   给后台 worker 控制器注入主线程复制出的检测配置。
+     *
+     * 参数：
+     *   settings 是检测开始瞬间的配置快照。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void setDetectSettingsSnapshot(const DetectSettingsSnapshot &settings)
+    {
+        m_detectSettingsSnapshot = settings;
+    }
+
+    /*
+     * detectSettings 的作用：
+     *   读取当前检测配置；主线程优先读控制器，后台线程使用复制出来的快照。
+     *
+     * 返回值：
+     *   返回参与本次检测的 DetectSettingsSnapshot。
+     */
+    DetectSettingsSnapshot detectSettings() const
+    {
+        if (m_detectSettingsController != nullptr) {
+            return m_detectSettingsController->settingsSnapshot();
+        }
+
+        return m_detectSettingsSnapshot;
     }
 
     /*
@@ -3223,6 +3916,9 @@ public:
         /* segmentModelPath 保存 UNet INT8 ONNX 模型路径，必须和部署脚本复制位置一致。 */
         const QString segmentModelPath = QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_MODEL);
 
+        /* settings 保存检测开始瞬间的真实参数快照，后台线程使用它而不是读取会变化的 QML 属性。 */
+        const DetectSettingsSnapshot settings = detectSettings();
+
         /* workerResult 保存后台线程最终结果，线程结束后由主线程读取并通知 QML。 */
         const QSharedPointer<QString> workerResult(new QString(QStringLiteral("检测失败：后台检测线程没有返回结果")));
 
@@ -3241,6 +3937,7 @@ public:
                                                  labelsPath,
                                                  segmentBin,
                                                  segmentModelPath,
+                                                 settings,
                                                  controllerPtr,
                                                  workerBundle,
                                                  workerResult]() {
@@ -3273,6 +3970,7 @@ public:
                                              imageDir,
                                              QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR));
             workerController.setAppendHistoryInSave(false);
+            workerController.setDetectSettingsSnapshot(settings);
 
             *workerResult = workerController.detectCurrentFrameOnce(mountPoint,
                                                                     imageDir,
@@ -3281,6 +3979,7 @@ public:
                                                                     labelsPath,
                                                                     segmentBin,
                                                                     segmentModelPath,
+                                                                    settings,
                                                                     workerBundle.data(),
                                                                     emitClassificationReady,
                                                                     emitModelsReady);
@@ -3330,6 +4029,7 @@ public:
             QString::fromLatin1(DEFAULT_DEFECT_CLASSIFY_LABELS),
             QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_BIN),
             QString::fromLatin1(DEFAULT_DEFECT_SEGMENT_MODEL),
+            detectSettings(),
             &bundle);
 
         if (result.startsWith(QStringLiteral("RESULT "))
@@ -3460,6 +4160,33 @@ public:
     }
 
     /*
+     * recordSettingsSummaryToSdCard 的作用：
+     *   响应参数设置页“保存配置”和“导出摘要”，把当前参数摘要追加到日志查看页可见的每日文件。
+     *
+     * 主要流程：
+     *   1. QML 负责组装当前界面参数、JSON 路径、保存结果和操作来源。
+     *   2. C++ 复用 saveAlarmTextToSdCard() 的挂载检查、目录创建、flush 和 fsync 逻辑。
+     *   3. 日志写入 /mnt/sdcard/logs/qt_settings_YYYYMMDD.log，日志查看页刷新后可以直接点开全文。
+     *
+     * 参数：
+     *   actionKey 是 settings-save 或 settings-export 等安全来源标识。
+     *   summaryText 是 QML 组装的参数摘要正文。
+     *
+     * 返回值：
+     *   成功返回“参数日志已保存：/mnt/sdcard/logs/qt_settings_YYYYMMDD.log”；
+     *   失败返回“参数日志保存失败：<中文原因>”。
+     */
+    Q_INVOKABLE QString recordSettingsSummaryToSdCard(const QString &actionKey, const QString &summaryText)
+    {
+        return saveAlarmTextToSdCard(QStringLiteral("settings-summary"),
+                                     QStringLiteral("参数日志"),
+                                     QString::fromLatin1(SETTINGS_LOG_PREFIX),
+                                     actionKey,
+                                     QStringLiteral(".log"),
+                                     summaryText);
+    }
+
+    /*
      * retryUploadRecord 的作用：
      *   响应历史详情页“重新发送”按钮，把已保存的本地 source/annotated 图片重新上传到云端。
      *
@@ -3508,7 +4235,8 @@ public:
          * fusedResult 保存分类模型和 UNet 分割模型共同生成的最终判定。
          * 旧历史缺少任一模型结果时会落到 review，避免重新发送时把证据不完整的记录误写成良品。
          */
-        const FusedDetectResult fusedResult = fusedResultFromModelResults(classificationResult, segmentationResult);
+        const FusedDetectResult fusedResult =
+            fusedResultFromModelResults(classificationResult, segmentationResult, detectSettings());
 
         /* cloudResult 保存云端 records.result 字段，必须来自综合判定而不是单个分类模型。 */
         const QString cloudResult = cloudResultFromFusedResult(fusedResult);
@@ -3629,6 +4357,7 @@ private:
      *   classificationResult 是 defect-classify 输出的 RESULT 行。
      *   segmentationResult 是 defect-segment 输出的 RESULT_SEG 行。
      *   uploadResult 是 defect-cos-upload 返回的上传状态。
+     *   settings 是本次检测开始时复制的真实参数配置。
      */
     struct DetectResultBundle
     {
@@ -3638,6 +4367,7 @@ private:
         QString classificationResult;
         QString segmentationResult;
         QString uploadResult;
+        DetectSettingsSnapshot settings;
     };
 
     /*
@@ -4182,7 +4912,8 @@ private:
      * 返回值：
      *   defect_pixels 大于 0 或 status=NG 时返回 true；否则返回 false。
      */
-    bool segmentationHasDefect(const QString &segmentationResult) const
+    bool segmentationHasDefect(const QString &segmentationResult,
+                               const DetectSettingsSnapshot &settings) const
     {
         const QString status = parseTokenValue(segmentationResult, QStringLiteral("status"));
         const QString defectPixelsText = parseTokenValue(segmentationResult, QStringLiteral("defect_pixels"));
@@ -4193,7 +4924,7 @@ private:
             return true;
         }
 
-        return ok && defectPixels > 0;
+        return ok && defectPixels >= settings.segmentMinPixels && defectPixels > 0;
     }
 
     /*
@@ -4201,36 +4932,46 @@ private:
      *   综合分类模型和 UNet 分割模型的详细输出，生成唯一最终判定。
      *
      * 主要流程：
-     *   1. 先读取分类 RESULT 的 status，只有 GOOD/BAD 属于可信输入。
-     *   2. 再读取 UNet RESULT_SEG 的 status 和 defect_pixels，NG 或缺陷像素大于 0 都视为发现缺陷。
-     *   3. 任一模型发现缺陷时最终判为 bad/待复核，禁止把 UNet 检出划痕的样本放进良品流。
-     *   4. 任一模型结果缺失或状态未知时最终判为 review，避免证据不完整时默认 good。
+     *   1. 先读取分类 RESULT 的 status/confidence，只有 GOOD/BAD 属于可信输入。
+     *   2. 再读取 UNet RESULT_SEG 的 status 和 defect_pixels，按 segmentMinPixels 判断缺陷是否有效。
+     *   3. 任一模型结果缺失或分类置信度低于复核阈值时最终判为 review，避免低可信样本默认 good。
+     *   4. 任一模型发现缺陷时最终判为 bad，禁止把 UNet 检出缺陷的样本放进良品流。
      *
      * 参数：
      *   classificationResult 是 defect-classify 输出的一行 RESULT。
      *   segmentationResult 是 defect-segment 输出的一行 RESULT_SEG。
+     *   settings 保存本次检测使用的阈值、ROI 和上传策略。
      *
      * 返回值：
      *   返回 FusedDetectResult，供云端上传、历史记录和 QML 首页共用。
      */
     FusedDetectResult fusedResultFromModelResults(const QString &classificationResult,
-                                                  const QString &segmentationResult) const
+                                                  const QString &segmentationResult,
+                                                  const DetectSettingsSnapshot &settings) const
     {
         FusedDetectResult result;
         const QString classifyStatus = parseTokenValue(classificationResult, QStringLiteral("status"));
+        const QString confidenceText = parseTokenValue(classificationResult, QStringLiteral("confidence"));
         const QString segmentStatus = parseTokenValue(segmentationResult, QStringLiteral("status"));
         const bool classifyKnown = classifyStatus == QStringLiteral("GOOD") || classifyStatus == QStringLiteral("BAD");
         const bool segmentKnown = segmentStatus == QStringLiteral("OK") || segmentStatus == QStringLiteral("NG");
+        bool confidenceOk = false;
+        const double confidence = confidenceText.toDouble(&confidenceOk);
 
         result.cloudResult = QStringLiteral("review");
         result.historyText = QStringLiteral("待复核");
         result.uiStatus = QStringLiteral("REVIEW");
         result.reason = QStringLiteral("模型结果待复核");
         result.classifyBad = classifyStatus == QStringLiteral("BAD");
-        result.segmentBad = segmentationHasDefect(segmentationResult);
+        result.segmentBad = segmentationHasDefect(segmentationResult, settings);
 
         if (!classifyKnown || !segmentKnown) {
             result.reason = QStringLiteral("模型结果不完整");
+            return result;
+        }
+
+        if (!confidenceOk || confidence < settings.reviewThreshold) {
+            result.reason = QStringLiteral("分类置信度低于复核阈值");
             return result;
         }
 
@@ -4426,7 +5167,9 @@ private:
         UploadHistoryEntry entry;
         const QFileInfo sourceInfo(bundle.sourcePath);
         const FusedDetectResult fusedResult =
-            fusedResultFromModelResults(bundle.classificationResult, bundle.segmentationResult);
+            fusedResultFromModelResults(bundle.classificationResult,
+                                        bundle.segmentationResult,
+                                        bundle.settings);
 
         entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
         entry.resultText = historyTextFromFusedResult(fusedResult);
@@ -4750,6 +5493,7 @@ private:
                                    const QString &labelsPath,
                                    const QString &segmentBin,
                                    const QString &segmentModelPath,
+                                   const DetectSettingsSnapshot &settings,
                                    DetectResultBundle *bundle,
                                    const DetectProgressCallback &classificationReadyCallback = DetectProgressCallback(),
                                    const DetectProgressCallback &modelsReadyCallback = DetectProgressCallback())
@@ -4772,7 +5516,13 @@ private:
                 << "classifyModel" << modelPath
                 << "labels" << labelsPath
                 << "segmentBin" << segmentBin
-                << "segmentModel" << segmentModelPath;
+                << "segmentModel" << segmentModelPath
+                << "roi" << settings.roiSize
+                << "badThreshold" << settings.modelThreshold
+                << "reviewThreshold" << settings.reviewThreshold
+                << "segmentMinPixels" << settings.segmentMinPixels
+                << "overlayAlpha" << settings.overlayAlpha
+                << "autoUpload" << settings.autoUploadEnabled;
 
         if (bundle == nullptr) {
             return QStringLiteral("检测失败：内部结果缓存为空");
@@ -4807,7 +5557,11 @@ private:
         /* totalDetectTimer 只覆盖两个模型本身，避免把拍照、文件校验和网络上传算进“检测耗时”。 */
         totalDetectTimer.start();
 
-        classificationResult = runDefectClassify(classifyBin, modelPath, labelsPath, detectImagePath);
+        classificationResult = runDefectClassify(classifyBin,
+                                                 modelPath,
+                                                 labelsPath,
+                                                 detectImagePath,
+                                                 settings);
         if (!classificationResult.startsWith(QStringLiteral("RESULT "))) {
             return classificationResult;
         }
@@ -4819,6 +5573,7 @@ private:
                                               segmentModelPath,
                                               detectImagePath,
                                               imageDir,
+                                              settings,
                                               bundle);
         if (!segmentationResult.startsWith(QStringLiteral("RESULT_SEG "))) {
             return segmentationResult;
@@ -4828,7 +5583,8 @@ private:
         bundle->sourcePath = detectImagePath;
         bundle->classificationResult = classificationResult;
         bundle->segmentationResult = segmentationResult;
-        fusedResult = fusedResultFromModelResults(classificationResult, segmentationResult);
+        bundle->settings = settings;
+        fusedResult = fusedResultFromModelResults(classificationResult, segmentationResult, settings);
         modelResult = buildDetectModelResultLine(classificationResult,
                                                  segmentationResult,
                                                  fusedResult,
@@ -4838,16 +5594,22 @@ private:
             modelsReadyCallback(modelResult);
         }
         cloudResult = cloudResultFromFusedResult(fusedResult);
-        uploadResult = uploadDetectImagesToCos(bundle->sourcePath,
-                                               bundle->annotatedPaths,
-                                               cloudResult,
-                                               partCodeFromClassificationResult(classificationResult),
-                                               parseTokenValue(classificationResult, QStringLiteral("class")));
+        if (settings.autoUploadEnabled) {
+            uploadResult = uploadDetectImagesToCos(bundle->sourcePath,
+                                                   bundle->annotatedPaths,
+                                                   cloudResult,
+                                                   partCodeFromClassificationResult(classificationResult),
+                                                   parseTokenValue(classificationResult, QStringLiteral("class")));
+        } else {
+            uploadResult = QStringLiteral("manualUploadDisabled upload_status=SKIP 本地已保存，自动上传已关闭");
+        }
         bundle->uploadResult = uploadResult;
 
         return modelResult
             + QStringLiteral(" upload_status=")
-            + (uploadResult.startsWith(QStringLiteral("上传成功：")) ? QStringLiteral("OK") : QStringLiteral("FAIL"));
+            + (settings.autoUploadEnabled
+               ? (uploadResult.startsWith(QStringLiteral("上传成功：")) ? QStringLiteral("OK") : QStringLiteral("FAIL"))
+               : QStringLiteral("SKIP"));
     }
 
     /*
@@ -4856,11 +5618,12 @@ private:
      *
      * 主要流程：
      *   1. 校验程序、模型、标签和图片文件是否存在。
-     *   2. 传入 --image/--model/--labels/--roi 300，保持板端预处理与训练采集一致。
+     *   2. 传入 --image/--model/--labels/--roi 和 --bad-threshold，使用参数页真实配置。
      *   3. 等待进程结束，成功时返回 stdout 中第一行 RESULT，失败时返回 stderr/stdout 中的首行错误。
      *
      * 参数：
      *   classifyBin/modelPath/labelsPath/imagePath 分别是推理程序、模型、标签和图片路径。
+     *   settings 保存本次检测使用的 ROI 和分类判坏阈值。
      *
      * 返回值：
      *   成功返回 RESULT 行；失败返回“检测失败：...”。
@@ -4868,7 +5631,8 @@ private:
     QString runDefectClassify(const QString &classifyBin,
                               const QString &modelPath,
                               const QString &labelsPath,
-                              const QString &imagePath) const
+                              const QString &imagePath,
+                              const DetectSettingsSnapshot &settings) const
     {
         QProcess process;
         QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -4901,7 +5665,8 @@ private:
                              << QStringLiteral("--image") << imagePath
                              << QStringLiteral("--model") << modelPath
                              << QStringLiteral("--labels") << labelsPath
-                             << QStringLiteral("--roi") << QStringLiteral("300"));
+                             << QStringLiteral("--roi") << QString::number(settings.roiSize)
+                             << QStringLiteral("--bad-threshold") << QString::number(settings.modelThreshold, 'f', 3));
         process.start();
 
         if (!process.waitForStarted(3000)) {
@@ -4949,12 +5714,13 @@ private:
      *
      * 主要流程：
      *   1. 校验程序、UNet 模型、输入图片和输出目录是否存在或可用。
-     *   2. 传入 --image/--model/--output-dir/--roi/--alpha，保持板端预处理与 PC 端测试一致。
+     *   2. 传入 --image/--model/--output-dir/--roi/--alpha/--min-defect-pixels，使用参数页真实配置。
      *   3. 等待进程结束，成功时解析 RESULT_SEG 中的 raw_path/overlay_path/mask_path。
      *   4. 把 raw/overlay/mask 三张图都放入 annotatedPaths，后续统一作为 --annotated 上传。
      *
      * 参数：
      *   segmentBin/modelPath/imagePath/outputDir 分别是推理程序、模型、输入图和输出目录。
+     *   settings 保存本次检测使用的 ROI、overlay 透明度和 UNet 像素阈值。
      *   bundle 用于保存分割结果图路径和标签。
      *
      * 返回值：
@@ -4964,6 +5730,7 @@ private:
                              const QString &modelPath,
                              const QString &imagePath,
                              const QString &outputDir,
+                             const DetectSettingsSnapshot &settings,
                              DetectResultBundle *bundle) const
     {
         QProcess process;
@@ -5004,8 +5771,9 @@ private:
                              << QStringLiteral("--image") << imagePath
                              << QStringLiteral("--model") << modelPath
                              << QStringLiteral("--output-dir") << outputDir
-                             << QStringLiteral("--roi") << QStringLiteral("300")
-                             << QStringLiteral("--alpha") << QStringLiteral("0.45"));
+                             << QStringLiteral("--roi") << QString::number(settings.roiSize)
+                             << QStringLiteral("--alpha") << QString::number(settings.overlayAlpha, 'f', 2)
+                             << QStringLiteral("--min-defect-pixels") << QString::number(settings.segmentMinPixels));
         process.start();
 
         if (!process.waitForStarted(3000)) {
@@ -5240,6 +6008,8 @@ private:
     QString m_imageDir;    /* m_imageDir 是图片保存目录。 */
     QString m_logDir;      /* m_logDir 是 SD 卡诊断和自动告警日志目录。 */
     UploadHistoryModel *m_historyModel; /* m_historyModel 指向 QML 使用的上传历史模型，保存成功后会追加记录。 */
+    DetectSettingsController *m_detectSettingsController; /* m_detectSettingsController 指向真实检测参数控制器，不拥有生命周期。 */
+    DetectSettingsSnapshot m_detectSettingsSnapshot; /* m_detectSettingsSnapshot 保存后台线程或自检路径使用的检测配置快照。 */
     bool m_appendHistoryInSave; /* m_appendHistoryInSave 控制同步保存函数是否立即追加历史记录。 */
     bool m_saveInProgress; /* m_saveInProgress 只在 Qt 主线程维护，用于防止保存图片任务重复启动。 */
     bool m_detectInProgress; /* m_detectInProgress 只在 Qt 主线程维护，用于防止检测任务重复启动。 */
@@ -5273,6 +6043,10 @@ class DeviceHealthController : public QObject
     Q_PROPERTY(QString cloudStatusColor READ cloudStatusColor NOTIFY cloudStatusChanged)
     Q_PROPERTY(QString sdcardStatusText READ sdcardStatusText NOTIFY sdcardStatusChanged)
     Q_PROPERTY(QString sdcardStatusColor READ sdcardStatusColor NOTIFY sdcardStatusChanged)
+    Q_PROPERTY(QString locationStatusText READ locationStatusText NOTIFY locationStatusChanged)
+    Q_PROPERTY(QString locationDisplayText READ locationDisplayText NOTIFY locationStatusChanged)
+    Q_PROPERTY(QString locationShortText READ locationShortText NOTIFY locationStatusChanged)
+    Q_PROPERTY(QString locationStatusColor READ locationStatusColor NOTIFY locationStatusChanged)
     Q_PROPERTY(QString detailText READ detailText NOTIFY detailTextChanged)
 
 public:
@@ -5294,6 +6068,7 @@ public:
           m_overlaySocket(QString::fromLatin1(DEFAULT_OVERLAY_CONTROL_SOCKET)),
           m_overlayRestartScript(QString::fromLatin1(DEFAULT_OVERLAY_RESTART_SCRIPT)),
           m_networkScript(QString::fromLatin1(DEFAULT_4G_PPP_SCRIPT)),
+          m_locationScript(QString::fromLatin1(DEFAULT_4G_LOCATION_SCRIPT)),
           m_cloudHealthUrl(QString::fromLatin1(DEFAULT_CLOUD_HEALTH_URL)),
           m_sdcardMount(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
           m_f4Device(QString::fromLatin1(DEFAULT_F4_SERIAL_DEVICE)),
@@ -5309,16 +6084,23 @@ public:
           m_cloudStatusColor(QStringLiteral("#f4b942")),
           m_sdcardStatusText(QStringLiteral("检测中")),
           m_sdcardStatusColor(QStringLiteral("#f4b942")),
+          m_locationStatusText(QStringLiteral("未定位")),
+          m_locationDisplayText(QStringLiteral("未定位")),
+          m_locationShortText(QStringLiteral("未定位")),
+          m_locationStatusColor(QStringLiteral("#f4b942")),
           m_detailText(QStringLiteral("设备健康检测启动")),
           m_lastOverlaySerial(0),
           m_cameraOfflineCount(0),
           m_overlayRestartCooldown(0),
           m_networkProbeRunning(false),
+          m_locationProbeRunning(false),
           m_cloudProbeRunning(false),
           m_f4ProbeRunning(false),
           m_f4CommandRunning(false),
           m_overlayProbeRunning(false),
           m_networkProbeTimedOut(false),
+          m_locationProbeTimedOut(false),
+          m_locationBootProbeDone(false),
           m_cloudProbeTimedOut(false)
     {
         /*
@@ -5344,6 +6126,22 @@ public:
                 &DeviceHealthController::handleNetworkProcessError);
         connect(&m_networkTimeout, &QTimer::timeout, this, &DeviceHealthController::handleNetworkProbeTimeout);
         m_networkTimeout.setSingleShot(true);
+
+        /*
+         * 定位进程只调用 4g-location。
+         * 4g-location 自身只访问高德 IP 定位 HTTPS 接口，不打开 GPS，也不访问 ttyUSB AT 串口。
+         */
+        m_locationProcess.setProcessChannelMode(QProcess::MergedChannels);
+        connect(&m_locationProcess,
+                static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this,
+                &DeviceHealthController::handleLocationProcessFinished);
+        connect(&m_locationProcess,
+                static_cast<void (QProcess::*)(QProcess::ProcessError)>(&QProcess::errorOccurred),
+                this,
+                &DeviceHealthController::handleLocationProcessError);
+        connect(&m_locationTimeout, &QTimer::timeout, this, &DeviceHealthController::handleLocationProbeTimeout);
+        m_locationTimeout.setSingleShot(true);
 
         m_cloudProcess.setProcessChannelMode(QProcess::MergedChannels);
         connect(&m_cloudProcess,
@@ -5388,6 +6186,18 @@ public:
     /* sdcardStatusColor 返回 SD 卡挂载状态颜色。 */
     QString sdcardStatusColor() const { return m_sdcardStatusColor; }
 
+    /* locationStatusText 返回定位状态，例如 IP定位、缺少Key、定位失败或未定位。 */
+    QString locationStatusText() const { return m_locationStatusText; }
+
+    /* locationDisplayText 返回完整位置文本；当前高德 IP 省份定位模式只返回省份，例如 河南省。 */
+    QString locationDisplayText() const { return m_locationDisplayText; }
+
+    /* locationShortText 返回顶部状态栏短位置文本；当前同样只返回省份或缺少Key。 */
+    QString locationShortText() const { return m_locationShortText; }
+
+    /* locationStatusColor 返回定位状态颜色，绿色成功、黄色等待/缺 Key、红色失败或超时。 */
+    QString locationStatusColor() const { return m_locationStatusColor; }
+
     /* detailText 返回最近一次健康检测详情，用于告警页和日志排查。 */
     QString detailText() const { return m_detailText; }
 
@@ -5413,6 +6223,13 @@ public:
         refreshSdcardStatus();
         refreshOverlayCameraStatus();
         startNetworkProbe();
+        if (!m_locationBootProbeDone) {
+            /*
+             * 位置只在 Qt 进程启动后的第一轮健康检测执行一次。
+             * 后续 8 秒周期刷新不再启动 4g-location，避免反复访问高德接口和占用 4G 网络。
+             */
+            startLocationProbe();
+        }
         startCloudProbe();
         startF4Probe(false);
     }
@@ -5435,7 +6252,7 @@ public:
 
     /*
      * sendF4Command 的作用：
-     *   从 QML 发送一条 F4 文本命令，例如称重标定 `CAL 1000`。
+     *   从 QML 发送一条 F4 称重文本命令，例如称重标定 `CAL 1000`。
      *
      * 主要流程：
      *   1. 拒绝空命令和非 CAL 命令，避免参数页误变成任意运动控制串口终端。
@@ -5458,8 +6275,8 @@ public:
         }
 
         /*
-         * 目前界面只开放称重标定命令。
-         * 传送带、机械臂和联锁类命令仍由 F4 固件和后续 MotionController 接管，避免在参数页绕开安全边界。
+         * 目前称重标定弹窗只开放 CAL 命令。
+         * 运动类命令必须走更窄的 sendF4BeltCommand() 白名单，避免参数页绕开安全边界。
          */
         if (!command.startsWith(QStringLiteral("CAL "))) {
             emit f4CommandFinished(false, QStringLiteral("当前界面只允许发送 CAL <克重> 标定命令"));
@@ -5512,6 +6329,91 @@ public:
         return true;
     }
 
+    /*
+     * sendF4BeltCommand 的作用：
+     *   从 QML 手动控制页发送 F407 已经实现的传送带 ASCII 命令。
+     *
+     * 主要流程：
+     *   1. 只允许 BELTSCAN、BELTSTOP、BELTINFO 三条已在 F407 `conveyor_motor_service.c` 中实现且有回包的命令。
+     *   2. 自动补齐 `\r\n`，保证落到 F407 USART1 文本命令入口。
+     *   3. 复用同一个串口忙标志，避免称重标定、传送带手动命令和 F4 心跳同时抢 `/dev/ttySTM2`。
+     *
+     * 参数：
+     *   commandText 是 QML 传入的传送带命令正文，不要求自带行结束符。
+     *
+     * 返回值：
+     *   true 表示后台发送任务已启动；false 表示命令不在白名单、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4BeltCommand(const QString &commandText)
+    {
+        QString command = commandText.trimmed().toUpper();
+        const QString commandLabel = command;
+
+        if (command.isEmpty()) {
+            emit f4ManualCommandFinished(false, commandLabel, QStringLiteral("F4传送带命令为空"));
+            return false;
+        }
+
+        /*
+         * 白名单必须和 F407 侧已有回包能力一致。
+         * BELTTRACK/BELTENABLE/BELTCAM 当前可能不返回固定 OK 文本，不适合做手动页按钮的同步回执。
+         */
+        if (!isAllowedF4BeltCommand(command)) {
+            emit f4ManualCommandFinished(false,
+                                         commandLabel,
+                                         QStringLiteral("当前界面只允许发送 BELTSCAN/BELTSTOP/BELTINFO"));
+            return false;
+        }
+
+        if (m_f4CommandRunning) {
+            emit f4ManualCommandFinished(false, commandLabel, QStringLiteral("上一条F4命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4ManualCommandFinished(false,
+                                         commandLabel,
+                                         QStringLiteral("F4状态刷新仍在进行，请稍后再发送传送带命令"));
+            return false;
+        }
+
+        if (!command.endsWith(QStringLiteral("\r\n"))) {
+            command += QStringLiteral("\r\n");
+        }
+
+        m_f4CommandRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+
+        QThread *workerThread = QThread::create([self, dev, command, commandLabel, baud]() {
+            QString detail;
+            const bool ok = sendF4SerialCommand(dev, command, baud, &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4ManualCommandFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, commandLabel),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            emit f4ManualCommandFinished(false, commandLabel, QStringLiteral("F4传送带命令线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
 signals:
     /* networkStatusChanged 通知 QML 网络状态和颜色已更新。 */
     void networkStatusChanged();
@@ -5528,11 +6430,17 @@ signals:
     /* sdcardStatusChanged 通知 QML SD 卡状态和颜色已更新。 */
     void sdcardStatusChanged();
 
+    /* locationStatusChanged 通知 QML 高德 IP 省份定位状态、显示文本和颜色已更新。 */
+    void locationStatusChanged();
+
     /* detailTextChanged 通知 QML 最近检测详情已更新。 */
     void detailTextChanged();
 
-    /* f4CommandFinished 通知 QML 手动 F4 命令发送完成，并带回成功/失败详情。 */
+    /* f4CommandFinished 通知 QML 称重标定命令发送完成，并带回成功/失败详情。 */
     void f4CommandFinished(bool ok, const QString &detail);
+
+    /* f4ManualCommandFinished 通知 QML 手动控制页的 F4 命令发送完成，并带回命令名和回复详情。 */
+    void f4ManualCommandFinished(bool ok, const QString &command, const QString &detail);
 
 private slots:
     /*
@@ -5595,6 +6503,112 @@ private slots:
         m_networkProbeTimedOut = false;
         setNetworkStatus(QStringLiteral("未安装"), QStringLiteral("#f4b942"));
         setDetailText(QStringLiteral("无法启动 4G 测试命令：") + m_networkProcess.errorString());
+    }
+
+    /*
+     * handleLocationProcessFinished 的作用：
+     *   接收开机单次 `4g-location once` 输出的 key=value 状态，并更新 Qt 位置显示。
+     *
+     * 主要流程：
+     *   1. 停止定位超时定时器并释放忙标志。
+     *   2. 解析脚本输出中的 state/display/short_display/detail 字段。
+     *   3. 只有 state=ip_ok 时显示高德 IP 定位成功；其它状态转成缺 Key、失败或未定位。
+     *
+     * 参数：
+     *   exitCode 是 4g-location 退出码。
+     *   exitStatus 表示进程是否正常退出。
+     *
+     * 返回值：
+     *   无返回值；结果通过 locationStatusChanged 通知 QML。
+     */
+    void handleLocationProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+    {
+        const QString output = QString::fromUtf8(m_locationProcess.readAll()).trimmed();
+
+        m_locationTimeout.stop();
+        m_locationProbeRunning = false;
+
+        if (m_locationProbeTimedOut) {
+            m_locationProbeTimedOut = false;
+            return;
+        }
+
+        const QMap<QString, QString> values = parseKeyValueOutput(output);
+        const QString state = values.value(QStringLiteral("state"));
+        const QString display = values.value(QStringLiteral("display"), QStringLiteral("未定位"));
+        const QString shortDisplay = values.value(QStringLiteral("short_display"), display);
+        const QString detail = values.value(QStringLiteral("detail"), compactText(output, 96));
+
+        if (exitStatus == QProcess::NormalExit && exitCode == 0 && state == QStringLiteral("ip_ok")) {
+            /*
+             * state=ip_ok 表示 4g-location 已用高德 IP 定位拿到省份。
+             * 当前 UI 只显示省份，不显示城市、区县、经纬度或卫星数，避免把运营商出口城市误当现场位置。
+             */
+            setLocationStatus(QStringLiteral("IP定位"),
+                              QStringLiteral("#35d07f"),
+                              display,
+                              shortDisplay);
+            setDetailText(QStringLiteral("IP定位：") + display);
+            return;
+        }
+
+        if (state == QStringLiteral("no_key")) {
+            setLocationStatus(QStringLiteral("缺少Key"),
+                              QStringLiteral("#f4b942"),
+                              display,
+                              shortDisplay);
+        } else if (state == QStringLiteral("ip_failed")) {
+            setLocationStatus(QStringLiteral("定位失败"),
+                              QStringLiteral("#ef5b5b"),
+                              display,
+                              shortDisplay);
+        } else {
+            setLocationStatus(QStringLiteral("未定位"),
+                              QStringLiteral("#f4b942"),
+                              display,
+                              shortDisplay);
+        }
+
+        setDetailText(QStringLiteral("定位未完成：") + detail);
+    }
+
+    /*
+     * handleLocationProbeTimeout 的作用：
+     *   定位脚本超过短超时后主动结束，避免高德 IP 定位请求拖住健康刷新。
+     */
+    void handleLocationProbeTimeout()
+    {
+        if (m_locationProcess.state() != QProcess::NotRunning) {
+            m_locationProbeTimedOut = true;
+            m_locationProcess.kill();
+        } else {
+            m_locationProbeRunning = false;
+        }
+        setLocationStatus(QStringLiteral("超时"),
+                          QStringLiteral("#ef5b5b"),
+                          m_locationDisplayText,
+                          m_locationShortText);
+        setDetailText(QStringLiteral("4G IP 定位超时"));
+    }
+
+    /*
+     * handleLocationProcessError 的作用：
+     *   异步接收 4G 定位脚本启动失败错误，避免 startLocationProbe() 阻塞 QML 主线程。
+     */
+    void handleLocationProcessError(QProcess::ProcessError error)
+    {
+        if (error != QProcess::FailedToStart) {
+            return;
+        }
+
+        m_locationTimeout.stop();
+        m_locationProbeRunning = false;
+        m_locationProbeTimedOut = false;
+        setLocationStatus(QStringLiteral("未安装"),
+                          QStringLiteral("#f4b942"),
+                          QStringLiteral("未定位"),
+                          QStringLiteral("未定位"));
+        setDetailText(QStringLiteral("无法启动 4G 定位命令：") + m_locationProcess.errorString());
     }
 
     /*
@@ -5720,7 +6734,50 @@ private slots:
         emit f4CommandFinished(ok, detail);
     }
 
+    /*
+     * handleF4ManualCommandFinished 的作用：
+     *   接收后台 F4 手动控制命令结果，并把命令名和回复详情同步给 QML 手动控制页。
+     *
+     * 参数：
+     *   ok 为 true 表示命令已写入串口且回复中包含成功关键字。
+     *   command 是本次下发的高层文本命令，例如 BELTSCAN。
+     *   detail 是串口回复文本或失败原因。
+     *
+     * 返回值：
+     *   无返回值；函数会释放发送忙标志并发出 f4ManualCommandFinished 信号。
+     */
+    void handleF4ManualCommandFinished(bool ok, const QString &command, const QString &detail)
+    {
+        m_f4CommandRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4 手动命令完成：") + command + QStringLiteral(" ") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4 手动命令失败：") + command + QStringLiteral(" ") + detail);
+        }
+
+        emit f4ManualCommandFinished(ok, command, detail);
+    }
+
 private:
+    /*
+     * isAllowedF4BeltCommand 的作用：
+     *   校验 QML 手动传送带按钮是否只发送 F407 当前已实现且能同步回包的安全命令。
+     *
+     * 参数：
+     *   command 是已经 trim 并转成大写的命令正文。
+     *
+     * 返回值：
+     *   true 表示命令可下发；false 表示命令不是当前 Qt 手动页开放的传送带命令。
+     */
+    static bool isAllowedF4BeltCommand(const QString &command)
+    {
+        return command == QStringLiteral("BELTSCAN")
+                || command == QStringLiteral("BELTSTOP")
+                || command == QStringLiteral("BELTINFO");
+    }
+
     /*
      * compactText 的作用：
      *   把外部命令输出压缩成适合界面显示的一行。
@@ -5757,6 +6814,33 @@ private:
         m_networkProcess.start(m_networkScript, QStringList() << QStringLiteral("test"));
         if (m_networkProbeRunning) {
             m_networkTimeout.start(7000);
+        }
+    }
+
+    /*
+     * startLocationProbe 的作用：
+     *   在 Qt 启动后的第一轮健康检测中执行一次高德 IP 省份定位。
+     *
+     * 主要流程：
+     *   1. 如果已经调度过开机定位，直接返回，保证后续健康刷新不再访问高德接口。
+     *   2. 把 m_locationBootProbeDone 立即置为 true，即使本次失败也不在本进程内自动重试。
+     *   3. 只调用 `4g-location once`；脚本内部只走高德 IP 定位，不走 GPS/AT 串口。
+     *
+     * 返回值：
+     *   无返回值；定位完成后通过 handleLocationProcessFinished() 更新 QML 属性。
+     */
+    void startLocationProbe()
+    {
+        if (m_locationBootProbeDone || m_locationProbeRunning) {
+            return;
+        }
+
+        m_locationBootProbeDone = true;
+        m_locationProbeRunning = true;
+        m_locationProbeTimedOut = false;
+        m_locationProcess.start(m_locationScript, QStringList() << QStringLiteral("once"));
+        if (m_locationProbeRunning) {
+            m_locationTimeout.start(LOCATION_PROBE_TIMEOUT_MS);
         }
     }
 
@@ -6038,6 +7122,44 @@ private:
     }
 
     /*
+     * parseKeyValueOutput 的作用：
+     *   解析 4g-location 输出的多行 key=value 文本，供定位完成回调读取 state/display 等字段。
+     *
+     * 主要流程：
+     *   1. 按 CR/LF 拆分输出，兼容 BusyBox shell 在不同环境下的换行。
+     *   2. 每行只按第一个等号切分，避免 detail 中带等号时被截断。
+     *   3. 空键名跳过，保留空值字段，便于 city/latitude 这类 IP 定位空字段保持明确语义。
+     *
+     * 参数：
+     *   output 是 `4g-location once` 的 stdout。
+     *
+     * 返回值：
+     *   返回字段名到字段值的映射；未出现的字段由调用方使用默认值处理。
+     */
+    QMap<QString, QString> parseKeyValueOutput(const QString &output) const
+    {
+        QMap<QString, QString> values;
+        const QStringList lines = output.split(QRegExp(QStringLiteral("[\\r\\n]+")), QString::SkipEmptyParts);
+
+        for (const QString &line : lines) {
+            const int equalIndex = line.indexOf(QLatin1Char('='));
+            if (equalIndex <= 0) {
+                continue;
+            }
+
+            const QString key = line.left(equalIndex).trimmed();
+            const QString value = line.mid(equalIndex + 1).trimmed();
+            if (key.isEmpty()) {
+                continue;
+            }
+
+            values.insert(key, value);
+        }
+
+        return values;
+    }
+
+    /*
      * queryOverlayStatus 的作用：
      *   发送 overlay `STATUS` 查询并读取回复。
      *
@@ -6309,7 +7431,9 @@ private:
         if (replyUpper.contains("ACK")
                 || replyUpper.contains("OK")
                 || replyUpper.contains("F4")
-                || replyUpper.contains("READY")) {
+                || replyUpper.contains("READY")
+                || replyUpper.contains("[INFO][BELT]")
+                || replyUpper.contains("[OK][BELT]")) {
             if (detail) {
                 *detail = replyText;
             }
@@ -6431,6 +7555,24 @@ private:
         emit sdcardStatusChanged();
     }
 
+    void setLocationStatus(const QString &text,
+                           const QString &color,
+                           const QString &display,
+                           const QString &shortDisplay)
+    {
+        if (m_locationStatusText == text
+                && m_locationStatusColor == color
+                && m_locationDisplayText == display
+                && m_locationShortText == shortDisplay) {
+            return;
+        }
+        m_locationStatusText = text;
+        m_locationStatusColor = color;
+        m_locationDisplayText = display;
+        m_locationShortText = shortDisplay;
+        emit locationStatusChanged();
+    }
+
     void setDetailText(const QString &text)
     {
         if (m_detailText == text) {
@@ -6445,6 +7587,7 @@ private:
     QString m_overlaySocket;            /* m_overlaySocket 保存 overlay 控制 socket 路径。 */
     QString m_overlayRestartScript;     /* m_overlayRestartScript 保存相机重连时要后台执行的控制脚本。 */
     QString m_networkScript;            /* m_networkScript 保存 4G PPP 管理命令。 */
+    QString m_locationScript;           /* m_locationScript 保存高德 IP 定位脚本命令，Qt 只在开机第一轮调用一次 once。 */
     QString m_cloudHealthUrl;           /* m_cloudHealthUrl 保存云端 health 地址。 */
     QString m_sdcardMount;              /* m_sdcardMount 保存 SD 卡挂载点。 */
     QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
@@ -6461,21 +7604,30 @@ private:
     QString m_cloudStatusColor;         /* m_cloudStatusColor 保存云端状态颜色。 */
     QString m_sdcardStatusText;         /* m_sdcardStatusText 保存 SD 卡状态文本。 */
     QString m_sdcardStatusColor;        /* m_sdcardStatusColor 保存 SD 卡状态颜色。 */
+    QString m_locationStatusText;       /* m_locationStatusText 保存定位状态文本，例如 IP定位、缺少Key或定位失败。 */
+    QString m_locationDisplayText;      /* m_locationDisplayText 保存完整位置显示；当前 IP 定位模式只显示省份。 */
+    QString m_locationShortText;        /* m_locationShortText 保存顶部状态栏短位置显示；当前同样只显示省份。 */
+    QString m_locationStatusColor;      /* m_locationStatusColor 保存定位状态颜色。 */
     QString m_detailText;               /* m_detailText 保存最近一次健康检测详情。 */
     unsigned int m_lastOverlaySerial;   /* m_lastOverlaySerial 保存上一次 overlay 帧序号，后续可用于卡帧判断。 */
     int m_cameraOfflineCount;           /* m_cameraOfflineCount 记录相机连续离线次数。 */
     int m_overlayRestartCooldown;       /* m_overlayRestartCooldown 防止相机离线时反复高频重启 overlay。 */
     bool m_networkProbeRunning;         /* m_networkProbeRunning 防止网络检测任务堆积。 */
+    bool m_locationProbeRunning;        /* m_locationProbeRunning 防止开机定位进程尚未退出时被重复调度。 */
     bool m_cloudProbeRunning;           /* m_cloudProbeRunning 防止云端检测任务堆积。 */
     bool m_f4ProbeRunning;              /* m_f4ProbeRunning 防止串口检测线程堆积。 */
     bool m_f4CommandRunning;            /* m_f4CommandRunning 防止 CAL 标定等手动命令并发写同一个 RS485 串口。 */
     bool m_overlayProbeRunning;         /* m_overlayProbeRunning 防止 overlay socket 查询重入。 */
     bool m_networkProbeTimedOut;        /* m_networkProbeTimedOut 标记当前 4G 进程已超时，finished 时不再覆盖超时状态。 */
+    bool m_locationProbeTimedOut;       /* m_locationProbeTimedOut 标记开机定位进程已超时，finished 时不再覆盖超时状态。 */
+    bool m_locationBootProbeDone;       /* m_locationBootProbeDone 标记本 Qt 进程已经调度过一次 IP 定位，后续周期刷新不再调用。 */
     bool m_cloudProbeTimedOut;          /* m_cloudProbeTimedOut 标记当前云端进程已超时，finished 时不再覆盖超时状态。 */
     QTimer m_healthTimer;               /* m_healthTimer 周期性调度整轮健康检测。 */
     QTimer m_networkTimeout;            /* m_networkTimeout 是 4G 测试短超时。 */
+    QTimer m_locationTimeout;           /* m_locationTimeout 是开机单次高德 IP 定位超时。 */
     QTimer m_cloudTimeout;              /* m_cloudTimeout 是云端测试短超时。 */
     QProcess m_networkProcess;          /* m_networkProcess 异步执行 4g-ppp test。 */
+    QProcess m_locationProcess;         /* m_locationProcess 异步执行 4g-location once，完成后自动退出。 */
     QProcess m_cloudProcess;            /* m_cloudProcess 异步执行 curl health。 */
 };
 
@@ -6800,10 +7952,12 @@ static int run_detect_self_test(int argc, char *argv[])
 
     QCoreApplication app(argc, argv);
     CameraStorageController storageController;
+    DetectSettingsController detectSettings;
     UploadHistoryModel uploadHistory(QString::fromLatin1(DEFAULT_UPLOAD_HISTORY_FILE));
 
     /* 自检入口复用同一个历史模型，保证 SSH 检测成功后屏幕历史页能看到这条记录。 */
     storageController.setHistoryModel(&uploadHistory);
+    storageController.setDetectSettingsController(&detectSettings);
 
     const QString result = storageController.detectCurrentFrameForSelfTest();
     QTextStream(stdout) << result << '\n';
@@ -6897,6 +8051,110 @@ static int run_alarm_log_self_test(int argc, char *argv[])
                                                                       alarmText);
     QTextStream(stdout) << result << '\n';
     return result.startsWith(QStringLiteral("告警日志已保存：")) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/*
+ * run_settings_log_self_test 的作用：
+ *   不启动 QML 界面，直接复用参数日志落盘路径，并验证日志查看模型能扫描到当天参数日志。
+ *
+ * 主要流程：
+ *   1. 创建 QCoreApplication，保证 Qt 文件、时间和文本接口可用。
+ *   2. 构造与 QML settingsLogText() 同字段的保存配置和导出摘要两段参数日志。
+ *   3. 调用 recordSettingsSummaryToSdCard() 追加 qt_settings_YYYYMMDD.log。
+ *   4. 刷新 LogFileModel settingsLogModel，检查日志查看页同源模型能看到 qt_settings 文件。
+ *
+ * 参数：
+ *   argc/argv 是 main 收到的原始参数。
+ *
+ * 返回值：
+ *   两次日志写入成功且模型扫描到 qt_settings 日志时返回 EXIT_SUCCESS，否则返回 EXIT_FAILURE。
+ */
+static int run_settings_log_self_test(int argc, char *argv[])
+{
+    /* 自检入口也设置默认业务时区，保证参数日志文件名和屏幕日期一致。 */
+    set_default_environment();
+
+    /* app 提供 Qt 文件系统、日期时间和 QTextStream 所需的应用上下文。 */
+    QCoreApplication app(argc, argv);
+
+    /* storageController 复用 QML 保存配置和导出摘要使用的同一条日志落盘路径。 */
+    CameraStorageController storageController;
+
+    /* settingsLogModel 与 QML 日志查看页使用同一个模型类，确保自检覆盖“写入后能被列表看到”。 */
+    LogFileModel settingsLogModel(QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR));
+
+    /* nowText 保存本次自检时间，写入日志正文便于 SSH tail 直接定位本次自检段落。 */
+    const QString nowText = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+
+    /* summaryPrefix 保存参数日志通用字段，字段名与 QML settingsLogText() 保持一致。 */
+    const QString summaryPrefix =
+        QStringLiteral("STM32MP157 Qt Settings Summary\n")
+        + QStringLiteral("time=") + nowText + QLatin1Char('\n')
+        + QStringLiteral("config_path=") + QString::fromLatin1(DEFAULT_DETECT_SETTINGS_FILE) + QLatin1Char('\n')
+        + QStringLiteral("part_type=波形垫圈\n")
+        + QStringLiteral("model_threshold=0.650 (65.0%)\n")
+        + QStringLiteral("review_threshold=0.820 (82.0%)\n")
+        + QStringLiteral("roi_size=352\n")
+        + QStringLiteral("segment_min_pixels=120\n")
+        + QStringLiteral("overlay_alpha=0.45\n")
+        + QStringLiteral("auto_upload_enabled=true\n")
+        + QStringLiteral("classify_args=--roi 352 --bad-threshold 0.650\n")
+        + QStringLiteral("segment_args=--roi 352 --alpha 0.45 --min-defect-pixels 120\n");
+
+    /* saveSummary 模拟参数页点击“保存配置”后写入的日志段。 */
+    const QString saveSummary =
+        QStringLiteral("action=保存配置\n")
+        + QStringLiteral("action_result=settings-log-self-test save\n")
+        + summaryPrefix;
+
+    /* exportSummary 模拟参数页点击“导出摘要”后写入的日志段。 */
+    const QString exportSummary =
+        QStringLiteral("action=导出摘要\n")
+        + QStringLiteral("action_result=settings-log-self-test export\n")
+        + summaryPrefix;
+
+    /* saveResult 保存第一段日志写入结果，成功时应以“参数日志已保存：”开头。 */
+    const QString saveResult = storageController.recordSettingsSummaryToSdCard(QStringLiteral("settings-save"),
+                                                                               saveSummary);
+
+    /* exportResult 保存第二段日志写入结果，成功时应写到同一天 qt_settings_YYYYMMDD.log。 */
+    const QString exportResult = storageController.recordSettingsSummaryToSdCard(QStringLiteral("settings-export"),
+                                                                                 exportSummary);
+
+    /* 写入完成后刷新模型，验证日志查看页面实际使用的扫描路径能看到这份参数日志。 */
+    settingsLogModel.refresh();
+
+    /* logModelContains 记录是否在日志模型中找到 qt_settings 文件。 */
+    bool logModelContains = false;
+
+    /* 遍历日志模型条目，检查文件名是否以 qt_settings_ 开头且后缀为 .log。 */
+    for (int row = 0; row < settingsLogModel.count(); ++row) {
+        const QVariantMap entry = settingsLogModel.entryAt(row);
+        const QString fileName = entry.value(QStringLiteral("fileName")).toString();
+
+        if (fileName.startsWith(QString::fromLatin1(SETTINGS_LOG_PREFIX) + QLatin1Char('_'))
+                && fileName.endsWith(QStringLiteral(".log"))) {
+            logModelContains = true;
+            break;
+        }
+    }
+
+    /* 输出完整自检摘要，方便 README 中的 SSH 命令用 grep/tail 直接判断。 */
+    QTextStream(stdout)
+            << "settings-log-self-test\n"
+            << "save_result=" << saveResult << '\n'
+            << "export_result=" << exportResult << '\n'
+            << "log_model_contains=" << (logModelContains ? "qt_settings_YYYYMMDD.log" : "missing") << '\n'
+            << "log_model_status=" << settingsLogModel.statusText() << '\n';
+
+    /* 两段日志都成功且模型能扫描到参数日志，才认为自检通过。 */
+    if (saveResult.startsWith(QStringLiteral("参数日志已保存："))
+            && exportResult.startsWith(QStringLiteral("参数日志已保存："))
+            && logModelContains) {
+        return EXIT_SUCCESS;
+    }
+
+    return EXIT_FAILURE;
 }
 
 /*
@@ -7115,6 +8373,11 @@ int main(int argc, char *argv[])
         return run_alarm_log_self_test(argc, argv);
     }
 
+    /* --settings-log-self-test 用于 SSH 验证参数保存/导出日志和日志查看模型同一条路径。 */
+    if (has_raw_argument(argc, argv, "--settings-log-self-test")) {
+        return run_settings_log_self_test(argc, argv);
+    }
+
     /* 先初始化 GStreamer，让 qmlglsink 插件能在 QML 加载前注册 GstGLVideoItem。 */
     gst_init(&argc, &argv);
 
@@ -7191,6 +8454,9 @@ int main(int argc, char *argv[])
     /* storageController 提供 SD 卡保存图片和安全卸载的真实动作入口。 */
     CameraStorageController storageController;
 
+    /* detectSettings 管理参数设置页真实 JSON 配置，并为检测线程提供稳定参数快照。 */
+    DetectSettingsController detectSettings;
+
     /* deviceHealth 负责异步探测 4G、相机、F4、云端和 SD 卡真实状态。 */
     DeviceHealthController deviceHealth(actualVideoBackend, cameraDevice);
 
@@ -7205,6 +8471,9 @@ int main(int argc, char *argv[])
 
     /* 保存控制器拿到历史模型后，保存/上传完成时可以立即追加一条记录。 */
     storageController.setHistoryModel(&uploadHistory);
+
+    /* 保存控制器拿到检测参数控制器后，分类阈值、复核阈值、ROI 和上传开关才会进入真实检测链路。 */
+    storageController.setDetectSettingsController(&detectSettings);
 
     /* SizeRootObjectToView 让 QML 根界面跟随窗口尺寸，适配 1024x600 全屏。 */
     view.setResizeMode(QQuickView::SizeRootObjectToView);
@@ -7228,6 +8497,9 @@ int main(int argc, char *argv[])
 
     /* 把 SD 卡动作控制器暴露给 QML，按钮点击时调用真实 C++/overlay/脚本链路。 */
     view.rootContext()->setContextProperty(QStringLiteral("storageController"), &storageController);
+
+    /* 把真实检测参数控制器暴露给 QML，参数页保存到 JSON 后检测线程会读取同一份配置。 */
+    view.rootContext()->setContextProperty(QStringLiteral("detectSettings"), &detectSettings);
 
     /* 把真实设备健康控制器暴露给 QML，顶部状态栏不再显示固定在线文案。 */
     view.rootContext()->setContextProperty(QStringLiteral("deviceHealth"), &deviceHealth);
