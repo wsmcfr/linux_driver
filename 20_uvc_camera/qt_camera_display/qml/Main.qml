@@ -43,6 +43,27 @@ Rectangle {
     /* workflowState 表示当前产线状态；按钮会改变该文本，后续可接真实状态机。 */
     property string workflowState: "定位预览"
 
+    /* autoControlBusy 表示首页开始/暂停/继续/停止命令正在等待 F4 二进制 ACK，忙时禁止重复点击。 */
+    property bool autoControlBusy: false
+
+    /* autoPendingAction 保存正在等待 ACK 的首页动作，空字符串表示当前没有自动流程命令在途。 */
+    property string autoPendingAction: ""
+
+    /* autoPendingStateText 保存正在等待 ACK 的界面目标状态，ACK 成功后再正式写入 workflowState。 */
+    property string autoPendingStateText: ""
+
+    /* autoCycleId 保存 MP157 当前自动检测流程号，由 C++ 在 F4 ACK/NACK 回调中返回。 */
+    property int autoCycleId: 0
+
+    /* autoWorkflowRunning 表示 MP157 本地认为 F4 自动检测流程正在运行，用于 UI 状态和后续按钮语义。 */
+    property bool autoWorkflowRunning: false
+
+    /* autoWorkflowPaused 表示当前自动流程处于暂停状态，停止后不能继续，只能重新开始。 */
+    property bool autoWorkflowPaused: false
+
+    /* autoLastAckText 保存最近一次 F4 二进制自动流程 ACK/NACK 文本，便于现场串口调试核对。 */
+    property string autoLastAckText: "自动流程待开始"
+
     /* storageState 表示检测流程、SD 卡安全卸载和告警快照的最近一次执行结果。 */
     property string storageState: "SD卡就绪"
 
@@ -112,8 +133,8 @@ Rectangle {
     /* manualBeltState 保存传送带最近一次真实控制意图和 F4 回执状态。 */
     property string manualBeltState: "停止"
 
-    /* manualBeltCommandText 保存传送带当前使用的 F407 ASCII 命令，便于现场确认 MP157 没有直接发送 Emm42 二进制帧。 */
-    property string manualBeltCommandText: "BELTSTOP"
+    /* manualBeltCommandText 保存传送带当前使用的 F407 二进制协议语义名，便于现场确认 MP157 没有发送 ASCII 文本或 Emm42 原始帧。 */
+    property string manualBeltCommandText: "BELT_MANUAL_STOP"
 
     /* manualReviewMark 保存人工复核标记，第一版只写界面状态，不回写检测记录。 */
     property string manualReviewMark: "未标记"
@@ -166,16 +187,16 @@ Rectangle {
     /* settingsDetailText 保存当前参数详情浮层正文，内容来自云端上传契约和当前板端接入边界。 */
     property string settingsDetailText: ""
 
-    /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发送 CAL 命令。 */
+    /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发起二进制标定占位命令。 */
     property bool calibrationPopupVisible: false
 
     /* calibrationWeightText 保存称重标定输入框中的克重文本，发送前会校验为 1~5000 的整数。 */
     property string calibrationWeightText: "1000"
 
     /* calibrationResultText 保存称重标定最近一次发送、成功或失败结果，便于操作员不看串口也能确认状态。 */
-    property string calibrationResultText: "放置砝码后输入克重，再发送 CAL 命令"
+    property string calibrationResultText: "放置砝码后输入克重；当前F4需先补称重标定二进制命令"
 
-    /* calibrationSending 表示当前 CAL 命令正在后台写入 F4 串口，发送完成前禁用重复点击。 */
+    /* calibrationSending 表示当前二进制标定占位命令正在后台写入 F4 串口，发送完成前禁用重复点击。 */
     property bool calibrationSending: false
 
     /* alarmCurrentCode 保存当前主告警码；运行期由相机、SD 卡、4G、云端、F4 和检测链路真实状态覆盖。 */
@@ -548,29 +569,42 @@ Rectangle {
      *   统一处理“开始、暂停、继续、停止”四个触摸按钮。
      *
      * 主要流程：
-     *   1. 先更新右侧结果面板中的流程状态，让触摸操作有即时反馈。
-     *   2. 如果当前是 Qt 自采集安全预览，则同步控制 V4L2VideoItem 的 running 状态。
-     *   3. 如果当前是 KMS overlay 后端，则只更新流程状态，避免 QML 误杀外部 overlay 进程和自身 Qt 进程。
+     *   1. 先检查是否已有 F4 自动流程命令在途，避免同一个串口同时下发多条关键命令。
+     *   2. 调用 C++ `sendF4AutoControlCommand()` 组装并发送二进制协议帧，QML 不直接拼帧。
+     *   3. 命令启动成功后先显示“下发中”，真正的运行、暂停、继续、停止状态等 F4 ACK 回调后再确认。
+     *   4. 如果当前是 Qt 自采集安全预览，只有 F4 ACK 成功后才同步控制 V4L2VideoItem 的 running 状态。
      *
      * 参数：
      *   action 是按钮动作标识，取值为 start、pause、resume 或 stop。
      *   stateText 是显示在界面上的流程状态文本。
      *
      * 返回值：
-     *   无返回值；函数会更新 workflowState，并在 qt-safe 后端下控制 cameraView.running。
+     *   无返回值；函数会更新 workflowState/storageState，并等待 onF4AutoControlFinished 确认结果。
      */
     function handleControlAction(action, stateText) {
-        workflowState = stateText
-
-        if (root.usingKmsOverlay || root.usingGstVideo) {
+        if (autoControlBusy) {
+            storageState = formatF4ToastText("自动流程命令下发中，请等待F4回执")
+            showStorageToast()
             return
         }
 
-        if (action === "pause" || action === "stop") {
-            cameraView.running = false
-        } else if (action === "start" || action === "resume") {
-            cameraView.running = true
+        autoPendingAction = action
+        autoPendingStateText = stateText
+        autoControlBusy = true
+        workflowState = stateText + "下发中"
+        storageState = formatF4ToastText("正在下发自动流程：" + stateText)
+
+        if (!deviceHealth.sendF4AutoControlCommand(action)) {
+            autoControlBusy = false
+            autoPendingAction = ""
+            autoPendingStateText = ""
+            workflowState = "自动流程命令未启动"
+            storageState = formatF4ToastText(autoLastAckText)
+            showStorageToast()
+            return
         }
+
+        showStorageToast()
     }
 
     /*
@@ -938,6 +972,34 @@ Rectangle {
     }
 
     /*
+     * formatF4ToastText 的作用：
+     *   把所有 F407 二进制协议回包转换成底部提示条统一格式。
+     *
+     * 主要流程：
+     *   1. 先把输入转换成字符串，避免 C++ 返回空详情时 QML 拼接出 undefined。
+     *   2. 如果内容已经带有 `F4:` 或 `F4：` 前缀，就原样返回，防止连续回调重复叠加前缀。
+     *   3. 其它 F4 回包统一加 `F4:`，让现场人员一眼知道底部提示来自 F407。
+     *
+     * 参数：
+     *   text 是 ACK、NACK、STATUS_REPORT、FAULT_REPORT 或串口失败原因的中文摘要。
+     *
+     * 返回值：
+     *   返回可以直接放入 storageState 的底部提示文本。
+     */
+    function formatF4ToastText(text) {
+        var detail = (text === undefined || text === null) ? "" : ("" + text)
+        if (detail.length === 0) {
+            detail = "无回包详情"
+        }
+
+        if (detail.indexOf("F4:") === 0 || detail.indexOf("F4：") === 0) {
+            return detail
+        }
+
+        return "F4: " + detail
+    }
+
+    /*
      * appendManualCommandLog 的作用：
      *   把手动控制页的每一次操作写入最新在前的命令日志，方便现场联调时追溯点击顺序和禁止原因。
      *
@@ -969,15 +1031,15 @@ Rectangle {
 
     /*
      * sendManualBeltCommand 的作用：
-     *   把手动页传送带按钮转换为 F407 已实现的 BELT ASCII 命令，并通过 MP157 的 `/dev/ttySTM2` 真实下发。
+     *   把手动页传送带按钮转换为 F407 二进制传送带命令，并通过 MP157 的 `/dev/ttySTM2` 真实下发。
      *
      * 主要流程：
      *   1. 记录正在等待的命令，防止同一时间重复点击多个传送带动作。
-     *   2. 调用 C++ `DeviceHealthController::sendF4BeltCommand()`，由 C++ 负责补 `\r\n`、串口互斥和回包读取。
+     *   2. 调用 C++ `DeviceHealthController::sendF4BeltCommand()`，由 C++ 负责二进制组帧、串口互斥和 ACK/NACK/STATUS_REPORT 读取。
      *   3. 如果 C++ 立即拒绝启动线程，则清空在途命令并把失败写入命令日志。
      *
      * 参数：
-     *   commandText 是要发送给 F407 的文本命令，例如 BELTSCAN、BELTSTOP、BELTINFO。
+     *   commandText 是按钮语义名称，例如 BELT_MANUAL_SCAN、BELT_MANUAL_STOP、QUERY_STATUS；底层不会把这些字符串写给 F407。
      *   label 是界面按钮文本，用于写入手动命令日志。
      *   pendingState 是命令发出后界面先显示的等待状态。
      *
@@ -987,7 +1049,7 @@ Rectangle {
     function sendManualBeltCommand(commandText, label, pendingState) {
         if (manualPendingF4Command !== "") {
             manualLastAckText = "F4命令发送中：" + manualPendingF4Command
-            storageState = manualLastAckText
+            storageState = formatF4ToastText(manualLastAckText)
             appendManualCommandLog(label, "传送带", manualLastAckText)
             showStorageToast()
             return false
@@ -997,7 +1059,7 @@ Rectangle {
         manualBeltCommandText = commandText
         manualBeltState = pendingState
         manualLastAckText = "正在下发 " + commandText + " 到 F407"
-        storageState = manualLastAckText
+        storageState = formatF4ToastText(manualLastAckText)
         appendManualCommandLog(label, "传送带", manualLastAckText)
         showStorageToast()
 
@@ -1005,7 +1067,7 @@ Rectangle {
             manualPendingF4Command = ""
             manualBeltState = "发送失败"
             manualLastAckText = "F4拒绝启动传送带命令：" + commandText
-            storageState = manualLastAckText
+            storageState = formatF4ToastText(manualLastAckText)
             appendManualCommandLog(label, "传送带", manualLastAckText)
             showStorageToast()
             return false
@@ -1049,7 +1111,7 @@ Rectangle {
 
     /*
      * handleManualAction 的作用：
-     *   统一处理手动控制页所有按钮点击；传送带会真实下发 F407 BELT 命令，其它入口只保留检测和标记辅助。
+     *   统一处理手动控制页所有按钮点击；传送带会真实下发 F407 二进制 ACK/NACK 协议命令，其它入口只保留检测和标记辅助。
      *
      * 主要流程：
      *   1. 先执行手动模式、急停和回零等安全保护判断。
@@ -1103,14 +1165,14 @@ Rectangle {
         }
 
         if (action === "belt-scan") {
-            sendManualBeltCommand("BELTSCAN", label, "巡航下发中")
+            sendManualBeltCommand("BELT_MANUAL_SCAN", label, "巡航下发中")
             return
         } else if (action === "belt-info") {
-            sendManualBeltCommand("BELTINFO", label, "查询中")
+            sendManualBeltCommand("QUERY_STATUS", label, "查询中")
             return
         } else if (action === "stop") {
             manualBeltState = "停止"
-            sendManualBeltCommand("BELTSTOP", label, "停止下发中")
+            sendManualBeltCommand("BELT_MANUAL_STOP", label, "停止下发中")
             return
         } else if (action === "mark-good") {
             manualReviewMark = "GOOD"
@@ -1280,7 +1342,7 @@ Rectangle {
         var lines = [
             "[串口接入]",
             "1. MP157 当前通过 /dev/ttySTM2、115200 波特率访问传送带/称重 F407 USART1。",
-            "2. 相机上下轴和前后轴后续应由 F407 另一路文本服务接入；MP157 侧预留串口标记为 /dev/ttySTM1，实际设备节点以设备树和接线复核为准。",
+            "2. 相机上下轴和前后轴后续应由 F407 二进制协议接入；MP157 侧预留串口标记为 /dev/ttySTM1，实际设备节点以设备树和接线复核为准。",
             "3. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
             "4. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
             "",
@@ -1293,10 +1355,10 @@ Rectangle {
             "[控制边界]",
             "1. MP157 负责视觉推理、图片保存、COS 上传、历史补传和云端记录创建。",
             "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
-            "3. 当前传送带只开放 BELTSCAN/BELTSTOP/BELTINFO 三条 F407 已实现高层命令。",
-            "4. 相机上下轴和前后轴暂不在 Qt 页面提供按钮，必须等 F407 固件给出固定命令、状态回读和失败码后再接入。",
+            "3. 当前传送带只开放 BELT_MANUAL_CONTROL 和 QUERY_STATUS 两类 F407 已实现二进制命令。",
+            "4. 相机上下轴和前后轴暂不在 Qt 页面提供按钮，必须等 F407 固件给出二进制命令、状态回读和失败码后再接入。",
             "5. 本页面不提供速度、位置、剔除动作、急停解除或联锁时序参数，避免绕过 F4 固件安全边界。",
-            "6. 后续若接入相机轴真实参数下发，需要先在 F407 定义回零、移动、停止、查询、ACK/NAK、状态回读和失败回滚流程。"
+            "6. 后续若接入相机轴真实参数下发，需要先在 F407 定义回零、移动、停止、查询、ACK/NACK、STATUS_REPORT 和 FAULT_REPORT 流程。"
         ]
         return lines.join("\n")
     }
@@ -1342,7 +1404,7 @@ Rectangle {
     function openCalibrationPopup() {
         calibrationPopupVisible = true
         calibrationSending = false
-        calibrationResultText = "F4状态：" + deviceHealth.f4StatusText + "，请放置砝码后发送CAL"
+        calibrationResultText = "F4状态：" + deviceHealth.f4StatusText + "，当前标定入口只走二进制协议"
         deviceHealth.refreshF4StatusNow()
     }
 
@@ -1378,7 +1440,7 @@ Rectangle {
      */
     function appendCalibrationDigit(digit) {
         if (calibrationSending) {
-            calibrationResultText = "CAL发送中，暂不能修改克重"
+            calibrationResultText = "二进制标定命令发送中，暂不能修改克重"
             return
         }
 
@@ -1410,7 +1472,7 @@ Rectangle {
      */
     function backspaceCalibrationDigit() {
         if (calibrationSending) {
-            calibrationResultText = "CAL发送中，暂不能修改克重"
+            calibrationResultText = "二进制标定命令发送中，暂不能修改克重"
             return
         }
 
@@ -1439,12 +1501,12 @@ Rectangle {
 
     /*
      * sendCalibrationCommand 的作用：
-     *   校验用户输入的标定克重，并通过 C++ DeviceHealthController 发送 `CAL <克重>`。
+     *   校验用户输入的标定克重，并通过 C++ DeviceHealthController 发起二进制标定占位命令。
      *
      * 主要流程：
      *   1. 去掉首尾空格后按十进制整数解析。
      *   2. 限制 1~5000g，匹配当前 HX711 服务默认 5kg 量程。
-     *   3. 调用 deviceHealth.sendF4Command()，由 C++ 自动补 `\r\n` 并等待 F4 回复。
+     *   3. 调用 deviceHealth.sendF4Command()，由 C++ 组二进制帧并等待 F4 ACK/NACK。
      *
      * 返回值：
      *   无返回值；结果通过 calibrationResultText 和底部提示条反馈。
@@ -1454,8 +1516,8 @@ Rectangle {
         var parsedWeight = parseInt(trimmedText, 10)
 
         if (calibrationSending) {
-            calibrationResultText = "上一条CAL命令仍在发送中"
-            storageState = calibrationResultText
+            calibrationResultText = "上一条二进制标定命令仍在发送中"
+            storageState = formatF4ToastText(calibrationResultText)
             showStorageToast()
             return
         }
@@ -1469,8 +1531,8 @@ Rectangle {
 
         calibrationSending = true
         calibrationWeightText = "" + parsedWeight
-        calibrationResultText = "正在发送 CAL " + parsedWeight + " ..."
-        storageState = calibrationResultText
+        calibrationResultText = "正在发送二进制标定占位命令，克重 " + parsedWeight + " g ..."
+        storageState = formatF4ToastText(calibrationResultText)
         showStorageToast()
 
         if (!deviceHealth.sendF4Command("CAL " + parsedWeight)) {
@@ -1649,7 +1711,7 @@ Rectangle {
         if (sourceKey === "f4-heartbeat-lost") {
             return [
                 "检查 /dev/ttySTM2 是否存在，确认 F4 供电、复位和串口线序。",
-                "用串口工具发送 STATUS，确认 F4 返回 ACK/OK/F4/READY。",
+                "用二进制 HEARTBEAT 帧确认 F4 返回 ACK；状态查询用 QUERY_STATUS，错误只看 NACK 或 FAULT_REPORT。",
                 "不要把 QML 清故障当成真实联锁解除，最终以 F4 状态帧为准。"
             ]
         }
@@ -3615,12 +3677,12 @@ Rectangle {
             root.calibrationSending = false
             if (ok) {
                 root.calibrationResultText = "标定命令成功：" + detail
-                root.settingsLastActionText = "已下发 CAL " + root.calibrationWeightText + " g"
+                root.settingsLastActionText = "已下发二进制标定占位命令 " + root.calibrationWeightText + " g"
             } else {
                 root.calibrationResultText = "标定命令失败：" + detail
                 root.settingsLastActionText = root.calibrationResultText
             }
-            root.storageState = root.calibrationResultText
+            root.storageState = root.formatF4ToastText(root.calibrationResultText)
             root.showStorageToast()
             root.evaluateRuntimeAlarms()
         }
@@ -3639,11 +3701,11 @@ Rectangle {
             root.manualBeltCommandText = command
 
             if (ok) {
-                if (command === "BELTSCAN") {
+                if (command === "BELT_MANUAL_SCAN") {
                     root.manualBeltState = "巡航中"
-                } else if (command === "BELTSTOP") {
+                } else if (command === "BELT_MANUAL_STOP") {
                     root.manualBeltState = "停止"
-                } else if (command === "BELTINFO") {
+                } else if (command === "QUERY_STATUS") {
                     root.manualBeltState = "状态已返回"
                 }
                 root.manualLastAckText = "F4回执：" + detail
@@ -3652,10 +3714,86 @@ Rectangle {
                 root.manualLastAckText = "F4命令失败：" + detail
             }
 
-            root.storageState = root.manualLastAckText
+            root.storageState = root.formatF4ToastText(root.manualLastAckText)
             root.appendManualCommandLog(command, "传送带", root.manualLastAckText)
             root.showStorageToast()
             root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4AutoControlFinished 的作用：
+         *   接收 C++ 二进制自动流程命令结果，首页四按钮只有收到 ACK 后才真正改变本地流程状态。
+         *
+         * 参数：
+         *   ok 表示 F4 是否返回匹配本次命令、SEQ 和 cycle_id 的 ACK。
+         *   action 是刚下发的首页动作。
+         *   cycleId 是本次自动检测流程号。
+         *   detail 是 ACK/NACK 解析文本或串口失败原因。
+         */
+        onF4AutoControlFinished: {
+            root.autoControlBusy = false
+            root.autoPendingAction = ""
+            root.autoPendingStateText = ""
+            root.autoCycleId = cycleId
+
+            if (ok) {
+                if (action === "start") {
+                    root.autoWorkflowRunning = true
+                    root.autoWorkflowPaused = false
+                    root.workflowState = "定位预览"
+                } else if (action === "pause") {
+                    root.autoWorkflowRunning = true
+                    root.autoWorkflowPaused = true
+                    root.workflowState = "暂停"
+                } else if (action === "resume") {
+                    root.autoWorkflowRunning = true
+                    root.autoWorkflowPaused = false
+                    root.workflowState = "继续检测"
+                } else if (action === "stop") {
+                    root.autoWorkflowRunning = false
+                    root.autoWorkflowPaused = false
+                    root.workflowState = "停止"
+                }
+
+                if (!root.usingKmsOverlay && !root.usingGstVideo) {
+                    if (action === "pause" || action === "stop") {
+                        cameraView.running = false
+                    } else if (action === "start" || action === "resume") {
+                        cameraView.running = true
+                    }
+                }
+
+                root.autoLastAckText = "自动流程ACK：cycle=" + cycleId + "，" + detail
+            } else {
+                root.autoLastAckText = "自动流程失败：" + detail
+                if (root.autoWorkflowPaused) {
+                    root.workflowState = "暂停"
+                } else if (root.autoWorkflowRunning) {
+                    root.workflowState = "自动检测运行中"
+                } else {
+                    root.workflowState = "定位预览"
+                }
+            }
+
+            root.storageState = root.formatF4ToastText(root.autoLastAckText)
+            root.showStorageToast()
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onDetailTextChanged 的作用：
+         *   当 C++ 后台 F4 心跳或异步故障更新设备详情时，把这条 F4 二进制回包摘要同步到底部提示。
+         *
+         * 说明：
+         *   detailText 也会被 4G、云端、相机和 SD 卡刷新修改，因此这里先按文本前缀过滤，
+         *   只处理确实来自 F4 的详情，避免把其它设备健康提示误标成 F4。
+         */
+        onDetailTextChanged: {
+            var detail = deviceHealth.detailText
+            if (detail.indexOf("F4") === 0) {
+                root.storageState = root.formatF4ToastText(detail)
+                root.showStorageToast()
+            }
         }
 
         /*
@@ -4333,14 +4471,19 @@ Rectangle {
                     width: (overlayControls.width - overlayControls.columnSpacing) / 2
                     height: 24
                     radius: 6
-                    color: overlayButtonMouse.pressed ? "#2d3338" : "#22272b"
-                    border.color: modelData.color
+                    property bool actionEnabled: !root.autoControlBusy
+                                                 && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                                                     || (modelData.action === "pause" && root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                                                     || (modelData.action === "resume" && root.autoWorkflowPaused)
+                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoWorkflowPaused)))
+                    color: !actionEnabled ? "#171b1e" : (overlayButtonMouse.pressed ? "#2d3338" : "#22272b")
+                    border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1
 
                     Text {
                         anchors.centerIn: parent
                         text: modelData.text
-                        color: "#ffffff"
+                        color: parent.actionEnabled ? "#ffffff" : "#6d777d"
                         font.pixelSize: 12
                         font.bold: true
                     }
@@ -4350,6 +4493,9 @@ Rectangle {
                         anchors.fill: parent
 
                         onClicked: {
+                            if (!parent.actionEnabled) {
+                                return
+                            }
                             root.handleControlAction(modelData.action, modelData.state)
                         }
                     }
@@ -5792,7 +5938,7 @@ Rectangle {
             }
         }
 
-        /* manualBeltPanel 负责把 MP157 手动按钮映射成 F407 已实现的 BELTSCAN/BELTSTOP/BELTINFO 命令。 */
+        /* manualBeltPanel 负责把 MP157 手动按钮映射成 F407 已实现的 BELT_MANUAL_CONTROL/QUERY_STATUS 二进制命令。 */
         Rectangle {
             id: manualBeltPanel
             x: 16
@@ -7203,7 +7349,7 @@ Rectangle {
                 y: 54
                 width: parent.width - 36
                 height: 42
-                text: "F4状态：" + deviceHealth.f4StatusText + "；串口 /dev/ttySTM2 115200；发送格式 CAL <克重>"
+                text: "F4状态：" + deviceHealth.f4StatusText + "；串口 /dev/ttySTM2 115200；MP157-F4主链路只发送二进制帧"
                 color: "#cfd7db"
                 font.pixelSize: 13
                 font.bold: true
@@ -7439,7 +7585,7 @@ Rectangle {
 
                 Text {
                     anchors.centerIn: parent
-                    text: root.calibrationSending ? "发送中..." : "发送CAL"
+                    text: root.calibrationSending ? "发送中..." : "发二进制"
                     color: "#eafff2"
                     font.pixelSize: 14
                     font.bold: true
@@ -8604,14 +8750,19 @@ Rectangle {
                     width: 64
                     height: 48
                     radius: 8
-                    color: mouseArea.pressed ? "#2d3338" : "#22272b"
-                    border.color: modelData.color
+                    property bool actionEnabled: !root.autoControlBusy
+                                                 && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                                                     || (modelData.action === "pause" && root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                                                     || (modelData.action === "resume" && root.autoWorkflowPaused)
+                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoWorkflowPaused)))
+                    color: !actionEnabled ? "#171b1e" : (mouseArea.pressed ? "#2d3338" : "#22272b")
+                    border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1
 
                     Text {
                         anchors.centerIn: parent
                         text: modelData.text
-                        color: "#ffffff"
+                        color: parent.actionEnabled ? "#ffffff" : "#6d777d"
                         font.pixelSize: 16
                         font.bold: true
                     }
@@ -8621,6 +8772,9 @@ Rectangle {
                         anchors.fill: parent
 
                         onClicked: {
+                            if (!parent.actionEnabled) {
+                                return
+                            }
                             root.handleControlAction(modelData.action, modelData.state)
                         }
                     }

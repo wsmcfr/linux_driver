@@ -161,6 +161,24 @@ require_grep "handleDetectAction" "qml/Main.qml"
 require_grep "storageToastTimer" "qml/Main.qml"
 require_grep "storageToastVisible" "qml/Main.qml"
 require_grep "showStorageToast" "qml/Main.qml"
+require_grep "formatF4ToastText" "qml/Main.qml"
+require_grep "F4:" "qml/Main.qml"
+f4_command_finished_block="$(sed -n '/onF4CommandFinished:/,/onF4ManualCommandFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$f4_command_finished_block" | grep -q 'formatF4ToastText'; then
+    fail "称重标定占位命令的底部提示必须通过 formatF4ToastText 加 F4: 前缀"
+fi
+f4_manual_finished_block="$(sed -n '/onF4ManualCommandFinished:/,/onF4AutoControlFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$f4_manual_finished_block" | grep -q 'formatF4ToastText'; then
+    fail "手动传送带 F4 回包底部提示必须通过 formatF4ToastText 加 F4: 前缀"
+fi
+f4_auto_finished_block="$(sed -n '/onF4AutoControlFinished:/,/onCloudStatusChanged:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$f4_auto_finished_block" | grep -q 'formatF4ToastText'; then
+    fail "首页自动流程 F4 回包底部提示必须通过 formatF4ToastText 加 F4: 前缀"
+fi
+f4_detail_changed_block="$(sed -n '/onDetailTextChanged:/,/onCloudStatusChanged:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$f4_detail_changed_block" | grep -q 'formatF4ToastText'; then
+    fail "F4 心跳/故障详情变化必须通过 formatF4ToastText 显示到底部提示"
+fi
 require_grep "LogFileModel" "main.cpp"
 require_grep "logFileModel" "main.cpp"
 require_grep "refreshLogFileList" "qml/Main.qml"
@@ -355,9 +373,12 @@ require_grep "sendManualBeltCommand" "qml/Main.qml"
 require_grep "sendF4BeltCommand" "main.cpp"
 require_grep "f4ManualCommandFinished" "main.cpp"
 require_grep "onF4ManualCommandFinished" "qml/Main.qml"
-require_grep "BELTSCAN" "qml/Main.qml"
-require_grep "BELTSTOP" "qml/Main.qml"
-require_grep "BELTINFO" "qml/Main.qml"
+require_grep "autoControlBusy" "qml/Main.qml"
+require_grep "sendF4AutoControlCommand" "qml/Main.qml"
+require_grep "onF4AutoControlFinished" "qml/Main.qml"
+require_grep "BELT_MANUAL_SCAN" "qml/Main.qml"
+require_grep "BELT_MANUAL_STOP" "qml/Main.qml"
+require_grep "QUERY_STATUS" "qml/Main.qml"
 require_grep "isAllowedF4BeltCommand" "main.cpp"
 require_grep '"name": "位置"' "qml/Main.qml"
 require_grep '"value": deviceHealth.locationShortText' "qml/Main.qml"
@@ -605,7 +626,7 @@ require_grep "退格" "qml/Main.qml"
 require_grep "calibrationResultFlickable" "qml/Main.qml"
 require_grep "contentHeight: calibrationResultTextItem.height" "qml/Main.qml"
 require_grep "sendCalibrationCommand" "qml/Main.qml"
-require_grep "CAL " "qml/Main.qml"
+require_grep "MP157-F4主链路只发送二进制帧" "qml/Main.qml"
 require_grep "model-detect-failed" "qml/Main.qml"
 if grep -Eq "/mnt/sdcard/logs/qt_alarm_snapshot\\.txt" "$SCRIPT_DIR/qml/Main.qml"; then
     fail "qml/Main.qml 不应继续提示固定 qt_alarm_snapshot.txt，保存诊断必须由 C++ 返回时间戳文件路径"
@@ -631,8 +652,60 @@ require_grep "startF4Probe" "main.cpp"
 require_grep "F4_HEARTBEAT_INTERVAL_MS" "main.cpp"
 require_grep "120000" "main.cpp"
 require_grep "sendF4Command" "main.cpp"
-require_grep "CAL " "main.cpp"
-require_grep "readF4ReplyText" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_MODEL_READY" "main.cpp"
+require_grep "CRC16-CCITT-FALSE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_START_CYCLE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_PAUSE_CYCLE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_RESUME_CYCLE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_STOP_CYCLE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_HEARTBEAT" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_QUERY_STATUS" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_STATUS_REPORT" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_FAULT_REPORT" "main.cpp"
+require_grep "sendF4BinaryHeartbeat" "main.cpp"
+require_grep "sendF4BinaryStatusQuery" "main.cpp"
+require_grep "sendF4AutoControlCommand" "main.cpp"
+require_grep "f4AutoControlFinished" "main.cpp"
+require_grep "readF4BinaryReply" "main.cpp"
+require_grep "describeF4FaultReport" "main.cpp"
+require_grep "STATUS_REPORT cycle=" "main.cpp"
+require_grep "BELT_MANUAL_CONTROL" "main.cpp"
+require_grep "BELT_MANUAL_SCAN" "main.cpp"
+require_grep "BELT_MANUAL_STOP" "main.cpp"
+require_grep "ACK重复帧" "main.cpp"
+require_grep "ACK未确认执行" "main.cpp"
+if grep -Eq 'BELTSCAN\\r\\n|BELTSTOP\\r\\n|BELTINFO\\r\\n|STATUS\\r\\n|QStringLiteral\("BELTSCAN"\)|QStringLiteral\("BELTSTOP"\)|QStringLiteral\("BELTINFO"\)' "$SCRIPT_DIR/main.cpp"; then
+    fail "MP157 Qt 不能再向 F4 发送或白名单允许 BELT/STATUS 文本命令；传送带、状态查询和心跳必须走二进制协议语义名"
+fi
+if grep -Eq 'readF4ReplyText|sendF4SerialCommand|replyUpper\.contains\("ACK"\)|replyUpper\.contains\("OK"\)|replyUpper\.contains\("READY"\)' "$SCRIPT_DIR/main.cpp"; then
+    fail "MP157 Qt 不能保留 F4 文本回包成功判定；正确和错误都必须解析二进制 ACK/NACK/STATUS_REPORT/FAULT_REPORT"
+fi
+if grep -Eq 'sendManualBeltCommand\("BELTSCAN"|sendManualBeltCommand\("BELTSTOP"|sendManualBeltCommand\("BELTINFO"|manualBeltCommandText: "BELTSTOP"' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 手动传送带按钮不能再传旧 ASCII 命令名，必须传 BELT_MANUAL_SCAN/BELT_MANUAL_STOP/QUERY_STATUS"
+fi
+F4_BINARY_PROTOCOL_SOURCE="/e/hal/bisai_f407_project/User/App/binary_protocol_service.c"
+if [ -f "$F4_BINARY_PROTOCOL_SOURCE" ]; then
+    grep -q 'BINARY_PROTOCOL_CMD_QUERY_STATUS' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须实现 QUERY_STATUS 二进制状态查询"
+    grep -q 'BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须实现 BELT_MANUAL_CONTROL 二进制手动传送带命令"
+    grep -q 'BINARY_PROTOCOL_CMD_STATUS_REPORT' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须实现 STATUS_REPORT 二进制状态回包"
+    grep -q 'BinaryProtocolService_ReportFault' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须用 FAULT_REPORT 二进制帧上报模块故障，不能让 LDC/电机错误刷文本"
+    grep -q 'g_binary_protocol_runtime.active_cycle_id == payload.cycle_id' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须识别同一 cycle_id 的重复 START_CYCLE"
+    grep -q 'ConveyorMotorService_RequestScan() == 0U' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 重复 START_CYCLE 分支必须重新投递 SCAN，避免只 ACK 不动作"
+    grep -q 'BINARY_PROTOCOL_ERROR_STATE_NOT_ALLOWED' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 暂停态重复 START_CYCLE 必须返回 NACK，不允许误恢复旧流程"
+    grep -q 'BinaryProtocolService_HandleVisionPos' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须实现 VISION_POS 二进制处理入口"
+    grep -q 'BinaryProtocolService_HandleVisionLost' "$F4_BINARY_PROTOCOL_SOURCE" || fail "F407 必须实现 VISION_LOST 二进制处理入口"
+    grep -A80 'BinaryProtocolService_HandleVisionPos' "$F4_BINARY_PROTOCOL_SOURCE" | grep -q 'BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U)' || fail "F407 VISION_POS 成功后必须返回 ACK，不能静默成功"
+    grep -A120 'BinaryProtocolService_HandleVisionLost' "$F4_BINARY_PROTOCOL_SOURCE" | grep -q 'BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U)' || fail "F407 VISION_LOST 成功后必须返回 ACK，不能静默成功"
+    if grep -Eq '\[OK\]\[BIN\]|\[ERROR\]\[BIN\]' "$F4_BINARY_PROTOCOL_SOURCE"; then
+        fail "F407 二进制协议处理路径不能再输出 [OK][BIN]/[ERROR][BIN] 文本回包，正确/错误必须用 ACK/NACK/STATUS_REPORT"
+    fi
+fi
+F4_UART_COMMAND_SOURCE="/e/hal/bisai_f407_project/User/App/uart_command.c"
+if [ -f "$F4_UART_COMMAND_SOURCE" ]; then
+    grep -q 'UART_COMMAND_USART1_TEXT_ENABLE' "$F4_UART_COMMAND_SOURCE" || fail "F407 USART1 必须提供文本输出静默开关，MP157 主链路不能再收到 [OK]/[ERROR] 文本日志"
+    grep -q '#define UART_COMMAND_USART1_TEXT_ENABLE[[:space:]]*(0U)' "$F4_UART_COMMAND_SOURCE" || fail "F407 USART1 面向 MP157 时文本输出默认必须关闭，只保留二进制协议帧"
+fi
 if grep -Eq 'reply\.left\(96\)|reply\.left\(48\)' "$SCRIPT_DIR/main.cpp"; then
     fail "F4 标定回包不能只截取 96/48 字节，否则 [OK][WEIGHT] Calibration success 详情可能在弹窗中显示不完整"
 fi

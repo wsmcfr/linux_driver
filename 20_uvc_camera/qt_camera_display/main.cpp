@@ -36,6 +36,7 @@
 #include "v4l2_video_item.h"  /* V4L2VideoItem 提供不依赖 QtMultimedia 的 UVC 预览控件。 */
 
 #include <QAbstractListModel>   /* QAbstractListModel 用于把上传历史记录以模型形式暴露给 QML ListView。 */
+#include <QByteArray>           /* QByteArray 用于保存串口二进制协议帧、F4 文本回包和上传脚本输出。 */
 #include <QDate>                /* QDate 用于把日志、告警和历史记录归档到当天日期文件。 */
 #include <QCommandLineOption>   /* QCommandLineOption 用于定义 --camera 等命令行选项。 */
 #include <QCommandLineParser>   /* QCommandLineParser 负责解析用户传入的调试参数。 */
@@ -170,11 +171,62 @@ static const char *DEFAULT_F4_SERIAL_DEVICE = "/dev/ttySTM2";
 /* 默认 F4 串口波特率；当前项目串口测试工具和文档均使用 115200 8N1。 */
 static const int DEFAULT_F4_SERIAL_BAUD = 115200;
 
-/* 默认 F4 握手命令；用户已确认没有现成协议时先按 STATUS 查询实现。 */
-static const char *DEFAULT_F4_HEALTH_QUERY = "STATUS\r\n";
-
 /* F4 心跳发送间隔，单位毫秒；120000ms 等于 2 分钟，避免 Qt 每 8 秒健康刷新都占用 RS485 串口。 */
 static const int F4_HEARTBEAT_INTERVAL_MS = 120000;
+
+/* 二进制协议帧头第 1 字节，固定 0xA5，用于从串口字节流中快速寻找帧起点。 */
+static const quint8 BINARY_PROTOCOL_SOF0 = 0xA5U;
+
+/* 二进制协议帧头第 2 字节，固定 0x5A，用于降低噪声误判成帧头的概率。 */
+static const quint8 BINARY_PROTOCOL_SOF1 = 0x5AU;
+
+/* 二进制协议版本号，当前 MP157 和 F407 约定首版为 0x01。 */
+static const quint8 BINARY_PROTOCOL_VERSION = 0x01U;
+
+/* 二进制协议帧尾，固定 0x6B，便于和 F407 侧协议解析状态机对齐。 */
+static const quint8 BINARY_PROTOCOL_EOF = 0x6BU;
+
+/* 二进制协议首版最大负载长度，和 F407 侧 64 字节级接收缓存保持余量。 */
+static const int BINARY_PROTOCOL_MAX_PAYLOAD = 48;
+
+/* 二进制协议最短固定帧长度，LEN=0 时仍包含帧头、版本、命令、长度、SEQ、CRC 和帧尾。 */
+static const int BINARY_PROTOCOL_MIN_FRAME_SIZE = 10;
+
+/* 自动流程开始命令：F4 收到后启动传送带扫描，等待零件进入相机视野。 */
+static const quint8 BINARY_PROTOCOL_CMD_START_CYCLE = 0x10U;
+
+/* 自动流程暂停命令：F4 收到后尽量进入安全静止点，并保留当前 cycle_id。 */
+static const quint8 BINARY_PROTOCOL_CMD_PAUSE_CYCLE = 0x11U;
+
+/* 自动流程继续命令：F4 收到后从暂停状态恢复同一个 cycle_id。 */
+static const quint8 BINARY_PROTOCOL_CMD_RESUME_CYCLE = 0x12U;
+
+/* 自动流程停止命令：F4 收到后停止传送带和可停止执行器，并作废本轮 cycle_id。 */
+static const quint8 BINARY_PROTOCOL_CMD_STOP_CYCLE = 0x13U;
+
+/* 二进制心跳命令：MP157 周期确认 F4 在线，成功只看 ACK，不再解析 STATUS 文本。 */
+static const quint8 BINARY_PROTOCOL_CMD_HEARTBEAT = 0x02U;
+
+/* 二进制模型完成命令：当前 F4 首轮保留该命令字，标定弹窗临时用它验证“非文本命令会收到 NACK”。 */
+static const quint8 BINARY_PROTOCOL_CMD_MODEL_READY = 0x30U;
+
+/* 二进制状态查询命令：F4 成功时返回 STATUS_REPORT，失败时返回 NACK。 */
+static const quint8 BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U;
+
+/* 二进制手动传送带命令：手动页扫描/停止只走 ACK/NACK，不再发送 BELTSCAN/BELTSTOP 文本。 */
+static const quint8 BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U;
+
+/* 二进制协议 ACK 命令：F4 用它确认关键命令已被接收并接受。 */
+static const quint8 BINARY_PROTOCOL_CMD_ACK = 0x80U;
+
+/* 二进制协议 NACK 命令：F4 用它拒绝命令并返回错误码、状态和细节。 */
+static const quint8 BINARY_PROTOCOL_CMD_NACK = 0x81U;
+
+/* 二进制状态回包命令：F4 用固定 24 字节负载返回协议状态和传送带状态。 */
+static const quint8 BINARY_PROTOCOL_CMD_STATUS_REPORT = 0x82U;
+
+/* 二进制故障上报命令：F4 用固定 16 字节负载返回 LDC、称重、电机等结构化错误。 */
+static const quint8 BINARY_PROTOCOL_CMD_FAULT_REPORT = 0x87U;
 
 /* 板端缺陷分类推理程序默认路径，首页“检测”按钮会通过 QProcess 调用它。 */
 static const char *DEFAULT_DEFECT_CLASSIFY_BIN = "/root/qt_camera_display/defect-classify";
@@ -6205,7 +6257,6 @@ public:
           m_cloudHealthUrl(QString::fromLatin1(DEFAULT_CLOUD_HEALTH_URL)),
           m_sdcardMount(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
           m_f4Device(QString::fromLatin1(DEFAULT_F4_SERIAL_DEVICE)),
-          m_f4Query(QString::fromLatin1(DEFAULT_F4_HEALTH_QUERY)),
           m_f4Baud(DEFAULT_F4_SERIAL_BAUD),
           m_networkStatusText(QStringLiteral("检测中")),
           m_networkStatusColor(QStringLiteral("#f4b942")),
@@ -6234,7 +6285,11 @@ public:
           m_networkProbeTimedOut(false),
           m_locationProbeTimedOut(false),
           m_locationBootProbeDone(false),
-          m_cloudProbeTimedOut(false)
+          m_cloudProbeTimedOut(false),
+          m_f4AutoCycleId(0U),
+          m_f4BinarySequence(0U),
+          m_f4AutoRunning(false),
+          m_f4AutoPaused(false)
     {
         /*
          * m_f4HeartbeatElapsed 只用于控制周期心跳节奏。
@@ -6369,7 +6424,7 @@ public:
 
     /*
      * refreshF4StatusNow 的作用：
-     *   供 QML 或人工操作立即触发一次 F4 STATUS 握手。
+     *   供 QML 或人工操作立即触发一次 F4 二进制 HEARTBEAT 握手。
      *
      * 主要流程：
      *   1. 不改变 4G、相机、云端和 SD 卡状态，只操作 F4 串口。
@@ -6385,15 +6440,15 @@ public:
 
     /*
      * sendF4Command 的作用：
-     *   从 QML 发送一条 F4 称重文本命令，例如称重标定 `CAL 1000`。
+     *   从 QML 发送一条二进制 F4 调试命令。
      *
      * 主要流程：
-     *   1. 拒绝空命令和非 CAL 命令，避免参数页误变成任意运动控制串口终端。
-     *   2. 自动补齐 `\r\n`，保证与 F407 文本命令解析入口一致。
-     *   3. 在后台线程打开 `/dev/ttySTM2` 发送命令并短暂等待 F4 文本回复。
+     *   1. 保留 QML 现有 CAL 按钮形状，但不再向 F4 写入 `CAL ...\r\n` 文本；
+     *   2. 当前 F4 尚未定义称重标定二进制命令，因此先发送保留命令字并等待二进制 ACK/NACK；
+     *   3. 收到 NACK 也以结构化错误显示，证明 MP157-F4 主链路已经不依赖文本回包。
      *
      * 参数：
-     *   commandText 是 QML 传入的命令正文，不要求自带行结束符。
+     *   commandText 是 QML 传入的原始命令文本，目前只用于校验界面仍传入 CAL。
      *
      * 返回值：
      *   true 表示后台发送任务已启动；false 表示参数非法或已有命令正在发送。
@@ -6407,12 +6462,8 @@ public:
             return false;
         }
 
-        /*
-         * 目前称重标定弹窗只开放 CAL 命令。
-         * 运动类命令必须走更窄的 sendF4BeltCommand() 白名单，避免参数页绕开安全边界。
-         */
         if (!command.startsWith(QStringLiteral("CAL "))) {
-            emit f4CommandFinished(false, QStringLiteral("当前界面只允许发送 CAL <克重> 标定命令"));
+            emit f4CommandFinished(false, QStringLiteral("当前界面只允许发起 CAL 二进制标定占位命令"));
             return false;
         }
 
@@ -6426,19 +6477,23 @@ public:
             return false;
         }
 
-        if (!command.endsWith(QStringLiteral("\r\n"))) {
-            command += QStringLiteral("\r\n");
-        }
-
         m_f4CommandRunning = true;
 
         QPointer<DeviceHealthController> self(this);
         const QString dev = m_f4Device;
         const int baud = m_f4Baud;
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_MODEL_READY, sequence, QByteArray());
 
-        QThread *workerThread = QThread::create([self, dev, command, baud]() {
+        QThread *workerThread = QThread::create([self, dev, baud, frame, sequence]() {
             QString detail;
-            const bool ok = sendF4SerialCommand(dev, command, baud, &detail);
+            const bool ok = sendF4BinaryCommand(dev,
+                                                baud,
+                                                frame,
+                                                BINARY_PROTOCOL_CMD_MODEL_READY,
+                                                sequence,
+                                                0U,
+                                                &detail);
 
             if (!self) {
                 return;
@@ -6464,15 +6519,16 @@ public:
 
     /*
      * sendF4BeltCommand 的作用：
-     *   从 QML 手动控制页发送 F407 已经实现的传送带 ASCII 命令。
+     *   从 QML 手动控制页发送 F407 二进制传送带调试命令。
      *
      * 主要流程：
-     *   1. 只允许 BELTSCAN、BELTSTOP、BELTINFO 三条已在 F407 `conveyor_motor_service.c` 中实现且有回包的命令。
-     *   2. 自动补齐 `\r\n`，保证落到 F407 USART1 文本命令入口。
-     *   3. 复用同一个串口忙标志，避免称重标定、传送带手动命令和 F4 心跳同时抢 `/dev/ttySTM2`。
+     *   1. QML 只传入 `BELT_MANUAL_SCAN`、`BELT_MANUAL_STOP`、`QUERY_STATUS` 这类按钮语义名；
+     *   2. `BELT_MANUAL_SCAN/STOP` 发送 BELT_MANUAL_CONTROL，成功只认 ACK，失败只认 NACK；
+     *   3. `QUERY_STATUS` 发送 QUERY_STATUS，成功只认 STATUS_REPORT，失败只认 NACK；
+     *   4. 复用同一个串口忙标志，避免自动流程、传送带手动命令和 F4 心跳同时抢 `/dev/ttySTM2`。
      *
      * 参数：
-     *   commandText 是 QML 传入的传送带命令正文，不要求自带行结束符。
+     *   commandText 是 QML 传入的传送带按钮语义名，不会被原样写到 F407 串口。
      *
      * 返回值：
      *   true 表示后台发送任务已启动；false 表示命令不在白名单、串口忙或线程创建失败。
@@ -6481,6 +6537,9 @@ public:
     {
         QString command = commandText.trimmed().toUpper();
         const QString commandLabel = command;
+        quint8 binaryCommand = 0U;        /* binaryCommand 保存实际发送给 F4 的二进制 CMD。 */
+        quint16 cycleId = 0U;             /* 手动传送带调试不绑定自动流程，cycle_id 固定为 0。 */
+        QByteArray payload;               /* payload 保存手动命令或状态查询负载。 */
 
         if (command.isEmpty()) {
             emit f4ManualCommandFinished(false, commandLabel, QStringLiteral("F4传送带命令为空"));
@@ -6488,13 +6547,13 @@ public:
         }
 
         /*
-         * 白名单必须和 F407 侧已有回包能力一致。
-         * BELTTRACK/BELTENABLE/BELTCAM 当前可能不返回固定 OK 文本，不适合做手动页按钮的同步回执。
+         * 白名单必须和 F407 侧已有二进制回包能力一致。
+         * 当前位置只开放扫描、停止和状态查询，避免 UI 发送 F407 尚未定义 ACK/NACK 的运动命令。
          */
         if (!isAllowedF4BeltCommand(command)) {
             emit f4ManualCommandFinished(false,
                                          commandLabel,
-                                         QStringLiteral("当前界面只允许发送 BELTSCAN/BELTSTOP/BELTINFO"));
+                                         QStringLiteral("当前界面只允许发送 BELT_MANUAL_SCAN/BELT_MANUAL_STOP/QUERY_STATUS"));
             return false;
         }
 
@@ -6510,19 +6569,39 @@ public:
             return false;
         }
 
-        if (!command.endsWith(QStringLiteral("\r\n"))) {
-            command += QStringLiteral("\r\n");
+        if (command == QStringLiteral("BELT_MANUAL_SCAN")) {
+            binaryCommand = BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL;
+            appendLe16(&payload, cycleId);
+            payload.append(static_cast<char>(0x01)); /* action=1，表示传送带进入扫描巡航。 */
+            payload.append(static_cast<char>(0x00)); /* flags=0，首版无额外标志。 */
+        } else if (command == QStringLiteral("BELT_MANUAL_STOP")) {
+            binaryCommand = BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL;
+            appendLe16(&payload, cycleId);
+            payload.append(static_cast<char>(0x00)); /* action=0，表示传送带停止。 */
+            payload.append(static_cast<char>(0x00)); /* flags=0，首版无额外标志。 */
+        } else if (command == QStringLiteral("QUERY_STATUS")) {
+            binaryCommand = BINARY_PROTOCOL_CMD_QUERY_STATUS;
+            appendLe16(&payload, cycleId);
+            payload.append(static_cast<char>(0x03)); /* query_mask bit0/bit1：查询协议状态和传送带状态。 */
         }
 
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(binaryCommand, sequence, payload);
         m_f4CommandRunning = true;
 
         QPointer<DeviceHealthController> self(this);
         const QString dev = m_f4Device;
         const int baud = m_f4Baud;
 
-        QThread *workerThread = QThread::create([self, dev, command, commandLabel, baud]() {
+        QThread *workerThread = QThread::create([self, dev, baud, frame, commandLabel, binaryCommand, sequence, cycleId]() {
             QString detail;
-            const bool ok = sendF4SerialCommand(dev, command, baud, &detail);
+            bool ok = false;
+
+            if (binaryCommand == BINARY_PROTOCOL_CMD_QUERY_STATUS) {
+                ok = sendF4BinaryStatusQuery(dev, baud, frame, sequence, cycleId, &detail);
+            } else {
+                ok = sendF4BinaryCommand(dev, baud, frame, binaryCommand, sequence, cycleId, &detail);
+            }
 
             if (!self) {
                 return;
@@ -6539,6 +6618,137 @@ public:
         if (workerThread == nullptr) {
             m_f4CommandRunning = false;
             emit f4ManualCommandFinished(false, commandLabel, QStringLiteral("F4传送带命令线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
+     * sendF4AutoControlCommand 的作用：
+     *   把首页“开始、暂停、继续、停止”四个按钮映射为 MP157->F407 二进制自动检测协议帧。
+     *
+     * 主要流程：
+     *   1. 根据当前 MP157 本地自动流程状态校验 action 是否允许，避免停止后继续、空闲时暂停等误操作。
+     *   2. 为开始命令创建新的 cycle_id；暂停、继续和停止复用当前 cycle_id。
+     *   3. 组装协议帧并在后台线程打开 `/dev/ttySTM2` 发送，等待 F4 返回 ACK/NACK 二进制帧。
+     *   4. 后台线程结束后回到 Qt 主线程更新本地 running/paused 状态，再通知 QML 更新首页文案。
+     *
+     * 参数：
+     *   action 是 QML 传入的动作标识，只允许 start、pause、resume、stop。
+     *
+     * 返回值：
+     *   true 表示后台发送任务已启动；false 表示动作非法、串口忙、状态不允许或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4AutoControlCommand(const QString &action)
+    {
+        const QString normalizedAction = action.trimmed().toLower();
+        quint8 command = 0U;             /* command 保存要写入协议 CMD 字段的命令字。 */
+        quint16 cycleId = m_f4AutoCycleId; /* cycleId 保存本次自动流程命令归属的流程号。 */
+        QByteArray payload;              /* payload 保存当前命令的固定负载，字段均按协议小端写入。 */
+        QString rejectText;              /* rejectText 保存本地状态机拒绝动作时给 QML 的中文原因。 */
+
+        if (m_f4CommandRunning) {
+            emit f4AutoControlFinished(false,
+                                       normalizedAction,
+                                       m_f4AutoCycleId,
+                                       QStringLiteral("上一条F4串口命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4AutoControlFinished(false,
+                                       normalizedAction,
+                                       m_f4AutoCycleId,
+                                       QStringLiteral("F4状态刷新仍在进行，请稍后再操作自动流程"));
+            return false;
+        }
+
+        /*
+         * 首页四按钮的本地状态机：
+         * start 只在空闲、停止或完成后新建 cycle；
+         * pause 只允许暂停正在运行且未暂停的 cycle；
+         * resume 只允许恢复已暂停的同一个 cycle；
+         * stop 允许终止运行中或暂停中的 cycle，空闲时直接拒绝。
+         */
+        if (normalizedAction == QStringLiteral("start")) {
+            if (m_f4AutoRunning || m_f4AutoPaused) {
+                rejectText = QStringLiteral("当前流程未停止，请先按停止后再开始新检测");
+            } else {
+                cycleId = nextF4AutoCycleId();
+                command = BINARY_PROTOCOL_CMD_START_CYCLE;
+                appendLe16(&payload, cycleId);
+                payload.append(static_cast<char>(0x00)); /* mode=0，表示完整自动检测。 */
+                appendLe16(&payload, 0x0007U);           /* option_bits bit0/1/2：称重、电感、分拣均启用。 */
+                payload.append(static_cast<char>(0x00)); /* camera_profile=0，调试阶段使用默认相机位置方案。 */
+            }
+        } else if (normalizedAction == QStringLiteral("pause")) {
+            if (!m_f4AutoRunning || m_f4AutoPaused || cycleId == 0U) {
+                rejectText = QStringLiteral("当前没有正在运行的自动检测流程可暂停");
+            } else {
+                command = BINARY_PROTOCOL_CMD_PAUSE_CYCLE;
+                appendLe16(&payload, cycleId);
+                payload.append(static_cast<char>(0x00)); /* pause_reason=0，表示用户按下暂停。 */
+                payload.append(static_cast<char>(0x01)); /* pause_mode=1，表示尽量进入安全静止点。 */
+            }
+        } else if (normalizedAction == QStringLiteral("resume")) {
+            if (!m_f4AutoPaused || cycleId == 0U) {
+                rejectText = QStringLiteral("停止或空闲状态不能继续，请按开始创建新检测流程");
+            } else {
+                command = BINARY_PROTOCOL_CMD_RESUME_CYCLE;
+                appendLe16(&payload, cycleId);
+                payload.append(static_cast<char>(0x00)); /* resume_mode=0，表示从暂停点继续。 */
+            }
+        } else if (normalizedAction == QStringLiteral("stop")) {
+            if (!m_f4AutoRunning && !m_f4AutoPaused) {
+                rejectText = QStringLiteral("当前没有自动检测流程需要停止");
+            } else {
+                command = BINARY_PROTOCOL_CMD_STOP_CYCLE;
+                appendLe16(&payload, cycleId);
+                payload.append(static_cast<char>(0x00)); /* stop_reason=0，表示用户按下停止。 */
+                payload.append(static_cast<char>(0x00)); /* stop_level=0，表示普通停止而非急停。 */
+            }
+        } else {
+            rejectText = QStringLiteral("未知自动流程动作：") + action;
+        }
+
+        if (!rejectText.isEmpty()) {
+            emit f4AutoControlFinished(false, normalizedAction, cycleId, rejectText);
+            return false;
+        }
+
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(command, sequence, payload);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+        m_f4CommandRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        QThread *workerThread = QThread::create([self, dev, baud, frame, normalizedAction, cycleId, command, sequence]() {
+            QString detail;
+            const bool ok = sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4AutoControlFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, normalizedAction),
+                                      Q_ARG(quint16, cycleId),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            emit f4AutoControlFinished(false,
+                                       normalizedAction,
+                                       cycleId,
+                                       QStringLiteral("F4自动流程命令线程创建失败"));
             return false;
         }
 
@@ -6574,6 +6784,9 @@ signals:
 
     /* f4ManualCommandFinished 通知 QML 手动控制页的 F4 命令发送完成，并带回命令名和回复详情。 */
     void f4ManualCommandFinished(bool ok, const QString &command, const QString &detail);
+
+    /* f4AutoControlFinished 通知 QML 首页自动流程命令发送完成，并带回动作、流程号和 ACK/NACK 详情。 */
+    void f4AutoControlFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
 
 private slots:
     /*
@@ -6824,8 +7037,8 @@ private slots:
      *   接收后台 F4 串口握手结果，并在 Qt 主线程更新 F4 接入状态。
      *
      * 参数：
-     *   ok 为 true 表示收到 ACK/OK/F4/READY 之一。
-     *   detail 保存失败原因或辅助说明。
+     *   ok 为 true 表示收到匹配 HEARTBEAT 的二进制 ACK。
+     *   detail 保存 ACK/NACK 解析结果、FAULT_REPORT 摘要或串口失败原因。
      *
      * 返回值：
      *   无返回值。
@@ -6835,7 +7048,7 @@ private slots:
         m_f4ProbeRunning = false;
         if (ok) {
             setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
-            setDetailText(QStringLiteral("F4 串口握手成功"));
+            setDetailText(QStringLiteral("F4 串口握手成功：") + detail);
         } else {
             setF4Status(QStringLiteral("待接入"), QStringLiteral("#f4b942"));
             setDetailText(QStringLiteral("F4 待接入：") + detail);
@@ -6847,8 +7060,8 @@ private slots:
      *   接收后台 F4 命令发送结果，并把结果同步给 QML 标定弹窗和顶部健康详情。
      *
      * 参数：
-     *   ok 为 true 表示命令已写入串口且回复中包含成功关键字。
-     *   detail 是串口回复文本或失败原因。
+     *   ok 为 true 表示命令已写入串口且收到匹配的二进制 ACK。
+     *   detail 是 ACK/NACK 二进制解析结果、FAULT_REPORT 摘要或失败原因。
      *
      * 返回值：
      *   无返回值；函数会释放发送忙标志并发出 f4CommandFinished 信号。
@@ -6872,9 +7085,9 @@ private slots:
      *   接收后台 F4 手动控制命令结果，并把命令名和回复详情同步给 QML 手动控制页。
      *
      * 参数：
-     *   ok 为 true 表示命令已写入串口且回复中包含成功关键字。
-     *   command 是本次下发的高层文本命令，例如 BELTSCAN。
-     *   detail 是串口回复文本或失败原因。
+     *   ok 为 true 表示命令已写入串口且收到匹配的二进制 ACK 或 STATUS_REPORT。
+     *   command 是本次按钮语义名称，例如 BELT_MANUAL_SCAN；底层不会把该字符串写给 F4。
+     *   detail 是 ACK/NACK/STATUS_REPORT 二进制解析结果或失败原因。
      *
      * 返回值：
      *   无返回值；函数会释放发送忙标志并发出 f4ManualCommandFinished 信号。
@@ -6893,7 +7106,65 @@ private slots:
         emit f4ManualCommandFinished(ok, command, detail);
     }
 
+    /*
+     * handleF4AutoControlFinished 的作用：
+     *   接收后台二进制自动流程命令结果，并在 Qt 主线程维护 MP157 本地 cycle 状态。
+     *
+     * 主要流程：
+     *   1. 释放 F4 串口命令忙标志，让后续 CAL、BELT 或自动流程命令可以继续下发。
+     *   2. ACK 成功时根据 action 更新 running/paused 状态；NACK 或超时时不推进本地状态。
+     *   3. 把 ACK/NACK 详情写入设备健康详情，并发信号给 QML 刷新首页状态和底部提示。
+     *
+     * 参数：
+     *   ok 为 true 表示 F4 返回了匹配当前命令、SEQ 和 cycle_id 的 ACK。
+     *   action 是本次首页动作，取值 start、pause、resume、stop。
+     *   cycleId 是本次命令归属的自动检测流程号。
+     *   detail 是 ACK/NACK 解析结果或串口失败原因。
+     *
+     * 返回值：
+     *   无返回值。
+     */
+    void handleF4AutoControlFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail)
+    {
+        m_f4CommandRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            if (action == QStringLiteral("start")) {
+                m_f4AutoCycleId = cycleId;
+                m_f4AutoRunning = true;
+                m_f4AutoPaused = false;
+            } else if (action == QStringLiteral("pause")) {
+                m_f4AutoRunning = true;
+                m_f4AutoPaused = true;
+            } else if (action == QStringLiteral("resume")) {
+                m_f4AutoRunning = true;
+                m_f4AutoPaused = false;
+            } else if (action == QStringLiteral("stop")) {
+                m_f4AutoRunning = false;
+                m_f4AutoPaused = false;
+            }
+            setDetailText(QStringLiteral("F4自动流程命令完成：") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4自动流程命令失败：") + detail);
+        }
+
+        emit f4AutoControlFinished(ok, action, cycleId, detail);
+    }
+
 private:
+    /*
+     * F4BinaryReply 的作用：
+     *   保存从 F407 收到的一帧二进制协议解析结果，避免 ACK/NACK 处理函数反复解析字节偏移。
+     */
+    struct F4BinaryReply
+    {
+        quint8 command;       /* command 保存回复帧 CMD 字段，例如 ACK=0x80 或 NACK=0x81。 */
+        quint16 sequence;     /* sequence 保存回复帧自身 SEQ，不等于被确认的请求 SEQ。 */
+        QByteArray payload;   /* payload 保存回复帧负载，ACK/NACK 字段从这里按小端读取。 */
+        QByteArray rawFrame;  /* rawFrame 保存完整原始帧，用于 CRC 错误或未知命令时打印十六进制排查。 */
+    };
+
     /*
      * isAllowedF4BeltCommand 的作用：
      *   校验 QML 手动传送带按钮是否只发送 F407 当前已实现且能同步回包的安全命令。
@@ -6906,9 +7177,520 @@ private:
      */
     static bool isAllowedF4BeltCommand(const QString &command)
     {
-        return command == QStringLiteral("BELTSCAN")
-                || command == QStringLiteral("BELTSTOP")
-                || command == QStringLiteral("BELTINFO");
+        return command == QStringLiteral("BELT_MANUAL_SCAN")
+                || command == QStringLiteral("BELT_MANUAL_STOP")
+                || command == QStringLiteral("QUERY_STATUS");
+    }
+
+    /*
+     * nextF4AutoCycleId 的作用：
+     *   为首页“开始”创建新的自动检测流程号。
+     *
+     * 关键说明：
+     *   cycle_id=0 保留为空闲/无流程语义，因此自增溢出到 0 时继续加到 1。
+     *
+     * 返回值：
+     *   返回新的非 0 cycle_id。
+     */
+    quint16 nextF4AutoCycleId()
+    {
+        quint16 nextId = static_cast<quint16>(m_f4AutoCycleId + 1U);
+
+        if (nextId == 0U) {
+            nextId = 1U;
+        }
+
+        m_f4AutoCycleId = nextId;
+        return m_f4AutoCycleId;
+    }
+
+    /*
+     * appendLe16 的作用：
+     *   按二进制协议小端序向负载追加一个 16 位无符号整数。
+     *
+     * 参数：
+     *   payload 是要追加字段的负载缓冲，不能为 NULL。
+     *   value 是要写入的字段值。
+     *
+     * 返回值：
+     *   无返回值；函数直接修改 payload。
+     */
+    static void appendLe16(QByteArray *payload, quint16 value)
+    {
+        payload->append(static_cast<char>(value & 0x00FFU));
+        payload->append(static_cast<char>((value >> 8) & 0x00FFU));
+    }
+
+    /*
+     * readLe16 的作用：
+     *   从二进制协议负载或帧头中按小端序读取一个 16 位无符号整数。
+     *
+     * 参数：
+     *   data 是源字节数组。
+     *   offset 是低字节所在下标，调用方必须先保证 offset+1 未越界。
+     *
+     * 返回值：
+     *   返回解析出的 16 位整数。
+     */
+    static quint16 readLe16(const QByteArray &data, int offset)
+    {
+        const quint16 low = static_cast<quint8>(data.at(offset));
+        const quint16 high = static_cast<quint8>(data.at(offset + 1));
+        return static_cast<quint16>(low | static_cast<quint16>(high << 8));
+    }
+
+    /*
+     * readLe32Signed 的作用：
+     *   从二进制协议负载中按小端序读取一个 32 位有符号整数。
+     *
+     * 参数：
+     *   data 是源字节数组。
+     *   offset 是最低字节所在下标，调用方必须先保证 offset+3 未越界。
+     *
+     * 返回值：
+     *   返回解析出的 32 位有符号整数，当前用于 STATUS_REPORT 的传送带像素误差。
+     */
+    static qint32 readLe32Signed(const QByteArray &data, int offset)
+    {
+        const quint32 b0 = static_cast<quint8>(data.at(offset));
+        const quint32 b1 = static_cast<quint8>(data.at(offset + 1));
+        const quint32 b2 = static_cast<quint8>(data.at(offset + 2));
+        const quint32 b3 = static_cast<quint8>(data.at(offset + 3));
+        return static_cast<qint32>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+    }
+
+    /*
+     * f4BinaryCommandName 的作用：
+     *   把二进制协议命令字转换成便于界面、日志和串口调试阅读的短名称。
+     *
+     * 参数：
+     *   command 是协议 CMD 字段。
+     *
+     * 返回值：
+     *   返回命令名称；未知命令返回带十六进制值的 UNKNOWN。
+     */
+    static QString f4BinaryCommandName(quint8 command)
+    {
+        switch (command) {
+        case BINARY_PROTOCOL_CMD_HEARTBEAT:
+            return QStringLiteral("HEARTBEAT");
+        case BINARY_PROTOCOL_CMD_START_CYCLE:
+            return QStringLiteral("START_CYCLE");
+        case BINARY_PROTOCOL_CMD_PAUSE_CYCLE:
+            return QStringLiteral("PAUSE_CYCLE");
+        case BINARY_PROTOCOL_CMD_RESUME_CYCLE:
+            return QStringLiteral("RESUME_CYCLE");
+        case BINARY_PROTOCOL_CMD_STOP_CYCLE:
+            return QStringLiteral("STOP_CYCLE");
+        case BINARY_PROTOCOL_CMD_QUERY_STATUS:
+            return QStringLiteral("QUERY_STATUS");
+        case BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL:
+            return QStringLiteral("BELT_MANUAL_CONTROL");
+        case BINARY_PROTOCOL_CMD_ACK:
+            return QStringLiteral("ACK");
+        case BINARY_PROTOCOL_CMD_NACK:
+            return QStringLiteral("NACK");
+        case BINARY_PROTOCOL_CMD_STATUS_REPORT:
+            return QStringLiteral("STATUS_REPORT");
+        case BINARY_PROTOCOL_CMD_FAULT_REPORT:
+            return QStringLiteral("FAULT_REPORT");
+        default:
+            return QStringLiteral("UNKNOWN_0x") + QString::number(command, 16).toUpper();
+        }
+    }
+
+    /*
+     * f4FaultSourceName 的作用：
+     *   把 F4 FAULT_REPORT 中的故障来源编号转换成界面可读短名称。
+     *
+     * 参数：
+     *   source 是协议中的 fault_source 字段。
+     *
+     * 返回值：
+     *   返回 UART/CONVEYOR/CAMERA_MOTOR/ARM/WEIGHT/LDC 等短名称；未知值返回 SOURCE_<数字>。
+     */
+    static QString f4FaultSourceName(quint8 source)
+    {
+        switch (source) {
+        case 1:
+            return QStringLiteral("UART");
+        case 2:
+            return QStringLiteral("CONVEYOR");
+        case 3:
+            return QStringLiteral("CAMERA_MOTOR");
+        case 4:
+            return QStringLiteral("ARM");
+        case 5:
+            return QStringLiteral("WEIGHT");
+        case 6:
+            return QStringLiteral("LDC");
+        default:
+            return QStringLiteral("SOURCE_") + QString::number(source);
+        }
+    }
+
+    /*
+     * f4FaultSeverityName 的作用：
+     *   把 F4 FAULT_REPORT 中的严重等级转换成界面可读短名称。
+     *
+     * 参数：
+     *   severity 是协议中的 severity 字段。
+     *
+     * 返回值：
+     *   返回 INFO/WARNING/STOP；未知值返回 SEVERITY_<数字>。
+     */
+    static QString f4FaultSeverityName(quint8 severity)
+    {
+        switch (severity) {
+        case 1:
+            return QStringLiteral("INFO");
+        case 2:
+            return QStringLiteral("WARNING");
+        case 3:
+            return QStringLiteral("STOP");
+        default:
+            return QStringLiteral("SEVERITY_") + QString::number(severity);
+        }
+    }
+
+    /*
+     * describeF4FaultReport 的作用：
+     *   把 F4 异步 FAULT_REPORT 二进制负载转换成状态栏可读摘要。
+     *
+     * 参数：
+     *   reply 是已经通过 CRC 校验的二进制帧。
+     *
+     * 返回值：
+     *   返回故障摘要；如果负载长度不对，返回长度错误并带原始字节。
+     */
+    static QString describeF4FaultReport(const F4BinaryReply &reply)
+    {
+        if (reply.payload.size() != 16) {
+            return QStringLiteral("FAULT_REPORT负载长度错误：")
+                    + QString::number(reply.payload.size())
+                    + QStringLiteral(" raw=")
+                    + hexByteString(reply.rawFrame);
+        }
+
+        const quint16 cycleId = readLe16(reply.payload, 0);
+        const quint16 faultCode = readLe16(reply.payload, 2);
+        const quint8 source = static_cast<quint8>(reply.payload.at(4));
+        const quint8 severity = static_cast<quint8>(reply.payload.at(5));
+        const quint8 state = static_cast<quint8>(reply.payload.at(6));
+        const qint32 detailValue = readLe32Signed(reply.payload, 8);
+        const quint16 relatedSequence = readLe16(reply.payload, 12);
+        const quint16 faultBits = readLe16(reply.payload, 14);
+
+        return QStringLiteral("FAULT_REPORT cycle=") + QString::number(cycleId)
+                + QStringLiteral(" source=") + f4FaultSourceName(source)
+                + QStringLiteral(" severity=") + f4FaultSeverityName(severity)
+                + QStringLiteral(" code=") + QString::number(faultCode)
+                + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                + QStringLiteral(" detail=") + QString::number(detailValue)
+                + QStringLiteral(" related_seq=") + QString::number(relatedSequence)
+                + QStringLiteral(" fault=0x") + QString::number(faultBits, 16).toUpper();
+    }
+
+    /*
+     * f4BeltModeName 的作用：
+     *   把 F4 STATUS_REPORT 中的传送带模式编号转换成界面可读短文本。
+     *
+     * 参数：
+     *   mode 是传送带模式，0=STOP，1=SCAN，2=TRACK。
+     *
+     * 返回值：
+     *   返回 STOP/SCAN/TRACK；未知模式返回 BELT_<数字>。
+     */
+    static QString f4BeltModeName(quint8 mode)
+    {
+        switch (mode) {
+        case 0:
+            return QStringLiteral("STOP");
+        case 1:
+            return QStringLiteral("SCAN");
+        case 2:
+            return QStringLiteral("TRACK");
+        default:
+            return QStringLiteral("BELT_") + QString::number(mode);
+        }
+    }
+
+    /*
+     * f4ProtocolStateName 的作用：
+     *   把 F4 ACK/NACK 中携带的主状态枚举转换成中文短文本，便于现场定位当前流程阶段。
+     *
+     * 参数：
+     *   state 是协议 8.4 定义的 F4 主状态枚举。
+     *
+     * 返回值：
+     *   返回状态中文名；未知值返回 STATE_<数字>。
+     */
+    static QString f4ProtocolStateName(quint8 state)
+    {
+        switch (state) {
+        case 0:
+            return QStringLiteral("IDLE");
+        case 1:
+            return QStringLiteral("SCANNING");
+        case 2:
+            return QStringLiteral("TRACKING");
+        case 3:
+            return QStringLiteral("CENTERED_HOLD");
+        case 4:
+            return QStringLiteral("WAIT_MODEL");
+        case 5:
+            return QStringLiteral("ARM_PICKING");
+        case 6:
+            return QStringLiteral("WEIGHING");
+        case 7:
+            return QStringLiteral("LDC_TESTING");
+        case 8:
+            return QStringLiteral("SORTING");
+        case 9:
+            return QStringLiteral("DONE");
+        case 10:
+            return QStringLiteral("PAUSED");
+        case 11:
+            return QStringLiteral("STOPPED");
+        case 12:
+            return QStringLiteral("FAULT");
+        default:
+            return QStringLiteral("STATE_") + QString::number(state);
+        }
+    }
+
+    /*
+     * f4NackErrorName 的作用：
+     *   把 NACK error_code 转换成协议文档中的错误名称，便于判断是状态不允许、忙还是 cycle 不匹配。
+     *
+     * 参数：
+     *   errorCode 是协议 8.5 定义的 NACK 错误码。
+     *
+     * 返回值：
+     *   返回错误名称；未知值返回 ERR_<数字>。
+     */
+    static QString f4NackErrorName(quint8 errorCode)
+    {
+        switch (errorCode) {
+        case 1:
+            return QStringLiteral("ERR_CRC");
+        case 2:
+            return QStringLiteral("ERR_FRAME_LENGTH");
+        case 3:
+            return QStringLiteral("ERR_CMD_UNKNOWN");
+        case 4:
+            return QStringLiteral("ERR_PAYLOAD_LENGTH");
+        case 5:
+            return QStringLiteral("ERR_FIELD_RANGE");
+        case 6:
+            return QStringLiteral("ERR_STATE_NOT_ALLOWED");
+        case 7:
+            return QStringLiteral("ERR_BUSY");
+        case 8:
+            return QStringLiteral("ERR_CYCLE_MISMATCH");
+        case 9:
+            return QStringLiteral("ERR_TIMEOUT");
+        case 10:
+            return QStringLiteral("ERR_HARDWARE_FAULT");
+        default:
+            return QStringLiteral("ERR_") + QString::number(errorCode);
+        }
+    }
+
+    /*
+     * crc16CcittFalse 的作用：
+     *   计算本文档二进制协议使用的 CRC16-CCITT-FALSE。
+     *
+     * 主要流程：
+     *   1. 使用 0xFFFF 初始化 CRC。
+     *   2. 每个输入字节先移入 CRC 高 8 位。
+     *   3. 每位按多项式 0x1021 左移计算，最终不反射、不异或。
+     *
+     * 参数：
+     *   data 是需要参与 CRC 的字节数组，调用方应传入 VER 到 PAYLOAD 范围。
+     *
+     * 返回值：
+     *   返回 16 位 CRC，组帧时按低字节、高字节发送。
+     */
+    static quint16 crc16CcittFalse(const QByteArray &data)
+    {
+        quint16 crc = 0xFFFFU;
+
+        for (int i = 0; i < data.size(); ++i) {
+            crc ^= static_cast<quint16>(static_cast<quint8>(data.at(i)) << 8);
+            for (int bit = 0; bit < 8; ++bit) {
+                if ((crc & 0x8000U) != 0U) {
+                    crc = static_cast<quint16>((crc << 1) ^ 0x1021U);
+                } else {
+                    crc = static_cast<quint16>(crc << 1);
+                }
+            }
+        }
+
+        return crc;
+    }
+
+    /*
+     * buildF4BinaryFrame 的作用：
+     *   按 `A5 5A VER CMD LEN SEQ PAYLOAD CRC 6B` 格式组装 MP157 发给 F407 的二进制短帧。
+     *
+     * 参数：
+     *   command 是 CMD 字段。
+     *   sequence 是 MP157 本地帧序号。
+     *   payload 是命令负载，长度不能超过 BINARY_PROTOCOL_MAX_PAYLOAD。
+     *
+     * 返回值：
+     *   返回完整可直接写入串口的二进制帧；负载过长时返回空数组。
+     */
+    static QByteArray buildF4BinaryFrame(quint8 command, quint16 sequence, const QByteArray &payload)
+    {
+        if (payload.size() > BINARY_PROTOCOL_MAX_PAYLOAD) {
+            return QByteArray();
+        }
+
+        QByteArray frame;       /* frame 保存最终完整帧，写串口时不再二次拼接。 */
+        QByteArray crcScope;    /* crcScope 保存 VER 到 PAYLOAD 范围，用于 CRC16-CCITT-FALSE。 */
+        const quint8 length = static_cast<quint8>(payload.size());
+
+        frame.append(static_cast<char>(BINARY_PROTOCOL_SOF0));
+        frame.append(static_cast<char>(BINARY_PROTOCOL_SOF1));
+        frame.append(static_cast<char>(BINARY_PROTOCOL_VERSION));
+        frame.append(static_cast<char>(command));
+        frame.append(static_cast<char>(length));
+        frame.append(static_cast<char>(sequence & 0x00FFU));
+        frame.append(static_cast<char>((sequence >> 8) & 0x00FFU));
+        frame.append(payload);
+
+        crcScope = frame.mid(2, 5 + payload.size());
+        const quint16 crc = crc16CcittFalse(crcScope);
+        frame.append(static_cast<char>(crc & 0x00FFU));
+        frame.append(static_cast<char>((crc >> 8) & 0x00FFU));
+        frame.append(static_cast<char>(BINARY_PROTOCOL_EOF));
+
+        return frame;
+    }
+
+    /*
+     * hexByteString 的作用：
+     *   把二进制帧转换成 `A5 5A 01 ...` 形式的十六进制文本，便于底部提示和串口日志核对。
+     *
+     * 参数：
+     *   data 是待显示的二进制数据。
+     *
+     * 返回值：
+     *   返回空格分隔的大写十六进制字符串。
+     */
+    static QString hexByteString(const QByteArray &data)
+    {
+        QStringList parts;
+
+        for (int i = 0; i < data.size(); ++i) {
+            parts << QStringLiteral("%1")
+                     .arg(static_cast<int>(static_cast<quint8>(data.at(i))), 2, 16, QLatin1Char('0'))
+                     .toUpper();
+        }
+
+        return parts.join(QLatin1Char(' '));
+    }
+
+    /*
+     * parseF4BinaryFrameFromBuffer 的作用：
+     *   从串口累计字节流中寻找并解析一帧完整 F4 二进制回复。
+     *
+     * 主要流程：
+     *   1. 丢弃帧头前的噪声字节，保留可能成为下一帧 SOF0 的尾字节。
+     *   2. 根据 LEN 计算完整帧长度，等待数据足够后再校验 EOF 和 CRC。
+     *   3. CRC 覆盖 VER 到 PAYLOAD，解析成功后填充 F4BinaryReply。
+     *
+     * 参数：
+     *   buffer 是持续追加 read 数据的缓冲，成功解析或丢弃噪声时会被修改。
+     *   reply 用于返回解析结果。
+     *   errorText 用于返回明确错误原因，可为 NULL。
+     *
+     * 返回值：
+     *   true 表示成功解析出一帧；false 表示数据不足或帧校验失败。
+     */
+    static bool parseF4BinaryFrameFromBuffer(QByteArray *buffer, F4BinaryReply *reply, QString *errorText)
+    {
+        while (buffer->size() >= 2) {
+            int headerIndex = -1;
+
+            for (int i = 0; i + 1 < buffer->size(); ++i) {
+                if (static_cast<quint8>(buffer->at(i)) == BINARY_PROTOCOL_SOF0
+                        && static_cast<quint8>(buffer->at(i + 1)) == BINARY_PROTOCOL_SOF1) {
+                    headerIndex = i;
+                    break;
+                }
+            }
+
+            if (headerIndex < 0) {
+                const bool keepLastSof0 = static_cast<quint8>(buffer->at(buffer->size() - 1)) == BINARY_PROTOCOL_SOF0;
+                buffer->clear();
+                if (keepLastSof0) {
+                    buffer->append(static_cast<char>(BINARY_PROTOCOL_SOF0));
+                }
+                return false;
+            }
+
+            if (headerIndex > 0) {
+                buffer->remove(0, headerIndex);
+            }
+
+            if (buffer->size() < BINARY_PROTOCOL_MIN_FRAME_SIZE) {
+                return false;
+            }
+
+            const quint8 payloadLength = static_cast<quint8>(buffer->at(4));
+            if (payloadLength > BINARY_PROTOCOL_MAX_PAYLOAD) {
+                if (errorText) {
+                    *errorText = QStringLiteral("F4二进制帧负载过长：") + QString::number(payloadLength);
+                }
+                buffer->remove(0, 1);
+                continue;
+            }
+
+            const int frameSize = BINARY_PROTOCOL_MIN_FRAME_SIZE + payloadLength;
+            if (buffer->size() < frameSize) {
+                return false;
+            }
+
+            const QByteArray frame = buffer->left(frameSize);
+            buffer->remove(0, frameSize);
+
+            if (static_cast<quint8>(frame.at(frameSize - 1)) != BINARY_PROTOCOL_EOF) {
+                if (errorText) {
+                    *errorText = QStringLiteral("F4二进制帧帧尾错误：") + hexByteString(frame);
+                }
+                continue;
+            }
+
+            if (static_cast<quint8>(frame.at(2)) != BINARY_PROTOCOL_VERSION) {
+                if (errorText) {
+                    *errorText = QStringLiteral("F4二进制协议版本不匹配：") + QString::number(static_cast<quint8>(frame.at(2)));
+                }
+                continue;
+            }
+
+            const quint16 expectedCrc = readLe16(frame, 7 + payloadLength);
+            const quint16 actualCrc = crc16CcittFalse(frame.mid(2, 5 + payloadLength));
+            if (expectedCrc != actualCrc) {
+                if (errorText) {
+                    *errorText = QStringLiteral("F4二进制帧CRC错误，recv=0x")
+                            + QString::number(expectedCrc, 16).toUpper()
+                            + QStringLiteral(" calc=0x")
+                            + QString::number(actualCrc, 16).toUpper();
+                }
+                continue;
+            }
+
+            reply->command = static_cast<quint8>(frame.at(3));
+            reply->sequence = readLe16(frame, 5);
+            reply->payload = frame.mid(7, payloadLength);
+            reply->rawFrame = frame;
+            return true;
+        }
+
+        return false;
     }
 
     /*
@@ -7146,10 +7928,10 @@ private:
 
     /*
      * startF4Probe 的作用：
-     *   在后台线程里执行 F4 串口握手，避免串口等待阻塞 QML。
+     *   在后台线程里执行 F4 二进制心跳，避免串口等待阻塞 QML。
      *
      * 参数：
-     *   forceNow 为 true 时立即发送 STATUS，适合人工点击刷新或标定前检查；
+     *   forceNow 为 true 时立即发送 HEARTBEAT，适合人工点击刷新或标定前检查；
      *   forceNow 为 false 时按 2 分钟间隔发送心跳，避免 8 秒健康刷新频繁占用 RS485。
      *
      * 返回值：
@@ -7171,12 +7953,13 @@ private:
         m_f4HeartbeatElapsed.restart();
         QPointer<DeviceHealthController> self(this);
         const QString dev = m_f4Device;
-        const QString query = m_f4Query;
         const int baud = m_f4Baud;
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_HEARTBEAT, sequence, QByteArray());
 
-        QThread *workerThread = QThread::create([self, dev, query, baud]() {
+        QThread *workerThread = QThread::create([self, dev, baud, frame, sequence]() {
             QString detail;
-            const bool ok = probeF4Serial(dev, query, baud, &detail);
+            const bool ok = sendF4BinaryHeartbeat(dev, baud, frame, sequence, &detail);
 
             if (!self) {
                 return;
@@ -7408,29 +8191,33 @@ private:
     }
 
     /*
-     * sendF4SerialCommand 的作用：
-     *   打开 MP157 到 F4 的 RS485/USART 串口，发送一条文本命令并等待短回复。
+     * readF4BinaryReply 的作用：
+     *   从 F4 串口读取一帧完整二进制协议回复，并完成帧头、长度、帧尾和 CRC 校验。
+     *
+     * 主要流程：
+     *   1. 通过 select 进行短周期等待，避免 F4 没回复时后台线程长时间阻塞。
+     *   2. 把多次 read 的数据追加到 buffer，允许串口粘包、半包和上电调试日志。
+     *   3. 调用 parseF4BinaryFrameFromBuffer() 找到第一帧合法二进制帧。
      *
      * 参数：
-     *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
-     *   command 是要发送的完整命令，调用方应保证已经包含 `\r\n`。
-     *   baud 是串口波特率，当前默认 115200。
-     *   detail 用于返回 F4 回复内容或失败原因，可为 NULL。
+     *   fd 是已经打开并配置好的 F4 串口文件描述符。
+     *   reply 用于返回合法二进制帧解析结果，不能为 NULL。
+     *   errorText 用于返回失败原因，可为 NULL。
      *
      * 返回值：
-     *   回复中包含 ACK、OK、F4 或 READY 时返回 true；
-     *   回复中包含 ERROR、打开失败、配置失败、写入失败或等待超时时返回 false。
+     *   成功解析出合法帧返回 true；超时、read 失败或只收到坏帧返回 false。
      */
-    static QString readF4ReplyText(int fd, QString *errorText)
+    static bool readF4BinaryReply(int fd, F4BinaryReply *reply, QString *errorText)
     {
-        QByteArray reply;                /* reply 保存本次串口命令收到的原始字节，最多保留 512 字节用于界面展示。 */
-        char buffer[128];                /* buffer 是单次 read 的临时缓冲，避免一次性栈空间过大。 */
-        QElapsedTimer elapsed;           /* elapsed 用于限制总等待时间，防止 F4 回包不带换行时线程长时间阻塞。 */
+        QByteArray buffer;       /* buffer 保存累计收到的串口字节，解析函数会从中丢弃噪声和已消费帧。 */
+        char chunk[128];         /* chunk 是单次 read 的临时缓冲，大小足够容纳首版 58 字节以内短帧。 */
+        QElapsedTimer elapsed;   /* elapsed 限制总等待时间，避免 F4 未回 ACK 时后台线程长时间占用。 */
+        QString lastFrameError;  /* lastFrameError 保存最近一帧坏帧原因，超时时优先反馈给界面。 */
 
         elapsed.start();
-        while (elapsed.elapsed() < 450 && reply.size() < 512) {
-            fd_set rfds;                 /* rfds 是 select 监听集合，只等待当前串口 fd 可读。 */
-            struct timeval tv;           /* tv 是每轮短等待时间，既能拼接多段回包，也不会卡住后台线程太久。 */
+        while (elapsed.elapsed() < 700) {
+            fd_set rfds;         /* rfds 是 select 读取集合，只等待当前串口 fd 可读。 */
+            struct timeval tv;   /* tv 是每轮 80ms 短等待，兼顾 ACK 及时性和 CPU 占用。 */
 
             FD_ZERO(&rfds);
             FD_SET(fd, &rfds);
@@ -7443,29 +8230,35 @@ private:
                     continue;
                 }
                 if (errorText) {
-                    *errorText = QStringLiteral("读取 F4 回复失败");
+                    *errorText = QStringLiteral("读取 F4 二进制回复失败");
                 }
-                return QString();
+                return false;
             }
 
             if (selected == 0) {
-                if (!reply.isEmpty()) {
-                    break;
-                }
                 continue;
             }
 
-            const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
+            const ssize_t nread = ::read(fd, chunk, sizeof(chunk));
             if (nread > 0) {
-                reply.append(buffer, static_cast<int>(nread));
-                if (reply.contains('\n')) {
-                    break;
+                buffer.append(chunk, static_cast<int>(nread));
+                if (parseF4BinaryFrameFromBuffer(&buffer, reply, &lastFrameError)) {
+                    /*
+                     * FAULT_REPORT 是 F4 的异步故障上报，不一定对应当前按钮命令。
+                     * 例如当前未接 LDC 时，F4 会周期上报 LDC 故障；此时 Qt 记录故障摘要，
+                     * 但继续等待当前 HEARTBEAT/ACK/NACK/STATUS_REPORT，避免把异步故障帧误当作控制命令失败。
+                     */
+                    if (reply->command == BINARY_PROTOCOL_CMD_FAULT_REPORT) {
+                        lastFrameError = describeF4FaultReport(*reply);
+                        continue;
+                    }
+                    return true;
                 }
                 continue;
             }
 
             if (nread == 0) {
-                break;
+                continue;
             }
 
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
@@ -7473,33 +8266,66 @@ private:
             }
 
             if (errorText) {
-                *errorText = QStringLiteral("读取 F4 回复失败");
+                *errorText = QStringLiteral("读取 F4 二进制回复失败");
             }
-            return QString();
+            return false;
         }
 
-        if (reply.isEmpty()) {
-            if (errorText) {
-                *errorText = QStringLiteral("未收到 F4 回复");
+        if (errorText) {
+            if (!lastFrameError.isEmpty()) {
+                *errorText = lastFrameError;
+            } else if (!buffer.isEmpty()) {
+                *errorText = QStringLiteral("F4二进制回复不完整：") + hexByteString(buffer);
+            } else {
+                *errorText = QStringLiteral("未收到 F4 二进制 ACK/NACK");
             }
-            return QString();
         }
-
-        return QString::fromLocal8Bit(reply).trimmed();
+        return false;
     }
 
-    static bool sendF4SerialCommand(const QString &device,
-                                    const QString &command,
-                                    int baud,
-                                    QString *detail)
+    /*
+     * exchangeF4BinaryFrame 的作用：
+     *   打开 F4 串口、发送一帧二进制协议、读取一帧合法二进制回复。
+     *
+     * 主要流程：
+     *   1. 使用 termios raw 配置 `/dev/ttySTM2`，避免文本终端处理修改二进制字节。
+     *   2. 写入完整帧并等待内核发送队列排空。
+     *   3. 调用 readF4BinaryReply() 从混有调试文本的串口流中抓取合法二进制帧。
+     *
+     * 参数：
+     *   device 是 Linux 串口节点。
+     *   baud 是串口波特率。
+     *   frame 是要发送的完整二进制帧。
+     *   reply 用于返回解析后的二进制回复，不能为 NULL。
+     *   detail 用于返回失败原因，可为 NULL。
+     *
+     * 返回值：
+     *   成功收到合法二进制回复返回 true；打开、配置、写入、超时或 CRC 失败返回 false。
+     */
+    static bool exchangeF4BinaryFrame(const QString &device,
+                                      int baud,
+                                      const QByteArray &frame,
+                                      F4BinaryReply *reply,
+                                      QString *detail)
     {
         const QByteArray devBytes = device.toLocal8Bit();
-        const QByteArray commandBytes = command.toLocal8Bit();
         int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
         struct termios tio;
-        QString replyText;
         QString readErrorText;
-        QByteArray replyUpper;
+
+        if (frame.isEmpty()) {
+            if (detail) {
+                *detail = QStringLiteral("F4二进制命令帧为空");
+            }
+            return false;
+        }
+
+        if (reply == nullptr) {
+            if (detail) {
+                *detail = QStringLiteral("F4二进制回复对象为空");
+            }
+            return false;
+        }
 
         if (fd < 0) {
             if (detail) {
@@ -7535,66 +8361,383 @@ private:
         }
 
         tcflush(fd, TCIOFLUSH);
-        if (!writeAllToFd(fd, commandBytes)) {
+        if (!writeAllToFd(fd, frame)) {
             if (detail) {
-                *detail = QStringLiteral("写入 F4 命令失败");
+                *detail = QStringLiteral("写入 F4 二进制命令失败：") + hexByteString(frame);
             }
             ::close(fd);
             return false;
         }
         tcdrain(fd);
 
-        replyText = readF4ReplyText(fd, &readErrorText);
+        if (!readF4BinaryReply(fd, reply, &readErrorText)) {
+            if (detail) {
+                *detail = readErrorText.isEmpty() ? QStringLiteral("F4二进制回复为空") : readErrorText;
+            }
+            ::close(fd);
+            return false;
+        }
+
         ::close(fd);
-        if (replyText.isEmpty()) {
-            if (detail) {
-                *detail = readErrorText.isEmpty() ? QStringLiteral("串口回复为空") : readErrorText;
-            }
+        return true;
+    }
+
+    /*
+     * sendF4BinaryCommand 的作用：
+     *   打开 MP157 到 F4 的串口，发送一帧自动流程二进制命令，并等待匹配的 ACK 或 NACK。
+     *
+     * 主要流程：
+     *   1. 使用现有 F4 串口节点和 115200 8N1 原始模式配置。
+     *   2. 写入完整二进制帧并等待 F4 回复合法二进制帧。
+     *   3. 对 ACK 校验 cycle_id、acked_seq 和 acked_cmd，防止旧 ACK 被误用。
+     *   4. 对 NACK 提取 error_code、state 和 detail，返回给 QML 显示。
+     *
+     * 参数：
+     *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
+     *   baud 是串口波特率，当前默认 115200。
+     *   frame 是已经组好的完整二进制帧。
+     *   expectedCommand 是本次期望被 ACK 的命令字。
+     *   expectedSequence 是本次期望被 ACK 的 MP157 帧序号。
+     *   expectedCycleId 是本次命令所属 cycle_id。
+     *   detail 用于返回 ACK/NACK 详情或失败原因，可为 NULL。
+     *
+     * 返回值：
+     *   收到匹配 ACK 返回 true；收到 NACK、旧 ACK、串口失败或超时返回 false。
+     */
+    static bool sendF4BinaryCommand(const QString &device,
+                                    int baud,
+                                    const QByteArray &frame,
+                                    quint8 expectedCommand,
+                                    quint16 expectedSequence,
+                                    quint16 expectedCycleId,
+                                    QString *detail)
+    {
+        F4BinaryReply reply;
+
+        if (!exchangeF4BinaryFrame(device, baud, frame, &reply, detail)) {
             return false;
         }
 
-        replyUpper = replyText.toLocal8Bit().toUpper();
-        if (replyUpper.contains("ERROR")) {
-            if (detail) {
-                *detail = QStringLiteral("F4返回错误：") + replyText;
+        if (reply.command == BINARY_PROTOCOL_CMD_ACK) {
+            if (reply.payload.size() != 7) {
+                if (detail) {
+                    *detail = QStringLiteral("ACK负载长度错误：") + QString::number(reply.payload.size());
+                }
+                return false;
             }
-            return false;
-        }
 
-        if (replyUpper.contains("ACK")
-                || replyUpper.contains("OK")
-                || replyUpper.contains("F4")
-                || replyUpper.contains("READY")
-                || replyUpper.contains("[INFO][BELT]")
-                || replyUpper.contains("[OK][BELT]")) {
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint16 ackedSequence = readLe16(reply.payload, 2);
+            const quint8 ackedCommand = static_cast<quint8>(reply.payload.at(4));
+            const quint8 status = static_cast<quint8>(reply.payload.at(5));
+            const quint8 state = static_cast<quint8>(reply.payload.at(6));
+
+            if (cycleId != expectedCycleId
+                    || ackedSequence != expectedSequence
+                    || ackedCommand != expectedCommand) {
+                if (detail) {
+                    *detail = QStringLiteral("ACK不匹配：cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                            + QStringLiteral(" cmd=") + f4BinaryCommandName(ackedCommand)
+                            + QStringLiteral(" raw=") + hexByteString(reply.rawFrame);
+                }
+                return false;
+            }
+
             if (detail) {
-                *detail = replyText;
+                *detail = QStringLiteral("ACK ")
+                        + f4BinaryCommandName(ackedCommand)
+                        + QStringLiteral(" cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                        + QStringLiteral(" status=") + QString::number(status)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state);
+            }
+
+            /*
+             * ACK.status 的含义来自二进制协议：
+             * 0 表示 F4 已接受并执行本次命令，1 表示重复帧已忽略但状态正常。
+             * 首页“开始”必须推动传送带重新进入扫描，不能把重复帧 ACK 当成新的启动成功，
+             * 否则会出现绿色提示成功但电机没有新动作的现场误判。
+             */
+            if (status != 0U) {
+                if (detail) {
+                    if (status == 1U) {
+                        *detail = QStringLiteral("ACK重复帧：F4认为该命令已处理，未重新执行 ")
+                                + f4BinaryCommandName(ackedCommand)
+                                + QStringLiteral(" cycle=") + QString::number(cycleId)
+                                + QStringLiteral(" state=") + f4ProtocolStateName(state);
+                    } else {
+                        *detail = QStringLiteral("ACK未确认执行：")
+                                + f4BinaryCommandName(ackedCommand)
+                                + QStringLiteral(" cycle=") + QString::number(cycleId)
+                                + QStringLiteral(" status=") + QString::number(status)
+                                + QStringLiteral(" state=") + f4ProtocolStateName(state);
+                    }
+                }
+                return false;
             }
             return true;
         }
 
+        if (reply.command == BINARY_PROTOCOL_CMD_NACK) {
+            if (reply.payload.size() != 9) {
+                if (detail) {
+                    *detail = QStringLiteral("NACK负载长度错误：") + QString::number(reply.payload.size());
+                }
+                return false;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint16 rejectedSequence = readLe16(reply.payload, 2);
+            const quint8 rejectedCommand = static_cast<quint8>(reply.payload.at(4));
+            const quint8 errorCode = static_cast<quint8>(reply.payload.at(5));
+            const quint8 state = static_cast<quint8>(reply.payload.at(6));
+            const quint16 nackDetail = readLe16(reply.payload, 7);
+
+            if (detail) {
+                *detail = QStringLiteral("NACK ")
+                        + f4BinaryCommandName(rejectedCommand)
+                        + QStringLiteral(" cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(rejectedSequence)
+                        + QStringLiteral(" error=") + f4NackErrorName(errorCode)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                        + QStringLiteral(" detail=") + QString::number(nackDetail);
+            }
+            return false;
+        }
+
         if (detail) {
-            *detail = QStringLiteral("回复不匹配：") + replyText;
+            *detail = QStringLiteral("收到非ACK/NACK回复：")
+                    + f4BinaryCommandName(reply.command)
+                    + QStringLiteral(" raw=")
+                    + hexByteString(reply.rawFrame);
         }
         return false;
     }
 
     /*
-     * probeF4Serial 的作用：
-     *   发送 STATUS 查询并复用通用串口命令等待逻辑，判断 F4 是否真实接入。
+     * sendF4BinaryHeartbeat 的作用：
+     *   发送 HEARTBEAT 二进制帧，只确认 F4 在线和协议链路正常。
+     *
+     * 关键说明：
+     *   心跳不能强制校验 cycle_id，因为 Qt 进程可能重启而 F4 仍保留旧的 active_cycle_id。
+     *   对心跳而言，只要 ACK 的 seq/cmd 匹配，就说明二进制链路可用；ACK 中的 cycle_id 只作为状态文本展示。
      *
      * 参数：
-     *   device 是 Linux TTY 节点。
-     *   query 是心跳查询命令，当前为 `STATUS\r\n`。
+     *   device 是 Linux 串口节点。
      *   baud 是串口波特率。
-     *   detail 返回 F4 回复内容或失败原因。
+     *   frame 是完整 HEARTBEAT 帧。
+     *   expectedSequence 是本次心跳帧序号。
+     *   detail 返回 ACK 摘要或 NACK 失败详情。
      *
      * 返回值：
-     *   收到成功关键字返回 true；否则返回 false。
+     *   收到匹配 HEARTBEAT ACK 返回 true；收到 NACK、旧帧、串口失败或负载错误返回 false。
      */
-    static bool probeF4Serial(const QString &device, const QString &query, int baud, QString *detail)
+    static bool sendF4BinaryHeartbeat(const QString &device,
+                                      int baud,
+                                      const QByteArray &frame,
+                                      quint16 expectedSequence,
+                                      QString *detail)
     {
-        return sendF4SerialCommand(device, query, baud, detail);
+        F4BinaryReply reply;
+
+        if (!exchangeF4BinaryFrame(device, baud, frame, &reply, detail)) {
+            return false;
+        }
+
+        if (reply.command == BINARY_PROTOCOL_CMD_ACK) {
+            if (reply.payload.size() != 7) {
+                if (detail) {
+                    *detail = QStringLiteral("HEARTBEAT ACK负载长度错误：") + QString::number(reply.payload.size());
+                }
+                return false;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint16 ackedSequence = readLe16(reply.payload, 2);
+            const quint8 ackedCommand = static_cast<quint8>(reply.payload.at(4));
+            const quint8 status = static_cast<quint8>(reply.payload.at(5));
+            const quint8 state = static_cast<quint8>(reply.payload.at(6));
+
+            if (ackedSequence != expectedSequence || ackedCommand != BINARY_PROTOCOL_CMD_HEARTBEAT) {
+                if (detail) {
+                    *detail = QStringLiteral("HEARTBEAT ACK不匹配：cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                            + QStringLiteral(" cmd=") + f4BinaryCommandName(ackedCommand)
+                            + QStringLiteral(" raw=") + hexByteString(reply.rawFrame);
+                }
+                return false;
+            }
+
+            if (status != 0U) {
+                if (detail) {
+                    *detail = QStringLiteral("HEARTBEAT ACK未确认：cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" status=") + QString::number(status)
+                            + QStringLiteral(" state=") + f4ProtocolStateName(state);
+                }
+                return false;
+            }
+
+            if (detail) {
+                *detail = QStringLiteral("ACK HEARTBEAT cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state);
+            }
+            return true;
+        }
+
+        if (reply.command == BINARY_PROTOCOL_CMD_NACK) {
+            if (reply.payload.size() != 9) {
+                if (detail) {
+                    *detail = QStringLiteral("HEARTBEAT NACK负载长度错误：") + QString::number(reply.payload.size());
+                }
+                return false;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint16 rejectedSequence = readLe16(reply.payload, 2);
+            const quint8 rejectedCommand = static_cast<quint8>(reply.payload.at(4));
+            const quint8 errorCode = static_cast<quint8>(reply.payload.at(5));
+            const quint8 state = static_cast<quint8>(reply.payload.at(6));
+            const quint16 nackDetail = readLe16(reply.payload, 7);
+
+            if (detail) {
+                *detail = QStringLiteral("NACK ")
+                        + f4BinaryCommandName(rejectedCommand)
+                        + QStringLiteral(" cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(rejectedSequence)
+                        + QStringLiteral(" error=") + f4NackErrorName(errorCode)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                        + QStringLiteral(" detail=") + QString::number(nackDetail);
+            }
+            return false;
+        }
+
+        if (detail) {
+            *detail = QStringLiteral("收到非HEARTBEAT ACK/NACK回复：")
+                    + f4BinaryCommandName(reply.command)
+                    + QStringLiteral(" raw=")
+                    + hexByteString(reply.rawFrame);
+        }
+        return false;
+    }
+
+    /*
+     * sendF4BinaryStatusQuery 的作用：
+     *   发送 QUERY_STATUS 二进制帧，并把 F4 返回的 STATUS_REPORT 转成界面可读文本。
+     *
+     * 参数：
+     *   device 是 Linux 串口节点。
+     *   baud 是串口波特率。
+     *   frame 是完整 QUERY_STATUS 帧。
+     *   expectedSequence 是本次查询帧序号。
+     *   expectedCycleId 是本次查询关注的 cycle_id，手动查询通常为 0。
+     *   detail 返回结构化状态摘要或 NACK 失败详情。
+     *
+     * 返回值：
+     *   收到匹配 STATUS_REPORT 返回 true；收到 NACK、旧帧、串口失败或负载错误返回 false。
+     */
+    static bool sendF4BinaryStatusQuery(const QString &device,
+                                        int baud,
+                                        const QByteArray &frame,
+                                        quint16 expectedSequence,
+                                        quint16 expectedCycleId,
+                                        QString *detail)
+    {
+        F4BinaryReply reply;
+
+        if (!exchangeF4BinaryFrame(device, baud, frame, &reply, detail)) {
+            return false;
+        }
+
+        if (reply.command == BINARY_PROTOCOL_CMD_STATUS_REPORT) {
+            if (reply.payload.size() != 24) {
+                if (detail) {
+                    *detail = QStringLiteral("STATUS_REPORT负载长度错误：") + QString::number(reply.payload.size());
+                }
+                return false;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint16 repliedSequence = readLe16(reply.payload, 2);
+            const quint8 repliedCommand = static_cast<quint8>(reply.payload.at(4));
+            const quint8 f4State = static_cast<quint8>(reply.payload.at(5));
+            const quint16 activeCycleId = readLe16(reply.payload, 6);
+            const quint8 pausedState = static_cast<quint8>(reply.payload.at(8));
+            const quint8 beltDesired = static_cast<quint8>(reply.payload.at(9));
+            const quint8 beltApplied = static_cast<quint8>(reply.payload.at(10));
+            const quint8 beltDirection = static_cast<quint8>(reply.payload.at(11));
+            const quint8 beltCentered = static_cast<quint8>(reply.payload.at(12));
+            const quint8 beltStable = static_cast<quint8>(reply.payload.at(13));
+            const quint16 beltSpeedRpm = readLe16(reply.payload, 14);
+            const qint32 beltErrorPx = readLe32Signed(reply.payload, 16);
+            const quint16 featureBits = readLe16(reply.payload, 20);
+            const quint16 faultBits = readLe16(reply.payload, 22);
+
+            if (cycleId != expectedCycleId
+                    || repliedSequence != expectedSequence
+                    || repliedCommand != BINARY_PROTOCOL_CMD_QUERY_STATUS) {
+                if (detail) {
+                    *detail = QStringLiteral("STATUS_REPORT不匹配：cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" seq=") + QString::number(repliedSequence)
+                            + QStringLiteral(" cmd=") + f4BinaryCommandName(repliedCommand)
+                            + QStringLiteral(" raw=") + hexByteString(reply.rawFrame);
+                }
+                return false;
+            }
+
+            if (detail) {
+                *detail = QStringLiteral("STATUS_REPORT cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" active=") + QString::number(activeCycleId)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(f4State)
+                        + QStringLiteral(" paused=") + f4ProtocolStateName(pausedState)
+                        + QStringLiteral(" belt_desired=") + f4BeltModeName(beltDesired)
+                        + QStringLiteral(" belt_applied=") + f4BeltModeName(beltApplied)
+                        + QStringLiteral(" speed=") + QString::number(beltSpeedRpm)
+                        + QStringLiteral("rpm dir=") + ((beltDirection == 0U) ? QStringLiteral("CW") : QStringLiteral("CCW"))
+                        + QStringLiteral(" error=") + QString::number(beltErrorPx)
+                        + QStringLiteral("px stable=") + QString::number(beltStable)
+                        + QStringLiteral(" centered=") + QString::number(beltCentered)
+                        + QStringLiteral(" feature=0x") + QString::number(featureBits, 16).toUpper()
+                        + QStringLiteral(" fault=0x") + QString::number(faultBits, 16).toUpper();
+            }
+            return true;
+        }
+
+        if (reply.command == BINARY_PROTOCOL_CMD_NACK) {
+            if (reply.payload.size() != 9) {
+                if (detail) {
+                    *detail = QStringLiteral("NACK负载长度错误：") + QString::number(reply.payload.size());
+                }
+                return false;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint16 rejectedSequence = readLe16(reply.payload, 2);
+            const quint8 rejectedCommand = static_cast<quint8>(reply.payload.at(4));
+            const quint8 errorCode = static_cast<quint8>(reply.payload.at(5));
+            const quint8 state = static_cast<quint8>(reply.payload.at(6));
+            const quint16 nackDetail = readLe16(reply.payload, 7);
+
+            if (detail) {
+                *detail = QStringLiteral("NACK ")
+                        + f4BinaryCommandName(rejectedCommand)
+                        + QStringLiteral(" cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(rejectedSequence)
+                        + QStringLiteral(" error=") + f4NackErrorName(errorCode)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                        + QStringLiteral(" detail=") + QString::number(nackDetail);
+            }
+            return false;
+        }
+
+        if (detail) {
+            *detail = QStringLiteral("收到非STATUS_REPORT/NACK回复：")
+                    + f4BinaryCommandName(reply.command)
+                    + QStringLiteral(" raw=")
+                    + hexByteString(reply.rawFrame);
+        }
+        return false;
     }
 
     /*
@@ -7724,9 +8867,8 @@ private:
     QString m_cloudHealthUrl;           /* m_cloudHealthUrl 保存云端 health 地址。 */
     QString m_sdcardMount;              /* m_sdcardMount 保存 SD 卡挂载点。 */
     QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
-    QString m_f4Query;                  /* m_f4Query 保存发给 F4 的握手查询。 */
     int m_f4Baud;                       /* m_f4Baud 保存 F4 串口波特率。 */
-    QElapsedTimer m_f4HeartbeatElapsed;  /* m_f4HeartbeatElapsed 记录上一次 STATUS 心跳发送时间，用于把周期心跳限制为 2 分钟一次。 */
+    QElapsedTimer m_f4HeartbeatElapsed;  /* m_f4HeartbeatElapsed 记录上一次二进制心跳发送时间，用于把周期心跳限制为 2 分钟一次。 */
     QString m_networkStatusText;        /* m_networkStatusText 保存网络状态文本。 */
     QString m_networkStatusColor;       /* m_networkStatusColor 保存网络状态颜色。 */
     QString m_cameraStatusText;         /* m_cameraStatusText 保存摄像头状态文本。 */
@@ -7755,6 +8897,10 @@ private:
     bool m_locationProbeTimedOut;       /* m_locationProbeTimedOut 标记开机定位进程已超时，finished 时不再覆盖超时状态。 */
     bool m_locationBootProbeDone;       /* m_locationBootProbeDone 标记本 Qt 进程已经调度过一次 IP 定位，后续周期刷新不再调用。 */
     bool m_cloudProbeTimedOut;          /* m_cloudProbeTimedOut 标记当前云端进程已超时，finished 时不再覆盖超时状态。 */
+    quint16 m_f4AutoCycleId;            /* m_f4AutoCycleId 保存 MP157 当前自动检测流程号，开始新流程时自增，停止后不复用旧值。 */
+    quint16 m_f4BinarySequence;         /* m_f4BinarySequence 保存 MP157 二进制协议发送帧序号，每下发一帧自动流程命令自增一次。 */
+    bool m_f4AutoRunning;               /* m_f4AutoRunning 表示 MP157 本地认为 F4 当前存在运行中的自动检测流程。 */
+    bool m_f4AutoPaused;                /* m_f4AutoPaused 表示当前自动检测流程已暂停，只有继续或停止能改变该状态。 */
     QTimer m_healthTimer;               /* m_healthTimer 周期性调度整轮健康检测。 */
     QTimer m_networkTimeout;            /* m_networkTimeout 是 4G 测试短超时。 */
     QTimer m_locationTimeout;           /* m_locationTimeout 是开机单次高德 IP 定位超时。 */
