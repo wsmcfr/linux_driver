@@ -400,6 +400,102 @@ static QString uploadHistoryDateStampFromText(const QString &uploadTime)
 }
 
 /*
+ * uploadStatusTokenValue 的作用：
+ *   从上传状态文本中提取 `key=value` 字段，供历史模型和检测控制器共用。
+ *
+ * 主要流程：
+ *   1. 查找指定 key 对应的 `key=` 起点。
+ *   2. 向后读取到空白、分号或中文/英文逗号为止。
+ *   3. 返回去掉首尾空格后的字段值。
+ *
+ * 参数：
+ *   text 是 defect-cos-upload、检测 RESULT 或历史 JSON 中保存的状态文本。
+ *   key 是 upload_status、record_id 或 record_no 这类字段名。
+ *
+ * 返回值：
+ *   找到字段时返回字段值；找不到时返回空字符串。
+ */
+static QString uploadStatusTokenValue(const QString &text, const QString &key)
+{
+    const QString marker = key + QLatin1Char('=');
+    const int markerIndex = text.indexOf(marker);
+
+    if (markerIndex < 0) {
+        return QString();
+    }
+
+    const int valueStart = markerIndex + marker.length();
+    int valueEnd = valueStart;
+
+    while (valueEnd < text.length()
+           && !text.at(valueEnd).isSpace()
+           && text.at(valueEnd) != QLatin1Char(';')
+           && text.at(valueEnd) != QLatin1Char(',')
+           && text.at(valueEnd) != QChar(0xFF0C)) {
+        valueEnd++;
+    }
+
+    return text.mid(valueStart, valueEnd - valueStart).trimmed();
+}
+
+/*
+ * isUploadStatusSuccess 的作用：
+ *   统一判断一次上传是否已经完成云端归档，避免各处只按中文前缀各自判断。
+ *
+ * 主要流程：
+ *   1. `upload_status=OK` 是检测链路最终 RESULT 的明确成功信号，优先返回成功。
+ *   2. `upload_status=FAIL/SKIP` 是明确失败或跳过信号，不能被 record_id 等历史字段误判为成功。
+ *   3. 脚本原始输出和压缩历史状态中的“上传成功”也视为成功。
+ *
+ * 参数：
+ *   uploadStatus 是脚本输出、历史 upload_status 字段或压缩后的历史状态。
+ *
+ * 返回值：
+ *   已完成云端上传返回 true；失败、跳过、本地保存或未知状态返回 false。
+ */
+static bool isUploadStatusSuccess(const QString &uploadStatus)
+{
+    const QString normalizedStatus = uploadStatus.trimmed();
+    const QString statusToken = uploadStatusTokenValue(normalizedStatus, QStringLiteral("upload_status")).toUpper();
+
+    if (statusToken == QStringLiteral("OK")) {
+        return true;
+    }
+    if (statusToken == QStringLiteral("FAIL") || statusToken == QStringLiteral("SKIP")) {
+        return false;
+    }
+
+    return normalizedStatus.startsWith(QStringLiteral("上传成功"))
+        || normalizedStatus.contains(QStringLiteral("上传成功"));
+}
+
+/*
+ * isUploadStatusFailure 的作用：
+ *   统一判断上传是否明确失败，供告警和历史重发逻辑避免误伤已成功归档的记录。
+ *
+ * 参数：
+ *   uploadStatus 是脚本输出、检测 RESULT 或历史状态文本。
+ *
+ * 返回值：
+ *   明确失败返回 true；成功、跳过或未知状态返回 false。
+ */
+static bool isUploadStatusFailure(const QString &uploadStatus)
+{
+    const QString normalizedStatus = uploadStatus.trimmed();
+    const QString statusToken = uploadStatusTokenValue(normalizedStatus, QStringLiteral("upload_status")).toUpper();
+
+    if (statusToken == QStringLiteral("FAIL")) {
+        return true;
+    }
+    if (statusToken == QStringLiteral("OK") || statusToken == QStringLiteral("SKIP")) {
+        return false;
+    }
+
+    return normalizedStatus.startsWith(QStringLiteral("上传失败"))
+        || normalizedStatus.contains(QStringLiteral("上传失败"));
+}
+
+/*
  * SetGstPipelineStateJob 的作用：
  *   把 GStreamer 管线状态切换放到 Qt Quick 渲染同步阶段执行。
  *
@@ -900,7 +996,7 @@ public:
 
         const UploadHistoryEntry oldEntry = m_entries.at(row);
         const QVector<UploadHistoryEntry> oldEntries = m_entries;
-        const bool uploadSucceeded = uploadStatus.startsWith(QStringLiteral("上传成功"));
+        const bool uploadSucceeded = isUploadStatusSuccess(uploadStatus);
         const QString refreshedUploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
 
         m_entries[row].uploadStatus = uploadStatus;
@@ -910,7 +1006,7 @@ public:
         if (!recordNo.isEmpty()) {
             m_entries[row].recordNo = recordNo;
         }
-        m_entries[row].workflowText = uploadStatus.startsWith(QStringLiteral("上传成功"))
+        m_entries[row].workflowText = uploadSucceeded
             ? QStringLiteral("云端已归档")
             : QStringLiteral("本地已保存，等待重新发送");
 
@@ -4287,10 +4383,10 @@ public:
                                                                  recordNo,
                                                                  &errorText)) {
                 resultText = QStringLiteral("重新发送失败：") + errorText;
-            } else if (workerResult->startsWith(QStringLiteral("上传成功："))) {
+            } else if (isUploadStatusSuccess(*workerResult)) {
                 resultText = QStringLiteral("重新发送成功：") + compactStatus;
             } else {
-                const QString failureDetail = workerResult->startsWith(QStringLiteral("上传失败："))
+                const QString failureDetail = isUploadStatusFailure(*workerResult)
                     ? workerResult->mid(QStringLiteral("上传失败：").length())
                     : *workerResult;
 
@@ -4399,6 +4495,37 @@ private:
         }
 
         return text.left(80);
+    }
+
+    /*
+     * firstLineWithPrefix 的作用：
+     *   从脚本多行输出中优先提取指定前缀的业务结果行。
+     *
+     * 主要流程：
+     *   1. 按行遍历 stdout/stderr。
+     *   2. 返回第一条以 prefix 开头的非空行。
+     *   3. 找不到时返回空字符串，调用方再回退到 firstUsefulLine()。
+     *
+     * 参数：
+     *   text 是脚本输出。
+     *   prefix 是要查找的中文业务前缀，例如“上传失败：”。
+     *
+     * 返回值：
+     *   找到匹配行时返回该行；否则返回空字符串。
+     */
+    QString firstLineWithPrefix(const QString &text, const QString &prefix) const
+    {
+        const QStringList lines = text.split(QLatin1Char('\n'), QString::SkipEmptyParts);
+
+        for (const QString &line : lines) {
+            const QString trimmed = line.trimmed();
+
+            if (trimmed.startsWith(prefix)) {
+                return trimmed;
+            }
+        }
+
+        return QString();
     }
 
     /*
@@ -5068,7 +5195,7 @@ private:
         const QString recordId = parseTokenValue(uploadResult, QStringLiteral("record_id"));
         const QString recordNo = parseTokenValue(uploadResult, QStringLiteral("record_no"));
 
-        if (uploadResult.startsWith(QStringLiteral("上传成功："))) {
+        if (isUploadStatusSuccess(uploadResult)) {
             QString status = QStringLiteral("上传成功");
 
             if (!recordId.isEmpty()) {
@@ -5082,7 +5209,7 @@ private:
             return status;
         }
 
-        if (uploadResult.startsWith(QStringLiteral("上传失败："))) {
+        if (isUploadStatusFailure(uploadResult)) {
             return uploadResult.left(80);
         }
 
@@ -5118,11 +5245,11 @@ private:
         const QFileInfo pngInfo(pair.pngPath);
 
         entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
-        entry.resultText = uploadResult.startsWith(QStringLiteral("上传成功："))
+        entry.resultText = isUploadStatusSuccess(uploadResult)
             ? QStringLiteral("良品")
             : QStringLiteral("待复核");
         entry.boardResultText = entry.resultText;
-        entry.workflowText = uploadResult.startsWith(QStringLiteral("上传成功："))
+        entry.workflowText = isUploadStatusSuccess(uploadResult)
             ? QStringLiteral("云端已归档")
             : QStringLiteral("本地已保存");
         entry.jpgPath = pair.jpgPath;
@@ -5178,7 +5305,7 @@ private:
             .arg(fusedResult.reason)
             .arg(fusedResult.classifyBad ? QStringLiteral("BAD") : QStringLiteral("GOOD"))
             .arg(fusedResult.segmentBad ? QStringLiteral("发现缺陷") : QStringLiteral("未见缺陷"))
-            .arg(bundle.uploadResult.startsWith(QStringLiteral("上传成功："))
+            .arg(isUploadStatusSuccess(bundle.uploadResult)
                  ? QStringLiteral("云端已归档")
                  : QStringLiteral("本地已保存"));
         entry.sourcePath = bundle.sourcePath;
@@ -5401,13 +5528,19 @@ private:
 
         if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
             if (!stderrText.isEmpty()) {
-                usefulLine = firstUsefulLine(stderrText);
+                usefulLine = firstLineWithPrefix(stderrText, QStringLiteral("上传失败："));
+                if (usefulLine.isEmpty()) {
+                    usefulLine = firstUsefulLine(stderrText);
+                }
                 return usefulLine.startsWith(QStringLiteral("上传失败："))
                     ? usefulLine
                     : QStringLiteral("上传失败：") + usefulLine;
             }
             if (!stdoutText.isEmpty()) {
-                usefulLine = firstUsefulLine(stdoutText);
+                usefulLine = firstLineWithPrefix(stdoutText, QStringLiteral("上传失败："));
+                if (usefulLine.isEmpty()) {
+                    usefulLine = firstUsefulLine(stdoutText);
+                }
                 return usefulLine.startsWith(QStringLiteral("上传失败："))
                     ? usefulLine
                     : QStringLiteral("上传失败：") + usefulLine;
@@ -5608,7 +5741,7 @@ private:
         return modelResult
             + QStringLiteral(" upload_status=")
             + (settings.autoUploadEnabled
-               ? (uploadResult.startsWith(QStringLiteral("上传成功：")) ? QStringLiteral("OK") : QStringLiteral("FAIL"))
+               ? (isUploadStatusSuccess(uploadResult) ? QStringLiteral("OK") : QStringLiteral("FAIL"))
                : QStringLiteral("SKIP"));
     }
 

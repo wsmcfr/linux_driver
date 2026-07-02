@@ -2508,6 +2508,85 @@ Rectangle {
     }
 
     /*
+     * uploadStatusTokenValue 的作用：
+     *   从上传状态文本中读取 upload_status、record_id、record_no 等短字段。
+     *
+     * 参数：
+     *   text 是 C++ 返回的检测 RESULT 或历史 JSON 中保存的 uploadStatus。
+     *   key 是需要读取的字段名。
+     *
+     * 返回值：
+     *   找到字段时返回字段值；找不到时返回空字符串。
+     */
+    function uploadStatusTokenValue(text, key) {
+        return tokenValue(text, key)
+    }
+
+    /*
+     * isUploadStatusSuccess 的作用：
+     *   统一判断云端上传是否成功，避免历史页、统计页和提示条各自用不同字符串规则。
+     *
+     * 参数：
+     *   rawStatus 是历史记录里的 uploadStatus 文本。
+     *   record 是可选历史记录对象，用于读取 recordId/recordNo 兼容旧记录。
+     *
+     * 返回值：
+     *   明确上传成功返回 true；失败、跳过或未知状态返回 false。
+     */
+    function isUploadStatusSuccess(rawStatus, record) {
+        var statusText = rawStatus ? String(rawStatus) : ""
+        var statusToken = uploadStatusTokenValue(statusText, "upload_status").toUpperCase()
+
+        if (statusText.indexOf("upload_status=OK") >= 0) {
+            return true
+        }
+        if (statusToken === "OK") {
+            return true
+        }
+        if (statusToken === "FAIL" || statusToken === "SKIP") {
+            return false
+        }
+        if (statusText.indexOf("上传失败") >= 0) {
+            return false
+        }
+        if (statusText.indexOf("上传成功") >= 0) {
+            return true
+        }
+        if (record && record.recordId && record.recordId.length > 0) {
+            return true
+        }
+        if (record && record.recordNo && record.recordNo.length > 0) {
+            return true
+        }
+
+        return false
+    }
+
+    /*
+     * isUploadStatusFailure 的作用：
+     *   统一判断上传是否明确失败，避免“云端已成功但回查诊断包含失败字样”时仍显示上传失败。
+     *
+     * 参数：
+     *   rawStatus 是上传状态文本。
+     *
+     * 返回值：
+     *   明确失败返回 true；成功、跳过或未知返回 false。
+     */
+    function isUploadStatusFailure(rawStatus) {
+        var statusText = rawStatus ? String(rawStatus) : ""
+        var statusToken = uploadStatusTokenValue(statusText, "upload_status").toUpperCase()
+
+        if (statusToken === "FAIL") {
+            return true
+        }
+        if (statusToken === "OK" || statusToken === "SKIP") {
+            return false
+        }
+
+        return statusText.indexOf("上传失败") >= 0
+    }
+
+    /*
      * cloudStatusSummary 的作用：
      *   把 upload_status 原始文本转换成适合 1024x600 屏幕展示的短摘要。
      *
@@ -2526,11 +2605,11 @@ Rectangle {
         var recordId = tokenValue(rawStatus, "record_id")
         var recordNo = tokenValue(rawStatus, "record_no")
 
-        if (rawStatus && rawStatus.indexOf("失败") >= 0) {
+        if (isUploadStatusFailure(rawStatus)) {
             return "上传失败，请查看日志"
         }
 
-        if (recordId.length > 0 || recordNo.length > 0) {
+        if (isUploadStatusSuccess(rawStatus, null) || recordId.length > 0 || recordNo.length > 0) {
             var summary = "上传成功"
             if (recordId.length > 0) {
                 summary += "  ID " + recordId
@@ -2539,10 +2618,6 @@ Rectangle {
                 summary += "  " + recordNo
             }
             return summary
-        }
-
-        if (rawStatus && rawStatus.indexOf("成功") >= 0) {
-            return "上传成功"
         }
 
         return rawStatus && rawStatus.length > 0 ? rawStatus : "未返回云端状态"
@@ -2888,7 +2963,7 @@ Rectangle {
             return false
         }
 
-        return record.uploadStatus && record.uploadStatus.indexOf("失败") >= 0
+        return isUploadStatusFailure(record.uploadStatus)
     }
 
     /*
@@ -3101,15 +3176,7 @@ Rectangle {
             return false
         }
 
-        if (record.recordId && record.recordId.length > 0) {
-            return true
-        }
-
-        if (record.recordNo && record.recordNo.length > 0) {
-            return true
-        }
-
-        return record.uploadStatus && record.uploadStatus.indexOf("成功") >= 0
+        return isUploadStatusSuccess(record.uploadStatus, record)
     }
 
     /*
@@ -3691,7 +3758,7 @@ Rectangle {
                                        resultText)
             } else {
                 root.markAlarmRecovered("model-detect-failed")
-                if (resultText.indexOf("上传失败") >= 0) {
+                if (isUploadStatusFailure(resultText)) {
                     root.raiseRuntimeAlarm("cloud-upload-failed",
                                            "ALM-UPLOAD-001",
                                            "预警",
@@ -4288,41 +4355,6 @@ Rectangle {
                     }
                 }
             }
-        }
-    }
-
-    /* storageToast 是底部横向提示条，利用 KMS overlay 模式下画面和右侧面板下方的空白区域显示保存/卸载结果。 */
-    Rectangle {
-        id: storageToast
-        x: 176
-        y: root.height - 38
-        width: root.width - 192
-        height: 28
-        radius: 6
-        color: storageState.indexOf("失败") >= 0 ? "#3a1b1f" : "#16291f"
-        border.color: storageState.indexOf("失败") >= 0 ? root.accentRed : root.accentGreen
-        border.width: 1
-        opacity: storageToastVisible ? 1.0 : 0.0
-        visible: opacity > 0.01
-
-        Behavior on opacity {
-            NumberAnimation {
-                duration: 160
-            }
-        }
-
-        Text {
-            anchors.left: parent.left
-            anchors.leftMargin: 12
-            anchors.right: parent.right
-            anchors.rightMargin: 12
-            anchors.verticalCenter: parent.verticalCenter
-            text: storageState
-            color: storageState.indexOf("失败") >= 0 ? "#ffd6dc" : "#d9ffe8"
-            font.pixelSize: 14
-            font.bold: true
-            elide: Text.ElideMiddle
-            verticalAlignment: Text.AlignVCenter
         }
     }
 
@@ -8602,6 +8634,52 @@ Rectangle {
             text: "上传状态：成功    显示路径：Qt Quick / OpenGL ES / " + (Qt.platform.os === "linux" ? "eglfs 或 wayland" : Qt.platform.os)
             color: "#7f898f"
             font.pixelSize: 13
+        }
+    }
+
+    /* globalStorageToastLayer 是全局操作提示层，放在所有页面之后渲染，避免被历史、统计、设置等页面底部控件盖住。 */
+    Item {
+        id: globalStorageToastLayer
+        anchors.fill: parent
+        z: 900
+        visible: true
+
+        /* storageToast 是底部横向提示条，用于显示检测、上传、安全卸载和参数保存的最近状态。 */
+        Rectangle {
+            id: storageToast
+            anchors.left: parent.left
+            anchors.leftMargin: 188
+            anchors.right: parent.right
+            anchors.rightMargin: 28
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 14
+            height: 32
+            radius: 6
+            color: isUploadStatusFailure(storageState) || storageState.indexOf("失败") >= 0 ? "#3a1b1f" : "#16291f"
+            border.color: isUploadStatusFailure(storageState) || storageState.indexOf("失败") >= 0 ? root.accentRed : root.accentGreen
+            border.width: 1
+            opacity: storageToastVisible ? 1.0 : 0.0
+            visible: opacity > 0.01
+
+            Behavior on opacity {
+                NumberAnimation {
+                    duration: 160
+                }
+            }
+
+            Text {
+                anchors.left: parent.left
+                anchors.leftMargin: 12
+                anchors.right: parent.right
+                anchors.rightMargin: 12
+                anchors.verticalCenter: parent.verticalCenter
+                text: storageState
+                color: isUploadStatusFailure(storageState) || storageState.indexOf("失败") >= 0 ? "#ffd6dc" : "#d9ffe8"
+                font.pixelSize: 14
+                font.bold: true
+                elide: Text.ElideMiddle
+                verticalAlignment: Text.AlignVCenter
+            }
         }
     }
 

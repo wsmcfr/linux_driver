@@ -284,8 +284,8 @@ if ! printf '%s\n' "$home_result_block" | grep -q 'compactHomeModelText(root.det
     fail "首页模型结果必须使用紧凑文本，避免综合判定长句挤出结果面板"
 fi
 update_upload_block="$(sed -n '/bool updateRecordUploadResult(int row/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
-if ! printf '%s\n' "$update_upload_block" | grep -q 'uploadStatus.startsWith(QStringLiteral("上传成功"))'; then
-    fail "历史重发只有上传成功时才能刷新本地时间和移动到最新位置，失败不应扰乱原记录顺序"
+if ! printf '%s\n' "$update_upload_block" | grep -q 'isUploadStatusSuccess(uploadStatus)'; then
+    fail "历史重发必须使用统一上传成功判定，避免 record_id 已生成但短状态不含上传成功时仍显示失败"
 fi
 if ! printf '%s\n' "$update_upload_block" | grep -q 'm_entries.move(row, lastRow)'; then
     fail "历史重发成功后必须把该记录移动到本地历史数组末尾，列表才会显示为最新记录"
@@ -296,6 +296,28 @@ fi
 retry_finished_block="$(sed -n '/onRetryUploadFinished:/,/^        }/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$retry_finished_block" | grep -q 'root.selectedHistoryIndex = uploadHistory.count - 1'; then
     fail "历史重发成功移动记录后，QML 必须重新选中末尾最新记录"
+fi
+require_grep "isUploadStatusSuccess" "main.cpp"
+require_grep "upload_status=OK" "main.cpp"
+require_grep "isUploadStatusFailure" "qml/Main.qml"
+require_grep "upload_status=OK" "qml/Main.qml"
+require_grep "id: globalStorageToastLayer" "qml/Main.qml"
+require_grep "z: 900" "qml/Main.qml"
+toast_layer_block="$(sed -n '/id: globalStorageToastLayer/,/id: splashOverlay/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$toast_layer_block" | grep -q 'id: storageToast'; then
+    fail "底部操作提示必须放在全局浮层内，避免历史、统计、设置等页面底部控件遮挡"
+fi
+if ! printf '%s\n' "$toast_layer_block" | grep -q 'anchors.bottom: parent.bottom'; then
+    fail "全局操作提示必须锚定根窗口底部，不能依赖某个页面内部坐标"
+fi
+if ! printf '%s\n' "$toast_layer_block" | grep -q 'visible: true'; then
+    fail "全局操作提示外层必须显式常驻可见，提示条自身再用 opacity/visible 控制显示和隐藏"
+fi
+if printf '%s\n' "$toast_layer_block" | grep -q 'visible: storageToast.visible'; then
+    fail "全局操作提示外层必须常驻渲染，不能反向绑定内部 storageToast.visible，否则提示可能完全不显示"
+fi
+if ! grep -q 'verify_status=warning' "$SCRIPT_DIR/defect-cos-upload"; then
+    fail "COS 上传脚本必须把上传完成后的详情回查失败降级为成功诊断，避免云端已有记录但本地历史显示上传失败"
 fi
 require_grep "statsPageVisible" "qml/Main.qml"
 require_grep "statsSummary" "qml/Main.qml"

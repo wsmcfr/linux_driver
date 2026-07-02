@@ -833,7 +833,8 @@ apply_runtime_overrides()
 
 apply_runtime_overrides
 
-# CLOUD_BASE_URL 是云端后端地址，默认使用当前项目已验证的轻量服务器地址。
+# CLOUD_BASE_URL 是云端后端地址，默认使用迁移后的新服务器地址。
+# 账号、接口路径和 Cookie 逻辑不变；现场排查时仍可通过环境变量覆盖。
 CLOUD_BASE_URL="${CLOUD_BASE_URL:-http://139.9.35.72}"
 
 # CLOUD_COOKIE_FILE 保存后端登录态 Cookie，避免每次点击按钮都重复登录。
@@ -1212,27 +1213,33 @@ verify_record_detail()
     #   $1 record_id：创建记录返回的新记录 id。
     #   $2 expected_file_count：期望文件总数，等于 1 张 source + N 张 annotated。
     # 返回值：
-    #   两类文件都存在返回 0；缺失或回查失败时终止脚本。
+    #   两类文件都存在返回 0；缺失或回查失败时返回非 0，让调用者决定是否降级。
     record_id="$1"
     expected_file_count="$2"
 
     if ! is_positive_number "$record_id"; then
-        fail "回查检测记录收到非法 record_id：$record_id"
+        log_upload_step "verify_status=warning verify_error=非法record_id:$record_id"
+        return 1
     fi
 
     if ! is_positive_number "$expected_file_count"; then
-        fail "回查检测记录收到非法期望文件数量：$expected_file_count"
+        log_upload_step "verify_status=warning verify_error=非法期望文件数量:$expected_file_count"
+        return 1
     fi
 
-    curl -fsS -b "$CLOUD_COOKIE_FILE" "$CLOUD_BASE_URL/api/v1/records/$record_id" -o /tmp/defect-cos-record-detail.json \
-        || fail "上传后回查检测记录失败：record_id=$record_id"
+    if ! curl -fsS -b "$CLOUD_COOKIE_FILE" "$CLOUD_BASE_URL/api/v1/records/$record_id" -o /tmp/defect-cos-record-detail.json; then
+        log_upload_step "verify_status=warning verify_error=回查检测记录失败 record_id=$record_id"
+        return 1
+    fi
 
     if ! grep -q '"file_kind"[[:space:]]*:[[:space:]]*"source"' /tmp/defect-cos-record-detail.json; then
-        fail "记录详情缺少 source 文件：record_id=$record_id"
+        log_upload_step "verify_status=warning verify_error=记录详情缺少source record_id=$record_id"
+        return 1
     fi
 
     if ! grep -q '"file_kind"[[:space:]]*:[[:space:]]*"annotated"' /tmp/defect-cos-record-detail.json; then
-        fail "记录详情缺少 annotated 文件：record_id=$record_id"
+        log_upload_step "verify_status=warning verify_error=记录详情缺少annotated record_id=$record_id"
+        return 1
     fi
 
     file_count=$(tr ',{}[]' '\n\n\n\n\n' < /tmp/defect-cos-record-detail.json \
@@ -1240,8 +1247,12 @@ verify_record_detail()
         | wc -l \
         | tr -d ' ')
     if [ "$file_count" != "$expected_file_count" ]; then
-        fail "记录详情文件数量异常：record_id=$record_id expected=$expected_file_count actual=$file_count"
+        log_upload_step "verify_status=warning verify_error=记录详情文件数量异常 record_id=$record_id expected=$expected_file_count actual=$file_count"
+        return 1
     fi
+
+    log_upload_step "verify_status=ok record_id=$record_id file_count=$file_count"
+    return 0
 }
 
 while [ "$#" -gt 0 ]; do
@@ -1331,6 +1342,10 @@ printf '%s\n' "$ANNOTATED_FILES" | while IFS= read -r annotated_file; do
     register_file "$record_id" "annotated" "$annotated_tag" "$annotated_file" "$annotated_content_type" "$annotated_header_file"
 done
 
-verify_record_detail "$record_id" "$((1 + annotated_count))"
+if verify_record_detail "$record_id" "$((1 + annotated_count))"; then
+    verify_status="ok"
+else
+    verify_status="warning"
+fi
 
-echo "上传成功：record_id=$record_id record_no=$created_record_no source_kind=source annotated_count=$annotated_count"
+echo "上传成功：upload_status=OK record_id=$record_id record_no=$created_record_no source_kind=source annotated_count=$annotated_count verify_status=$verify_status"
