@@ -207,8 +207,8 @@ static const quint8 BINARY_PROTOCOL_CMD_STOP_CYCLE = 0x13U;
 /* 二进制心跳命令：MP157 周期确认 F4 在线，成功只看 ACK，不再解析 STATUS 文本。 */
 static const quint8 BINARY_PROTOCOL_CMD_HEARTBEAT = 0x02U;
 
-/* 二进制模型完成命令：当前 F4 首轮保留该命令字，标定弹窗临时用它验证“非文本命令会收到 NACK”。 */
-static const quint8 BINARY_PROTOCOL_CMD_MODEL_READY = 0x30U;
+/* 二进制称重标定命令：MP157 发送已知砝码克重，F407 调用 HX711 标定入口并返回 ACK/NACK。 */
+static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE = 0x30U;
 
 /* 二进制状态查询命令：F4 成功时返回 STATUS_REPORT，失败时返回 NACK。 */
 static const quint8 BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U;
@@ -6745,15 +6745,16 @@ public:
 
     /*
      * sendF4Command 的作用：
-     *   从 QML 发送一条二进制 F4 调试命令。
+     *   从 QML 发送一条二进制 F4 称重标定命令。
      *
      * 主要流程：
-     *   1. 保留 QML 现有 CAL 按钮形状，但不再向 F4 写入 `CAL ...\r\n` 文本；
-     *   2. 当前 F4 尚未定义称重标定二进制命令，因此先发送保留命令字并等待二进制 ACK/NACK；
-     *   3. 收到 NACK 也以结构化错误显示，证明 MP157-F4 主链路已经不依赖文本回包。
+     *   1. 保留 QML 现有 `CAL <克重>` 调用形状，避免 QML 直接关心二进制 payload 偏移；
+     *   2. C++ 再次解析并校验 1~5000g，防止 QML 被绕过时发送非法克重；
+     *   3. 组装 WEIGHT_CALIBRATE 负载：cycle_id=0、known_weight_g、flags=0；
+     *   4. 后台线程写入 `/dev/ttySTM2`，并等待 F4 返回匹配 ACK/NACK。
      *
      * 参数：
-     *   commandText 是 QML 传入的原始命令文本，目前只用于校验界面仍传入 CAL。
+     *   commandText 是 QML 传入的原始命令文本，格式必须是 `CAL <1~5000整数克重>`。
      *
      * 返回值：
      *   true 表示后台发送任务已启动；false 表示参数非法或已有命令正在发送。
@@ -6761,14 +6762,25 @@ public:
     Q_INVOKABLE bool sendF4Command(const QString &commandText)
     {
         QString command = commandText.trimmed();
+        const QStringList commandParts = command.split(QRegExp(QStringLiteral("\\s+")), QString::SkipEmptyParts);
+        bool weightOk = false;
+        quint32 knownWeight = 0U;
+        QByteArray payload;
 
         if (command.isEmpty()) {
             emit f4CommandFinished(false, QStringLiteral("F4命令为空"));
             return false;
         }
 
-        if (!command.startsWith(QStringLiteral("CAL "))) {
-            emit f4CommandFinished(false, QStringLiteral("当前界面只允许发起 CAL 二进制标定占位命令"));
+        if (commandParts.size() != 2
+                || commandParts.at(0).compare(QStringLiteral("CAL"), Qt::CaseInsensitive) != 0) {
+            emit f4CommandFinished(false, QStringLiteral("当前界面只允许发起 CAL 二进制称重标定命令"));
+            return false;
+        }
+
+        knownWeight = commandParts.at(1).toUInt(&weightOk, 10);
+        if (!weightOk || knownWeight < 1U || knownWeight > 5000U) {
+            emit f4CommandFinished(false, QStringLiteral("标定克重必须是1~5000g整数"));
             return false;
         }
 
@@ -6788,14 +6800,17 @@ public:
         const QString dev = m_f4Device;
         const int baud = m_f4Baud;
         const quint16 sequence = m_f4BinarySequence++;
-        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_MODEL_READY, sequence, QByteArray());
+        appendLe16(&payload, 0U);                                    /* cycle_id=0，人工称重标定不绑定自动检测流程。 */
+        appendLe16(&payload, static_cast<quint16>(knownWeight));      /* known_weight_g，单位克，F4 仍会按 HX711 量程复核。 */
+        payload.append(static_cast<char>(0U));                        /* flags=0，首版不自动去皮、不保存 Flash、不扩展动作。 */
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE, sequence, payload);
 
         QThread *workerThread = QThread::create([self, dev, baud, frame, sequence]() {
             QString detail;
             const bool ok = sendF4BinaryCommand(dev,
                                                 baud,
                                                 frame,
-                                                BINARY_PROTOCOL_CMD_MODEL_READY,
+                                                BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE,
                                                 sequence,
                                                 0U,
                                                 &detail);
@@ -7781,6 +7796,8 @@ private:
             return QStringLiteral("RESUME_CYCLE");
         case BINARY_PROTOCOL_CMD_STOP_CYCLE:
             return QStringLiteral("STOP_CYCLE");
+        case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:
+            return QStringLiteral("WEIGHT_CALIBRATE");
         case BINARY_PROTOCOL_CMD_QUERY_STATUS:
             return QStringLiteral("QUERY_STATUS");
         case BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL:

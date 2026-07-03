@@ -211,16 +211,16 @@ Rectangle {
     /* stepperSpeedInputText 保存速度数字键盘当前输入文本，点击应用后写入 normalSpeedRpm。 */
     property string stepperSpeedInputText: "0"
 
-    /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发起二进制标定占位命令。 */
+    /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发起二进制称重标定命令。 */
     property bool calibrationPopupVisible: false
 
     /* calibrationWeightText 保存称重标定输入框中的克重文本，发送前会校验为 1~5000 的整数。 */
     property string calibrationWeightText: "1000"
 
     /* calibrationResultText 保存称重标定最近一次发送、成功或失败结果，便于操作员不看串口也能确认状态。 */
-    property string calibrationResultText: "放置砝码后输入克重；当前F4需先补称重标定二进制命令"
+    property string calibrationResultText: "放置砝码后输入克重；F4 将按二进制 WEIGHT_CALIBRATE 标定"
 
-    /* calibrationSending 表示当前二进制标定占位命令正在后台写入 F4 串口，发送完成前禁用重复点击。 */
+    /* calibrationSending 表示当前二进制称重标定命令正在后台写入 F4 串口，发送完成前禁用重复点击。 */
     property bool calibrationSending: false
 
     /* alarmCurrentCode 保存当前主告警码；运行期由相机、SD 卡、4G、云端、F4 和检测链路真实状态覆盖。 */
@@ -1810,7 +1810,7 @@ Rectangle {
 
     /*
      * sendCalibrationCommand 的作用：
-     *   校验用户输入的标定克重，并通过 C++ DeviceHealthController 发起二进制标定占位命令。
+     *   校验用户输入的标定克重，并通过 C++ DeviceHealthController 发起二进制称重标定命令。
      *
      * 主要流程：
      *   1. 去掉首尾空格后按十进制整数解析。
@@ -1840,7 +1840,7 @@ Rectangle {
 
         calibrationSending = true
         calibrationWeightText = "" + parsedWeight
-        calibrationResultText = "正在发送二进制标定占位命令，克重 " + parsedWeight + " g ..."
+        calibrationResultText = "正在发送二进制称重标定命令，克重 " + parsedWeight + " g ..."
         storageState = formatF4ToastText(calibrationResultText)
         showStorageToast()
 
@@ -3987,7 +3987,7 @@ Rectangle {
             root.calibrationSending = false
             if (ok) {
                 root.calibrationResultText = "标定命令成功：" + detail
-                root.settingsLastActionText = "已下发二进制标定占位命令 " + root.calibrationWeightText + " g"
+                root.settingsLastActionText = "已下发二进制称重标定命令 " + root.calibrationWeightText + " g"
             } else {
                 root.calibrationResultText = "标定命令失败：" + detail
                 root.settingsLastActionText = root.calibrationResultText
@@ -7208,7 +7208,7 @@ Rectangle {
                 Repeater {
                     model: [
                         {"name": "传送带", "value": "BELT命令已接", "color": root.accentGreen},
-                        {"name": "称重", "value": "CAL命令保留", "color": root.accentAmber},
+                        {"name": "称重", "value": "WEIGHT标定已接", "color": root.accentGreen},
                         {"name": "串口边界", "value": "MP157只发高层命令", "color": "#9fdcff"},
                         {"name": "安全联锁", "value": "仍由F407执行", "color": "#eef3f4"}
                     ]
