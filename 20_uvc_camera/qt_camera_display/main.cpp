@@ -216,6 +216,9 @@ static const quint8 BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U;
 /* 二进制手动传送带命令：手动页扫描/停止只走 ACK/NACK，不再发送 BELTSCAN/BELTSTOP 文本。 */
 static const quint8 BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U;
 
+/* 二进制步进电机参数命令：参数页保存后把三台 Emm42 的地址、步长、速度和方向下发给 F407。 */
+static const quint8 BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U;
+
 /* 二进制协议 ACK 命令：F4 用它确认关键命令已被接收并接受。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACK = 0x80U;
 
@@ -268,6 +271,144 @@ static const char *DEFAULT_BOARD_REVIEW_SOURCE = "cloud";
 static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
 
 /*
+ * StepperMotorSettings 的作用：
+ *   保存参数页中一台张大头 Emm42 步进电机的现场可调参数。
+ *
+ * 字段说明：
+ *   name 是界面显示名称，例如传送带电机或摄像头前后电机。
+ *   role 是稳定英文角色名，用于 JSON 和后续 F4 参数下发协议识别电机。
+ *   serialName 是 F4 侧串口归属，帮助现场确认 UART4 或 USART6 接线。
+ *   address 是 Emm42 从机地址，也就是用户口语里的电机 ID 地址。
+ *   minStep 是单次点动或闭环微调的最小步长，单位为 step。
+ *   normalSpeedRpm 是常规运动速度，单位为 rpm，允许 0~5000 的现场任意整数配置。
+ *   direction 是方向映射，1 表示正向，-1 表示反向，用于现场坐标越调越远时快速反转。
+ */
+struct StepperMotorSettings
+{
+    QString name;
+    QString role;
+    QString serialName;
+    int address = 1;
+    int minStep = 10;
+    int normalSpeedRpm = 300;
+    int direction = 1;
+};
+
+/*
+ * defaultStepperMotorSettings 的作用：
+ *   返回三台步进电机的比赛现场推荐默认参数。
+ *
+ * 主要流程：
+ *   1. 传送带电机固定使用 F4 UART4、地址 0x01。
+ *   2. 摄像头前后和上下电机共用 F4 USART6，分别使用 0x02 和 0x03，避免两个轴同时响应。
+ *   3. 速度和步长先给保守值，真实下发前仍必须由 F4 固件做限幅和联锁保护。
+ *
+ * 返回值：
+ *   返回包含三台电机配置的 QVector，顺序与弹窗三页一致。
+ */
+static QVector<StepperMotorSettings> defaultStepperMotorSettings()
+{
+    QVector<StepperMotorSettings> motors;
+
+    StepperMotorSettings beltMotor;
+    beltMotor.name = QStringLiteral("传送带电机");
+    beltMotor.role = QStringLiteral("conveyor");
+    beltMotor.serialName = QStringLiteral("UART4 PC10/PC11");
+    beltMotor.address = 1;
+    beltMotor.minStep = 20;
+    beltMotor.normalSpeedRpm = 300;
+    beltMotor.direction = 1;
+    motors.append(beltMotor);
+
+    StepperMotorSettings cameraForwardMotor;
+    cameraForwardMotor.name = QStringLiteral("摄像头前后电机");
+    cameraForwardMotor.role = QStringLiteral("camera_forward");
+    cameraForwardMotor.serialName = QStringLiteral("USART6 PC6/PC7");
+    cameraForwardMotor.address = 2;
+    cameraForwardMotor.minStep = 5;
+    cameraForwardMotor.normalSpeedRpm = 120;
+    cameraForwardMotor.direction = 1;
+    motors.append(cameraForwardMotor);
+
+    StepperMotorSettings cameraZMotor;
+    cameraZMotor.name = QStringLiteral("摄像头上下电机");
+    cameraZMotor.role = QStringLiteral("camera_z");
+    cameraZMotor.serialName = QStringLiteral("USART6 PC6/PC7");
+    cameraZMotor.address = 3;
+    cameraZMotor.minStep = 5;
+    cameraZMotor.normalSpeedRpm = 80;
+    cameraZMotor.direction = 1;
+    motors.append(cameraZMotor);
+
+    return motors;
+}
+
+/*
+ * stepperDirectionText 的作用：
+ *   把方向映射值转换成界面可读中文。
+ *
+ * 参数：
+ *   direction 是方向映射，非负数显示正向，负数显示反向。
+ *
+ * 返回值：
+ *   返回“正向”或“反向”。
+ */
+static QString stepperDirectionText(int direction)
+{
+    return direction >= 0 ? QStringLiteral("正向") : QStringLiteral("反向");
+}
+
+/*
+ * stepperMotorToVariantMap 的作用：
+ *   把单台步进电机参数转换成 QML 可以直接读取的 QVariantMap。
+ *
+ * 参数：
+ *   motor 是 C++ 内部保存的一台电机参数。
+ *   index 是电机在三页弹窗中的页序号。
+ *
+ * 返回值：
+ *   返回包含名称、角色、串口、地址、速度、步长和方向文本的 map。
+ */
+static QVariantMap stepperMotorToVariantMap(const StepperMotorSettings &motor, int index)
+{
+    QVariantMap map;
+
+    map.insert(QStringLiteral("index"), index);
+    map.insert(QStringLiteral("name"), motor.name);
+    map.insert(QStringLiteral("role"), motor.role);
+    map.insert(QStringLiteral("serialName"), motor.serialName);
+    map.insert(QStringLiteral("address"), motor.address);
+    map.insert(QStringLiteral("addressHex"), QStringLiteral("0x%1")
+        .arg(motor.address, 2, 16, QLatin1Char('0')).toUpper());
+    map.insert(QStringLiteral("minStep"), motor.minStep);
+    map.insert(QStringLiteral("normalSpeedRpm"), motor.normalSpeedRpm);
+    map.insert(QStringLiteral("direction"), motor.direction);
+    map.insert(QStringLiteral("directionText"), stepperDirectionText(motor.direction));
+    return map;
+}
+
+/*
+ * stepperMotorSettingsToVariantList 的作用：
+ *   把三台步进电机配置转换成 QML Repeater 可消费的数组。
+ *
+ * 参数：
+ *   motors 是当前已清洗的电机参数列表。
+ *
+ * 返回值：
+ *   返回 QVariantList，每个元素都是 stepperMotorToVariantMap() 生成的 QVariantMap。
+ */
+static QVariantList stepperMotorSettingsToVariantList(const QVector<StepperMotorSettings> &motors)
+{
+    QVariantList list;
+
+    for (int index = 0; index < motors.size(); ++index) {
+        list.append(stepperMotorToVariantMap(motors.at(index), index));
+    }
+
+    return list;
+}
+
+/*
  * DetectSettingsSnapshot 的作用：
  *   保存参数设置页真正参与检测链路的配置快照。
  *
@@ -279,6 +420,7 @@ static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
  *   segmentMinPixels 是 UNet 判 NG 的最小缺陷像素数，传给 defect-segment 的 --min-defect-pixels。
  *   overlayAlpha 是 UNet 叠加图透明度，传给 defect-segment 的 --alpha。
  *   autoUploadEnabled 为 false 时检测仍写本地历史，但跳过 COS 上传并返回 upload_status=SKIP。
+ *   stepperMotors 保存三台步进电机的地址、最小步长、常规速度和方向配置。
  */
 struct DetectSettingsSnapshot
 {
@@ -289,6 +431,7 @@ struct DetectSettingsSnapshot
     int segmentMinPixels = 1;
     double overlayAlpha = 0.45;
     bool autoUploadEnabled = true;
+    QVector<StepperMotorSettings> stepperMotors = defaultStepperMotorSettings();
 };
 
 /*
@@ -344,6 +487,7 @@ static QVariantMap detectSettingsToVariantMap(const DetectSettingsSnapshot &sett
     map.insert(QStringLiteral("segmentMinPixels"), settings.segmentMinPixels);
     map.insert(QStringLiteral("overlayAlpha"), settings.overlayAlpha);
     map.insert(QStringLiteral("autoUploadEnabled"), settings.autoUploadEnabled);
+    map.insert(QStringLiteral("stepperMotors"), stepperMotorSettingsToVariantList(settings.stepperMotors));
     return map;
 }
 
@@ -3136,6 +3280,7 @@ class DetectSettingsController : public QObject
     Q_PROPERTY(int segmentMinPixels READ segmentMinPixels WRITE setSegmentMinPixels NOTIFY settingsChanged)
     Q_PROPERTY(double overlayAlpha READ overlayAlpha WRITE setOverlayAlpha NOTIFY settingsChanged)
     Q_PROPERTY(bool autoUploadEnabled READ autoUploadEnabled WRITE setAutoUploadEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(QVariantList stepperMotorSettings READ stepperMotorSettings NOTIFY settingsChanged)
     Q_PROPERTY(QString lastStatusText READ lastStatusText NOTIFY lastStatusTextChanged)
 
 public:
@@ -3251,6 +3396,18 @@ public:
     bool autoUploadEnabled() const
     {
         return m_settings.autoUploadEnabled;
+    }
+
+    /*
+     * stepperMotorSettings 的作用：
+     *   返回三台步进电机当前参数，供 QML 弹窗按页展示。
+     *
+     * 返回值：
+     *   返回 QVariantList；每个元素包含 name/address/minStep/normalSpeedRpm/direction 等字段。
+     */
+    QVariantList stepperMotorSettings() const
+    {
+        return stepperMotorSettingsToVariantList(m_settings.stepperMotors);
     }
 
     /*
@@ -3384,6 +3541,52 @@ public:
     }
 
     /*
+     * setStepperMotorValue 的作用：
+     *   从 QML 步进电机参数弹窗更新某一台电机的单个参数。
+     *
+     * 主要流程：
+     *   1. 校验 index 是否指向三台已知电机，非法页号直接拒绝。
+     *   2. 根据 key 更新 ID 地址、最小步长、常规速度或方向。
+     *   3. 调用 applySettings() 统一清洗范围并发出 settingsChanged。
+     *
+     * 参数：
+     *   index 是弹窗页序号，0=传送带，1=摄像头前后，2=摄像头上下。
+     *   key 是字段名，支持 address/minStep/normalSpeedRpm/direction。
+     *   value 是字段新值，函数内部会再次限幅。
+     *
+     * 返回值：
+     *   true 表示字段已接受并进入内存配置；false 表示页号或字段名非法。
+     */
+    Q_INVOKABLE bool setStepperMotorValue(int index, const QString &key, int value)
+    {
+        if (index < 0 || index >= m_settings.stepperMotors.size()) {
+            setLastStatusText(QStringLiteral("步进电机参数：页号无效"));
+            return false;
+        }
+
+        DetectSettingsSnapshot next = m_settings;
+        StepperMotorSettings &motor = next.stepperMotors[index];
+
+        if (key == QStringLiteral("address")) {
+            motor.address = value;
+        } else if (key == QStringLiteral("minStep")) {
+            motor.minStep = value;
+        } else if (key == QStringLiteral("normalSpeedRpm")) {
+            motor.normalSpeedRpm = value;
+        } else if (key == QStringLiteral("direction")) {
+            motor.direction = value >= 0 ? 1 : -1;
+        } else {
+            setLastStatusText(QStringLiteral("步进电机参数：字段无效 ") + key);
+            return false;
+        }
+
+        applySettings(next, QStringLiteral("步进电机参数：")
+            + motor.name
+            + QStringLiteral(" 已更新"));
+        return true;
+    }
+
+    /*
      * loadSettingsFromDisk 的作用：
      *   从 /mnt/sdcard/config/defect_ui_config.json 读取检测配置。
      *
@@ -3430,6 +3633,24 @@ public:
             object.value(QStringLiteral("overlayAlpha")).toDouble(next.overlayAlpha));
         next.autoUploadEnabled = object.value(QStringLiteral("auto_upload_enabled")).toBool(
             object.value(QStringLiteral("autoUploadEnabled")).toBool(next.autoUploadEnabled));
+        /* stepperArray 保存配置文件中的三台电机参数数组；兼容旧 camelCase 键，便于调试期间手写 JSON。 */
+        const QJsonArray stepperArray = object.value(QStringLiteral("stepper_motors")).toArray(
+            object.value(QStringLiteral("stepperMotors")).toArray());
+        for (int index = 0; index < stepperArray.size() && index < next.stepperMotors.size(); ++index) {
+            /* motorObject 保存当前页电机的 JSON 对象，字段缺失时继续沿用默认值。 */
+            const QJsonObject motorObject = stepperArray.at(index).toObject();
+            /* motor 保存当前页待更新的电机配置副本，最后写回 next.stepperMotors。 */
+            StepperMotorSettings motor = next.stepperMotors.at(index);
+
+            motor.address = motorObject.value(QStringLiteral("address")).toInt(
+                motorObject.value(QStringLiteral("id")).toInt(motor.address));
+            motor.minStep = motorObject.value(QStringLiteral("min_step")).toInt(
+                motorObject.value(QStringLiteral("minStep")).toInt(motor.minStep));
+            motor.normalSpeedRpm = motorObject.value(QStringLiteral("normal_speed_rpm")).toInt(
+                motorObject.value(QStringLiteral("normalSpeedRpm")).toInt(motor.normalSpeedRpm));
+            motor.direction = motorObject.value(QStringLiteral("direction")).toInt(motor.direction);
+            next.stepperMotors[index] = motor;
+        }
 
         applySettings(normalizedSettings(next), QStringLiteral("真实检测配置：已读取 ") + m_configPath);
         return true;
@@ -3469,6 +3690,22 @@ public:
         object.insert(QStringLiteral("segment_min_pixels"), m_settings.segmentMinPixels);
         object.insert(QStringLiteral("overlay_alpha"), m_settings.overlayAlpha);
         object.insert(QStringLiteral("auto_upload_enabled"), m_settings.autoUploadEnabled);
+        /* stepperMotorsArray 保存三台步进电机参数，和界面三页顺序保持一致。 */
+        QJsonArray stepperMotorsArray;
+        for (const StepperMotorSettings &motor : m_settings.stepperMotors) {
+            /* motorObject 保存单台电机的可追溯字段，后续 F4 参数协议可按 role 定位目标电机。 */
+            QJsonObject motorObject;
+
+            motorObject.insert(QStringLiteral("name"), motor.name);
+            motorObject.insert(QStringLiteral("role"), motor.role);
+            motorObject.insert(QStringLiteral("serial"), motor.serialName);
+            motorObject.insert(QStringLiteral("address"), motor.address);
+            motorObject.insert(QStringLiteral("min_step"), motor.minStep);
+            motorObject.insert(QStringLiteral("normal_speed_rpm"), motor.normalSpeedRpm);
+            motorObject.insert(QStringLiteral("direction"), motor.direction);
+            stepperMotorsArray.append(motorObject);
+        }
+        object.insert(QStringLiteral("stepper_motors"), stepperMotorsArray);
         object.insert(QStringLiteral("saved_at"), QDateTime::currentDateTime().toString(Qt::ISODate));
 
         QSaveFile file(m_configPath);
@@ -3567,6 +3804,72 @@ private:
     }
 
     /*
+     * normalizedStepperMotors 的作用：
+     *   清洗三台步进电机参数，避免 JSON 或 QML 输入越过 F4 固件安全边界。
+     *
+     * 主要流程：
+     *   1. 以 defaultStepperMotorSettings() 为基准，确保始终只有三台已知电机。
+     *   2. 只继承用户可调的 address/minStep/normalSpeedRpm/direction，不允许 JSON 改写 name/role/serialName。
+     *   3. 对地址、步长、速度和方向做统一限幅；速度允许 0~5000，0 表示配置为常规停止速度。
+     *
+     * 参数：
+     *   input 是待清洗的电机参数列表。
+     *
+     * 返回值：
+     *   返回清洗后的三台电机配置。
+     */
+    QVector<StepperMotorSettings> normalizedStepperMotors(const QVector<StepperMotorSettings> &input) const
+    {
+        QVector<StepperMotorSettings> normalized = defaultStepperMotorSettings();
+        const int motorCount = std::min(normalized.size(), input.size());
+
+        for (int index = 0; index < motorCount; ++index) {
+            const StepperMotorSettings source = input.at(index);
+            StepperMotorSettings motor = normalized.at(index);
+
+            motor.address = clampedInt(source.address, 1, 247);
+            motor.minStep = clampedInt(source.minStep, 1, 10000);
+            motor.normalSpeedRpm = clampedInt(source.normalSpeedRpm, 0, 5000);
+            motor.direction = source.direction >= 0 ? 1 : -1;
+            normalized[index] = motor;
+        }
+
+        return normalized;
+    }
+
+    /*
+     * stepperMotorSettingsEqual 的作用：
+     *   比较两组三台电机参数是否一致，用于避免重复发送 settingsChanged 信号。
+     *
+     * 参数：
+     *   left/right 是两组已经或即将进入内存的步进电机配置。
+     *
+     * 返回值：
+     *   完全一致返回 true；任一地址、步长、速度或方向不同返回 false。
+     */
+    bool stepperMotorSettingsEqual(const QVector<StepperMotorSettings> &left,
+                                   const QVector<StepperMotorSettings> &right) const
+    {
+        if (left.size() != right.size()) {
+            return false;
+        }
+
+        for (int index = 0; index < left.size(); ++index) {
+            const StepperMotorSettings leftMotor = left.at(index);
+            const StepperMotorSettings rightMotor = right.at(index);
+
+            if (leftMotor.address != rightMotor.address
+                    || leftMotor.minStep != rightMotor.minStep
+                    || leftMotor.normalSpeedRpm != rightMotor.normalSpeedRpm
+                    || leftMotor.direction != rightMotor.direction) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /*
      * normalizedSettings 的作用：
      *   统一清洗配置值，保证 JSON、QML 和默认值都落在同一合法范围内。
      *
@@ -3590,6 +3893,7 @@ private:
         next.roiSize = clampedInt(next.roiSize, 160, 640);
         next.segmentMinPixels = clampedInt(next.segmentMinPixels, 0, 50000);
         next.overlayAlpha = clampedDouble(next.overlayAlpha, 0.0, 1.0);
+        next.stepperMotors = normalizedStepperMotors(next.stepperMotors);
         return next;
     }
 
@@ -3606,7 +3910,8 @@ private:
             && left.roiSize == right.roiSize
             && left.segmentMinPixels == right.segmentMinPixels
             && qFuzzyCompare(left.overlayAlpha + 1.0, right.overlayAlpha + 1.0)
-            && left.autoUploadEnabled == right.autoUploadEnabled;
+            && left.autoUploadEnabled == right.autoUploadEnabled
+            && stepperMotorSettingsEqual(left.stepperMotors, right.stepperMotors);
     }
 
     /*
@@ -6627,6 +6932,81 @@ public:
     }
 
     /*
+     * sendF4StepperSettings 的作用：
+     *   把参数页当前三台步进电机配置下发给 F407，让 F4 侧电机服务更新运行参数。
+     *
+     * 主要流程：
+     *   1. 从 QML 传入的 stepperMotorSettings 数组提取三台电机配置。
+     *   2. 组装 STEPPER_PARAM_SET 固定负载：cycle_id、数量、保留位和三条电机记录。
+     *   3. 后台线程写入 /dev/ttySTM2 并等待 F4 返回匹配 ACK/NACK。
+     *
+     * 参数：
+     *   motors 是 DetectSettingsController::stepperMotorSettings 暴露给 QML 的 QVariantList。
+     *
+     * 返回值：
+     *   true 表示后台发送任务已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4StepperSettings(const QVariantList &motors)
+    {
+        QByteArray payload;       /* payload 保存将写入 F4 的三台电机参数负载。 */
+        QString rejectText;       /* rejectText 保存本地校验失败原因，直接显示给参数弹窗。 */
+
+        if (!buildStepperSettingsPayload(motors, &payload, &rejectText)) {
+            emit f4StepperSettingsFinished(false, rejectText);
+            return false;
+        }
+
+        if (m_f4CommandRunning) {
+            emit f4StepperSettingsFinished(false, QStringLiteral("上一条F4命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4StepperSettingsFinished(false, QStringLiteral("F4状态刷新仍在进行，请稍后再下发步进参数"));
+            return false;
+        }
+
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET, sequence, payload);
+        m_f4CommandRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+
+        QThread *workerThread = QThread::create([self, dev, baud, frame, sequence]() {
+            QString detail;
+            const bool ok = sendF4BinaryCommand(dev,
+                                                baud,
+                                                frame,
+                                                BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET,
+                                                sequence,
+                                                0U,
+                                                &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4StepperSettingsFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            emit f4StepperSettingsFinished(false, QStringLiteral("F4步进参数线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
      * sendF4AutoControlCommand 的作用：
      *   把首页“开始、暂停、继续、停止”四个按钮映射为 MP157->F407 二进制自动检测协议帧。
      *
@@ -6784,6 +7164,9 @@ signals:
 
     /* f4ManualCommandFinished 通知 QML 手动控制页的 F4 命令发送完成，并带回命令名和回复详情。 */
     void f4ManualCommandFinished(bool ok, const QString &command, const QString &detail);
+
+    /* f4StepperSettingsFinished 通知 QML 步进电机参数下发完成，并带回 ACK/NACK 详情。 */
+    void f4StepperSettingsFinished(bool ok, const QString &detail);
 
     /* f4AutoControlFinished 通知 QML 首页自动流程命令发送完成，并带回动作、流程号和 ACK/NACK 详情。 */
     void f4AutoControlFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
@@ -7107,6 +7490,31 @@ private slots:
     }
 
     /*
+     * handleF4StepperSettingsFinished 的作用：
+     *   接收后台步进电机参数下发结果，并把 ACK/NACK 详情同步给 QML 参数弹窗。
+     *
+     * 参数：
+     *   ok 为 true 表示 F4 已接受三台电机参数。
+     *   detail 是 ACK/NACK 二进制解析结果或串口失败原因。
+     *
+     * 返回值：
+     *   无返回值；函数会释放发送忙标志并发出 f4StepperSettingsFinished 信号。
+     */
+    void handleF4StepperSettingsFinished(bool ok, const QString &detail)
+    {
+        m_f4CommandRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4 步进参数已接收：") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4 步进参数下发失败：") + detail);
+        }
+
+        emit f4StepperSettingsFinished(ok, detail);
+    }
+
+    /*
      * handleF4AutoControlFinished 的作用：
      *   接收后台二进制自动流程命令结果，并在 Qt 主线程维护 MP157 本地 cycle 状态。
      *
@@ -7222,6 +7630,97 @@ private:
     }
 
     /*
+     * stepperMotorRoleId 的作用：
+     *   把 QML/JSON 中稳定的英文 role 映射成 F4 二进制协议中的电机编号。
+     *
+     * 参数：
+     *   role 是电机角色名，当前允许 conveyor/camera_forward/camera_z。
+     *
+     * 返回值：
+     *   返回 1/2/3；未知角色返回 0，调用方据此拒绝下发。
+     */
+    static quint8 stepperMotorRoleId(const QString &role)
+    {
+        if (role == QStringLiteral("conveyor")) {
+            return 1U;
+        }
+        if (role == QStringLiteral("camera_forward")) {
+            return 2U;
+        }
+        if (role == QStringLiteral("camera_z")) {
+            return 3U;
+        }
+        return 0U;
+    }
+
+    /*
+     * buildStepperSettingsPayload 的作用：
+     *   把三台步进电机设置编码成 F4 STEPPER_PARAM_SET 负载。
+     *
+     * 主要流程：
+     *   1. 校验 QML 传来的数组必须正好包含三台电机，避免 F4 和 MP157 页序错位。
+     *   2. 每台电机编码 role_id、address、min_step、normal_speed_rpm 和 direction。
+     *   3. 地址、步长、速度和方向在 MP157 再做一次限幅，F4 收到后还会重复校验。
+     *
+     * 参数：
+     *   motors 是 QML 传入的 stepperMotorSettings。
+     *   payload 是输出负载缓存，不能为空。
+     *   errorText 是本地校验失败原因输出，可为 NULL。
+     *
+     * 返回值：
+     *   true 表示负载可发送；false 表示参数缺失或 role 非法。
+     */
+    static bool buildStepperSettingsPayload(const QVariantList &motors,
+                                            QByteArray *payload,
+                                            QString *errorText)
+    {
+        if (payload == nullptr) {
+            return false;
+        }
+
+        payload->clear();
+        if (motors.size() != 3) {
+            if (errorText) {
+                *errorText = QStringLiteral("步进参数数量错误：") + QString::number(motors.size());
+            }
+            return false;
+        }
+
+        appendLe16(payload, 0U);                 /* cycle_id=0，参数下发不绑定某一轮自动检测流程。 */
+        payload->append(static_cast<char>(3U));  /* motor_count=3，固定三台已规划 Emm42。 */
+        payload->append(static_cast<char>(0U));  /* flags=0，首版没有持久化到 F4 Flash 的含义。 */
+
+        for (int index = 0; index < motors.size(); ++index) {
+            const QVariantMap motor = motors.at(index).toMap();
+            const QString role = motor.value(QStringLiteral("role")).toString();
+            const quint8 roleId = stepperMotorRoleId(role);
+
+            if (roleId == 0U) {
+                if (errorText) {
+                    *errorText = QStringLiteral("步进参数角色非法：") + role;
+                }
+                payload->clear();
+                return false;
+            }
+
+            const int address = clampedInt(motor.value(QStringLiteral("address")).toInt(), 1, 247);
+            const int minStep = clampedInt(motor.value(QStringLiteral("minStep")).toInt(), 1, 10000);
+            const int normalSpeed = clampedInt(motor.value(QStringLiteral("normalSpeedRpm")).toInt(), 0, 5000);
+            /* directionRaw 保存 QML 传来的方向数值，Qt 5.12 的 QVariant::toInt() 不能传默认整数。 */
+            const int directionRaw = motor.value(QStringLiteral("direction")).toInt();
+            const int direction = directionRaw >= 0 ? 1 : -1;
+
+            payload->append(static_cast<char>(roleId));
+            payload->append(static_cast<char>(address & 0xFF));
+            appendLe16(payload, static_cast<quint16>(minStep));
+            appendLe16(payload, static_cast<quint16>(normalSpeed));
+            payload->append(static_cast<char>(direction));
+        }
+
+        return true;
+    }
+
+    /*
      * readLe16 的作用：
      *   从二进制协议负载或帧头中按小端序读取一个 16 位无符号整数。
      *
@@ -7286,6 +7785,8 @@ private:
             return QStringLiteral("QUERY_STATUS");
         case BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL:
             return QStringLiteral("BELT_MANUAL_CONTROL");
+        case BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET:
+            return QStringLiteral("STEPPER_PARAM_SET");
         case BINARY_PROTOCOL_CMD_ACK:
             return QStringLiteral("ACK");
         case BINARY_PROTOCOL_CMD_NACK:
@@ -9377,6 +9878,27 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("segment_min_pixels=120\n")
         + QStringLiteral("overlay_alpha=0.45\n")
         + QStringLiteral("auto_upload_enabled=true\n")
+        + QStringLiteral("stepper_motor[0].name=传送带电机\n")
+        + QStringLiteral("stepper_motor[0].role=conveyor\n")
+        + QStringLiteral("stepper_motor[0].serial=UART4 PC10/PC11\n")
+        + QStringLiteral("stepper_motor[0].address=1\n")
+        + QStringLiteral("stepper_motor[0].min_step=20\n")
+        + QStringLiteral("stepper_motor[0].normal_speed_rpm=300\n")
+        + QStringLiteral("stepper_motor[0].direction=1 (正向)\n")
+        + QStringLiteral("stepper_motor[1].name=摄像头前后电机\n")
+        + QStringLiteral("stepper_motor[1].role=camera_forward\n")
+        + QStringLiteral("stepper_motor[1].serial=USART6 PC6/PC7\n")
+        + QStringLiteral("stepper_motor[1].address=2\n")
+        + QStringLiteral("stepper_motor[1].min_step=5\n")
+        + QStringLiteral("stepper_motor[1].normal_speed_rpm=137\n")
+        + QStringLiteral("stepper_motor[1].direction=1 (正向)\n")
+        + QStringLiteral("stepper_motor[2].name=摄像头上下电机\n")
+        + QStringLiteral("stepper_motor[2].role=camera_z\n")
+        + QStringLiteral("stepper_motor[2].serial=USART6 PC6/PC7\n")
+        + QStringLiteral("stepper_motor[2].address=3\n")
+        + QStringLiteral("stepper_motor[2].min_step=5\n")
+        + QStringLiteral("stepper_motor[2].normal_speed_rpm=5000\n")
+        + QStringLiteral("stepper_motor[2].direction=1 (正向)\n")
         + QStringLiteral("classify_args=--roi 352 --bad-threshold 0.650\n")
         + QStringLiteral("segment_args=--roi 352 --alpha 0.45 --min-defect-pixels 120\n");
 

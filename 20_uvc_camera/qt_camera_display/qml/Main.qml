@@ -187,6 +187,30 @@ Rectangle {
     /* settingsDetailText 保存当前参数详情浮层正文，内容来自云端上传契约和当前板端接入边界。 */
     property string settingsDetailText: ""
 
+    /* stepperMotorSettings 保存 C++ DetectSettingsController 暴露的三台步进电机参数，用于三页弹窗显示。 */
+    property var stepperMotorSettings: detectSettings.stepperMotorSettings
+
+    /* stepperMotorPageNames 保存三页固定名称，也作为 QML 资源 marker，便于部署后用 strings 验证。 */
+    property var stepperMotorPageNames: ["传送带电机", "摄像头前后电机", "摄像头上下电机"]
+
+    /* stepperMotorPopupVisible 表示步进电机参数弹窗是否打开，避免把完整表单塞进参数页小卡片。 */
+    property bool stepperMotorPopupVisible: false
+
+    /* stepperMotorPageIndex 保存步进电机弹窗当前页，0=传送带，1=摄像头前后，2=摄像头上下。 */
+    property int stepperMotorPageIndex: 0
+
+    /* stepperMotorResultText 保存最近一次修改提示，提醒用户点击“保存并下发”后同时写 JSON 和通知 F4。 */
+    property string stepperMotorResultText: "调整后点击保存并下发；MP157 写入 JSON，并向 F4 下发运行时参数"
+
+    /* stepperSettingsSending 表示步进电机参数正在通过二进制协议下发给 F407，防止重复点击保存。 */
+    property bool stepperSettingsSending: false
+
+    /* stepperSpeedEditorVisible 表示常规速度数字键盘是否打开，用于输入 0~5000 rpm 任意整数。 */
+    property bool stepperSpeedEditorVisible: false
+
+    /* stepperSpeedInputText 保存速度数字键盘当前输入文本，点击应用后写入 normalSpeedRpm。 */
+    property string stepperSpeedInputText: "0"
+
     /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发起二进制标定占位命令。 */
     property bool calibrationPopupVisible: false
 
@@ -1230,6 +1254,7 @@ Rectangle {
                 + "  复核" + settingsThresholdText(settingsReviewThreshold)
                 + "  ROI" + settingsRoiSize
                 + "  UNet>" + settingsSegmentMinPixels + "px"
+                + "  电机ID" + stepperMotorCompactSummary()
                 + "  上传" + (settingsUploadEnabled ? "自动" : "手动")
     }
 
@@ -1263,6 +1288,7 @@ Rectangle {
             "segment_min_pixels=" + settingsSegmentMinPixels,
             "overlay_alpha=" + settingsOverlayAlpha.toFixed(2),
             "auto_upload_enabled=" + (settingsUploadEnabled ? "true" : "false"),
+            stepperMotorLogText(),
             "classify_args=--roi " + settingsRoiSize + " --bad-threshold " + (settingsDecisionThreshold / 1000.0).toFixed(3),
             "segment_args=--roi " + settingsRoiSize + " --alpha " + settingsOverlayAlpha.toFixed(2) + " --min-defect-pixels " + settingsSegmentMinPixels,
             "summary=" + settingsSummaryText()
@@ -1283,6 +1309,289 @@ Rectangle {
             return settingsSupportedPartTypes[0]
         }
         return settingsSupportedPartTypes[(index + 1) % settingsSupportedPartTypes.length]
+    }
+
+    /*
+     * currentStepperMotorSetting 的作用：
+     *   返回步进电机弹窗当前页对应的电机参数。
+     *
+     * 主要流程：
+     *   1. 从 detectSettings.stepperMotorSettings 读取 C++ 当前配置，避免使用过期缓存。
+     *   2. 如果当前页越界，返回空对象，调用方再显示占位文本。
+     *
+     * 返回值：
+     *   返回包含 name、address、minStep、normalSpeedRpm 和 direction 的对象。
+     */
+    function currentStepperMotorSetting() {
+        var motors = detectSettings.stepperMotorSettings
+        if (!motors || stepperMotorPageIndex < 0 || stepperMotorPageIndex >= motors.length) {
+            return {}
+        }
+        return motors[stepperMotorPageIndex]
+    }
+
+    /*
+     * stepperMotorAddressText 的作用：
+     *   把电机地址显示成十进制和十六进制双格式，方便对照 F4/Emm42 文档。
+     *
+     * 参数：
+     *   motor 是 currentStepperMotorSetting() 返回的当前电机对象。
+     *
+     * 返回值：
+     *   返回例如 `2 / 0x02` 的地址文本；缺失时返回 `--`。
+     */
+    function stepperMotorAddressText(motor) {
+        if (!motor || motor.address === undefined) {
+            return "--"
+        }
+        return motor.address + " / " + motor.addressHex
+    }
+
+    /*
+     * stepperMotorDirectionText 的作用：
+     *   把方向映射整数转成界面文案。
+     *
+     * 参数：
+     *   direction 是 C++ 保存的方向值，1 表示正向，-1 表示反向。
+     *
+     * 返回值：
+     *   返回“正向”或“反向”。
+     */
+    function stepperMotorDirectionText(direction) {
+        return direction >= 0 ? "正向" : "反向"
+    }
+
+    /*
+     * stepperMotorCompactSummary 的作用：
+     *   生成参数页摘要中的短电机 ID 串，避免在顶部小条中展示完整表单。
+     *
+     * 返回值：
+     *   返回 `1/2/3` 这种短地址组合；没有配置时返回 `--`。
+     */
+    function stepperMotorCompactSummary() {
+        var motors = detectSettings.stepperMotorSettings
+        var ids = []
+        if (!motors || motors.length === 0) {
+            return "--"
+        }
+
+        for (var index = 0; index < motors.length; ++index) {
+            ids.push(motors[index].address)
+        }
+        return ids.join("/")
+    }
+
+    /*
+     * stepperMotorLogText 的作用：
+     *   把三台步进电机参数展开为参数日志字段，便于 SSH 复盘当前保存值。
+     *
+     * 返回值：
+     *   返回多行 key=value 文本，会被 settingsLogText() 合并写入 qt_settings 日志。
+     */
+    function stepperMotorLogText() {
+        var motors = detectSettings.stepperMotorSettings
+        var lines = []
+        if (!motors || motors.length === 0) {
+            return "stepper_motors=missing"
+        }
+
+        for (var index = 0; index < motors.length; ++index) {
+            var motor = motors[index]
+            var prefix = "stepper_motor[" + index + "]"
+            lines.push(prefix + ".name=" + motor.name)
+            lines.push(prefix + ".role=" + motor.role)
+            lines.push(prefix + ".serial=" + motor.serialName)
+            lines.push(prefix + ".address=" + motor.address)
+            lines.push(prefix + ".min_step=" + motor.minStep)
+            lines.push(prefix + ".normal_speed_rpm=" + motor.normalSpeedRpm)
+            lines.push(prefix + ".direction=" + motor.direction + " (" + root.stepperMotorDirectionText(motor.direction) + ")")
+        }
+        return lines.join("\n")
+    }
+
+    /*
+     * openStepperMotorPopup 的作用：
+     *   打开步进电机参数弹窗，并把页面定位到用户选择的电机。
+     *
+     * 参数：
+     *   pageIndex 是希望打开的页号，非法时回到 0 页。
+     *
+     * 返回值：
+     *   无返回值；函数只更新弹窗显隐、页号和提示文本。
+     */
+    function openStepperMotorPopup(pageIndex) {
+        var motors = detectSettings.stepperMotorSettings
+        var maxIndex = motors && motors.length > 0 ? motors.length - 1 : 0
+        stepperMotorPageIndex = Math.max(0, Math.min(maxIndex, pageIndex))
+        stepperMotorResultText = "保存并下发后会写入 JSON，并发送 STEPPER_PARAM_SET 给 F4；F4 只更新运行内存"
+        stepperSpeedEditorVisible = false
+        stepperSpeedInputText = "" + (currentStepperMotorSetting().normalSpeedRpm || 0)
+        stepperMotorPopupVisible = true
+    }
+
+    /*
+     * openStepperSpeedEditor 的作用：
+     *   打开常规速度数字键盘，并把当前电机速度拷贝到输入框。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 stepperSpeedInputText 和 stepperSpeedEditorVisible。
+     */
+    function openStepperSpeedEditor() {
+        var motor = currentStepperMotorSetting()
+        stepperSpeedInputText = "" + (motor.normalSpeedRpm || 0)
+        stepperSpeedEditorVisible = true
+    }
+
+    /*
+     * appendStepperSpeedDigit 的作用：
+     *   向速度输入框追加一个数字，让触摸屏能输入 0~5000 rpm 任意整数。
+     *
+     * 主要流程：
+     *   1. 把当前文本和新数字拼成候选值，并去掉多余前导零。
+     *   2. 允许候选值为 0；大于 5000 时拒绝追加并提示。
+     *
+     * 参数：
+     *   digit 是被点击的数字字符，取值为 "0" 到 "9"。
+     *
+     * 返回值：
+     *   无返回值；函数只更新输入文本和结果提示。
+     */
+    function appendStepperSpeedDigit(digit) {
+        var nextText = (stepperSpeedInputText + digit).replace(/^0+/, "")
+        if (nextText.length === 0) {
+            nextText = "0"
+        }
+
+        var nextValue = parseInt(nextText, 10)
+        if (nextValue > 5000) {
+            stepperMotorResultText = "常规速度范围是 0~5000 rpm"
+            return
+        }
+
+        stepperSpeedInputText = nextText
+        stepperMotorResultText = "速度待应用：" + stepperSpeedInputText + " rpm"
+    }
+
+    /*
+     * backspaceStepperSpeedDigit 的作用：
+     *   删除速度输入框最后一位，便于触摸屏纠正输入。
+     *
+     * 返回值：
+     *   无返回值；输入为空时回到 0，避免出现不可应用的空速度。
+     */
+    function backspaceStepperSpeedDigit() {
+        stepperSpeedInputText = stepperSpeedInputText.substring(0, Math.max(0, stepperSpeedInputText.length - 1))
+        if (stepperSpeedInputText.length === 0) {
+            stepperSpeedInputText = "0"
+        }
+        stepperMotorResultText = "速度待应用：" + stepperSpeedInputText + " rpm"
+    }
+
+    /*
+     * clearStepperSpeedInput 的作用：
+     *   清空并重置常规速度输入为 0，便于快速设置停止速度。
+     *
+     * 返回值：
+     *   无返回值；函数只更新输入文本和结果提示。
+     */
+    function clearStepperSpeedInput() {
+        stepperSpeedInputText = "0"
+        stepperMotorResultText = "速度待应用：0 rpm"
+    }
+
+    /*
+     * applyStepperSpeedInput 的作用：
+     *   校验速度输入框并写入当前页电机的 normalSpeedRpm。
+     *
+     * 主要流程：
+     *   1. 只接受 0~5000 的十进制整数。
+     *   2. 调用 C++ setStepperMotorValue() 写入内存配置。
+     *   3. 提示用户还需要点击保存配置，才能写入 JSON 并在重启后恢复。
+     *
+     * 返回值：
+     *   无返回值；成功后关闭速度数字键盘。
+     */
+    function applyStepperSpeedInput() {
+        var trimmedText = stepperSpeedInputText.replace(/^\s+|\s+$/g, "")
+        var parsedSpeed = parseInt(trimmedText, 10)
+
+        if (!/^[0-9]+$/.test(trimmedText) || parsedSpeed < 0 || parsedSpeed > 5000) {
+            stepperMotorResultText = "常规速度必须是 0~5000 rpm 的整数"
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        if (!detectSettings.setStepperMotorValue(stepperMotorPageIndex, "normalSpeedRpm", parsedSpeed)) {
+            stepperMotorResultText = detectSettings.lastStatusText
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        stepperSpeedEditorVisible = false
+        stepperSpeedInputText = "" + parsedSpeed
+        stepperMotorResultText = currentStepperMotorSetting().name + "：常规速度 " + parsedSpeed + " rpm，点击保存并下发写入JSON并通知F4"
+        settingsLastActionText = "步进电机速度已更新为 " + parsedSpeed + " rpm"
+        storageState = settingsLastActionText
+        showStorageToast()
+    }
+
+    /*
+     * changeStepperMotorValue 的作用：
+     *   处理步进电机弹窗内的加减按钮，把修改写入 C++ 检测配置控制器。
+     *
+     * 参数：
+     *   key 是 address、minStep、normalSpeedRpm 或 direction。
+     *   delta 是要增加或减少的数值；direction 会被当作目标方向值使用。
+     *
+     * 返回值：
+     *   无返回值；成功或失败都会更新 stepperMotorResultText 和底部提示条。
+     */
+    function changeStepperMotorValue(key, delta) {
+        var motor = currentStepperMotorSetting()
+        var nextValue = 0
+
+        if (!motor || motor.name === undefined) {
+            stepperMotorResultText = "步进电机参数异常：当前页没有电机配置"
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        if (key === "address") {
+            nextValue = motor.address + delta
+        } else if (key === "minStep") {
+            nextValue = motor.minStep + delta
+        } else if (key === "normalSpeedRpm") {
+            nextValue = motor.normalSpeedRpm + delta
+        } else if (key === "direction") {
+            nextValue = delta >= 0 ? 1 : -1
+        } else {
+            stepperMotorResultText = "步进电机参数异常：未知字段 " + key
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        if (!detectSettings.setStepperMotorValue(stepperMotorPageIndex, key, nextValue)) {
+            stepperMotorResultText = detectSettings.lastStatusText
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        motor = currentStepperMotorSetting()
+        if (key === "normalSpeedRpm") {
+            stepperSpeedInputText = "" + motor.normalSpeedRpm
+        }
+        stepperMotorResultText = motor.name + "：地址 " + motor.addressHex
+                + "，最小步长 " + motor.minStep + " step"
+                + "，常规速度 " + motor.normalSpeedRpm + " rpm"
+                + "，方向 " + root.stepperMotorDirectionText(motor.direction)
+        settingsLastActionText = "步进电机参数已更新，点击保存配置写入JSON"
+        storageState = settingsLastActionText
+        showStorageToast()
     }
 
     /*
@@ -1356,9 +1665,9 @@ Rectangle {
             "1. MP157 负责视觉推理、图片保存、COS 上传、历史补传和云端记录创建。",
             "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
             "3. 当前传送带只开放 BELT_MANUAL_CONTROL 和 QUERY_STATUS 两类 F407 已实现二进制命令。",
-            "4. 相机上下轴和前后轴暂不在 Qt 页面提供按钮，必须等 F407 固件给出二进制命令、状态回读和失败码后再接入。",
-            "5. 本页面不提供速度、位置、剔除动作、急停解除或联锁时序参数，避免绕过 F4 固件安全边界。",
-            "6. 后续若接入相机轴真实参数下发，需要先在 F407 定义回零、移动、停止、查询、ACK/NACK、STATUS_REPORT 和 FAULT_REPORT 流程。"
+            "4. 步进电机参数弹窗只保存三台 Emm42 的地址、最小步长、常规速度和方向，方便后续 F4 固件读取同一份 JSON 或按协议下发。",
+            "5. 当前 Qt 不直接拼 Emm42 帧，不绕过 F407 下发速度、位置、剔除动作、急停解除或联锁时序。",
+            "6. 后续若接入相机轴真实参数下发，需要先在 F407 定义回零、移动、停止、查询、参数应用、ACK/NACK、STATUS_REPORT 和 FAULT_REPORT 流程。"
         ]
         return lines.join("\n")
     }
@@ -2196,6 +2505,7 @@ Rectangle {
         activePage = pageName
         alarmAdviceDetailVisible = false
         settingsDetailVisible = false
+        stepperMotorPopupVisible = false
         calibrationPopupVisible = false
         logDetailVisible = false
 
@@ -3716,6 +4026,28 @@ Rectangle {
 
             root.storageState = root.formatF4ToastText(root.manualLastAckText)
             root.appendManualCommandLog(command, "传送带", root.manualLastAckText)
+            root.showStorageToast()
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4StepperSettingsFinished 的作用：
+         *   接收 C++ 后台步进电机参数下发结果，更新参数弹窗和底部提示条。
+         *
+         * 参数：
+         *   ok 表示 F4 是否返回匹配 STEPPER_PARAM_SET 的 ACK。
+         *   detail 是 ACK/NACK 解析文本或串口失败原因。
+         */
+        onF4StepperSettingsFinished: {
+            root.stepperSettingsSending = false
+            if (ok) {
+                root.stepperMotorResultText = "F4已接收步进参数：" + detail
+                root.settingsLastActionText = "步进电机参数已保存并下发 F4"
+            } else {
+                root.stepperMotorResultText = "F4步进参数下发失败：" + detail
+                root.settingsLastActionText = root.stepperMotorResultText
+            }
+            root.storageState = root.formatF4ToastText(root.settingsLastActionText)
             root.showStorageToast()
             root.evaluateRuntimeAlarms()
         }
@@ -6920,7 +7252,7 @@ Rectangle {
             Rectangle {
                 x: 14
                 y: 132
-                width: 92
+                width: 68
                 height: 26
                 radius: 7
                 color: calibrationOpenMouse.pressed ? "#273940" : "#1d3036"
@@ -6929,9 +7261,9 @@ Rectangle {
 
                 Text {
                     anchors.centerIn: parent
-                    text: "称重标定"
+                    text: "称重"
                     color: "#e8f5ff"
-                    font.pixelSize: 12
+                    font.pixelSize: 11
                     font.bold: true
                 }
 
@@ -6946,7 +7278,35 @@ Rectangle {
             }
 
             Rectangle {
-                width: 86
+                x: 90
+                y: 132
+                width: 94
+                height: 26
+                radius: 7
+                color: stepperMotorOpenMouse.pressed ? "#30413a" : "#1f332b"
+                border.color: root.accentGreen
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "步进参数"
+                    color: "#eafff2"
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: stepperMotorOpenMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.openStepperMotorPopup(0)
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 58
                 height: 26
                 radius: 7
                 anchors.right: parent.right
@@ -6958,9 +7318,9 @@ Rectangle {
 
                 Text {
                     anchors.centerIn: parent
-                    text: "查看详情"
+                    text: "详情"
                     color: "#fff3d5"
-                    font.pixelSize: 12
+                    font.pixelSize: 11
                     font.bold: true
                 }
 
@@ -7267,6 +7627,839 @@ Rectangle {
                     lineHeightMode: Text.ProportionalHeight
                     lineHeight: 1.26
                     wrapMode: Text.Wrap
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: stepperMotorPopup
+        anchors.fill: parent
+        z: 894
+        visible: root.stepperMotorPopupVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.stepperMotorPopupVisible = false
+            }
+        }
+
+        Rectangle {
+            id: stepperMotorPopupPanel
+            width: 660
+            height: 520
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: root.accentGreen
+            border.width: 1
+            clip: true
+
+            /* motorConfig 保存当前页电机参数对象，所有字段显示都从 C++ 配置控制器读取。 */
+            property var motorConfig: root.currentStepperMotorSetting()
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 126
+                text: "步进电机参数"
+                color: "#f1f4f5"
+                font.pixelSize: 20
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 7
+                color: closeStepperMotorMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeStepperMotorMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.stepperMotorPopupVisible = false
+                    }
+                }
+            }
+
+            Text {
+                x: 18
+                y: 50
+                width: parent.width - 36
+                height: 34
+                text: "保存并下发会写入 MP157 JSON 并通知 F407；真正运动、限幅、急停和联锁仍由 F407 固件执行。"
+                color: "#cfd7db"
+                font.pixelSize: 13
+                font.bold: true
+                wrapMode: Text.Wrap
+            }
+
+            Row {
+                id: stepperMotorPageTabs
+                x: 18
+                y: 92
+                width: parent.width - 36
+                height: 36
+                spacing: 8
+
+                Repeater {
+                    model: detectSettings.stepperMotorSettings
+
+                    Rectangle {
+                        width: (stepperMotorPageTabs.width - 16) / 3
+                        height: 36
+                        radius: 7
+                        color: root.stepperMotorPageIndex === index
+                               ? "#1f332b"
+                               : (stepperTabMouse.pressed ? "#26323a" : "#1a2024")
+                        border.color: root.stepperMotorPageIndex === index ? root.accentGreen : "#344149"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.name
+                            color: root.stepperMotorPageIndex === index ? "#eafff2" : "#d7dee2"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+
+                        MouseArea {
+                            id: stepperTabMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.stepperMotorPageIndex = index
+                                root.stepperSpeedEditorVisible = false
+                                root.stepperSpeedInputText = "" + (modelData.normalSpeedRpm || 0)
+                                root.stepperMotorResultText = modelData.name + " 参数页"
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 142
+                width: parent.width - 36
+                height: 264
+                radius: 8
+                color: "#171b1e"
+                border.color: "#344149"
+                border.width: 1
+
+                Text {
+                    x: 14
+                    y: 12
+                    width: parent.width - 28
+                    text: (stepperMotorPopupPanel.motorConfig.name || "--")
+                          + "  " + (stepperMotorPopupPanel.motorConfig.serialName || "--")
+                    color: "#f1f4f5"
+                    font.pixelSize: 16
+                    font.bold: true
+                    elide: Text.ElideRight
+                }
+
+                Text {
+                    x: 14
+                    y: 38
+                    width: parent.width - 28
+                    height: 34
+                    text: "ID 地址用于区分同一串口上的 Emm42；速度单位为 rpm，最小步长单位为 step。"
+                    color: "#8f9aa1"
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                Row {
+                    x: 14
+                    y: 82
+                    width: parent.width - 28
+                    height: 38
+                    spacing: 8
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "ID地址"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 132
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: root.stepperMotorAddressText(stepperMotorPopupPanel.motorConfig)
+                            color: "#eef3f4"
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84
+                        height: 34
+                        radius: 7
+                        color: stepperAddressMinusMouse.pressed ? "#30363b" : "#22272b"
+                        border.color: "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "地址-"
+                            color: "#d9ecff"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperAddressMinusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("address", -1)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84
+                        height: 34
+                        radius: 7
+                        color: stepperAddressPlusMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "地址+"
+                            color: "#eafff2"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperAddressPlusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("address", 1)
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    x: 14
+                    y: 128
+                    width: parent.width - 28
+                    height: 38
+                    spacing: 8
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "最小步长"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: (stepperMotorPopupPanel.motorConfig.minStep || 0) + " step"
+                            color: "#eef3f4"
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84
+                        height: 34
+                        radius: 7
+                        color: stepperMinStepMinusMouse.pressed ? "#30363b" : "#22272b"
+                        border.color: "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "步长-"
+                            color: "#d9ecff"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperMinStepMinusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("minStep", -1)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84
+                        height: 34
+                        radius: 7
+                        color: stepperMinStepPlusMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "步长+"
+                            color: "#eafff2"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperMinStepPlusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("minStep", 1)
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    x: 14
+                    y: 174
+                    width: parent.width - 28
+                    height: 38
+                    spacing: 8
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "常规速度"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: (stepperMotorPopupPanel.motorConfig.normalSpeedRpm || 0) + " rpm"
+                            color: "#eef3f4"
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
+                    }
+
+                    Rectangle {
+                        width: 72
+                        height: 34
+                        radius: 7
+                        color: stepperSpeedMinusMouse.pressed ? "#30363b" : "#22272b"
+                        border.color: "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "速度-"
+                            color: "#d9ecff"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperSpeedMinusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("normalSpeedRpm", -10)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 72
+                        height: 34
+                        radius: 7
+                        color: stepperSpeedInputMouse.pressed ? "#3c3322" : "#33291b"
+                        border.color: root.accentAmber
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "输入"
+                            color: "#fff3d5"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperSpeedInputMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.openStepperSpeedEditor()
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 72
+                        height: 34
+                        radius: 7
+                        color: stepperSpeedPlusMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "速度+"
+                            color: "#eafff2"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperSpeedPlusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("normalSpeedRpm", 10)
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    x: 14
+                    y: 220
+                    width: parent.width - 28
+                    height: 34
+                    spacing: 8
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "方向"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: root.stepperMotorDirectionText(stepperMotorPopupPanel.motorConfig.direction || 1)
+                            color: "#eef3f4"
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84
+                        height: 34
+                        radius: 7
+                        color: stepperReverseMouse.pressed ? "#3a1b1f" : "#2a2020"
+                        border.color: root.accentRed
+                        border.width: 1
+                        opacity: stepperMotorPopupPanel.motorConfig.direction < 0 ? 1.0 : 0.78
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "反向"
+                            color: "#ffecef"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperReverseMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("direction", -1)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84
+                        height: 34
+                        radius: 7
+                        color: stepperForwardMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+                        opacity: stepperMotorPopupPanel.motorConfig.direction >= 0 ? 1.0 : 0.78
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "正向"
+                            color: "#eafff2"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperForwardMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("direction", 1)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 418
+                width: parent.width - 36
+                height: 46
+                radius: 7
+                color: "#141719"
+                border.color: "#344149"
+                border.width: 1
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 12
+                    anchors.right: parent.right
+                    anchors.rightMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.stepperMotorResultText
+                    color: "#dce3e6"
+                    font.pixelSize: 12
+                    font.bold: true
+                    wrapMode: Text.Wrap
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 474
+                width: 140
+                height: 34
+                radius: 8
+                color: stepperNextPageMouse.pressed ? "#26323a" : "#1a2024"
+                border.color: "#5aa7ff"
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "下一台电机"
+                    color: "#d9ecff"
+                    font.pixelSize: 13
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: stepperNextPageMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        var motors = detectSettings.stepperMotorSettings
+                        var count = motors && motors.length > 0 ? motors.length : 1
+                        root.stepperMotorPageIndex = (root.stepperMotorPageIndex + 1) % count
+                        root.stepperSpeedEditorVisible = false
+                        root.stepperSpeedInputText = "" + (root.currentStepperMotorSetting().normalSpeedRpm || 0)
+                        root.stepperMotorResultText = root.currentStepperMotorSetting().name + " 参数页"
+                    }
+                }
+            }
+
+            Rectangle {
+                x: parent.width - 178
+                y: 474
+                width: 160
+                height: 34
+                radius: 8
+                color: stepperSaveMouse.pressed ? "#30413a" : "#1f332b"
+                border.color: root.accentGreen
+                border.width: 1
+                opacity: root.stepperSettingsSending ? 0.55 : 1.0
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.stepperSettingsSending ? "下发中..." : "保存并下发"
+                    color: "#eafff2"
+                    font.pixelSize: 13
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: stepperSaveMouse
+                    anchors.fill: parent
+                    enabled: !root.stepperSettingsSending
+
+                    onClicked: {
+                        root.settingsApplyAction("save")
+                        root.stepperSettingsSending = true
+                        root.stepperMotorResultText = root.settingsLastActionText + "；正在通过二进制协议下发 F4"
+                        root.storageState = root.stepperMotorResultText
+                        root.showStorageToast()
+                        if (!deviceHealth.sendF4StepperSettings(detectSettings.stepperMotorSettings)) {
+                            root.stepperSettingsSending = false
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                id: stepperSpeedEditor
+                anchors.fill: parent
+                z: 30
+                visible: root.stepperSpeedEditorVisible
+                color: "#cc000000"
+
+                MouseArea {
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.stepperSpeedEditorVisible = false
+                    }
+                }
+
+                Rectangle {
+                    width: 424
+                    height: 420
+                    anchors.centerIn: parent
+                    radius: 10
+                    color: "#20262a"
+                    border.color: root.accentAmber
+                    border.width: 1
+                    clip: true
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Text {
+                        x: 16
+                        y: 14
+                        width: parent.width - 108
+                        text: "常规速度输入"
+                        color: "#f1f4f5"
+                        font.pixelSize: 18
+                        font.bold: true
+                        elide: Text.ElideRight
+                    }
+
+                    Rectangle {
+                        x: parent.width - 80
+                        y: 12
+                        width: 64
+                        height: 30
+                        radius: 7
+                        color: closeSpeedEditorMouse.pressed ? "#3a1b1f" : "#2a2020"
+                        border.color: root.accentRed
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "关闭"
+                            color: "#ffecef"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: closeSpeedEditorMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.stepperSpeedEditorVisible = false
+                            }
+                        }
+                    }
+
+                    Text {
+                        x: 16
+                        y: 54
+                        width: parent.width - 32
+                        text: "范围 0~5000 rpm；0 表示保存为常规停止速度。"
+                        color: "#cfd7db"
+                        font.pixelSize: 12
+                        font.bold: true
+                        wrapMode: Text.Wrap
+                    }
+
+                    Rectangle {
+                        x: 16
+                        y: 88
+                        width: parent.width - 32
+                        height: 54
+                        radius: 8
+                        color: "#171b1e"
+                        border.color: "#344149"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: root.stepperSpeedInputText + " rpm"
+                            color: "#ffffff"
+                            font.pixelSize: 24
+                            font.bold: true
+                        }
+                    }
+
+                    Grid {
+                        id: stepperSpeedKeypadGrid
+                        x: 16
+                        y: 158
+                        width: parent.width - 32
+                        columns: 3
+                        rowSpacing: 8
+                        columnSpacing: 8
+
+                        Repeater {
+                            model: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "清空", "0", "退格"]
+
+                            Rectangle {
+                                width: (stepperSpeedKeypadGrid.width - 16) / 3
+                                height: 42
+                                radius: 7
+                                color: stepperSpeedKeyMouse.pressed ? "#26323a" : "#1a2024"
+                                border.color: modelData === "清空" || modelData === "退格" ? "#5aa7ff" : "#344149"
+                                border.width: 1
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData
+                                    color: modelData === "清空" || modelData === "退格" ? "#d9ecff" : "#f1f4f5"
+                                    font.pixelSize: 15
+                                    font.bold: true
+                                }
+
+                                MouseArea {
+                                    id: stepperSpeedKeyMouse
+                                    anchors.fill: parent
+
+                                    onClicked: {
+                                        if (modelData === "清空") {
+                                            root.clearStepperSpeedInput()
+                                        } else if (modelData === "退格") {
+                                            root.backspaceStepperSpeedDigit()
+                                        } else {
+                                            root.appendStepperSpeedDigit(modelData)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        x: 16
+                        y: 370
+                        width: 140
+                        height: 36
+                        radius: 8
+                        color: resetSpeedMouse.pressed ? "#30363b" : "#22272b"
+                        border.color: "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "重置为0"
+                            color: "#d9ecff"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: resetSpeedMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.clearStepperSpeedInput()
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        x: parent.width - 176
+                        y: 370
+                        width: 160
+                        height: 36
+                        radius: 8
+                        color: applySpeedMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "应用速度"
+                            color: "#eafff2"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: applySpeedMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.applyStepperSpeedInput()
+                            }
+                        }
+                    }
                 }
             }
         }
