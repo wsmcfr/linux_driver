@@ -103,6 +103,42 @@ Rectangle {
     /* autoVisionLastText 保存自动视觉闭环最近一次可读状态，底部提示和调试日志会复用它。 */
     property string autoVisionLastText: "视觉闭环待开始"
 
+    /* autoVisionLocatePurpose 标记当前 LOCATE 用途：center 用于传送带居中，fine-tune 用于 Z 轴下降后的前后轴微调复查。 */
+    property string autoVisionLocatePurpose: "center"
+
+    /* autoVisionActuatorPhase 保存正在等待 ACK 或等待稳定的执行器阶段，空字符串表示当前没有自动执行器动作。 */
+    property string autoVisionActuatorPhase: ""
+
+    /* autoVisionFineTuneAttempts 保存 Z 轴下降后已经尝试的前后轴微调次数，避免定位抖动导致无限移动。 */
+    property int autoVisionFineTuneAttempts: 0
+
+    /* autoVisionFineTuneMaxAttempts 是前后轴微调次数上限，超过后进入模型检测并把结果交给人工复核。 */
+    property int autoVisionFineTuneMaxAttempts: 3
+
+    /* autoVisionFineTuneTolerancePx 是 Z 轴下降后 ROI 复查的中心死区，默认复用视觉居中死区。 */
+    property int autoVisionFineTuneTolerancePx: 24
+
+    /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
+    property int autoVisionZFocusSettleMs: 3000
+
+    /* autoVisionPostFocusDetectDelayMs 是已经完成 Z 轴对焦等待后的短检测延时，给 overlay 刷新一帧。 */
+    property int autoVisionPostFocusDetectDelayMs: 300
+
+    /* autoVisionDefaultDetectDelayMs 是没有执行 Z 轴下探时保留的默认静止检测延时。 */
+    property int autoVisionDefaultDetectDelayMs: 2000
+
+    /* autoVisionShortSettleMs 是跳过下探或前后轴微调后的短机械稳定等待时间，单位 ms。 */
+    property int autoVisionShortSettleMs: 450
+
+    /* autoVisionZFocusSettled 表示本轮已经完成 Z 轴下降后的 3 秒对焦等待。 */
+    property bool autoVisionZFocusSettled: false
+
+    /* autoVisionNeedsZUp 表示本轮自动检测已经执行过 Z 轴下探，模型检测结束后必须请求回升。 */
+    property bool autoVisionNeedsZUp: false
+
+    /* autoVisionDetectFromZFlow 表示当前检测由“居中后下探”自动链路触发，检测完成后需要进入 Z 轴回升阶段。 */
+    property bool autoVisionDetectFromZFlow: false
+
     /* autoVisionCenterTolerancePx 是 MP157 侧居中判定死区，必须和 F4 死区保持同量级。 */
     property int autoVisionCenterTolerancePx: 24
 
@@ -193,6 +229,12 @@ Rectangle {
     /* manualEmergencyStop 表示急停模拟状态；为 true 时禁止除停止、刷新和清故障外的手动动作。 */
     property bool manualEmergencyStop: false
 
+    /* manualMotorPopup 表示三轴手动电机控制弹窗是否打开，marker 用于静态测试确认手动控制不再只有传送带。 */
+    property bool manualMotorPopup: false
+
+    /* manualMotorPageIndex 保存三轴手动弹窗当前页，0=传送带，1=摄像头前后，2=摄像头上下。 */
+    property int manualMotorPageIndex: 0
+
     /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
     property var settingsSupportedPartTypes: ["波形垫圈", "平垫圈", "弹性垫圈"]
 
@@ -250,11 +292,26 @@ Rectangle {
     /* stepperSettingsSending 表示步进电机参数正在通过二进制协议下发给 F407，防止重复点击保存。 */
     property bool stepperSettingsSending: false
 
+    /* stepperHomeSending 表示当前正在等待 F4 返回 ACTUATOR_HOME ACK，防止重复把当前位置清零。 */
+    property bool stepperHomeSending: false
+
+    /* stepperHomePendingCommand 保存正在等待回执的设零命令名，空字符串表示当前没有设零命令在途。 */
+    property string stepperHomePendingCommand: ""
+
     /* stepperSpeedEditorVisible 表示常规速度数字键盘是否打开，用于输入 0~5000 rpm 任意整数。 */
     property bool stepperSpeedEditorVisible: false
 
     /* stepperSpeedInputText 保存速度数字键盘当前输入文本，点击应用后写入 normalSpeedRpm。 */
     property string stepperSpeedInputText: "0"
+
+    /* stepperStepEditorVisible 表示上下电机固定位置步数数字键盘是否打开。 */
+    property bool stepperStepEditorVisible: false
+
+    /* stepperStepInputText 保存固定下探/回升步数数字键盘当前输入文本，范围为 0~4294967295 step。 */
+    property string stepperStepInputText: "0"
+
+    /* stepperStepEditKey 保存当前正在编辑的 32 位 step 字段：zDownFixedSteps 或 zUpFixedSteps。 */
+    property string stepperStepEditKey: ""
 
     /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发起二进制称重标定命令。 */
     property bool calibrationPopupVisible: false
@@ -772,12 +829,19 @@ Rectangle {
         autoVisionLastFrameId = 0
         autoVisionLastLostMs = 0
         autoVisionLastErrorY = 0
+        autoVisionLocatePurpose = "center"
+        autoVisionActuatorPhase = ""
+        autoVisionFineTuneAttempts = 0
+        autoVisionZFocusSettled = false
+        autoVisionNeedsZUp = false
+        autoVisionDetectFromZFlow = false
         dxPixels = 0
         dxPixelsValid = false
         autoVisionLastText = "自动视觉：等待零件从上方进入 ROI"
         workflowState = "视觉居中"
         storageState = autoVisionLastText
         autoVisionDetectDelayTimer.stop()
+        autoVisionActuatorSettleTimer.stop()
         autoVisionTimer.restart()
         showStorageToast()
     }
@@ -802,6 +866,12 @@ Rectangle {
         autoVisionCenteredSent = false
         autoVisionHasSeenTarget = false
         autoVisionLostFrames = 0
+        autoVisionLocatePurpose = "center"
+        autoVisionActuatorPhase = ""
+        autoVisionFineTuneAttempts = 0
+        autoVisionZFocusSettled = false
+        autoVisionDetectFromZFlow = false
+        autoVisionActuatorSettleTimer.stop()
         dxPixelsValid = false
         if (reason && reason.length > 0) {
             autoVisionLastText = reason
@@ -817,7 +887,7 @@ Rectangle {
      *   2. 找到目标时用 center_y 对齐 height/2，因为零件从画面上方进入。
      *   3. 已经识别过目标后，如果黑色波形零件短暂漏检，不再发送 VISION_LOST，避免 F4 重新扫描把零件送走。
      *   4. 未连续居中时发送 VISION_POS，让 F4 根据 Y 轴误差调速。
-     *   5. 连续 3 帧进入 ±24px 死区后发送 BELT_STOP_CENTERED，并等待 F4 ACK 后再启动 2 秒检测延时。
+     *   5. 连续 3 帧进入 ±24px 死区后发送 BELT_STOP_CENTERED，并等待 F4 ACK 后进入 Z 轴下探和对焦流程。
      *
      * 参数：
      *   ok 表示 overlay LOCATE 是否成功返回。
@@ -829,6 +899,12 @@ Rectangle {
      */
     function handleAutoVisionLocateFinished(ok, result, detail) {
         autoVisionLocateBusy = false
+
+        if (autoVisionLocatePurpose === "fine-tune") {
+            autoVisionLocatePurpose = "center"
+            handleAutoVisionFineTuneLocateFinished(ok, result, detail)
+            return
+        }
 
         if (!autoVisionRunning || autoWorkflowPaused || autoVisionCenteredSent) {
             return
@@ -933,6 +1009,249 @@ Rectangle {
         if (deviceHealth.sendF4VisionPosition(result)) {
             autoVisionCommandBusy = true
         }
+    }
+
+    /*
+     * autoVisionRequestZDown 的作用：
+     *   在 F4 确认传送带居中停机后，请求上下电机按固定步数下降到模型检测高度。
+     *
+     * 主要流程：
+     *   1. 从参数页第三台电机读取 zDownFixedSteps 和 normalSpeedRpm。
+     *   2. 如果用户把下探步数设为 0，则跳过 Z 轴运动，直接进入前后轴复查。
+     *   3. 下发 ACTUATOR_POS_MOVE，方向 0 代表下降，实际电机正反由 F4 运行时方向映射负责。
+     *
+     * 返回值：
+     *   true 表示已启动串口命令或无需下探；false 表示命令未能启动。
+     */
+    function autoVisionRequestZDown() {
+        var motor = cameraZMotorSetting()
+        var steps = Math.floor(Number(motor.zDownFixedSteps || 0))
+        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+
+        autoVisionFineTuneAttempts = 0
+        autoVisionZFocusSettled = false
+        autoVisionDetectFromZFlow = false
+
+        if (steps <= 0) {
+            autoVisionLastText = "上下电机下探步数为0，跳过Z轴下降，进入ROI复查"
+            storageState = autoVisionLastText
+            autoVisionActuatorPhase = "z-down-skip"
+            autoVisionActuatorSettleTimer.interval = autoVisionShortSettleMs
+            autoVisionActuatorSettleTimer.restart()
+            showStorageToast()
+            return true
+        }
+
+        workflowState = "Z轴下降"
+        autoVisionActuatorPhase = "z-down"
+        autoVisionLastText = "自动视觉：上下电机下降 " + steps + " step，等待 F4 ACK"
+        storageState = autoVisionLastText
+        showStorageToast()
+
+        if (deviceHealth.sendF4ActuatorPositionMove(2, 0, 0, speed, steps, 0)) {
+            autoVisionCommandBusy = true
+            return true
+        }
+
+        autoVisionActuatorPhase = ""
+        autoVisionLastText = "上下电机下降命令未启动"
+        storageState = autoVisionLastText
+        showStorageToast()
+        return false
+    }
+
+    /*
+     * autoVisionRequestFineTuneLocate 的作用：
+     *   在 Z 轴下降对焦稳定或前后轴微调后重新请求 overlay LOCATE，确认零件是否仍在 ROI 中央。
+     *
+     * 返回值：
+     *   true 表示 LOCATE 请求已启动；false 表示 overlay 请求被拒绝。
+     */
+    function autoVisionRequestFineTuneLocate() {
+        autoVisionLocatePurpose = "fine-tune"
+        autoVisionLocateBusy = true
+        workflowState = "ROI复查"
+        autoVisionLastText = autoVisionZFocusSettled
+                ? "自动视觉：Z轴下降后已等待对焦稳定，复查ROI中心"
+                : "自动视觉：复查ROI中心"
+        storageState = autoVisionLastText
+        showStorageToast()
+
+        if (deviceHealth.requestAutoVisionLocate()) {
+            return true
+        }
+
+        autoVisionLocateBusy = false
+        autoVisionLocatePurpose = "center"
+        autoVisionLastText = "ROI复查 LOCATE 请求未启动，进入模型检测"
+        storageState = autoVisionLastText
+        autoVisionStartDetectDelay()
+        showStorageToast()
+        return false
+    }
+
+    /*
+     * autoVisionStartDetectDelay 的作用：
+     *   根据本轮是否已经完成 Z 轴 3 秒对焦等待，选择模型检测前的延时。
+     *
+     * 主要流程：
+     *   1. 如果 autoVisionZFocusSettled 为 true，说明刚才已经等待过 3 秒对焦，此时只等 300ms 刷新一帧。
+     *   2. 如果没有执行 Z 轴下探或没有完成对焦等待，保留旧的 2000ms 静止等待。
+     *   3. 统一重启 autoVisionDetectDelayTimer，避免各分支手写不同延时。
+     *
+     * 返回值：
+     *   无返回值；定时器触发后会调用 handleDetectAction()。
+     */
+    function autoVisionStartDetectDelay() {
+        autoVisionDetectDelayTimer.interval = autoVisionZFocusSettled
+                ? autoVisionPostFocusDetectDelayMs
+                : autoVisionDefaultDetectDelayMs
+        autoVisionDetectDelayTimer.restart()
+    }
+
+    /*
+     * handleAutoVisionFineTuneLocateFinished 的作用：
+     *   处理 Z 轴下降后的 ROI 复查结果，必要时用摄像头前后电机做固定步数微调。
+     *
+     * 主要流程：
+     *   1. 定位失败或无目标时不继续移动，直接检测并把风险写到底部状态。
+     *   2. 如果中心误差已经进入死区，启动模型检测延时。
+     *   3. 如果误差超出死区且未超过次数上限，发送前后轴 ACTUATOR_POS_MOVE 微调一次。
+     *   4. 达到次数上限后停止继续微调，进入模型检测，避免现场机械反复抖动。
+     *
+     * 参数：
+     *   ok/result/detail 来自 autoVisionLocateFinished。
+     *
+     * 返回值：
+     *   无返回值；函数会继续发前后轴命令或启动模型检测延时。
+     */
+    function handleAutoVisionFineTuneLocateFinished(ok, result, detail) {
+        autoVisionLocateBusy = false
+
+        if (!ok || !result || Number(result.has_target) !== 1 || Number(result.height) <= 0) {
+            workflowState = "模型检测"
+            autoVisionLastText = "ROI复查未稳定返回目标，先进入模型检测：" + detail
+            storageState = autoVisionLastText
+            autoVisionStartDetectDelay()
+            showStorageToast()
+            return
+        }
+
+        var centerY = Number(result.center_y)
+        var height = Number(result.height)
+        var targetY = Math.round(height / 2)
+        var errorY = Math.round(centerY - targetY)
+        var absErrorY = Math.abs(errorY)
+
+        dxPixels = errorY
+        dxPixelsValid = true
+
+        if (absErrorY <= autoVisionFineTuneTolerancePx) {
+            workflowState = "模型检测"
+            autoVisionLastText = "ROI复查通过：error=" + errorY + "，进入模型检测"
+            storageState = autoVisionLastText
+            autoVisionStartDetectDelay()
+            showStorageToast()
+            return
+        }
+
+        if (autoVisionFineTuneAttempts >= autoVisionFineTuneMaxAttempts) {
+            workflowState = "模型检测"
+            autoVisionLastText = "ROI复查仍偏移 error=" + errorY
+                    + "，已达到微调上限 " + autoVisionFineTuneMaxAttempts + " 次，进入模型检测"
+            storageState = autoVisionLastText
+            autoVisionStartDetectDelay()
+            showStorageToast()
+            return
+        }
+
+        autoVisionFineTuneForward(errorY)
+    }
+
+    /*
+     * autoVisionFineTuneForward 的作用：
+     *   根据 ROI 复查误差请求摄像头前后电机做一次固定步数微调。
+     *
+     * 参数：
+     *   errorY 是零件中心 Y 与 ROI 中心的像素差，正值表示零件在画面中心下方。
+     *
+     * 返回值：
+     *   true 表示微调命令已启动；false 表示命令未能启动并改为进入模型检测。
+     */
+    function autoVisionFineTuneForward(errorY) {
+        var motor = cameraForwardMotorSetting()
+        var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var direction = errorY > 0 ? 0 : 1
+
+        autoVisionFineTuneAttempts += 1
+        autoVisionActuatorPhase = "fine-tune"
+        workflowState = "前后微调"
+        autoVisionLastText = "自动视觉：前后轴微调第 " + autoVisionFineTuneAttempts
+                + " 次，error=" + errorY + "，steps=" + steps
+        storageState = autoVisionLastText
+        showStorageToast()
+
+        if (deviceHealth.sendF4ActuatorPositionMove(1, direction, 0, speed, steps, 0)) {
+            autoVisionCommandBusy = true
+            return true
+        }
+
+        autoVisionActuatorPhase = ""
+        workflowState = "模型检测"
+        autoVisionLastText = "前后轴微调命令未启动，进入模型检测"
+        storageState = autoVisionLastText
+        autoVisionStartDetectDelay()
+        showStorageToast()
+        return false
+    }
+
+    /*
+     * autoVisionRequestZUp 的作用：
+     *   模型检测完成后请求上下电机按固定回升步数返回识别高度。
+     *
+     * 主要流程：
+     *   1. 只在 autoVisionNeedsZUp 为 true 时执行，避免手动检测或跳过下探时误回升。
+     *   2. 使用参数页 zUpFixedSteps，方向 1 表示上升，实际正反由 F4 运行时方向映射负责。
+     *   3. 如果回升步数为 0，则仅清除本地待回升标志。
+     *
+     * 返回值：
+     *   true 表示命令已启动或无需回升；false 表示命令未能启动。
+     */
+    function autoVisionRequestZUp() {
+        if (!autoVisionNeedsZUp) {
+            return true
+        }
+
+        var motor = cameraZMotorSetting()
+        var steps = Math.floor(Number(motor.zUpFixedSteps || 0))
+        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+
+        if (steps <= 0) {
+            autoVisionNeedsZUp = false
+            autoVisionActuatorPhase = ""
+            autoVisionLastText = "上下电机回升步数为0，本轮不回升"
+            storageState = autoVisionLastText
+            showStorageToast()
+            return true
+        }
+
+        workflowState = "Z轴回升"
+        autoVisionActuatorPhase = "z-up"
+        autoVisionLastText = "模型检测完成，上下电机回升 " + steps + " step"
+        storageState = autoVisionLastText
+        showStorageToast()
+
+        if (deviceHealth.sendF4ActuatorPositionMove(2, 1, 0, speed, steps, 0)) {
+            autoVisionCommandBusy = true
+            return true
+        }
+
+        autoVisionActuatorPhase = ""
+        autoVisionLastText = "上下电机回升命令未启动，请手动复位"
+        storageState = autoVisionLastText
+        showStorageToast()
+        return false
     }
 
     /*
@@ -1338,6 +1657,213 @@ Rectangle {
     }
 
     /*
+     * openManualMotorPopup 的作用：
+     *   打开三轴手动电机控制弹窗，并切换到指定电机页。
+     *
+     * 参数：
+     *   pageIndex 是三轴页号，0=传送带，1=摄像头前后，2=摄像头上下。
+     *
+     * 返回值：
+     *   无返回值；函数只更新弹窗显示状态。
+     */
+    function openManualMotorPopup(pageIndex) {
+        var motors = detectSettings.stepperMotorSettings
+        var count = motors && motors.length > 0 ? motors.length : 3
+        manualMotorPageIndex = Math.max(0, Math.min(count - 1, pageIndex))
+        manualMotorPopup = true
+        manualLastAckText = "已打开三轴手动控制弹窗：" + stepperMotorPageNames[manualMotorPageIndex]
+        storageState = manualLastAckText
+        showStorageToast()
+    }
+
+    /*
+     * manualMotorSetting 的作用：
+     *   读取三轴手动弹窗当前页的电机配置。
+     *
+     * 返回值：
+     *   返回当前页电机配置对象；配置缺失时返回空对象。
+     */
+    function manualMotorSetting() {
+        var motors = detectSettings.stepperMotorSettings
+        if (!motors || manualMotorPageIndex < 0 || manualMotorPageIndex >= motors.length) {
+            return {}
+        }
+        return motors[manualMotorPageIndex]
+    }
+
+    /*
+     * sendManualActuatorVelocityMove 的作用：
+     *   把手动弹窗中传送带和摄像头前后轴的方向按钮转换为 ACTUATOR_VEL_MOVE 连续速度命令。
+     *
+     * 主要流程：
+     *   1. 从当前页读取 normalSpeedRpm，速度为 0 时不下发，避免界面显示运动但电机保持停止。
+     *   2. 设置 manualPendingF4Command，防止上一条串口 ACK/NACK 未返回时重复点击。
+     *   3. 调用 C++ sendF4ActuatorVelocityMove()，F4 收到后保持速度模式运行，直到停止按钮下发 ACTUATOR_STOP。
+     *
+     * 参数：
+     *   actuator 是执行器编号，0=传送带，1=摄像头前后；上下轴不允许连续速度模式。
+     *   direction 是方向编号，0=后退，1=前进。
+     *   label 是按钮文本，用于命令日志显示。
+     *
+     * 返回值：
+     *   true 表示命令线程已启动；false 表示命令未能进入 C++ 串口层。
+     */
+    function sendManualActuatorVelocityMove(actuator, direction, label) {
+        var motor = manualMotorSetting()
+        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var commandText = "ACTUATOR_VEL_MOVE_" + actuator + "_" + direction
+
+        if (manualPendingF4Command !== "") {
+            manualLastAckText = "F4命令发送中：" + manualPendingF4Command
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "三轴电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        if (speed <= 0) {
+            manualLastAckText = "持续运动速度为0，请先在参数设置中把当前电机常规速度改为1~5000 rpm"
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, stepperMotorPageNames[manualMotorPageIndex], manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        manualPendingF4Command = commandText
+        manualLastAckText = "正在下发持续" + label + "：actuator=" + actuator + " speed=" + speed + "rpm"
+        storageState = formatF4ToastText(manualLastAckText)
+        appendManualCommandLog(label, stepperMotorPageNames[manualMotorPageIndex], manualLastAckText)
+        showStorageToast()
+
+        if (!deviceHealth.sendF4ActuatorVelocityMove(actuator, direction, speed, 0)) {
+            manualPendingF4Command = ""
+            manualLastAckText = "F4拒绝启动执行器命令：" + commandText
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, stepperMotorPageNames[manualMotorPageIndex], manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
+     * sendManualActuatorZFixedMove 的作用：
+     *   把上下电机手动“下降/上升”按钮转换为固定步数 ACTUATOR_POS_MOVE。
+     *
+     * 主要流程：
+     *   1. direction=0 时读取 zDownFixedSteps，direction=1 时读取 zUpFixedSteps。
+     *   2. 步数为 0 时拒绝下发，让现场先到参数页配置固定下降/上升值。
+     *   3. 调用 C++ sendF4ActuatorPositionMove()，F4 只执行一次固定步数位置运动。
+     *
+     * 参数：
+     *   direction 是上下轴方向，0=下降，1=上升。
+     *   label 是按钮文本，用于命令日志显示。
+     *
+     * 返回值：
+     *   true 表示命令线程已启动；false 表示命令未能进入 C++ 串口层。
+     */
+    function sendManualActuatorZFixedMove(direction, label) {
+        var motor = manualMotorSetting()
+        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var steps = direction === 0
+                ? Math.floor(Number(motor.zDownFixedSteps || 0))
+                : Math.floor(Number(motor.zUpFixedSteps || 0))
+        var commandText = "ACTUATOR_POS_MOVE_Z_" + direction
+
+        if (manualPendingF4Command !== "") {
+            manualLastAckText = "F4命令发送中：" + manualPendingF4Command
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "上下电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        if (steps <= 0) {
+            manualLastAckText = (direction === 0 ? "下降" : "上升")
+                    + "固定步数为0，请先在参数设置中配置上下电机"
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "上下电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        manualPendingF4Command = commandText
+        manualLastAckText = "正在下发上下电机" + label + "：steps=" + steps + " speed=" + speed + "rpm"
+        storageState = formatF4ToastText(manualLastAckText)
+        appendManualCommandLog(label, "上下电机", manualLastAckText)
+        showStorageToast()
+
+        if (!deviceHealth.sendF4ActuatorPositionMove(2, direction, 0, speed, steps, 0)) {
+            manualPendingF4Command = ""
+            manualLastAckText = "F4拒绝启动上下电机固定步数命令：" + commandText
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "上下电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
+     * sendManualActuatorMove 的作用：
+     *   统一处理手动弹窗方向按钮，并按执行器类型选择连续速度模式或固定步数位置模式。
+     *
+     * 分流规则：
+     *   1. 传送带和摄像头前后轴使用 ACTUATOR_VEL_MOVE，按一次持续运动，停止键结束。
+     *   2. 摄像头上下轴使用 ACTUATOR_POS_MOVE，下降取 zDownFixedSteps，上升取 zUpFixedSteps。
+     */
+    function sendManualActuatorMove(actuator, direction, label) {
+        if (actuator === 2) {
+            return sendManualActuatorZFixedMove(direction, label)
+        }
+
+        return sendManualActuatorVelocityMove(actuator, direction, label)
+    }
+
+    /*
+     * sendManualActuatorStop 的作用：
+     *   把三轴手动停止或模拟急停转换为 ACTUATOR_STOP 二进制命令。
+     *
+     * 参数：
+     *   actuator 是执行器编号，0/1/2 表示单轴，255 表示全部。
+     *   label 是按钮文本，用于命令日志显示。
+     *
+     * 返回值：
+     *   true 表示命令线程已启动；false 表示命令未能进入 C++ 串口层。
+     */
+    function sendManualActuatorStop(actuator, label) {
+        var commandText = actuator === 255 ? "ACTUATOR_STOP_ALL" : ("ACTUATOR_STOP_" + actuator)
+        var targetText = actuator === 255 ? "全部执行器" : stepperMotorPageNames[Math.max(0, Math.min(2, actuator))]
+
+        if (manualPendingF4Command !== "") {
+            manualLastAckText = "F4命令发送中：" + manualPendingF4Command
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, targetText, manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        manualPendingF4Command = commandText
+        manualLastAckText = "正在下发 " + commandText + " 到 F407"
+        storageState = formatF4ToastText(manualLastAckText)
+        appendManualCommandLog(label, targetText, manualLastAckText)
+        showStorageToast()
+
+        if (!deviceHealth.sendF4ActuatorStop(actuator, 0)) {
+            manualPendingF4Command = ""
+            manualLastAckText = "F4拒绝启动停止命令：" + commandText
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, targetText, manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
      * manualActionAllowed 的作用：
      *   集中判断某个手动动作当前是否允许执行，让按钮置灰条件和点击保护分支使用同一套安全规则。
      *
@@ -1345,7 +1871,7 @@ Rectangle {
      *   1. 检测当前帧、刷新状态、进入手动、停止和清故障属于安全动作，可以在未进入手动模式时执行。
      *   2. 其它运动或执行器动作必须先进入手动模式。
      *   3. 急停状态下只允许停止、刷新状态和清故障。
-     *   4. 未接入的相机运动轴不在界面显示，也不保留假按钮，避免操作员误认为可以控制。
+     *   4. 三轴运动按钮只在进入手动模式且未急停时允许点击。
      *
      * 参数：
      *   action 是手动控制动作标识。
@@ -1355,7 +1881,8 @@ Rectangle {
      */
     function manualActionAllowed(action) {
         if (action === "enter-manual" || action === "stop" || action === "detect-frame"
-                || action === "refresh" || action === "clear-alarm" || action === "emergency-toggle") {
+                || action === "refresh" || action === "clear-alarm" || action === "emergency-toggle"
+                || action === "open-motor-popup") {
             return true
         }
 
@@ -1377,7 +1904,8 @@ Rectangle {
      * 主要流程：
      *   1. 先执行手动模式、急停和回零等安全保护判断。
      *   2. 检测当前帧动作复用首页双模型检测链路，避免只保存无检测结果的图片。
-     *   3. 传送带动作通过 sendManualBeltCommand() 走 `/dev/ttySTM2`；未接入运动轴不在本页出现。
+     *   3. 传送带兼容按钮通过 sendManualBeltCommand() 走旧手动命令。
+     *   4. 三轴弹窗和模拟急停通过 ACTUATOR_POS_MOVE/ACTUATOR_STOP 走新执行器命令。
      *
      * 参数：
      *   action 是动作标识，例如 belt-scan、belt-info、detect-frame。
@@ -1389,7 +1917,8 @@ Rectangle {
     function handleManualAction(action, label) {
         if (!manualMode && action !== "enter-manual" && action !== "stop"
                 && action !== "detect-frame" && action !== "refresh"
-                && action !== "clear-alarm" && action !== "emergency-toggle") {
+                && action !== "clear-alarm" && action !== "emergency-toggle"
+                && action !== "open-motor-popup") {
             manualLastAckText = "请先进入手动模式"
             storageState = manualLastAckText
             appendManualCommandLog(label, "安全联锁", manualLastAckText)
@@ -1398,7 +1927,8 @@ Rectangle {
         }
 
         if (manualEmergencyStop && action !== "stop" && action !== "refresh"
-                && action !== "clear-alarm" && action !== "emergency-toggle") {
+                && action !== "clear-alarm" && action !== "emergency-toggle"
+                && action !== "open-motor-popup") {
             manualLastAckText = "急停中，禁止执行运动命令"
             storageState = manualLastAckText
             appendManualCommandLog(label, "急停保护", manualLastAckText)
@@ -1425,6 +1955,12 @@ Rectangle {
             return
         }
 
+        if (action === "open-motor-popup") {
+            openManualMotorPopup(manualMotorPageIndex)
+            appendManualCommandLog(label, "三轴电机", manualLastAckText)
+            return
+        }
+
         if (action === "belt-scan") {
             sendManualBeltCommand("BELT_MANUAL_SCAN", label, "巡航下发中")
             return
@@ -1448,6 +1984,8 @@ Rectangle {
             manualEmergencyStop = !manualEmergencyStop
             if (manualEmergencyStop) {
                 manualBeltState = "停止"
+                sendManualActuatorStop(255, label)
+                return
             }
             manualLastAckText = manualEmergencyStop ? "急停已按下，运动禁止" : "急停已释放，等待清故障"
         } else if (action === "clear-alarm") {
@@ -1568,6 +2106,36 @@ Rectangle {
     }
 
     /*
+     * cameraForwardMotorSetting 的作用：
+     *   读取参数页第二台摄像头前后电机配置，供自动 ROI 微调和手动三轴弹窗复用。
+     *
+     * 返回值：
+     *   返回摄像头前后电机配置对象；配置缺失时返回空对象，调用方会使用保守默认值。
+     */
+    function cameraForwardMotorSetting() {
+        var motors = detectSettings.stepperMotorSettings
+        if (!motors || motors.length < 2) {
+            return {}
+        }
+        return motors[1]
+    }
+
+    /*
+     * cameraZMotorSetting 的作用：
+     *   读取参数页第三台摄像头上下电机配置，供自动下探/回升和手动三轴弹窗复用。
+     *
+     * 返回值：
+     *   返回摄像头上下电机配置对象；配置缺失时返回空对象，调用方会使用保守默认值。
+     */
+    function cameraZMotorSetting() {
+        var motors = detectSettings.stepperMotorSettings
+        if (!motors || motors.length < 3) {
+            return {}
+        }
+        return motors[2]
+    }
+
+    /*
      * stepperMotorAddressText 的作用：
      *   把电机地址显示成十进制和十六进制双格式，方便对照 F4/Emm42 文档。
      *
@@ -1619,6 +2187,57 @@ Rectangle {
     }
 
     /*
+     * sendStepperActuatorHome 的作用：
+     *   参数设置页请求 F4 把当前页步进电机的当前位置设为新的零点。
+     *
+     * 主要流程：
+     *   1. 使用 stepperMotorPageIndex 作为 actuator 编号，和协议定义 0=传送带、1=前后轴、2=上下轴一致。
+     *   2. 设置 stepperHomeSending 和 stepperHomePendingCommand，防止重复点击导致同一电机多次清零。
+     *   3. 调用 C++ sendF4ActuatorHome() 发送 ACTUATOR_HOME 0x53，等待 ACK/NACK 后更新参数页提示。
+     *
+     * 返回值：
+     *   true 表示命令线程已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    function sendStepperActuatorHome() {
+        var actuator = stepperMotorPageIndex
+        var motor = currentStepperMotorSetting()
+        var commandText = "ACTUATOR_HOME_" + actuator
+
+        if (stepperHomeSending || stepperHomePendingCommand !== "") {
+            stepperMotorResultText = "当前位置设零命令正在等待 F4 回执：" + stepperHomePendingCommand
+            storageState = formatF4ToastText(stepperMotorResultText)
+            showStorageToast()
+            return false
+        }
+
+        if (actuator < 0 || actuator > 2) {
+            stepperMotorResultText = "当前位置设零失败：当前电机页无效"
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return false
+        }
+
+        stepperHomeSending = true
+        stepperHomePendingCommand = commandText
+        stepperMotorResultText = "正在请求 F4 将 " + (motor.name || ("电机" + actuator)) + " 当前位置设为零点"
+        settingsLastActionText = stepperMotorResultText
+        storageState = formatF4ToastText(stepperMotorResultText)
+        showStorageToast()
+
+        if (!deviceHealth.sendF4ActuatorHome(actuator, 0)) {
+            stepperHomeSending = false
+            stepperHomePendingCommand = ""
+            stepperMotorResultText = "F4拒绝启动当前位置设零命令：" + commandText
+            settingsLastActionText = stepperMotorResultText
+            storageState = formatF4ToastText(stepperMotorResultText)
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
      * stepperMotorLogText 的作用：
      *   把三台步进电机参数展开为参数日志字段，便于 SSH 复盘当前保存值。
      *
@@ -1642,6 +2261,8 @@ Rectangle {
             lines.push(prefix + ".min_step=" + motor.minStep)
             lines.push(prefix + ".normal_speed_rpm=" + motor.normalSpeedRpm)
             lines.push(prefix + ".direction=" + motor.direction + " (" + root.stepperMotorDirectionText(motor.direction) + ")")
+            lines.push(prefix + ".z_down_fixed_steps=" + (motor.zDownFixedSteps || 0))
+            lines.push(prefix + ".z_up_fixed_steps=" + (motor.zUpFixedSteps || 0))
         }
         return lines.join("\n")
     }
@@ -1662,6 +2283,8 @@ Rectangle {
         stepperMotorPageIndex = Math.max(0, Math.min(maxIndex, pageIndex))
         stepperMotorResultText = "保存并下发后会写入 JSON，并发送 STEPPER_PARAM_SET 给 F4；F4 只更新运行内存"
         stepperSpeedEditorVisible = false
+        stepperStepEditorVisible = false
+        stepperStepEditKey = ""
         stepperSpeedInputText = "" + (currentStepperMotorSetting().normalSpeedRpm || 0)
         stepperMotorPopupVisible = true
     }
@@ -1676,7 +2299,35 @@ Rectangle {
     function openStepperSpeedEditor() {
         var motor = currentStepperMotorSetting()
         stepperSpeedInputText = "" + (motor.normalSpeedRpm || 0)
+        stepperStepEditorVisible = false
         stepperSpeedEditorVisible = true
+    }
+
+    /*
+     * openStepperStepEditor 的作用：
+     *   打开上下电机固定下探/回升步数数字键盘，并载入当前字段值。
+     *
+     * 参数：
+     *   key 是 zDownFixedSteps 或 zUpFixedSteps。
+     *
+     * 返回值：
+     *   无返回值；字段非法时只更新提示，不打开数字键盘。
+     */
+    function openStepperStepEditor(key) {
+        var motor = currentStepperMotorSetting()
+        if (key !== "zDownFixedSteps" && key !== "zUpFixedSteps") {
+            stepperMotorResultText = "位置步数字段无效：" + key
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        stepperStepEditKey = key
+        stepperStepInputText = "" + Math.floor(Number(motor[key] || 0))
+        stepperSpeedEditorVisible = false
+        stepperStepEditorVisible = true
+        stepperMotorResultText = "请输入 " + (key === "zDownFixedSteps" ? "下探" : "回升")
+                + " 固定步数：0~4294967295 step"
     }
 
     /*
@@ -1770,6 +2421,97 @@ Rectangle {
         stepperSpeedInputText = "" + parsedSpeed
         stepperMotorResultText = currentStepperMotorSetting().name + "：常规速度 " + parsedSpeed + " rpm，点击保存并下发写入JSON并通知F4"
         settingsLastActionText = "步进电机速度已更新为 " + parsedSpeed + " rpm"
+        storageState = settingsLastActionText
+        showStorageToast()
+    }
+
+    /*
+     * appendStepperStepDigit 的作用：
+     *   向 32 位位置步数输入框追加一个数字，让触摸屏可以输入完整 Emm42 位置模式范围。
+     *
+     * 参数：
+     *   digit 是被点击的数字字符。
+     *
+     * 返回值：
+     *   无返回值；超过 4294967295 时拒绝追加。
+     */
+    function appendStepperStepDigit(digit) {
+        var nextText = (stepperStepInputText + digit).replace(/^0+/, "")
+        if (nextText.length === 0) {
+            nextText = "0"
+        }
+
+        if (!/^[0-9]+$/.test(nextText) || Number(nextText) > 4294967295) {
+            stepperMotorResultText = "固定步数范围是 0~4294967295 step"
+            return
+        }
+
+        stepperStepInputText = nextText
+        stepperMotorResultText = "位置步数待应用：" + stepperStepInputText + " step"
+    }
+
+    /*
+     * backspaceStepperStepDigit 的作用：
+     *   删除位置步数输入框最后一位，便于触摸屏纠正输入。
+     *
+     * 返回值：
+     *   无返回值；输入为空时回到 0。
+     */
+    function backspaceStepperStepDigit() {
+        stepperStepInputText = stepperStepInputText.substring(0, Math.max(0, stepperStepInputText.length - 1))
+        if (stepperStepInputText.length === 0) {
+            stepperStepInputText = "0"
+        }
+        stepperMotorResultText = "位置步数待应用：" + stepperStepInputText + " step"
+    }
+
+    /*
+     * clearStepperStepInput 的作用：
+     *   清空并重置固定位置步数输入为 0。
+     *
+     * 返回值：
+     *   无返回值；函数只更新输入文本和提示。
+     */
+    function clearStepperStepInput() {
+        stepperStepInputText = "0"
+        stepperMotorResultText = "位置步数待应用：0 step"
+    }
+
+    /*
+     * applyStepperStepInput 的作用：
+     *   校验 32 位位置步数输入框，并写入当前页上下电机参数。
+     *
+     * 主要流程：
+     *   1. 只接受 0~4294967295 十进制整数。
+     *   2. 调用 C++ setStepperMotorStepValue()，避免 32 位 step 经过 int 截断。
+     *   3. 成功后关闭数字键盘，提示用户保存并下发配置。
+     *
+     * 返回值：
+     *   无返回值；成功后关闭位置步数数字键盘。
+     */
+    function applyStepperStepInput() {
+        var trimmedText = stepperStepInputText.replace(/^\s+|\s+$/g, "")
+
+        if (!/^[0-9]+$/.test(trimmedText) || Number(trimmedText) > 4294967295) {
+            stepperMotorResultText = "固定步数必须是 0~4294967295 step 的整数"
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        if (!detectSettings.setStepperMotorStepValue(stepperMotorPageIndex, stepperStepEditKey, trimmedText)) {
+            stepperMotorResultText = detectSettings.lastStatusText
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        stepperStepEditorVisible = false
+        var motor = currentStepperMotorSetting()
+        stepperMotorResultText = motor.name + "：下探 " + (motor.zDownFixedSteps || 0)
+                + " step，回升 " + (motor.zUpFixedSteps || 0)
+                + " step，点击保存并下发写入JSON并通知F4"
+        settingsLastActionText = "上下电机固定位置步数已更新"
         storageState = settingsLastActionText
         showStorageToast()
     }
@@ -2743,7 +3485,9 @@ Rectangle {
         alarmAdviceDetailVisible = false
         settingsDetailVisible = false
         stepperMotorPopupVisible = false
+        manualMotorPopup = false
         calibrationPopupVisible = false
+        stepperStepEditorVisible = false
         logDetailVisible = false
 
         if (pageName === "history") {
@@ -4108,18 +4852,38 @@ Rectangle {
         }
     }
 
-    /* autoVisionDetectDelayTimer 等 F4 居中停机 ACK 后延时 2 秒，再复用现有当前帧检测链路。 */
+    /* autoVisionDetectDelayTimer 等对焦或静止延时结束后，再复用现有当前帧检测链路。 */
     Timer {
         id: autoVisionDetectDelayTimer
-        interval: 2000
+        interval: root.autoVisionDefaultDetectDelayMs
         repeat: false
         running: false
 
         onTriggered: {
+            root.autoVisionDetectFromZFlow = root.autoVisionNeedsZUp
             root.workflowState = "模型检测"
-            root.storageState = "零件已居中，开始模型检测"
+            root.storageState = "零件已在检测高度，开始模型检测"
             root.showStorageToast()
             root.handleDetectAction()
+        }
+    }
+
+    /* autoVisionActuatorSettleTimer 给 Z 轴下降对焦或前后轴微调留出稳定时间，然后再复查 ROI。 */
+    Timer {
+        id: autoVisionActuatorSettleTimer
+        interval: 450
+        repeat: false
+        running: false
+
+        onTriggered: {
+            if (root.autoVisionActuatorPhase === "z-down"
+                    || root.autoVisionActuatorPhase === "z-down-skip"
+                    || root.autoVisionActuatorPhase === "fine-tune") {
+                if (root.autoVisionActuatorPhase === "z-down") {
+                    root.autoVisionZFocusSettled = true
+                }
+                root.autoVisionRequestFineTuneLocate()
+            }
         }
     }
 
@@ -4433,9 +5197,9 @@ Rectangle {
                 if (ok) {
                     root.autoVisionRunning = false
                     autoVisionTimer.stop()
-                    root.workflowState = "居中保持"
-                    root.storageState = "F4已确认居中停机，2秒后开始模型检测"
-                    autoVisionDetectDelayTimer.restart()
+                    root.workflowState = "准备下探"
+                    root.storageState = "F4已确认居中停机，准备让上下电机下降到检测高度"
+                    root.autoVisionRequestZDown()
                 } else {
                     root.autoVisionCenteredSent = false
                     root.autoVisionStableFrames = 0
@@ -4445,6 +5209,89 @@ Rectangle {
                         autoVisionTimer.restart()
                     }
                 }
+                root.showStorageToast()
+            }
+
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4ActuatorCommandFinished 的作用：
+         *   接收 ACTUATOR_POS_MOVE/ACTUATOR_STOP 的 ACK/NACK，并按自动阶段或手动阶段分别推进。
+         *
+         * 参数：
+         *   ok 表示 F4 是否 ACK 本次执行器命令。
+         *   action 是执行器命令名称。
+         *   cycleId 是当前自动流程号，手动命令通常为 0。
+         *   detail 是 ACK/NACK 解析结果或串口失败原因。
+         */
+        onF4ActuatorCommandFinished: {
+            root.autoVisionCommandBusy = false
+            root.autoCycleId = cycleId
+
+            if (root.autoVisionActuatorPhase !== "") {
+                if (ok) {
+                    root.autoVisionLastText = "执行器ACK：" + root.autoVisionActuatorPhase + " " + detail
+                    if (root.autoVisionActuatorPhase === "z-down") {
+                        root.autoVisionNeedsZUp = true
+                        root.workflowState = "对焦稳定"
+                        root.storageState = "上下电机下降完成，等待约3秒让摄像头对焦稳定"
+                        root.showStorageToast()
+                        autoVisionActuatorSettleTimer.interval = root.autoVisionZFocusSettleMs
+                        autoVisionActuatorSettleTimer.restart()
+                    } else if (root.autoVisionActuatorPhase === "fine-tune") {
+                        autoVisionActuatorSettleTimer.interval = root.autoVisionShortSettleMs
+                        autoVisionActuatorSettleTimer.restart()
+                    } else if (root.autoVisionActuatorPhase === "z-up") {
+                        root.autoVisionNeedsZUp = false
+                        root.autoVisionZFocusSettled = false
+                        root.autoVisionDetectFromZFlow = false
+                        root.autoVisionActuatorPhase = ""
+                        root.workflowState = "高度已恢复"
+                        root.storageState = "上下电机已回升到识别高度：" + detail
+                        root.showStorageToast()
+                    }
+                } else {
+                    root.autoVisionLastText = "执行器失败：" + root.autoVisionActuatorPhase + " " + detail
+                    root.storageState = root.autoVisionLastText
+                    root.showStorageToast()
+                    if (root.autoVisionActuatorPhase === "z-up") {
+                        root.autoVisionNeedsZUp = true
+                    }
+                    root.autoVisionActuatorPhase = ""
+                }
+
+                root.evaluateRuntimeAlarms()
+                return
+            }
+
+            if (root.stepperHomePendingCommand !== "") {
+                var finishedHomeCommand = root.stepperHomePendingCommand
+                var homeResult = ok
+                        ? ("F4已将当前位置设为零点：" + detail)
+                        : ("F4当前位置设零失败：" + detail)
+                root.stepperHomeSending = false
+                root.stepperHomePendingCommand = ""
+                root.stepperMotorResultText = homeResult
+                root.settingsLastActionText = homeResult
+                root.storageState = root.formatF4ToastText(homeResult + " [" + finishedHomeCommand + "]")
+                root.showStorageToast()
+                root.evaluateRuntimeAlarms()
+                return
+            }
+
+            if (root.manualPendingF4Command !== "") {
+                var finishedManualCommand = root.manualPendingF4Command
+                var manualResult = ok ? ("F4执行器回执：" + detail) : ("F4执行器失败：" + detail)
+                if (ok && finishedManualCommand.indexOf("ACTUATOR_VEL_MOVE") === 0) {
+                    manualResult = "F4执行器回执：" + detail + "；持续运动中，按停止结束"
+                } else if (ok && finishedManualCommand.indexOf("ACTUATOR_POS_MOVE_Z") === 0) {
+                    manualResult = "F4执行器回执：" + detail + "；上下轴固定步数已下发"
+                }
+                root.manualLastAckText = manualResult
+                root.manualPendingF4Command = ""
+                root.storageState = root.formatF4ToastText(manualResult)
+                root.appendManualCommandLog(action, "三轴电机", manualResult)
                 root.showStorageToast()
             }
 
@@ -4521,6 +5368,11 @@ Rectangle {
                 root.markAlarmRecovered("cloud-upload-failed")
             }
             showStorageToast()
+
+            if (root.autoVisionDetectFromZFlow) {
+                root.autoVisionDetectFromZFlow = false
+                root.autoVisionRequestZUp()
+            }
         }
 
         /*
@@ -6609,7 +7461,7 @@ Rectangle {
             }
         }
 
-        /* manualBeltPanel 负责把 MP157 手动按钮映射成 F407 已实现的 BELT_MANUAL_CONTROL/QUERY_STATUS 二进制命令。 */
+        /* manualBeltPanel 负责进入三轴手动控制弹窗，同时保留传送带停止和状态查询的快捷入口。 */
         Rectangle {
             id: manualBeltPanel
             x: 16
@@ -6624,7 +7476,7 @@ Rectangle {
             Text {
                 x: 14
                 y: 10
-                text: "传送带"
+                text: "三轴电机"
                 color: "#f1f4f5"
                 font.pixelSize: 18
                 font.bold: true
@@ -6653,8 +7505,8 @@ Rectangle {
                 Repeater {
                     model: [
                         {"text": "进入手动", "action": "enter-manual", "color": root.manualMode ? root.accentAmber : root.accentGreen},
+                        {"text": "三轴控制", "action": "open-motor-popup", "color": "#5aa7ff"},
                         {"text": "停止", "action": "stop", "color": root.accentRed},
-                        {"text": "巡航启动", "action": "belt-scan", "color": root.accentGreen},
                         {"text": "查询状态", "action": "belt-info", "color": "#5aa7ff"}
                     ]
 
@@ -6705,7 +7557,7 @@ Rectangle {
                     anchors.leftMargin: 8
                     anchors.rightMargin: 8
                     verticalAlignment: Text.AlignVCenter
-                    text: "协议：MP157->F4 USART1；F4->Emm42 USART6"
+                    text: "协议：ACTUATOR_POS_MOVE/STOP；传送带/前后/上下三页操作"
                     color: "#9aa5ab"
                     font.pixelSize: 11
                     elide: Text.ElideRight
@@ -6816,52 +7668,64 @@ Rectangle {
                 font.bold: true
             }
 
-            Column {
+            Flickable {
+                id: manualSafetyFlickable
                 x: 14
                 y: 42
                 width: parent.width - 28
-                spacing: 8
+                height: 138
+                clip: true
+                contentHeight: manualSafetyColumn.height
+                boundsBehavior: Flickable.StopAtBounds
 
-                Repeater {
-                    model: [
-                        {"name": "F4控制器", "value": deviceHealth.f4StatusText, "color": deviceHealth.f4StatusColor},
-                        {"name": "手动模式", "value": root.manualMode ? "允许" : "未进入", "color": root.manualMode ? root.accentAmber : root.accentGreen},
-                        {"name": "急停", "value": root.manualEmergencyStop ? "已按下" : "释放", "color": root.manualEmergencyStop ? root.accentRed : root.accentGreen},
-                        {"name": "限位", "value": "未触发", "color": root.accentGreen},
-                        {"name": "传送带", "value": root.manualBeltState, "color": root.manualBeltState === "停止" ? root.accentGreen : root.accentAmber},
-                        {"name": "复核标记", "value": root.manualReviewMark, "color": "#dce3e6"}
-                    ]
+                Column {
+                    id: manualSafetyColumn
+                    width: manualSafetyFlickable.width
+                    spacing: 8
 
-                    Row {
-                        width: parent.width
-                        height: 20
-                        spacing: 8
+                    Repeater {
+                        model: [
+                            {"name": "F4控制器", "value": deviceHealth.f4StatusText, "color": deviceHealth.f4StatusColor},
+                            {"name": "手动模式", "value": root.manualMode ? "允许" : "未进入", "color": root.manualMode ? root.accentAmber : root.accentGreen},
+                            {"name": "急停", "value": root.manualEmergencyStop ? "已按下" : "释放", "color": root.manualEmergencyStop ? root.accentRed : root.accentGreen},
+                            {"name": "限位", "value": "未触发", "color": root.accentGreen},
+                            {"name": "传送带", "value": root.manualBeltState, "color": root.manualBeltState === "停止" ? root.accentGreen : root.accentAmber},
+                            {"name": "前后轴", "value": "位置模式待命", "color": root.accentGreen},
+                            {"name": "上下轴", "value": root.autoVisionNeedsZUp ? "等待回升" : "位置模式待命", "color": root.autoVisionNeedsZUp ? root.accentAmber : root.accentGreen},
+                            {"name": "复核标记", "value": root.manualReviewMark, "color": "#dce3e6"}
+                        ]
 
-                        Rectangle {
-                            width: 8
-                            height: 8
-                            radius: 4
-                            anchors.verticalCenter: parent.verticalCenter
-                            color: modelData.color
-                        }
+                        Row {
+                            width: parent.width
+                            height: 20
+                            spacing: 8
 
-                        Text {
-                            width: 86
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: modelData.name
-                            color: "#9aa5ab"
-                            font.pixelSize: 12
-                            font.bold: true
-                        }
+                            Rectangle {
+                                width: 8
+                                height: 8
+                                radius: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: modelData.color
+                            }
 
-                        Text {
-                            width: parent.width - 110
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: modelData.value
-                            color: modelData.color
-                            font.pixelSize: 12
-                            font.bold: true
-                            elide: Text.ElideRight
+                            Text {
+                                width: 86
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData.name
+                                color: "#9aa5ab"
+                                font.pixelSize: 12
+                                font.bold: true
+                            }
+
+                            Text {
+                                width: parent.width - 110
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData.value
+                                color: modelData.color
+                                font.pixelSize: 12
+                                font.bold: true
+                                elide: Text.ElideRight
+                            }
                         }
                     }
                 }
@@ -7065,6 +7929,239 @@ Rectangle {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    Rectangle {
+        id: manualMotorPopupOverlay
+        anchors.fill: parent
+        z: 892
+        visible: root.manualMotorPopup
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.manualMotorPopup = false
+            }
+        }
+
+        Rectangle {
+            id: manualMotorPopupPanel
+            width: 610
+            height: 430
+            anchors.centerIn: parent
+            radius: 10
+            color: "#20262a"
+            border.color: root.manualEmergencyStop ? root.accentRed : root.accentGreen
+            border.width: 1
+            clip: true
+
+            property var motorConfig: root.manualMotorSetting()
+            property int actuatorId: root.manualMotorPageIndex
+            property string negativeLabel: root.manualMotorPageIndex === 2 ? "下降" : "后退"
+            property string positiveLabel: root.manualMotorPageIndex === 2 ? "上升" : "前进"
+
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 126
+                text: "三轴手动控制"
+                color: "#f1f4f5"
+                font.pixelSize: 20
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 7
+                color: closeManualMotorMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeManualMotorMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.manualMotorPopup = false
+                    }
+                }
+            }
+
+            Row {
+                id: manualMotorPageTabs
+                x: 18
+                y: 58
+                width: parent.width - 36
+                height: 38
+                spacing: 8
+
+                Repeater {
+                    model: detectSettings.stepperMotorSettings
+
+                    Rectangle {
+                        width: (manualMotorPageTabs.width - 16) / 3
+                        height: 38
+                        radius: 7
+                        color: root.manualMotorPageIndex === index
+                               ? "#1f332b"
+                               : (manualMotorTabMouse.pressed ? "#26323a" : "#1a2024")
+                        border.color: root.manualMotorPageIndex === index ? root.accentGreen : "#344149"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.name
+                            color: root.manualMotorPageIndex === index ? "#eafff2" : "#d7dee2"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+
+                        MouseArea {
+                            id: manualMotorTabMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.manualMotorPageIndex = index
+                                root.manualLastAckText = modelData.name + " 手动页"
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 18
+                y: 114
+                width: parent.width - 36
+                height: 92
+                radius: 8
+                color: "#171b1e"
+                border.color: "#344149"
+                border.width: 1
+
+                Text {
+                    x: 14
+                    y: 12
+                    width: parent.width - 28
+                    text: (manualMotorPopupPanel.motorConfig.name || "--")
+                          + "  ID " + (manualMotorPopupPanel.motorConfig.addressHex || "--")
+                          + "  " + (manualMotorPopupPanel.motorConfig.serialName || "--")
+                    color: "#f1f4f5"
+                    font.pixelSize: 16
+                    font.bold: true
+                    elide: Text.ElideRight
+                }
+
+                Text {
+                    x: 14
+                    y: 44
+                    width: parent.width - 28
+                    height: 34
+                    text: root.manualMotorPageIndex === 2
+                          ? ("上下轴：下降 "
+                             + Math.floor(Number(manualMotorPopupPanel.motorConfig.zDownFixedSteps || 0))
+                             + " step，上升 "
+                             + Math.floor(Number(manualMotorPopupPanel.motorConfig.zUpFixedSteps || 0))
+                             + " step；点击一次只走对应固定步数。")
+                          : ("速度 "
+                             + (manualMotorPopupPanel.motorConfig.normalSpeedRpm || 0)
+                             + " rpm；点击方向键后持续运动，按停止键结束。")
+                    color: "#aeb8be"
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+            }
+
+            Row {
+                x: 18
+                y: 232
+                width: parent.width - 36
+                height: 72
+                spacing: 12
+
+                Repeater {
+                    model: [
+                        {"text": manualMotorPopupPanel.negativeLabel, "direction": 0, "color": "#5aa7ff"},
+                        {"text": "停止", "direction": -1, "color": root.accentRed},
+                        {"text": manualMotorPopupPanel.positiveLabel, "direction": 1, "color": root.accentGreen}
+                    ]
+
+                    Rectangle {
+                        property bool actionAllowed: root.manualMode && !root.manualEmergencyStop
+                        property bool stopButton: modelData.direction < 0
+
+                        width: (parent.width - 24) / 3
+                        height: 72
+                        radius: 8
+                        color: actionAllowed || stopButton
+                               ? (manualMotorActionMouse.pressed ? "#2d3338" : "#22272b")
+                               : "#171b1e"
+                        border.color: actionAllowed || stopButton ? modelData.color : "#3a4147"
+                        border.width: 1
+                        opacity: actionAllowed || stopButton ? 1.0 : 0.45
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.text
+                            color: "#ffffff"
+                            font.pixelSize: 18
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: manualMotorActionMouse
+                            anchors.fill: parent
+                            enabled: parent.actionAllowed || parent.stopButton
+
+                            onClicked: {
+                                if (parent.stopButton) {
+                                    root.sendManualActuatorStop(manualMotorPopupPanel.actuatorId, modelData.text)
+                                } else {
+                                    root.sendManualActuatorMove(manualMotorPopupPanel.actuatorId,
+                                                                modelData.direction,
+                                                                modelData.text)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text {
+                x: 18
+                y: 326
+                width: parent.width - 36
+                height: 54
+                text: root.manualEmergencyStop
+                      ? "急停已按下：只允许停止和清故障；释放后仍需确认 F4/现场联锁。"
+                      : (root.manualMode
+                         ? "手动模式已允许：传送带/前后轴按一次持续运动；上下轴按一次走固定步数。"
+                         : "请先点击手动页“进入手动”，再执行三轴手动动作。")
+                color: root.manualEmergencyStop ? "#ffd6dc" : "#dce3e6"
+                font.pixelSize: 13
+                font.bold: true
+                wrapMode: Text.Wrap
             }
         }
     }
@@ -7989,7 +9086,7 @@ Rectangle {
         Rectangle {
             id: stepperMotorPopupPanel
             width: 660
-            height: 520
+            height: 560
             anchors.centerIn: parent
             radius: 10
             color: "#20262a"
@@ -8092,6 +9189,8 @@ Rectangle {
                             onClicked: {
                                 root.stepperMotorPageIndex = index
                                 root.stepperSpeedEditorVisible = false
+                                root.stepperStepEditorVisible = false
+                                root.stepperStepEditKey = ""
                                 root.stepperSpeedInputText = "" + (modelData.normalSpeedRpm || 0)
                                 root.stepperMotorResultText = modelData.name + " 参数页"
                             }
@@ -8104,7 +9203,7 @@ Rectangle {
                 x: 18
                 y: 142
                 width: parent.width - 36
-                height: 264
+                height: 314
                 radius: 8
                 color: "#171b1e"
                 border.color: "#344149"
@@ -8135,7 +9234,7 @@ Rectangle {
 
                 Row {
                     x: 14
-                    y: 82
+                    y: 72
                     width: parent.width - 28
                     height: 38
                     spacing: 8
@@ -8221,7 +9320,7 @@ Rectangle {
 
                 Row {
                     x: 14
-                    y: 128
+                    y: 112
                     width: parent.width - 28
                     height: 38
                     spacing: 8
@@ -8307,7 +9406,7 @@ Rectangle {
 
                 Row {
                     x: 14
-                    y: 174
+                    y: 152
                     width: parent.width - 28
                     height: 38
                     spacing: 8
@@ -8419,7 +9518,7 @@ Rectangle {
 
                 Row {
                     x: 14
-                    y: 220
+                    y: 192
                     width: parent.width - 28
                     height: 34
                     spacing: 8
@@ -8504,11 +9603,135 @@ Rectangle {
                         }
                     }
                 }
+
+                Row {
+                    x: 14
+                    y: 232
+                    width: parent.width - 28
+                    height: 34
+                    spacing: 8
+                    visible: (stepperMotorPopupPanel.motorConfig.role || "") === "camera_z"
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "下探步数"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: Math.floor(Number(stepperMotorPopupPanel.motorConfig.zDownFixedSteps || 0)) + " step"
+                            color: "#eef3f4"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: stepperZDownInputMouse.pressed ? "#3c3322" : "#33291b"
+                        border.color: root.accentAmber
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "输入0~4294967295"
+                            color: "#fff3d5"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperZDownInputMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.openStepperStepEditor("zDownFixedSteps")
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    x: 14
+                    y: 272
+                    width: parent.width - 28
+                    height: 34
+                    spacing: 8
+                    visible: (stepperMotorPopupPanel.motorConfig.role || "") === "camera_z"
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "回升步数"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: Math.floor(Number(stepperMotorPopupPanel.motorConfig.zUpFixedSteps || 0)) + " step"
+                            color: "#eef3f4"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: stepperZUpInputMouse.pressed ? "#3c3322" : "#33291b"
+                        border.color: root.accentAmber
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "输入0~4294967295"
+                            color: "#fff3d5"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperZUpInputMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.openStepperStepEditor("zUpFixedSteps")
+                            }
+                        }
+                    }
+                }
             }
 
             Rectangle {
                 x: 18
-                y: 418
+                y: 466
                 width: parent.width - 36
                 height: 46
                 radius: 7
@@ -8532,8 +9755,8 @@ Rectangle {
 
             Rectangle {
                 x: 18
-                y: 474
-                width: 140
+                y: 522
+                width: 132
                 height: 34
                 radius: 8
                 color: stepperNextPageMouse.pressed ? "#26323a" : "#1a2024"
@@ -8557,6 +9780,8 @@ Rectangle {
                         var count = motors && motors.length > 0 ? motors.length : 1
                         root.stepperMotorPageIndex = (root.stepperMotorPageIndex + 1) % count
                         root.stepperSpeedEditorVisible = false
+                        root.stepperStepEditorVisible = false
+                        root.stepperStepEditKey = ""
                         root.stepperSpeedInputText = "" + (root.currentStepperMotorSetting().normalSpeedRpm || 0)
                         root.stepperMotorResultText = root.currentStepperMotorSetting().name + " 参数页"
                     }
@@ -8564,8 +9789,39 @@ Rectangle {
             }
 
             Rectangle {
+                x: 166
+                y: 522
+                width: 180
+                height: 34
+                radius: 8
+                color: stepperHomeMouse.pressed ? "#3c3322" : "#33291b"
+                border.color: root.accentAmber
+                border.width: 1
+                opacity: root.stepperHomeSending ? 0.55 : 1.0
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.stepperHomeSending ? "设零中..." : "设当前位置为零点"
+                    color: "#fff3d5"
+                    font.pixelSize: 12
+                    font.bold: true
+                    elide: Text.ElideRight
+                }
+
+                MouseArea {
+                    id: stepperHomeMouse
+                    anchors.fill: parent
+                    enabled: !root.stepperHomeSending && !root.stepperSettingsSending
+
+                    onClicked: {
+                        root.sendStepperActuatorHome()
+                    }
+                }
+            }
+
+            Rectangle {
                 x: parent.width - 178
-                y: 474
+                y: 522
                 width: 160
                 height: 34
                 radius: 8
@@ -8796,6 +10052,209 @@ Rectangle {
 
                             onClicked: {
                                 root.applyStepperSpeedInput()
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                id: stepperStepEditor
+                anchors.fill: parent
+                z: 31
+                visible: root.stepperStepEditorVisible
+                color: "#cc000000"
+
+                MouseArea {
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.stepperStepEditorVisible = false
+                    }
+                }
+
+                Rectangle {
+                    width: 470
+                    height: 430
+                    anchors.centerIn: parent
+                    radius: 10
+                    color: "#20262a"
+                    border.color: root.accentAmber
+                    border.width: 1
+                    clip: true
+
+                    MouseArea {
+                        anchors.fill: parent
+                    }
+
+                    Text {
+                        x: 16
+                        y: 14
+                        width: parent.width - 108
+                        text: stepperStepEditKey === "zDownFixedSteps" ? "下探固定步数" : "回升固定步数"
+                        color: "#f1f4f5"
+                        font.pixelSize: 18
+                        font.bold: true
+                        elide: Text.ElideRight
+                    }
+
+                    Rectangle {
+                        x: parent.width - 80
+                        y: 12
+                        width: 64
+                        height: 30
+                        radius: 7
+                        color: closeStepEditorMouse.pressed ? "#3a1b1f" : "#2a2020"
+                        border.color: root.accentRed
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "关闭"
+                            color: "#ffecef"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: closeStepEditorMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.stepperStepEditorVisible = false
+                            }
+                        }
+                    }
+
+                    Text {
+                        x: 16
+                        y: 54
+                        width: parent.width - 32
+                        text: "范围 0~4294967295 step，对应张大头42步进电机位置模式 4 字节脉冲数。"
+                        color: "#cfd7db"
+                        font.pixelSize: 12
+                        font.bold: true
+                        wrapMode: Text.Wrap
+                    }
+
+                    Rectangle {
+                        x: 16
+                        y: 92
+                        width: parent.width - 32
+                        height: 54
+                        radius: 8
+                        color: "#171b1e"
+                        border.color: "#344149"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: root.stepperStepInputText + " step"
+                            color: "#ffffff"
+                            font.pixelSize: 22
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    Grid {
+                        id: stepperStepKeypadGrid
+                        x: 16
+                        y: 160
+                        width: parent.width - 32
+                        columns: 3
+                        rowSpacing: 8
+                        columnSpacing: 8
+
+                        Repeater {
+                            model: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "清空", "0", "退格"]
+
+                            Rectangle {
+                                width: (stepperStepKeypadGrid.width - 16) / 3
+                                height: 42
+                                radius: 7
+                                color: stepperStepKeyMouse.pressed ? "#26323a" : "#1a2024"
+                                border.color: modelData === "清空" || modelData === "退格" ? "#5aa7ff" : "#344149"
+                                border.width: 1
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData
+                                    color: modelData === "清空" || modelData === "退格" ? "#d9ecff" : "#f1f4f5"
+                                    font.pixelSize: 15
+                                    font.bold: true
+                                }
+
+                                MouseArea {
+                                    id: stepperStepKeyMouse
+                                    anchors.fill: parent
+
+                                    onClicked: {
+                                        if (modelData === "清空") {
+                                            root.clearStepperStepInput()
+                                        } else if (modelData === "退格") {
+                                            root.backspaceStepperStepDigit()
+                                        } else {
+                                            root.appendStepperStepDigit(modelData)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        x: 16
+                        y: 380
+                        width: 140
+                        height: 36
+                        radius: 8
+                        color: resetStepMouse.pressed ? "#30363b" : "#22272b"
+                        border.color: "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "重置为0"
+                            color: "#d9ecff"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: resetStepMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.clearStepperStepInput()
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        x: parent.width - 176
+                        y: 380
+                        width: 160
+                        height: 36
+                        radius: 8
+                        color: applyStepMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "应用步数"
+                            color: "#eafff2"
+                            font.pixelSize: 13
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: applyStepMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.applyStepperStepInput()
                             }
                         }
                     }

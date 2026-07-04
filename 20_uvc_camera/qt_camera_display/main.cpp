@@ -82,6 +82,7 @@
 #include <QVariantMap>          /* QVariantMap 用于向 QML 返回当前选中历史记录详情。 */
 #include <QVector>              /* QVector 用于保存内存中的上传历史记录列表。 */
 #include <algorithm>            /* std::stable_sort 用于把跨日期历史记录按上传时间重新排成时间顺序。 */
+#include <cmath>                /* std::isfinite 用于校验 QML/JSON 传入的 32 位位置步数是否为有效数字。 */
 #include <cstdlib>              /* EXIT_SUCCESS/EXIT_FAILURE 是 main 返回值语义。 */
 #include <ctime>                /* tzset 用于让运行时立刻重新读取 TZ 时区变量。 */
 #include <functional>           /* std::function 用于给检测同步流程注入“分类完成/双模型完成”进度回调。 */
@@ -234,6 +235,18 @@ static const quint8 BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U;
 /* 二进制步进电机参数命令：参数页保存后把三台 Emm42 的地址、步长、速度和方向下发给 F407。 */
 static const quint8 BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U;
 
+/* 二进制执行器位置运动命令：用于让 F4 以 Emm42 位置模式控制传送带、前后轴或上下轴移动固定步数。 */
+static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE = 0x50U;
+
+/* 二进制执行器停止命令：用于手动急停或停止指定执行器，actuator=0xFF 表示全部可停止执行器。 */
+static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_STOP = 0x51U;
+
+/* 二进制执行器速度运动命令：用于手动调试时让传送带或摄像头前后轴持续运动，直到 STOP。 */
+static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE = 0x52U;
+
+/* 二进制执行器设零命令：用于参数设置页把当前电机位置设为新的零点，不主动运动。 */
+static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_HOME = 0x53U;
+
 /* 二进制协议 ACK 命令：F4 用它确认关键命令已被接收并接受。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACK = 0x80U;
 
@@ -297,6 +310,8 @@ static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
  *   minStep 是单次点动或闭环微调的最小步长，单位为 step。
  *   normalSpeedRpm 是常规运动速度，单位为 rpm，允许 0~5000 的现场任意整数配置。
  *   direction 是方向映射，1 表示正向，-1 表示反向，用于现场坐标越调越远时快速反转。
+ *   zDownFixedSteps 是上下电机自动检测前下探的固定相对位置步数，单位为 step。
+ *   zUpFixedSteps 是上下电机模型检测后回升的固定相对位置步数，单位为 step。
  */
 struct StepperMotorSettings
 {
@@ -307,6 +322,8 @@ struct StepperMotorSettings
     int minStep = 10;
     int normalSpeedRpm = 300;
     int direction = 1;
+    quint32 zDownFixedSteps = 0U;
+    quint32 zUpFixedSteps = 0U;
 };
 
 /*
@@ -353,6 +370,8 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraZMotor.minStep = 5;
     cameraZMotor.normalSpeedRpm = 80;
     cameraZMotor.direction = 1;
+    cameraZMotor.zDownFixedSteps = 800U;
+    cameraZMotor.zUpFixedSteps = 800U;
     motors.append(cameraZMotor);
 
     return motors;
@@ -399,6 +418,8 @@ static QVariantMap stepperMotorToVariantMap(const StepperMotorSettings &motor, i
     map.insert(QStringLiteral("normalSpeedRpm"), motor.normalSpeedRpm);
     map.insert(QStringLiteral("direction"), motor.direction);
     map.insert(QStringLiteral("directionText"), stepperDirectionText(motor.direction));
+    map.insert(QStringLiteral("zDownFixedSteps"), static_cast<double>(motor.zDownFixedSteps));
+    map.insert(QStringLiteral("zUpFixedSteps"), static_cast<double>(motor.zUpFixedSteps));
     return map;
 }
 
@@ -435,7 +456,7 @@ static QVariantList stepperMotorSettingsToVariantList(const QVector<StepperMotor
  *   segmentMinPixels 是 UNet 判 NG 的最小缺陷像素数，传给 defect-segment 的 --min-defect-pixels。
  *   overlayAlpha 是 UNet 叠加图透明度，传给 defect-segment 的 --alpha。
  *   autoUploadEnabled 为 false 时检测仍写本地历史，但跳过 COS 上传并返回 upload_status=SKIP。
- *   stepperMotors 保存三台步进电机的地址、最小步长、常规速度和方向配置。
+ *   stepperMotors 保存三台步进电机的地址、最小步长、常规速度、方向和上下轴固定位置步数配置。
  */
 struct DetectSettingsSnapshot
 {
@@ -479,6 +500,64 @@ static double clampedDouble(double value, double low, double high)
 static int clampedInt(int value, int low, int high)
 {
     return std::max(low, std::min(high, value));
+}
+
+/*
+ * clampedUInt32FromDouble 的作用：
+ *   把 QML Number 或 JSON number 表示的位置模式步数限制到 Emm42 4 字节脉冲数字段范围。
+ *
+ * 主要流程：
+ *   1. 小于 0、NaN 或无穷大都按 0 处理，避免非法 UI 文本越过 C++ 进入协议层。
+ *   2. 大于 0xFFFFFFFF 的值按最大 32 位无符号数处理，和张大头 42 步进位置模式字段宽度一致。
+ *   3. 合法数值向下取整，保证最终发给 F4 的 step 是整数。
+ *
+ * 参数：
+ *   value 是 QML 或 JSON 传来的数值。
+ *
+ * 返回值：
+ *   返回 0~4294967295 范围内的 quint32 步数。
+ */
+static quint32 clampedUInt32FromDouble(double value)
+{
+    if (!std::isfinite(value) || value <= 0.0) {
+        return 0U;
+    }
+
+    if (value >= 4294967295.0) {
+        return 0xFFFFFFFFU;
+    }
+
+    return static_cast<quint32>(value);
+}
+
+/*
+ * clampedUInt32FromText 的作用：
+ *   把 QML 数字键盘输入的十进制文本转换成 Emm42 位置模式允许的 32 位步数。
+ *
+ * 参数：
+ *   text 是用户输入的十进制文本。
+ *   ok 非空时用于返回解析是否成功；空字符串、非数字或越界文本会返回 false。
+ *
+ * 返回值：
+ *   返回解析并限幅后的 0~4294967295 step。
+ */
+static quint32 clampedUInt32FromText(const QString &text, bool *ok)
+{
+    const QString trimmed = text.trimmed();
+    bool localOk = false;
+    const qulonglong rawValue = trimmed.toULongLong(&localOk, 10);
+
+    if (!localOk || rawValue > 0xFFFFFFFFULL) {
+        if (ok) {
+            *ok = false;
+        }
+        return 0U;
+    }
+
+    if (ok) {
+        *ok = true;
+    }
+    return static_cast<quint32>(rawValue);
 }
 
 /*
@@ -3602,6 +3681,57 @@ public:
     }
 
     /*
+     * setStepperMotorStepValue 的作用：
+     *   从 QML 数字键盘更新上下步进电机的固定下探或回升步数。
+     *
+     * 主要流程：
+     *   1. 校验 index 指向三台已知电机中的一台，通常只有摄像头上下电机页会显示该入口。
+     *   2. 使用 clampedUInt32FromText() 解析十进制文本，确保范围完整覆盖 Emm42 位置模式 4 字节脉冲数。
+     *   3. 只接受 zDownFixedSteps 和 zUpFixedSteps 两个字段，避免 QML 误把其它参数绕过 int 限幅。
+     *   4. 通过 applySettings() 统一归一化并通知 QML 刷新。
+     *
+     * 参数：
+     *   index 是弹窗页序号，0=传送带，1=摄像头前后，2=摄像头上下。
+     *   key 是字段名，只支持 zDownFixedSteps/zUpFixedSteps。
+     *   valueText 是用户输入的十进制 step 文本，合法范围为 0~4294967295。
+     *
+     * 返回值：
+     *   true 表示字段已接受；false 表示页号、字段名或数值文本非法。
+     */
+    Q_INVOKABLE bool setStepperMotorStepValue(int index, const QString &key, const QString &valueText)
+    {
+        bool ok = false;                                      /* ok 标记十进制文本是否能完整解析为 32 位步数。 */
+        const quint32 steps = clampedUInt32FromText(valueText, &ok);
+
+        if (index < 0 || index >= m_settings.stepperMotors.size()) {
+            setLastStatusText(QStringLiteral("步进电机位置参数：页号无效"));
+            return false;
+        }
+
+        if (!ok) {
+            setLastStatusText(QStringLiteral("步进电机位置参数必须是 0~4294967295 的整数 step"));
+            return false;
+        }
+
+        DetectSettingsSnapshot next = m_settings;
+        StepperMotorSettings &motor = next.stepperMotors[index];
+
+        if (key == QStringLiteral("zDownFixedSteps")) {
+            motor.zDownFixedSteps = steps;
+        } else if (key == QStringLiteral("zUpFixedSteps")) {
+            motor.zUpFixedSteps = steps;
+        } else {
+            setLastStatusText(QStringLiteral("步进电机位置参数：字段无效 ") + key);
+            return false;
+        }
+
+        applySettings(next, QStringLiteral("步进电机位置参数：")
+            + motor.name
+            + QStringLiteral(" 已更新"));
+        return true;
+    }
+
+    /*
      * loadSettingsFromDisk 的作用：
      *   从 /mnt/sdcard/config/defect_ui_config.json 读取检测配置。
      *
@@ -3664,6 +3794,14 @@ public:
             motor.normalSpeedRpm = motorObject.value(QStringLiteral("normal_speed_rpm")).toInt(
                 motorObject.value(QStringLiteral("normalSpeedRpm")).toInt(motor.normalSpeedRpm));
             motor.direction = motorObject.value(QStringLiteral("direction")).toInt(motor.direction);
+            motor.zDownFixedSteps = clampedUInt32FromDouble(
+                motorObject.value(QStringLiteral("z_down_fixed_steps")).toDouble(
+                    motorObject.value(QStringLiteral("zDownFixedSteps")).toDouble(
+                        static_cast<double>(motor.zDownFixedSteps))));
+            motor.zUpFixedSteps = clampedUInt32FromDouble(
+                motorObject.value(QStringLiteral("z_up_fixed_steps")).toDouble(
+                    motorObject.value(QStringLiteral("zUpFixedSteps")).toDouble(
+                        static_cast<double>(motor.zUpFixedSteps))));
             next.stepperMotors[index] = motor;
         }
 
@@ -3718,6 +3856,8 @@ public:
             motorObject.insert(QStringLiteral("min_step"), motor.minStep);
             motorObject.insert(QStringLiteral("normal_speed_rpm"), motor.normalSpeedRpm);
             motorObject.insert(QStringLiteral("direction"), motor.direction);
+            motorObject.insert(QStringLiteral("z_down_fixed_steps"), static_cast<double>(motor.zDownFixedSteps));
+            motorObject.insert(QStringLiteral("z_up_fixed_steps"), static_cast<double>(motor.zUpFixedSteps));
             stepperMotorsArray.append(motorObject);
         }
         object.insert(QStringLiteral("stepper_motors"), stepperMotorsArray);
@@ -3846,6 +3986,8 @@ private:
             motor.minStep = clampedInt(source.minStep, 1, 10000);
             motor.normalSpeedRpm = clampedInt(source.normalSpeedRpm, 0, 5000);
             motor.direction = source.direction >= 0 ? 1 : -1;
+            motor.zDownFixedSteps = source.zDownFixedSteps;
+            motor.zUpFixedSteps = source.zUpFixedSteps;
             normalized[index] = motor;
         }
 
@@ -3876,7 +4018,9 @@ private:
             if (leftMotor.address != rightMotor.address
                     || leftMotor.minStep != rightMotor.minStep
                     || leftMotor.normalSpeedRpm != rightMotor.normalSpeedRpm
-                    || leftMotor.direction != rightMotor.direction) {
+                    || leftMotor.direction != rightMotor.direction
+                    || leftMotor.zDownFixedSteps != rightMotor.zDownFixedSteps
+                    || leftMotor.zUpFixedSteps != rightMotor.zUpFixedSteps) {
                 return false;
             }
         }
@@ -7038,6 +7182,224 @@ public:
     }
 
     /*
+     * sendF4ActuatorPositionMove 的作用：
+     *   让 QML 通过统一二进制协议请求 F4 控制某个执行器做固定步数位置运动。
+     *
+     * 主要流程：
+     *   1. 校验 actuator/direction/mode/speed/steps，防止 QML 或触摸误操作把非法值发到 F4。
+     *   2. 自动流程运行时复用当前 cycle_id，手动调试时使用 cycle_id=0。
+     *   3. 按 `cycle_id, actuator, direction, mode, speed_rpm, steps, flags` 编码负载。
+     *   4. 复用串口忙标志和 ACK/NACK 等待逻辑，保证不会和视觉闭环、称重标定、参数下发抢串口。
+     *
+     * 参数：
+     *   actuator 是执行器编号：0=传送带，1=摄像头前后，2=摄像头上下。
+     *   direction 是逻辑方向：0=后退/下降，1=前进/上升。
+     *   mode 是位置运动模式，首版使用 0 表示相对位置模式。
+     *   speedRpm 是本次运动速度，0 表示让 F4 使用该轴运行时默认速度，最大 5000 rpm。
+     *   stepsValue 是相对移动步数，合法范围 1~4294967295 step。
+     *   flags 是扩展标志，首版填 0。
+     *
+     * 返回值：
+     *   true 表示后台串口任务已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4ActuatorPositionMove(int actuator,
+                                                int direction,
+                                                int mode,
+                                                int speedRpm,
+                                                double stepsValue,
+                                                int flags)
+    {
+        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
+        const quint32 steps = clampedUInt32FromDouble(stepsValue);
+        QByteArray payload;        /* payload 保存 ACTUATOR_POS_MOVE 的固定 12 字节负载。 */
+        QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
+
+        if (actuator < 0 || actuator > 2) {
+            rejectText = QStringLiteral("执行器编号必须是 0=传送带、1=前后轴、2=上下轴");
+        } else if (direction != 0 && direction != 1) {
+            rejectText = QStringLiteral("执行器方向必须是 0=后退/下降 或 1=前进/上升");
+        } else if (mode != 0) {
+            rejectText = QStringLiteral("执行器位置模式首版只支持 mode=0 相对移动");
+        } else if (speedRpm < 0 || speedRpm > 5000) {
+            rejectText = QStringLiteral("执行器速度必须是 0~5000 rpm");
+        } else if (steps == 0U) {
+            rejectText = QStringLiteral("执行器位置移动步数必须大于 0");
+        } else if (flags < 0 || flags > 255) {
+            rejectText = QStringLiteral("执行器 flags 必须是 0~255");
+        }
+
+        if (!rejectText.isEmpty()) {
+            emit f4ActuatorCommandFinished(false,
+                                           QStringLiteral("ACTUATOR_POS_MOVE"),
+                                           cycleId,
+                                           rejectText);
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                                  /* cycle_id：自动流程中用于和本轮检测绑定。 */
+        payload.append(static_cast<char>(actuator & 0xFF));             /* actuator：0 传送带，1 前后轴，2 上下轴。 */
+        payload.append(static_cast<char>(direction & 0xFF));            /* direction：0 后退/下降，1 前进/上升。 */
+        payload.append(static_cast<char>(mode & 0xFF));                 /* mode：0 相对位置模式。 */
+        appendLe16(&payload, static_cast<quint16>(speedRpm));           /* speed_rpm：位置运动速度，0 交给 F4 用默认速度。 */
+        appendLe32(&payload, steps);                                    /* steps：Emm42 0xFD 位置模式 4 字节脉冲数。 */
+        payload.append(static_cast<char>(flags & 0xFF));                /* flags：首版保留，当前填 0。 */
+
+        return startF4ActuatorCommand(QStringLiteral("ACTUATOR_POS_MOVE"),
+                                      BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE,
+                                      cycleId,
+                                      payload);
+    }
+
+    /*
+     * sendF4ActuatorVelocityMove 的作用：
+     *   让 QML 通过统一二进制协议请求 F4 控制某个执行器持续速度运动。
+     *
+     * 主要流程：
+     *   1. 校验 actuator/direction/speed/flags，防止触摸误操作把危险命令发给 F4。
+     *   2. 按 `cycle_id, actuator, direction, speed_rpm, flags` 编码 ACTUATOR_VEL_MOVE 负载。
+     *   3. 复用串口忙标志和 ACK/NACK 等待逻辑，保证和自动视觉、称重标定、参数下发互斥。
+     *
+     * 参数：
+     *   actuator 是执行器编号：0=传送带，1=摄像头前后；上下轴不允许速度连续运动。
+     *   direction 是逻辑方向：0=后退，1=前进。
+     *   speedRpm 是持续运动速度，必须是 1~5000 rpm。
+     *   flags 是扩展标志，首版填 0。
+     *
+     * 返回值：
+     *   true 表示后台串口任务已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4ActuatorVelocityMove(int actuator,
+                                                int direction,
+                                                int speedRpm,
+                                                int flags)
+    {
+        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
+        QByteArray payload;        /* payload 保存 ACTUATOR_VEL_MOVE 的固定 7 字节负载。 */
+        QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
+
+        if (actuator < 0 || actuator > 1) {
+            rejectText = QStringLiteral("速度模式只允许 0=传送带、1=前后轴；上下轴必须用固定步数位置模式");
+        } else if (direction != 0 && direction != 1) {
+            rejectText = QStringLiteral("执行器方向必须是 0=后退 或 1=前进");
+        } else if (speedRpm <= 0 || speedRpm > 5000) {
+            rejectText = QStringLiteral("持续运动速度必须是 1~5000 rpm，请先在参数设置中配置常规速度");
+        } else if (flags < 0 || flags > 255) {
+            rejectText = QStringLiteral("执行器 flags 必须是 0~255");
+        }
+
+        if (!rejectText.isEmpty()) {
+            emit f4ActuatorCommandFinished(false,
+                                           QStringLiteral("ACTUATOR_VEL_MOVE"),
+                                           cycleId,
+                                           rejectText);
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                                  /* cycle_id：手动调试通常为 0。 */
+        payload.append(static_cast<char>(actuator & 0xFF));             /* actuator：0 传送带，1 前后轴。 */
+        payload.append(static_cast<char>(direction & 0xFF));            /* direction：0 后退，1 前进。 */
+        appendLe16(&payload, static_cast<quint16>(speedRpm));           /* speed_rpm：持续速度，必须大于 0。 */
+        payload.append(static_cast<char>(flags & 0xFF));                /* flags：首版保留，当前填 0。 */
+
+        return startF4ActuatorCommand(QStringLiteral("ACTUATOR_VEL_MOVE"),
+                                      BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE,
+                                      cycleId,
+                                      payload);
+    }
+
+    /*
+     * sendF4ActuatorStop 的作用：
+     *   让 QML 通过二进制协议请求 F4 停止指定执行器或全部执行器。
+     *
+     * 主要流程：
+     *   1. 校验 actuator：0=传送带，1=前后轴，2=上下轴，0xFF=全部停止。
+     *   2. 自动流程运行时带当前 cycle_id，手动急停或调试时 cycle_id=0。
+     *   3. 下发 ACTUATOR_STOP 后等待 F4 ACK/NACK，成功与否通过 f4ActuatorCommandFinished 返回 QML。
+     *
+     * 参数：
+     *   actuator 是执行器编号，0xFF 表示全部。
+     *   flags 是扩展标志，首版填 0。
+     *
+     * 返回值：
+     *   true 表示后台串口任务已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4ActuatorStop(int actuator, int flags)
+    {
+        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
+        QByteArray payload;        /* payload 保存 ACTUATOR_STOP 的固定 4 字节负载。 */
+        QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
+
+        if (!((actuator >= 0 && actuator <= 2) || actuator == 0xFF)) {
+            rejectText = QStringLiteral("停止执行器编号必须是 0/1/2 或 0xFF");
+        } else if (flags < 0 || flags > 255) {
+            rejectText = QStringLiteral("停止执行器 flags 必须是 0~255");
+        }
+
+        if (!rejectText.isEmpty()) {
+            emit f4ActuatorCommandFinished(false,
+                                           QStringLiteral("ACTUATOR_STOP"),
+                                           cycleId,
+                                           rejectText);
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                         /* cycle_id：自动流程中用于和本轮检测绑定。 */
+        payload.append(static_cast<char>(actuator & 0xFF));    /* actuator：0/1/2 指定轴，0xFF 表示全部执行器。 */
+        payload.append(static_cast<char>(flags & 0xFF));       /* flags：首版保留，当前填 0。 */
+
+        return startF4ActuatorCommand(QStringLiteral("ACTUATOR_STOP"),
+                                      BINARY_PROTOCOL_CMD_ACTUATOR_STOP,
+                                      cycleId,
+                                      payload);
+    }
+
+    /*
+     * sendF4ActuatorHome 的作用：
+     *   让参数设置页通过二进制协议请求 F4 把某个执行器当前位置设为新的零点。
+     *
+     * 主要流程：
+     *   1. 校验 actuator/flags，禁止把 0xFF 当作全部清零，避免误改多个电机的标定基准。
+     *   2. 按 `cycle_id, actuator, flags` 编码 ACTUATOR_HOME 负载。
+     *   3. 复用执行器串口命令线程，等待 F4 ACK/NACK 后由 QML 显示结果。
+     *
+     * 参数：
+     *   actuator 是执行器编号：0=传送带，1=摄像头前后轴，2=摄像头上下轴。
+     *   flags 是扩展标志，首版填 0。
+     *
+     * 返回值：
+     *   true 表示后台串口任务已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4ActuatorHome(int actuator, int flags)
+    {
+        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
+        QByteArray payload;        /* payload 保存 ACTUATOR_HOME 的固定 4 字节负载。 */
+        QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
+
+        if (actuator < 0 || actuator > 2) {
+            rejectText = QStringLiteral("设零执行器编号必须是 0=传送带、1=前后轴、2=上下轴");
+        } else if (flags < 0 || flags > 255) {
+            rejectText = QStringLiteral("设零 flags 必须是 0~255");
+        }
+
+        if (!rejectText.isEmpty()) {
+            emit f4ActuatorCommandFinished(false,
+                                           QStringLiteral("ACTUATOR_HOME"),
+                                           cycleId,
+                                           rejectText);
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                         /* cycle_id：参数页标定通常为 0。 */
+        payload.append(static_cast<char>(actuator & 0xFF));    /* actuator：0/1/2 指定当前页电机。 */
+        payload.append(static_cast<char>(flags & 0xFF));       /* flags：首版保留，当前填 0。 */
+
+        return startF4ActuatorCommand(QStringLiteral("ACTUATOR_HOME"),
+                                      BINARY_PROTOCOL_CMD_ACTUATOR_HOME,
+                                      cycleId,
+                                      payload);
+    }
+
+    /*
      * sendF4AutoControlCommand 的作用：
      *   把首页“开始、暂停、继续、停止”四个按钮映射为 MP157->F407 二进制自动检测协议帧。
      *
@@ -7419,6 +7781,9 @@ signals:
 
     /* f4VisionCommandFinished 通知 QML 视觉闭环命令发送完成，并带回 ACK/NACK 详情。 */
     void f4VisionCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
+
+    /* f4ActuatorCommandFinished 通知 QML 执行器位置运动或停止命令完成，并带回 ACK/NACK 详情。 */
+    void f4ActuatorCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
 
 private slots:
     /*
@@ -7834,6 +8199,33 @@ private slots:
     }
 
     /*
+     * handleF4ActuatorCommandFinished 的作用：
+     *   接收后台执行器位置运动或停止命令发送结果，并释放 F4 串口忙标志。
+     *
+     * 参数：
+     *   ok 为 true 表示 F4 返回了匹配当前命令、SEQ 和 cycle_id 的 ACK。
+     *   action 是执行器命令名称，例如 ACTUATOR_POS_MOVE 或 ACTUATOR_STOP。
+     *   cycleId 是本次命令所属自动流程号；手动命令通常为 0。
+     *   detail 是 ACK/NACK 解析结果或串口失败原因。
+     *
+     * 返回值：
+     *   无返回值；结果通过 f4ActuatorCommandFinished 通知 QML 自动流程或手动弹窗。
+     */
+    void handleF4ActuatorCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail)
+    {
+        m_f4CommandRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4执行器命令完成：") + action + QStringLiteral(" ") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4执行器命令失败：") + action + QStringLiteral(" ") + detail);
+        }
+
+        emit f4ActuatorCommandFinished(ok, action, cycleId, detail);
+    }
+
+    /*
      * handleF4AutoControlFinished 的作用：
      *   接收后台二进制自动流程命令结果，并在 Qt 主线程维护 MP157 本地 cycle 状态。
      *
@@ -8152,6 +8544,14 @@ private:
             return QStringLiteral("BELT_MANUAL_CONTROL");
         case BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET:
             return QStringLiteral("STEPPER_PARAM_SET");
+        case BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE:
+            return QStringLiteral("ACTUATOR_POS_MOVE");
+        case BINARY_PROTOCOL_CMD_ACTUATOR_STOP:
+            return QStringLiteral("ACTUATOR_STOP");
+        case BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE:
+            return QStringLiteral("ACTUATOR_VEL_MOVE");
+        case BINARY_PROTOCOL_CMD_ACTUATOR_HOME:
+            return QStringLiteral("ACTUATOR_HOME");
         case BINARY_PROTOCOL_CMD_ACK:
             return QStringLiteral("ACK");
         case BINARY_PROTOCOL_CMD_NACK:
@@ -8262,10 +8662,10 @@ private:
      *   把 F4 STATUS_REPORT 中的传送带模式编号转换成界面可读短文本。
      *
      * 参数：
-     *   mode 是传送带模式，0=STOP，1=SCAN，2=TRACK。
+     *   mode 是传送带模式，0=STOP，1=SCAN，2=TRACK，3=POSITION，4=JOG。
      *
      * 返回值：
-     *   返回 STOP/SCAN/TRACK；未知模式返回 BELT_<数字>。
+     *   返回 STOP/SCAN/TRACK/POSITION/JOG；未知模式返回 BELT_<数字>。
      */
     static QString f4BeltModeName(quint8 mode)
     {
@@ -8276,6 +8676,10 @@ private:
             return QStringLiteral("SCAN");
         case 2:
             return QStringLiteral("TRACK");
+        case 3:
+            return QStringLiteral("POSITION");
+        case 4:
+            return QStringLiteral("JOG");
         default:
             return QStringLiteral("BELT_") + QString::number(mode);
         }
@@ -8918,6 +9322,84 @@ private:
                                          action,
                                          cycleId,
                                          QStringLiteral("F4视觉闭环命令线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
+     * startF4ActuatorCommand 的作用：
+     *   统一发送执行器位置移动和停止类 F4 二进制命令。
+     *
+     * 主要流程：
+     *   1. 使用 m_f4CommandRunning 统一串口互斥，避免自动视觉、手动运动和心跳同抢 `/dev/ttySTM2`。
+     *   2. 生成全局 sequence 并组装完整二进制帧。
+     *   3. 后台线程调用 sendF4BinaryCommand() 等待匹配 ACK/NACK。
+     *   4. 主线程 handleF4ActuatorCommandFinished() 释放忙标志并通知 QML。
+     *
+     * 参数：
+     *   action 是给 QML 和日志使用的动作名。
+     *   command 是要写入协议 CMD 字段的命令字。
+     *   cycleId 是本次命令归属的流程号，手动命令允许为 0。
+     *   payload 是已经编码好的协议负载。
+     *
+     * 返回值：
+     *   true 表示后台任务已启动；false 表示串口忙或线程创建失败。
+     */
+    bool startF4ActuatorCommand(const QString &action,
+                                quint8 command,
+                                quint16 cycleId,
+                                const QByteArray &payload)
+    {
+        if (m_f4CommandRunning) {
+            emit f4ActuatorCommandFinished(false,
+                                           action,
+                                           cycleId,
+                                           QStringLiteral("上一条F4串口命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4ActuatorCommandFinished(false,
+                                           action,
+                                           cycleId,
+                                           QStringLiteral("F4状态刷新仍在进行，请稍后再发送执行器命令"));
+            return false;
+        }
+
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(command, sequence, payload);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+        m_f4CommandRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId]() {
+            QString detail;
+            const bool ok = sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4ActuatorCommandFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, action),
+                                      Q_ARG(quint16, cycleId),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            emit f4ActuatorCommandFinished(false,
+                                           action,
+                                           cycleId,
+                                           QStringLiteral("F4执行器命令线程创建失败"));
             return false;
         }
 

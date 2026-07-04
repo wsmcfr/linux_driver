@@ -43,6 +43,16 @@ require_fixed_grep()
     grep -Fq -- "$pattern" "$SCRIPT_DIR/$file" || fail "$file 缺少固定文本：$pattern"
 }
 
+# 作用：确认指定文件中不存在某个正则模式，用于防止旧协议语义或旧界面文案回流。
+require_absent()
+{
+    pattern="$1"
+    file="$2"
+    if grep -Eq -- "$pattern" "$SCRIPT_DIR/$file"; then
+        fail "$file 不应再包含模式：$pattern"
+    fi
+}
+
 require_file "uvc_kms_overlay.c"
 require_file "build_uvc_kms_overlay.sh"
 require_file "run_qt_kms_overlay_display.sh"
@@ -369,8 +379,37 @@ require_grep "id: manualBeltPanel" "qml/Main.qml"
 require_grep "id: manualAssistPanel" "qml/Main.qml"
 require_grep "id: manualSafetyPanel" "qml/Main.qml"
 require_grep "id: manualCommandLogView" "qml/Main.qml"
+require_grep "manualMotorPopup" "qml/Main.qml"
+require_grep "manualMotorPageIndex" "qml/Main.qml"
+require_grep "manualSafetyFlickable" "qml/Main.qml"
+require_grep "autoVisionRequestZDown" "qml/Main.qml"
+require_grep "autoVisionFineTuneForward" "qml/Main.qml"
+require_grep "autoVisionRequestZUp" "qml/Main.qml"
+require_grep "autoVisionZFocusSettleMs" "qml/Main.qml"
+require_grep "autoVisionPostFocusDetectDelayMs" "qml/Main.qml"
+require_grep "autoVisionStartDetectDelay" "qml/Main.qml"
+require_grep "等待约3秒让摄像头对焦稳定" "qml/Main.qml"
+require_grep "zDownFixedSteps" "qml/Main.qml"
+require_grep "zUpFixedSteps" "qml/Main.qml"
 require_grep "sendManualBeltCommand" "qml/Main.qml"
 require_grep "sendF4BeltCommand" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_ACTUATOR_STOP" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_ACTUATOR_HOME" "main.cpp"
+require_grep "sendF4ActuatorPositionMove" "main.cpp"
+require_grep "sendF4ActuatorVelocityMove" "main.cpp"
+require_grep "sendF4ActuatorStop" "main.cpp"
+require_grep "sendF4ActuatorHome" "main.cpp"
+require_grep "ACTUATOR_VEL_MOVE" "qml/Main.qml"
+require_grep "ACTUATOR_HOME" "qml/Main.qml"
+require_grep "sendManualActuatorVelocityMove" "qml/Main.qml"
+require_grep "sendStepperActuatorHome" "qml/Main.qml"
+require_grep "设当前位置为零点" "qml/Main.qml"
+require_absent "每次点击只发送一次位置模式点动命令" "qml/Main.qml"
+require_grep "zDownFixedSteps" "main.cpp"
+require_grep "zUpFixedSteps" "main.cpp"
+require_grep "f4ActuatorCommandFinished" "main.cpp"
 require_grep "f4ManualCommandFinished" "main.cpp"
 require_grep "onF4ManualCommandFinished" "qml/Main.qml"
 require_grep "autoControlBusy" "qml/Main.qml"
@@ -424,8 +463,8 @@ fi
 if grep -Eq 'QGPS|QGPSLOC|/dev/ttyUSB|AT\\+QGPS|AT\\+QGPSLOC|coordsys=gps' "$SCRIPT_DIR/../../22_4g_ppp/4g-location"; then
     fail "22_4g_ppp/4g-location 当前只允许高德 IP 省份定位，不能访问 GPS、AT 串口或 ttyUSB"
 fi
-if grep -Eq 'manualBeltSpeed|belt-forward|belt-reverse|belt-speed|正向点动|反向点动|速度档位|夹爪开|夹爪关|manualArmPanel|manualArmButtonGrid|arm-home|arm-standby|arm-pick|arm-good|arm-bad|actuator-on|actuator-off|摄像头双轴|待F4协议|等待CAM协议|双轴停止|"name": "双轴"' "$SCRIPT_DIR/qml/Main.qml"; then
-    fail "手动控制页只保留真实传送带和检测辅助；顶部保留位置显示，但界面不能继续显示双轴、待F4协议或旧点动/夹爪入口"
+if grep -Eq 'manualBeltSpeed|belt-forward|belt-reverse|belt-speed|正向点动|反向点动|速度档位|夹爪开|夹爪关|manualArmPanel|manualArmButtonGrid|arm-home|arm-standby|arm-pick|arm-good|arm-bad|actuator-on|actuator-off|待F4协议|等待CAM协议|"name": "双轴"' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "手动控制页必须使用新的三轴二进制协议弹窗，不能恢复旧速度档、机械臂、夹爪或待接入假按钮"
 fi
 if grep -Eq "背光|补光|亮度|manualLight|manualTopLight|backlight|toplight|light-low|light-mid|light-high" "$SCRIPT_DIR/qml/Main.qml"; then
     fail "qml/Main.qml 当前不需要背光/补光/亮度配置，界面和状态栏必须完全删除相关展示"

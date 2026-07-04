@@ -7,7 +7,7 @@
 | 现有主协议 | `docs/stm32mp157-f407-binary-protocol.md`。 |
 | 机械臂协议 | `docs/f4_esp32s3_arm_protocol/README.md`。 |
 | 云端字段依据 | `D:\yunfuwu\docs\stm32mp157-cloud-upload-data-contract.md`。 |
-| 更新时间 | `2026-07-03`。 |
+| 更新时间 | `2026-07-04`。 |
 
 ## 1. 总目标
 
@@ -17,7 +17,7 @@
 |---|---|---|---|
 | 上料扫描 | F4 | 启动传送带张大头 Emm42，让零件进入摄像头视野。 | MP157 识别到零件并开始发送视觉坐标。 |
 | 视觉对中 | MP157 + F4 | MP157 周期发送零件坐标，F4 控制传送带调整位置；小偏移时可用摄像头前后轴微调。 | 零件进入中心 ROI，MP157 发送 `BELT_STOP_CENTERED`。 |
-| 静止对焦 | F4 + MP157 | F4 停止传送带，MP157 等待约 2s 让画面稳定。 | MP157 开始模型检测。 |
+| Z 轴下探、对焦和复查 | MP157 + F4 | F4 停止传送带后，MP157 让摄像头上下轴下降固定步数，收到下降 ACK 后等待约 3 秒让摄像头对焦稳定，再重新读取 ROI；若仍有轻微偏移，使用摄像头前后轴短步微调。 | 零件仍在 ROI 中央，MP157 开始模型检测。 |
 | 模型检测 | MP157 | 保存本次原图，运行 MobileNetV3-Small 和 UNet，先缓存结果不立即上传。 | MP157 生成本次模型结果、零件类型、综合 good/bad/review。 |
 | 机械臂到称重 | F4 + ESP32S3 | F4 通知 ESP32S3 抓取 ROI 中零件并放到称重模块。 | ESP32S3 返回 `ARM_STAGE_DONE stage=PICK_BELT_TO_WEIGHT result=OK`。 |
 | 称重 | F4 | F4 读取 HX711，稳定后把重量结果发给 MP157。 | MP157 收到 `WEIGHT_RESULT` 并 ACK。 |
@@ -42,12 +42,15 @@
 | MP157-F4 帧格式 | 已定义帧头 `A5 5A`、版本、命令、长度、SEQ、payload、CRC16-CCITT-FALSE、帧尾 `6B`。 | `docs/stm32mp157-f407-binary-protocol.md`。 |
 | MP157 首页四按钮 | 首页 `开始/暂停/继续/停止` 已调用 C++ 发送二进制 `START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE`。 | `20_uvc_camera/qt_camera_display/main.cpp`、`qml/Main.qml`。 |
 | MP157 overlay 内存定位 | `uvc_kms_overlay` 已新增 `LOCATE` 命令，直接从原始 YUYV 帧中间 300px 宽全高搜索带计算零件中心、bbox 和置信度，不保存图片、不调用模型。 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c`；板端可用 `printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock` 验证。 |
-| MP157 视觉坐标闭环首版 | 首页 `开始` 收到 F4 ACK 后启动 `autoVisionTimer`，每 100ms 请求 `LOCATE`；已按“上方来料”使用 `center_y` 对齐 `height/2`，下发 `VISION_POS`；连续 3 帧进入 ±24px 后发送 `BELT_STOP_CENTERED`，ACK 后等待 2s 自动触发现有双模型检测；目标出现过后短暂漏检不再发送 `VISION_LOST reason=1`，避免 F4 重新扫描把零件送走。 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/qml/Main.qml`；本地静态测试已覆盖 `requestAutoVisionLocate/sendF4VisionPosition/autoVisionTimer/autoVisionHasSeenTarget` 等 marker。 |
+| MP157 视觉坐标闭环首版 | 首页 `开始` 收到 F4 ACK 后启动 `autoVisionTimer`，每 100ms 请求 `LOCATE`；已按“上方来料”使用 `center_y` 对齐 `height/2`，下发 `VISION_POS`；连续 3 帧进入 ±24px 后发送 `BELT_STOP_CENTERED`；目标出现过后短暂漏检不再发送 `VISION_LOST reason=1`，避免 F4 重新扫描把零件送走。 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/qml/Main.qml`；本地静态测试已覆盖 `requestAutoVisionLocate/sendF4VisionPosition/autoVisionTimer/autoVisionHasSeenTarget` 等 marker。 |
+| MP157 Z 轴同步下探检测 | 收到 `BELT_STOP_CENTERED` ACK 后，QML 下发 `ACTUATOR_POS_MOVE actuator=ACT_CAMERA_Z direction=DOWN`，用参数页 `zDownFixedSteps` 下降固定步数；下降 ACK 后等待约 3 秒让摄像头对焦稳定，再复查 ROI，必要时用 `ACT_CAMERA_FORWARD` 短步微调；模型检测完成后再用 `zUpFixedSteps` 自动回升。 | `20_uvc_camera/qt_camera_display/main.cpp`、`qml/Main.qml`；静态测试覆盖 `ACTUATOR_POS_MOVE`、`zDownFixedSteps`、`zUpFixedSteps`、`autoVisionZFocusSettleMs`、`manualMotorPopup` 等 marker。 |
 | MP157 底部提示 | F4 返回内容已在底部提示前统一加 `F4:`。 | `Main.qml::f4ToastText()`。 |
 | MP157 手动传送带调试 | 手动页可发送 `BELT_MANUAL_CONTROL` 和 `QUERY_STATUS`。 | F4 ACK、STATUS_REPORT 能被 Qt 解析。 |
-| F4 二进制解析 | F4 已能解析 `HELLO/HEARTBEAT/START/PAUSE/RESUME/STOP/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/QUERY_STATUS/BELT_MANUAL_CONTROL`。 | `E:\hal\bisai_f407_project\User\App\binary_protocol_service.c`。 |
+| MP157 三轴手动控制 | 手动页已改成三轴弹窗，三页分别控制传送带、摄像头前后轴、摄像头上下轴；传送带/前后轴按一次方向键下发 `ACTUATOR_VEL_MOVE` 并持续运动到停止，上下轴按一次下降/上升只执行 `zDownFixedSteps/zUpFixedSteps` 固定步数；模拟急停下发 `ACTUATOR_STOP actuator=0xFF`，安全状态区域改为可滑动查看。 | `20_uvc_camera/qt_camera_display/qml/Main.qml`。 |
+| F4 二进制解析 | F4 已能解析 `HELLO/HEARTBEAT/START/PAUSE/RESUME/STOP/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/QUERY_STATUS/BELT_MANUAL_CONTROL/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME`，并修正执行器成功 ACK 必须统一 `status=0`。 | `E:\hal\bisai_f407_project\User\App\binary_protocol_service.c`。 |
 | F4 传送带绑定 | 传送带服务已按当前方案使用 `UART4 PC10/PC11`，Emm42 地址 `0x01`。 | F4 启动日志显示 `UART4=PC10/PC11, addr=1`。 |
 | F4 摄像头电机 ID 规划 | 摄像头前后轴地址 `0x02`，摄像头上下轴地址 `0x03`，共用 `USART6 PC6/PC7`。 | F4 启动日志显示 `forward_addr=2, z_addr=3`。 |
+| F4 执行器位置、速度和设零模式 | `binary_protocol_service` 已分发 `ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME`；`conveyor_motor_service` 和 `camera_motor_service` 分别负责速度持续运动、相对位置移动、停止和当前位置设零；`emm42_motor` 已接入 Emm42 速度模式、`0xFD` 相对位置模式和 `[addr 0A 6D 6B]` 当前位置清零命令。 | `E:\hal\bisai_f407_project\User\App\binary_protocol_service.c`、`camera_motor_service.c`、`conveyor_motor_service.c`、`E:\hal\bisai_f407_project\User\Driver\emm42_motor.c`。 |
 | F4 状态查询 | `QUERY_STATUS` 成功返回 `STATUS_REPORT`，包含 F4 状态、传送带模式、方向、速度、误差、故障位。 | 当前串口助手已看到 `belt_desired=SCAN`、`speed_rpm=300` 这类状态。 |
 | 云端图片上传 | MP157 已能上传 source 原图和多张 annotated 结果图，并创建云端记录。 | `defect-cos-upload` 支持 `--jpg` 和多次 `--annotated`。 |
 
@@ -59,7 +62,7 @@
 |---|---|---|
 | 自动视觉坐标下发 | 首版代码已落地：`LOCATE` -> `VISION_POS`，上方来料使用 `center_y` 和 `height/2`。 | 还需要同步到虚拟机、交叉编译、部署到板端，并用真实三种零件调阈值、看 F4 `latest_error_px` 是否随零件靠近中心而减小。 |
 | ROI 居中停止 | 首版代码已落地：连续 3 帧 `abs(center_y-height/2)<=24px` 后发送 `BELT_STOP_CENTERED hold_ms=2000`，与当前 F4 死区保持同量级。 | 还需要实测传送带惯性、F4 停机响应和相机画面稳定时间；必要时调整死区、稳定帧数或 F4 减速曲线。 |
-| 对焦等待与自动模型触发 | 首版代码已落地：F4 居中停机 ACK 后 QML 等 2s，调用现有 `handleDetectAction()`。 | 还需要板端确认自动检测不会和 overlay `LOCATE`、F4 串口 ACK、SD 卡保存互相抢资源。 |
+| Z 轴下降后 ROI 复查 | 首版代码已落地：F4 居中停机 ACK 后 QML 先让 Z 轴下降，再复查 ROI，必要时用前后轴微调，最后调用现有 `handleDetectAction()`。 | 还需要板端确认 Z 轴下降固定值、前后轴微调方向、ROI 死区和模型检测触发不会互相抢串口或摄像头资源。 |
 | 模型结果缓存并通知 F4 | 当前上传脚本能拿模型结果，但自动流程没有把模型结果下发 F4。 | 定义并实现 `MODEL_READY` payload，把 `part_type/model_result/confidence/defect_type/model_time_ms` 发给 F4。 |
 | 机械臂任务触发 | MP157 还没有向 F4 下发正式 `ARM_JOB_START`。 | 模型完成后发送 `ARM_JOB_START`，告诉 F4 本件可进入机械臂、称重、电感流程。 |
 | F4 异步结果解析 | Qt 目前主要等 ACK/NACK/STATUS_REPORT/FAULT_REPORT，未完整消费 `EVENT_REPORT/WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE`。 | 串口接收线程要持续读取 F4 主动上报帧，并按 `cycle_id` 存入当前检测上下文。 |
@@ -80,7 +83,7 @@
 | 结果 ACK 和重发 | `WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE` 需要 MP157 ACK，但 F4 还没实现主动结果帧和等待 ACK。 | 结果帧发送后保留最近结果，超时可重发或进入故障。 |
 | `EVENT_REPORT` | 命令字保留，未用于阶段提示。 | 上报 `TARGET_CENTERED/ARM_WEIGHT_PLACED/ARM_LDC_PLACED/NEXT_SCAN_STARTED` 等事件。 |
 | 连续下一件扫描 | 文档定义了 CYCLE_DONE 后继续扫描，但 F4 自动状态机还未完整实现。 | 收到 MP157 对 `CYCLE_DONE` 的 ACK 后，若未停止/暂停/故障，自动 `ConveyorMotorService_RequestScan()`。 |
-| 摄像头前后轴微调 | 串口和地址已规划，自动闭环策略未落地。 | ROI 附近小误差时点动地址 `0x02`，连续无改善标记该方向到边界，不再硬顶。 |
+| 摄像头轴实机验证 | F4 位置模式代码已接入，地址规划为前后轴 `0x02`、上下轴 `0x03`。 | 编译烧录后确认 `ACTUATOR_POS_MOVE` 能让前后轴、上下轴按方向和步数动作，并确认方向映射、限位、堵转和错误码。 |
 
 ### 3.3 ESP32S3 还缺什么
 
@@ -146,9 +149,10 @@
 | `0x84` | `WEIGHT_RESULT` | F4 -> MP157 | 命令字已保留，未主动上报。 | 上报 `raw_adc/tare_raw/net_weight_mg/stable/sample_count/decision/status`。 |
 | `0x85` | `LDC_RESULT` | F4 -> MP157 | 命令字已保留，未主动上报。 | 上报 2 或 4 通道 raw/delta、overall_decision、status。 |
 | `0x86` | `CYCLE_DONE` | F4 -> MP157 | 命令字已保留，未主动上报。 | 上报 `weight_status/ldc_status/arm_status/fault_bits`，MP157 ACK 后 F4 连续扫描下一件。 |
-| `0x50` | `ACTUATOR_JOG` | MP157 -> F4 | 文档建议，未实现。 | 手动点动传送带、摄像头前后、摄像头上下。 |
-| `0x51` | `ACTUATOR_STOP` | MP157 -> F4 | 文档建议，未实现。 | 停止指定执行器。 |
-| `0x52` | `ACTUATOR_HOME` | MP157 -> F4 | 文档建议，未实现。 | 摄像头轴回零或回标定位置。 |
+| `0x50` | `ACTUATOR_POS_MOVE` | MP157 -> F4 | MP157/F4 代码已实现，待编译烧录和硬件验证。 | 负载为 `cycle_id:u16, actuator:u8, direction:u8, mode:u8, speed_rpm:u16, steps:u32, flags:u8`，用于三轴相对位置模式移动。 |
+| `0x51` | `ACTUATOR_STOP` | MP157 -> F4 | MP157/F4 代码已实现，待编译烧录和硬件验证。 | 负载为 `cycle_id:u16, actuator:u8, flags:u8`，`actuator=0xFF` 表示模拟急停停止全部可停止执行器。 |
+| `0x52` | `ACTUATOR_VEL_MOVE` | MP157 -> F4 | MP157/F4 代码已实现，待编译烧录和硬件验证。 | 负载为 `cycle_id:u16, actuator:u8, direction:u8, speed_rpm:u16, flags:u8`，当前用于手动传送带和前后轴持续速度运动，直到收到 `ACTUATOR_STOP`。 |
+| `0x53` | `ACTUATOR_HOME` | MP157 -> F4 | MP157/F4 代码已实现，待编译烧录和硬件验证。 | 负载为 `cycle_id:u16, actuator:u8, flags:u8`，参数页把当前电机页对应执行器的当前位置设为新的零点；不做主动回零运动，也不支持 `actuator=0xFF`。 |
 | `0x60` | `WEIGHT_TARE` | MP157 -> F4 | 未定义。 | 后续替代文本 `TARE`。 |
 | `0x61` | `WEIGHT_CALIBRATE` | MP157 -> F4 | 未定义。 | 后续替代文本 `CAL <克重>`。 |
 | `0x62` | `FAULT_CLEAR` | MP157 -> F4 | 未定义。 | 清除可恢复故障位，重新允许开始。 |
@@ -160,16 +164,18 @@
 | 步骤 | 触发 | F4 动作 | F4 回 MP157 |
 |---:|---|---|---|
 | 1 | MP157 发 `BELT_STOP_CENTERED` | F4 停传送带，状态置 `CENTERED_HOLD`。 | 立即回 `ACK`，可再发 `EVENT_REPORT event=TARGET_CENTERED`。 |
-| 2 | MP157 等约 2s 并完成模型检测 | F4 等待模型结果，不动作。 | 无主动动作。 |
-| 3 | MP157 发 `MODEL_READY` | F4 保存模型结果。 | 回 `ACK`。 |
-| 4 | MP157 发 `ARM_JOB_START` | F4 状态置 `ARM_PICKING`，向 ESP32S3 发 `ARM_MOVE_TO_WEIGHT`。 | 回 `ACK` 表示已接受机械臂任务。 |
-| 5 | ESP32S3 回 `ACK` | F4 知道 ESP32S3 已接收动作。 | 可发 `EVENT_REPORT event=ARM_STAGE_ACCEPTED`。 |
-| 6 | ESP32S3 回 `ARM_STAGE_DONE stage=PICK_BELT_TO_WEIGHT result=OK` | F4 状态置 `WEIGHING`，开始 HX711 稳定采样。 | 采样完成后发 `WEIGHT_RESULT`。 |
-| 7 | MP157 ACK `WEIGHT_RESULT` | F4 向 ESP32S3 发 `ARM_MOVE_TO_LDC`。 | 可发 `EVENT_REPORT event=WEIGHT_ACKED`。 |
-| 8 | ESP32S3 回 `ARM_STAGE_DONE stage=WEIGHT_TO_LDC result=OK` | F4 状态置 `LDC_TESTING`，开始 LDC1614 检测。 | 检测完成后发 `LDC_RESULT`。 |
-| 9 | MP157 ACK `LDC_RESULT`，且 F4 已收到 ESP32S3 的电感放置完成回包 | F4 读取本轮缓存的 `MODEL_READY.model_result`，把 `GOOD` 映射到良品盘、`BAD` 映射到不良品盘、`UNCERTAIN/UNKNOWN` 映射到待复核盘，然后向 ESP32S3 发 `ARM_SORT_RESULT`。 | 可发 `EVENT_REPORT event=SORT_COMMAND_SENT`，事件中带 `target_bin`。 |
-| 10 | ESP32S3 回 `ARM_STAGE_DONE stage=LDC_TO_SORT_BIN result=OK` | F4 发 `CYCLE_DONE`。 | MP157 合并图片、模型、重量、电感、分拣目标和 F4 状态上传云端。 |
-| 11 | MP157 ACK `CYCLE_DONE` | F4 自动启动传送带扫描下一件。 | 可发 `EVENT_REPORT event=NEXT_SCAN_STARTED`。 |
+| 2 | MP157 发 `ACTUATOR_POS_MOVE actuator=ACT_CAMERA_Z direction=DOWN` | F4 控制上下轴按相对位置模式下降固定步数。 | 回 `ACK` 或 `NACK`。 |
+| 3 | MP157 收到下降 ACK 后等待约 3 秒，再复查 ROI，必要时发 `ACTUATOR_POS_MOVE actuator=ACT_CAMERA_FORWARD direction=0/1` | F4 控制前后轴短步微调。 | 每次回 `ACK` 或 `NACK`，MP157 再读下一帧坐标。 |
+| 4 | MP157 完成模型检测后发 `ACTUATOR_POS_MOVE actuator=ACT_CAMERA_Z direction=UP` | F4 控制上下轴回升固定步数。 | 回 `ACK` 或 `NACK`，MP157 同步提示。 |
+| 5 | MP157 发 `MODEL_READY` | F4 保存模型结果。 | 回 `ACK`。 |
+| 6 | MP157 发 `ARM_JOB_START` | F4 状态置 `ARM_PICKING`，向 ESP32S3 发 `ARM_MOVE_TO_WEIGHT`。 | 回 `ACK` 表示已接受机械臂任务。 |
+| 7 | ESP32S3 回 `ACK` | F4 知道 ESP32S3 已接收动作。 | 可发 `EVENT_REPORT event=ARM_STAGE_ACCEPTED`。 |
+| 8 | ESP32S3 回 `ARM_STAGE_DONE stage=PICK_BELT_TO_WEIGHT result=OK` | F4 状态置 `WEIGHING`，开始 HX711 稳定采样。 | 采样完成后发 `WEIGHT_RESULT`。 |
+| 9 | MP157 ACK `WEIGHT_RESULT` | F4 向 ESP32S3 发 `ARM_MOVE_TO_LDC`。 | 可发 `EVENT_REPORT event=WEIGHT_ACKED`。 |
+| 10 | ESP32S3 回 `ARM_STAGE_DONE stage=WEIGHT_TO_LDC result=OK` | F4 状态置 `LDC_TESTING`，开始 LDC1614 检测。 | 检测完成后发 `LDC_RESULT`。 |
+| 11 | MP157 ACK `LDC_RESULT`，且 F4 已收到 ESP32S3 的电感放置完成回包 | F4 读取本轮缓存的 `MODEL_READY.model_result`，把 `GOOD` 映射到良品盘、`BAD` 映射到不良品盘、`UNCERTAIN/UNKNOWN` 映射到待复核盘，然后向 ESP32S3 发 `ARM_SORT_RESULT`。 | 可发 `EVENT_REPORT event=SORT_COMMAND_SENT`，事件中带 `target_bin`。 |
+| 12 | ESP32S3 回 `ARM_STAGE_DONE stage=LDC_TO_SORT_BIN result=OK` | F4 发 `CYCLE_DONE`。 | MP157 合并图片、模型、重量、电感、分拣目标和 F4 状态上传云端。 |
+| 13 | MP157 ACK `CYCLE_DONE` | F4 自动启动传送带扫描下一件。 | 可发 `EVENT_REPORT event=NEXT_SCAN_STARTED`。 |
 
 ## 7. 首页按钮在完整自动流程里的语义
 
@@ -190,13 +196,15 @@
 | 2 | overlay 视觉定位 | 板端执行 `printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock`，再把零件从画面上方送入相机中间竖向搜索带。 | 无零件时 `has_target=0`；有零件时 `has_target=1`，`center_y` 随零件从上方向下移动而变化。 |
 | 3 | 视觉坐标闭环 | 首页按 `开始`，MP157 识别目标后周期发 `VISION_POS`。 | F4 `latest_error_px = axis-target` 的绝对值变小；进入死区后 MP157 发 `BELT_STOP_CENTERED`。 |
 | 3.1 | 黑色波形零件漏检保持 | 首页按 `开始`，让黑色波形零件已经被识别一次后，遮挡/反光导致 `LOCATE` 偶发返回 `has_target=0`。 | Qt 显示 `目标短暂丢失` 或 `连续丢失但保持停机`，右侧偏差显示 `-- px`；F4 不应收到 `VISION_LOST reason=1` 后重新扫描，传送带应保持或超时停住等待重新识别。 |
-| 4 | 自动模型触发 | ROI 居中并收到 `BELT_STOP_CENTERED` ACK 后等待 2s。 | Qt 自动调用现有检测链路，生成 source、annotated、模型结果缓存。 |
-| 5 | F4-ESP32S3 握手 | F4 发 `HELLO/HEARTBEAT/ARM_HOME`。 | ESP32S3 ACK，机械臂可回安全位。 |
-| 6 | 称重阶段 | F4 发 `ARM_MOVE_TO_WEIGHT`，ESP32S3 完成后 F4 采样 HX711。 | MP157 收到 `WEIGHT_RESULT`。 |
-| 7 | 电感阶段 | F4 发 `ARM_MOVE_TO_LDC`，ESP32S3 完成后 F4 采样 LDC1614。 | MP157 收到 `LDC_RESULT`。 |
-| 8 | 模型结果分拣 | F4 根据本轮缓存的 MP157 模型结果发送 `ARM_SORT_RESULT target_bin=good/bad/review`。 | ESP32S3 把零件放入对应盘子，F4 收到分拣完成回包。 |
-| 9 | 云端完整字段 | MP157 组装完整 `record.json` 上传。 | 云端详情能看到图片、模型、重量、电感、分拣目标、F4 状态。 |
-| 10 | 连续自动 | CYCLE_DONE ACK 后 F4 自动扫描下一件。 | 不再需要人工重复点开始。 |
+| 4 | Z 轴下探和对焦等待 | ROI 居中并收到 `BELT_STOP_CENTERED` ACK 后，Qt 发送 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN steps=zDownFixedSteps`。 | F4 返回 ACK，摄像头上下轴下降固定高度，Qt 显示等待约 3 秒对焦稳定，传送带保持停止。 |
+| 5 | 对焦稳定后 ROI 复查和前后微调 | 3 秒等待结束后继续读取 `LOCATE`，若偏差超出死区，Qt 发送 `ACTUATOR_POS_MOVE actuator=1 direction=0/1 steps=minStep`。 | 微调次数受限，偏差回到 ±24px 内后进入检测；超限时界面显示需要人工复核。 |
+| 6 | 自动模型触发和 Z 轴回升 | ROI 复查通过后运行双模型；模型检测完成回调发送 `ACTUATOR_POS_MOVE actuator=2 direction=UP steps=zUpFixedSteps`。 | Qt 生成 source、annotated、模型结果缓存，Z 轴回到原高度。 |
+| 7 | F4-ESP32S3 握手 | F4 发 `HELLO/HEARTBEAT/ARM_HOME`。 | ESP32S3 ACK，机械臂可回安全位。 |
+| 8 | 称重阶段 | F4 发 `ARM_MOVE_TO_WEIGHT`，ESP32S3 完成后 F4 采样 HX711。 | MP157 收到 `WEIGHT_RESULT`。 |
+| 9 | 电感阶段 | F4 发 `ARM_MOVE_TO_LDC`，ESP32S3 完成后 F4 采样 LDC1614。 | MP157 收到 `LDC_RESULT`。 |
+| 10 | 模型结果分拣 | F4 根据本轮缓存的 MP157 模型结果发送 `ARM_SORT_RESULT target_bin=good/bad/review`。 | ESP32S3 把零件放入对应盘子，F4 收到分拣完成回包。 |
+| 11 | 云端完整字段 | MP157 组装完整 `record.json` 上传。 | 云端详情能看到图片、模型、重量、电感、分拣目标、F4 状态。 |
+| 12 | 连续自动 | CYCLE_DONE ACK 后 F4 自动扫描下一件。 | 不再需要人工重复点开始。 |
 
 ## 9. 当前现场调试提醒
 
