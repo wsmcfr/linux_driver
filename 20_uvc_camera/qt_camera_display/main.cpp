@@ -332,7 +332,7 @@ struct StepperMotorSettings
  *
  * 主要流程：
  *   1. 传送带电机固定使用 F4 UART4、地址 0x01。
- *   2. 摄像头前后和上下电机共用 F4 USART6，分别使用 0x02 和 0x03，避免两个轴同时响应。
+ *   2. 摄像头前后和上下电机共用 F4 USART6，现场实物当前为前后轴 0x03、上下轴 0x02，避免两个轴同时响应。
  *   3. 速度和步长先给保守值，真实下发前仍必须由 F4 固件做限幅和联锁保护。
  *
  * 返回值：
@@ -356,7 +356,7 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraForwardMotor.name = QStringLiteral("摄像头前后电机");
     cameraForwardMotor.role = QStringLiteral("camera_forward");
     cameraForwardMotor.serialName = QStringLiteral("USART6 PC6/PC7");
-    cameraForwardMotor.address = 2;
+    cameraForwardMotor.address = 3;
     cameraForwardMotor.minStep = 5;
     cameraForwardMotor.normalSpeedRpm = 120;
     cameraForwardMotor.direction = 1;
@@ -366,7 +366,7 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraZMotor.name = QStringLiteral("摄像头上下电机");
     cameraZMotor.role = QStringLiteral("camera_z");
     cameraZMotor.serialName = QStringLiteral("USART6 PC6/PC7");
-    cameraZMotor.address = 3;
+    cameraZMotor.address = 2;
     cameraZMotor.minStep = 5;
     cameraZMotor.normalSpeedRpm = 80;
     cameraZMotor.direction = 1;

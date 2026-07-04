@@ -226,6 +226,12 @@ Rectangle {
     /* manualPendingF4Command 保存正在等待 F4 回复的手动命令名，空字符串表示当前没有手动串口命令在途。 */
     property string manualPendingF4Command: ""
 
+    /* manualQueuedStopActuator 保存等待普通手动命令 ACK 后必须补发停止的执行器编号，-1 表示没有排队停止。 */
+    property int manualQueuedStopActuator: -1
+
+    /* manualQueuedStopLabel 保存排队停止按钮的原始文案，方便 ACK 返回后日志仍能看出是哪个按钮触发。 */
+    property string manualQueuedStopLabel: ""
+
     /* manualEmergencyStop 表示急停模拟状态；为 true 时禁止除停止、刷新和清故障外的手动动作。 */
     property bool manualEmergencyStop: false
 
@@ -1692,6 +1698,34 @@ Rectangle {
     }
 
     /*
+     * manualMotorActionButtons 的作用：
+     *   根据当前三轴手动页生成按钮模型，避免上下轴新增“回原位”后仍按固定三按钮宽度布局。
+     *
+     * 主要流程：
+     *   1. 传送带和摄像头前后轴保持后退/停止/前进三按钮。
+     *   2. 摄像头上下轴增加“回原位”，该按钮复用上升固定步数，便于下降后快速回到识别高度。
+     *
+     * 返回值：
+     *   返回 QML Repeater 可直接使用的数组，每项包含 text、direction、action 和 color。
+     */
+    function manualMotorActionButtons() {
+        if (manualMotorPageIndex === 2) {
+            return [
+                {"text": "下降", "direction": 0, "action": "move", "color": "#5aa7ff"},
+                {"text": "停止", "direction": -1, "action": "stop", "color": root.accentRed},
+                {"text": "上升", "direction": 1, "action": "move", "color": root.accentGreen},
+                {"text": "回原位", "direction": 1, "action": "return", "color": root.accentAmber}
+            ]
+        }
+
+        return [
+            {"text": manualMotorPopupPanel.negativeLabel, "direction": 0, "action": "move", "color": "#5aa7ff"},
+            {"text": "停止", "direction": -1, "action": "stop", "color": root.accentRed},
+            {"text": manualMotorPopupPanel.positiveLabel, "direction": 1, "action": "move", "color": root.accentGreen}
+        ]
+    }
+
+    /*
      * sendManualActuatorVelocityMove 的作用：
      *   把手动弹窗中传送带和摄像头前后轴的方向按钮转换为 ACTUATOR_VEL_MOVE 连续速度命令。
      *
@@ -1823,6 +1857,40 @@ Rectangle {
     }
 
     /*
+     * sendManualActuatorZReturnHome 的作用：
+     *   手动上下轴下降后，使用参数页配置的 zUpFixedSteps 固定步数回到识别高度。
+     *
+     * 主要流程：
+     *   1. 直接复用 sendManualActuatorZFixedMove(direction=1)，保证和“上升”按钮走同一条协议。
+     *   2. 日志保留“回原位”文案，便于现场区分普通上升和复位高度操作。
+     *
+     * 返回值：
+     *   true 表示上升固定步数命令已启动；false 表示参数非法或串口层拒绝。
+     */
+    function sendManualActuatorZReturnHome(label) {
+        return sendManualActuatorZFixedMove(1, label)
+    }
+
+    /*
+     * flushManualQueuedStop 的作用：
+     *   在普通手动命令 ACK/NACK 返回后，补发用户刚才点击但被串口互斥延后的 STOP。
+     *
+     * 返回值：
+     *   true 表示成功启动补发停止；false 表示没有排队停止或当前仍有命令在途。
+     */
+    function flushManualQueuedStop() {
+        if (manualQueuedStopActuator < 0 || manualPendingF4Command !== "") {
+            return false
+        }
+
+        var actuator = manualQueuedStopActuator
+        var label = manualQueuedStopLabel.length > 0 ? manualQueuedStopLabel : "停止"
+        manualQueuedStopActuator = -1
+        manualQueuedStopLabel = ""
+        return sendManualActuatorStop(actuator, label)
+    }
+
+    /*
      * sendManualActuatorStop 的作用：
      *   把三轴手动停止或模拟急停转换为 ACTUATOR_STOP 二进制命令。
      *
@@ -1838,13 +1906,17 @@ Rectangle {
         var targetText = actuator === 255 ? "全部执行器" : stepperMotorPageNames[Math.max(0, Math.min(2, actuator))]
 
         if (manualPendingF4Command !== "") {
-            manualLastAckText = "F4命令发送中：" + manualPendingF4Command
+            manualQueuedStopActuator = actuator
+            manualQueuedStopLabel = label
+            manualLastAckText = "停止已排队：等待 " + manualPendingF4Command + " 回执后立即下发 " + commandText
             storageState = formatF4ToastText(manualLastAckText)
             appendManualCommandLog(label, targetText, manualLastAckText)
             showStorageToast()
-            return false
+            return true
         }
 
+        manualQueuedStopActuator = -1
+        manualQueuedStopLabel = ""
         manualPendingF4Command = commandText
         manualLastAckText = "正在下发 " + commandText + " 到 F407"
         storageState = formatF4ToastText(manualLastAckText)
@@ -2184,6 +2256,24 @@ Rectangle {
             ids.push(motors[index].address)
         }
         return ids.join("/")
+    }
+
+    /*
+     * stepperMotorRoleAddressSummary 的作用：
+     *   生成保存并下发时展示给现场的三台电机角色地址，避免只看到 F4 ACK 但不知道本次发了哪个 ID。
+     *
+     * 返回值：
+     *   返回 `传送带=1，前后=3，上下=2` 这种摘要；配置缺失时返回占位文本。
+     */
+    function stepperMotorRoleAddressSummary() {
+        var motors = detectSettings.stepperMotorSettings
+        if (!motors || motors.length < 3) {
+            return "传送带/前后/上下=--"
+        }
+
+        return "传送带=" + motors[0].address
+                + "，前后=" + motors[1].address
+                + "，上下=" + motors[2].address
     }
 
     /*
@@ -2630,7 +2720,7 @@ Rectangle {
         var lines = [
             "[串口接入]",
             "1. MP157 当前通过 /dev/ttySTM2、115200 波特率访问传送带/称重 F407 USART1。",
-            "2. 相机上下轴和前后轴后续应由 F407 二进制协议接入；MP157 侧预留串口标记为 /dev/ttySTM1，实际设备节点以设备树和接线复核为准。",
+            "2. 摄像头前后轴和上下轴已通过 F407 ACTUATOR/STEPPER 二进制协议接入，当前主链路设备节点为 /dev/ttySTM2。",
             "3. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
             "4. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
             "",
@@ -2643,10 +2733,10 @@ Rectangle {
             "[控制边界]",
             "1. MP157 负责视觉推理、图片保存、COS 上传、历史补传和云端记录创建。",
             "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
-            "3. 当前传送带只开放 BELT_MANUAL_CONTROL 和 QUERY_STATUS 两类 F407 已实现二进制命令。",
-            "4. 步进电机参数弹窗只保存三台 Emm42 的地址、最小步长、常规速度和方向，方便后续 F4 固件读取同一份 JSON 或按协议下发。",
+            "3. 传送带开放 BELT_MANUAL_CONTROL/QUERY_STATUS，摄像头轴开放 ACTUATOR_POS_MOVE、ACTUATOR_STOP、ACTUATOR_VEL_MOVE 和 ACTUATOR_HOME。",
+            "4. 步进电机参数弹窗保存三台 Emm42 的地址、最小步长、常规速度和方向，保存并下发会发送 STEPPER_PARAM_SET 给 F407。",
             "5. 当前 Qt 不直接拼 Emm42 帧，不绕过 F407 下发速度、位置、剔除动作、急停解除或联锁时序。",
-            "6. 后续若接入相机轴真实参数下发，需要先在 F407 定义回零、移动、停止、查询、参数应用、ACK/NACK、STATUS_REPORT 和 FAULT_REPORT 流程。"
+            "6. F4 ACK 表示命令被协议层接收，现场仍要用 CAMINFO、QUERY_STATUS 或实际动作确认运行时参数和电机地址。"
         ]
         return lines.join("\n")
     }
@@ -5079,8 +5169,8 @@ Rectangle {
         onF4StepperSettingsFinished: {
             root.stepperSettingsSending = false
             if (ok) {
-                root.stepperMotorResultText = "F4已接收步进参数：" + detail
-                root.settingsLastActionText = "步进电机参数已保存并下发 F4"
+                root.stepperMotorResultText = "F4已接收步进参数：" + root.stepperMotorRoleAddressSummary() + "；" + detail
+                root.settingsLastActionText = "步进电机参数已保存并下发 F4：" + root.stepperMotorRoleAddressSummary()
             } else {
                 root.stepperMotorResultText = "F4步进参数下发失败：" + detail
                 root.settingsLastActionText = root.stepperMotorResultText
@@ -5293,6 +5383,10 @@ Rectangle {
                 root.storageState = root.formatF4ToastText(manualResult)
                 root.appendManualCommandLog(action, "三轴电机", manualResult)
                 root.showStorageToast()
+                if (root.manualQueuedStopActuator >= 0
+                        && finishedManualCommand.indexOf("ACTUATOR_STOP") !== 0) {
+                    Qt.callLater(root.flushManualQueuedStop)
+                }
             }
 
             root.evaluateRuntimeAlarms()
@@ -8081,9 +8175,9 @@ Rectangle {
                     text: root.manualMotorPageIndex === 2
                           ? ("上下轴：下降 "
                              + Math.floor(Number(manualMotorPopupPanel.motorConfig.zDownFixedSteps || 0))
-                             + " step，上升 "
+                             + " step，上升/回原位 "
                              + Math.floor(Number(manualMotorPopupPanel.motorConfig.zUpFixedSteps || 0))
-                             + " step；点击一次只走对应固定步数。")
+                             + " step。")
                           : ("速度 "
                              + (manualMotorPopupPanel.motorConfig.normalSpeedRpm || 0)
                              + " rpm；点击方向键后持续运动，按停止键结束。")
@@ -8101,17 +8195,15 @@ Rectangle {
                 spacing: 12
 
                 Repeater {
-                    model: [
-                        {"text": manualMotorPopupPanel.negativeLabel, "direction": 0, "color": "#5aa7ff"},
-                        {"text": "停止", "direction": -1, "color": root.accentRed},
-                        {"text": manualMotorPopupPanel.positiveLabel, "direction": 1, "color": root.accentGreen}
-                    ]
+                    id: manualMotorActionRepeater
+                    model: root.manualMotorActionButtons()
 
                     Rectangle {
                         property bool actionAllowed: root.manualMode && !root.manualEmergencyStop
-                        property bool stopButton: modelData.direction < 0
+                        property bool stopButton: modelData.action === "stop"
 
-                        width: (parent.width - 24) / 3
+                        width: (parent.width - parent.spacing * Math.max(0, manualMotorActionRepeater.count - 1))
+                               / Math.max(1, manualMotorActionRepeater.count)
                         height: 72
                         radius: 8
                         color: actionAllowed || stopButton
@@ -8137,6 +8229,8 @@ Rectangle {
                             onClicked: {
                                 if (parent.stopButton) {
                                     root.sendManualActuatorStop(manualMotorPopupPanel.actuatorId, modelData.text)
+                                } else if (modelData.action === "return") {
+                                    root.sendManualActuatorZReturnHome(modelData.text)
                                 } else {
                                     root.sendManualActuatorMove(manualMotorPopupPanel.actuatorId,
                                                                 modelData.direction,
@@ -9846,7 +9940,9 @@ Rectangle {
                     onClicked: {
                         root.settingsApplyAction("save")
                         root.stepperSettingsSending = true
-                        root.stepperMotorResultText = root.settingsLastActionText + "；正在通过二进制协议下发 F4"
+                        root.stepperMotorResultText = root.settingsLastActionText
+                                + "；下发ID：" + root.stepperMotorRoleAddressSummary()
+                                + "；正在通过二进制协议下发 F4"
                         root.storageState = root.stepperMotorResultText
                         root.showStorageToast()
                         if (!deviceHealth.sendF4StepperSettings(detectSettings.stepperMotorSettings)) {

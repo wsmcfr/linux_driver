@@ -49,7 +49,7 @@
 | MP157 三轴手动控制 | 手动页已改成三轴弹窗，三页分别控制传送带、摄像头前后轴、摄像头上下轴；传送带/前后轴按一次方向键下发 `ACTUATOR_VEL_MOVE` 并持续运动到停止，上下轴按一次下降/上升只执行 `zDownFixedSteps/zUpFixedSteps` 固定步数；模拟急停下发 `ACTUATOR_STOP actuator=0xFF`，安全状态区域改为可滑动查看。 | `20_uvc_camera/qt_camera_display/qml/Main.qml`。 |
 | F4 二进制解析 | F4 已能解析 `HELLO/HEARTBEAT/START/PAUSE/RESUME/STOP/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/QUERY_STATUS/BELT_MANUAL_CONTROL/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME`，并修正执行器成功 ACK 必须统一 `status=0`。 | `E:\hal\bisai_f407_project\User\App\binary_protocol_service.c`。 |
 | F4 传送带绑定 | 传送带服务已按当前方案使用 `UART4 PC10/PC11`，Emm42 地址 `0x01`。 | F4 启动日志显示 `UART4=PC10/PC11, addr=1`。 |
-| F4 摄像头电机 ID 规划 | 摄像头前后轴地址 `0x02`，摄像头上下轴地址 `0x03`，共用 `USART6 PC6/PC7`。 | F4 启动日志显示 `forward_addr=2, z_addr=3`。 |
+| F4 摄像头电机 ID 规划 | 当前现场摄像头前后轴地址 `0x03`，摄像头上下轴地址 `0x02`，共用 `USART6 PC6/PC7`。 | F4 启动日志或 `CAMINFO` 显示 `forward_addr=3, z_addr=2`。 |
 | F4 执行器位置、速度和设零模式 | `binary_protocol_service` 已分发 `ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME`；`conveyor_motor_service` 和 `camera_motor_service` 分别负责速度持续运动、相对位置移动、停止和当前位置设零；`emm42_motor` 已接入 Emm42 速度模式、`0xFD` 相对位置模式和 `[addr 0A 6D 6B]` 当前位置清零命令。 | `E:\hal\bisai_f407_project\User\App\binary_protocol_service.c`、`camera_motor_service.c`、`conveyor_motor_service.c`、`E:\hal\bisai_f407_project\User\Driver\emm42_motor.c`。 |
 | F4 状态查询 | `QUERY_STATUS` 成功返回 `STATUS_REPORT`，包含 F4 状态、传送带模式、方向、速度、误差、故障位。 | 当前串口助手已看到 `belt_desired=SCAN`、`speed_rpm=300` 这类状态。 |
 | 云端图片上传 | MP157 已能上传 source 原图和多张 annotated 结果图，并创建云端记录。 | `defect-cos-upload` 支持 `--jpg` 和多次 `--annotated`。 |
@@ -83,7 +83,7 @@
 | 结果 ACK 和重发 | `WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE` 需要 MP157 ACK，但 F4 还没实现主动结果帧和等待 ACK。 | 结果帧发送后保留最近结果，超时可重发或进入故障。 |
 | `EVENT_REPORT` | 命令字保留，未用于阶段提示。 | 上报 `TARGET_CENTERED/ARM_WEIGHT_PLACED/ARM_LDC_PLACED/NEXT_SCAN_STARTED` 等事件。 |
 | 连续下一件扫描 | 文档定义了 CYCLE_DONE 后继续扫描，但 F4 自动状态机还未完整实现。 | 收到 MP157 对 `CYCLE_DONE` 的 ACK 后，若未停止/暂停/故障，自动 `ConveyorMotorService_RequestScan()`。 |
-| 摄像头轴实机验证 | F4 位置模式代码已接入，地址规划为前后轴 `0x02`、上下轴 `0x03`。 | 编译烧录后确认 `ACTUATOR_POS_MOVE` 能让前后轴、上下轴按方向和步数动作，并确认方向映射、限位、堵转和错误码。 |
+| 摄像头轴实机验证 | F4 位置模式代码已接入，现场地址规划为前后轴 `0x03`、上下轴 `0x02`。 | 编译烧录后确认 `ACTUATOR_POS_MOVE` 能让前后轴、上下轴按方向和步数动作，并确认方向映射、限位、堵转和错误码。 |
 
 ### 3.3 ESP32S3 还缺什么
 
