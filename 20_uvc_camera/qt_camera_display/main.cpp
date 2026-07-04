@@ -235,13 +235,13 @@ static const quint8 BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U;
 /* 二进制步进电机参数命令：参数页保存后把三台 Emm42 的地址、步长、速度和方向下发给 F407。 */
 static const quint8 BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U;
 
-/* 二进制执行器位置运动命令：用于让 F4 以 Emm42 位置模式控制传送带、前后轴或上下轴移动固定步数。 */
+/* 二进制执行器位置运动命令：用于让 F4 以 Emm42 位置模式控制传送带、左右轴或上下轴移动固定步数。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE = 0x50U;
 
 /* 二进制执行器停止命令：用于手动急停或停止指定执行器，actuator=0xFF 表示全部可停止执行器。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_STOP = 0x51U;
 
-/* 二进制执行器速度运动命令：用于手动调试时让传送带或摄像头前后轴持续运动，直到 STOP。 */
+/* 二进制执行器速度运动命令：用于手动调试时让传送带或摄像头左右轴持续运动，直到 STOP。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE = 0x52U;
 
 /* 二进制执行器设零命令：用于参数设置页把当前电机位置设为新的零点，不主动运动。 */
@@ -303,7 +303,7 @@ static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
  *   保存参数页中一台张大头 Emm42 步进电机的现场可调参数。
  *
  * 字段说明：
- *   name 是界面显示名称，例如传送带电机或摄像头前后电机。
+ *   name 是界面显示名称，例如传送带电机或摄像头左右电机。
  *   role 是稳定英文角色名，用于 JSON 和后续 F4 参数下发协议识别电机。
  *   serialName 是 F4 侧串口归属，帮助现场确认 UART4 或 USART6 接线。
  *   address 是 Emm42 从机地址，也就是用户口语里的电机 ID 地址。
@@ -332,7 +332,7 @@ struct StepperMotorSettings
  *
  * 主要流程：
  *   1. 传送带电机固定使用 F4 UART4、地址 0x01。
- *   2. 摄像头前后和上下电机共用 F4 USART6，现场实物当前为前后轴 0x03、上下轴 0x02，避免两个轴同时响应。
+ *   2. 摄像头左右和上下电机共用 F4 USART6，现场实物当前为左右轴 0x03、上下轴 0x02，避免两个轴同时响应。
  *   3. 速度和步长先给保守值，真实下发前仍必须由 F4 固件做限幅和联锁保护。
  *
  * 返回值：
@@ -352,15 +352,15 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     beltMotor.direction = 1;
     motors.append(beltMotor);
 
-    StepperMotorSettings cameraForwardMotor;
-    cameraForwardMotor.name = QStringLiteral("摄像头前后电机");
-    cameraForwardMotor.role = QStringLiteral("camera_forward");
-    cameraForwardMotor.serialName = QStringLiteral("USART6 PC6/PC7");
-    cameraForwardMotor.address = 3;
-    cameraForwardMotor.minStep = 5;
-    cameraForwardMotor.normalSpeedRpm = 120;
-    cameraForwardMotor.direction = 1;
-    motors.append(cameraForwardMotor);
+    StepperMotorSettings cameraLateralMotor;
+    cameraLateralMotor.name = QStringLiteral("摄像头左右电机");
+    cameraLateralMotor.role = QStringLiteral("camera_lateral");
+    cameraLateralMotor.serialName = QStringLiteral("USART6 PC6/PC7");
+    cameraLateralMotor.address = 3;
+    cameraLateralMotor.minStep = 5;
+    cameraLateralMotor.normalSpeedRpm = 120;
+    cameraLateralMotor.direction = 1;
+    motors.append(cameraLateralMotor);
 
     StepperMotorSettings cameraZMotor;
     cameraZMotor.name = QStringLiteral("摄像头上下电机");
@@ -3644,7 +3644,7 @@ public:
      *   3. 调用 applySettings() 统一清洗范围并发出 settingsChanged。
      *
      * 参数：
-     *   index 是弹窗页序号，0=传送带，1=摄像头前后，2=摄像头上下。
+     *   index 是弹窗页序号，0=传送带，1=摄像头左右，2=摄像头上下。
      *   key 是字段名，支持 address/minStep/normalSpeedRpm/direction。
      *   value 是字段新值，函数内部会再次限幅。
      *
@@ -3691,7 +3691,7 @@ public:
      *   4. 通过 applySettings() 统一归一化并通知 QML 刷新。
      *
      * 参数：
-     *   index 是弹窗页序号，0=传送带，1=摄像头前后，2=摄像头上下。
+     *   index 是弹窗页序号，0=传送带，1=摄像头左右，2=摄像头上下。
      *   key 是字段名，只支持 zDownFixedSteps/zUpFixedSteps。
      *   valueText 是用户输入的十进制 step 文本，合法范围为 0~4294967295。
      *
@@ -7192,8 +7192,8 @@ public:
      *   4. 复用串口忙标志和 ACK/NACK 等待逻辑，保证不会和视觉闭环、称重标定、参数下发抢串口。
      *
      * 参数：
-     *   actuator 是执行器编号：0=传送带，1=摄像头前后，2=摄像头上下。
-     *   direction 是逻辑方向：0=后退/下降，1=前进/上升。
+     *   actuator 是执行器编号：0=传送带，1=摄像头左右，2=摄像头上下。
+     *   direction 是逻辑方向：传送带 0=后退/1=前进，左右轴 0=左移/1=右移，上下轴 0=下降/1=上升。
      *   mode 是位置运动模式，首版使用 0 表示相对位置模式。
      *   speedRpm 是本次运动速度，0 表示让 F4 使用该轴运行时默认速度，最大 5000 rpm。
      *   stepsValue 是相对移动步数，合法范围 1~4294967295 step。
@@ -7215,7 +7215,7 @@ public:
         QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
 
         if (actuator < 0 || actuator > 2) {
-            rejectText = QStringLiteral("执行器编号必须是 0=传送带、1=前后轴、2=上下轴");
+            rejectText = QStringLiteral("执行器编号必须是 0=传送带、1=左右轴、2=上下轴");
         } else if (direction != 0 && direction != 1) {
             rejectText = QStringLiteral("执行器方向必须是 0=后退/下降 或 1=前进/上升");
         } else if (mode != 0) {
@@ -7237,8 +7237,8 @@ public:
         }
 
         appendLe16(&payload, cycleId);                                  /* cycle_id：自动流程中用于和本轮检测绑定。 */
-        payload.append(static_cast<char>(actuator & 0xFF));             /* actuator：0 传送带，1 前后轴，2 上下轴。 */
-        payload.append(static_cast<char>(direction & 0xFF));            /* direction：0 后退/下降，1 前进/上升。 */
+        payload.append(static_cast<char>(actuator & 0xFF));             /* actuator：0 传送带，1 左右轴，2 上下轴。 */
+        payload.append(static_cast<char>(direction & 0xFF));            /* direction：传送带后退/前进，左右轴左移/右移，上下轴下降/上升。 */
         payload.append(static_cast<char>(mode & 0xFF));                 /* mode：0 相对位置模式。 */
         appendLe16(&payload, static_cast<quint16>(speedRpm));           /* speed_rpm：位置运动速度，0 交给 F4 用默认速度。 */
         appendLe32(&payload, steps);                                    /* steps：Emm42 0xFD 位置模式 4 字节脉冲数。 */
@@ -7260,8 +7260,8 @@ public:
      *   3. 复用串口忙标志和 ACK/NACK 等待逻辑，保证和自动视觉、称重标定、参数下发互斥。
      *
      * 参数：
-     *   actuator 是执行器编号：0=传送带，1=摄像头前后；上下轴不允许速度连续运动。
-     *   direction 是逻辑方向：0=后退，1=前进。
+     *   actuator 是执行器编号：0=传送带，1=摄像头左右；上下轴不允许速度连续运动。
+     *   direction 是逻辑方向：传送带 0=后退/1=前进，左右轴 0=左移/1=右移。
      *   speedRpm 是持续运动速度，必须是 1~5000 rpm。
      *   flags 是扩展标志，首版填 0。
      *
@@ -7278,9 +7278,9 @@ public:
         QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
 
         if (actuator < 0 || actuator > 1) {
-            rejectText = QStringLiteral("速度模式只允许 0=传送带、1=前后轴；上下轴必须用固定步数位置模式");
+            rejectText = QStringLiteral("速度模式只允许 0=传送带、1=左右轴；上下轴必须用固定步数位置模式");
         } else if (direction != 0 && direction != 1) {
-            rejectText = QStringLiteral("执行器方向必须是 0=后退 或 1=前进");
+            rejectText = QStringLiteral("执行器方向必须是 0=后退/左移 或 1=前进/右移");
         } else if (speedRpm <= 0 || speedRpm > 5000) {
             rejectText = QStringLiteral("持续运动速度必须是 1~5000 rpm，请先在参数设置中配置常规速度");
         } else if (flags < 0 || flags > 255) {
@@ -7296,8 +7296,8 @@ public:
         }
 
         appendLe16(&payload, cycleId);                                  /* cycle_id：手动调试通常为 0。 */
-        payload.append(static_cast<char>(actuator & 0xFF));             /* actuator：0 传送带，1 前后轴。 */
-        payload.append(static_cast<char>(direction & 0xFF));            /* direction：0 后退，1 前进。 */
+        payload.append(static_cast<char>(actuator & 0xFF));             /* actuator：0 传送带，1 左右轴。 */
+        payload.append(static_cast<char>(direction & 0xFF));            /* direction：传送带后退/前进，左右轴左移/右移。 */
         appendLe16(&payload, static_cast<quint16>(speedRpm));           /* speed_rpm：持续速度，必须大于 0。 */
         payload.append(static_cast<char>(flags & 0xFF));                /* flags：首版保留，当前填 0。 */
 
@@ -7312,7 +7312,7 @@ public:
      *   让 QML 通过二进制协议请求 F4 停止指定执行器或全部执行器。
      *
      * 主要流程：
-     *   1. 校验 actuator：0=传送带，1=前后轴，2=上下轴，0xFF=全部停止。
+     *   1. 校验 actuator：0=传送带，1=左右轴，2=上下轴，0xFF=全部停止。
      *   2. 自动流程运行时带当前 cycle_id，手动急停或调试时 cycle_id=0。
      *   3. 下发 ACTUATOR_STOP 后等待 F4 ACK/NACK，成功与否通过 f4ActuatorCommandFinished 返回 QML。
      *
@@ -7363,7 +7363,7 @@ public:
      *   3. 不检查 m_f4CommandRunning，也不等待 ACK，只要求后台线程把完整帧写入串口并 tcdrain。
      *
      * 关键原因：
-     *   手动前后轴采用 ACTUATOR_VEL_MOVE 连续速度模式。若上一条运动命令线程正在等待 ACK，
+     *   手动左右轴采用 ACTUATOR_VEL_MOVE 连续速度模式。若上一条运动命令线程正在等待 ACK，
      *   普通 startF4ActuatorCommand() 会拒绝 STOP，现场就会表现为“停止键没有反应”。
      *   这里不抢读 ACK，避免两个后台线程同时读取 `/dev/ttySTM2` 导致回包被错误线程消费；
      *   F4 收到 STOP 后会在自己的摄像头电机队列中插队停止。
@@ -7410,7 +7410,7 @@ public:
      *   3. 复用执行器串口命令线程，等待 F4 ACK/NACK 后由 QML 显示结果。
      *
      * 参数：
-     *   actuator 是执行器编号：0=传送带，1=摄像头前后轴，2=摄像头上下轴。
+     *   actuator 是执行器编号：0=传送带，1=摄像头左右轴，2=摄像头上下轴。
      *   flags 是扩展标志，首版填 0。
      *
      * 返回值：
@@ -7423,7 +7423,7 @@ public:
         QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
 
         if (actuator < 0 || actuator > 2) {
-            rejectText = QStringLiteral("设零执行器编号必须是 0=传送带、1=前后轴、2=上下轴");
+            rejectText = QStringLiteral("设零执行器编号必须是 0=传送带、1=左右轴、2=上下轴");
         } else if (flags < 0 || flags > 255) {
             rejectText = QStringLiteral("设零 flags 必须是 0~255");
         }
@@ -8456,7 +8456,7 @@ private:
      *   把 QML/JSON 中稳定的英文 role 映射成 F4 二进制协议中的电机编号。
      *
      * 参数：
-     *   role 是电机角色名，当前允许 conveyor/camera_forward/camera_z。
+     *   role 是电机角色名，当前允许 conveyor/camera_lateral/camera_z。
      *
      * 返回值：
      *   返回 1/2/3；未知角色返回 0，调用方据此拒绝下发。
@@ -8466,7 +8466,7 @@ private:
         if (role == QStringLiteral("conveyor")) {
             return 1U;
         }
-        if (role == QStringLiteral("camera_forward")) {
+        if (role == QStringLiteral("camera_lateral") || role == QStringLiteral("camera_forward")) {
             return 2U;
         }
         if (role == QStringLiteral("camera_z")) {
@@ -11061,17 +11061,17 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("stepper_motor[0].min_step=20\n")
         + QStringLiteral("stepper_motor[0].normal_speed_rpm=300\n")
         + QStringLiteral("stepper_motor[0].direction=1 (正向)\n")
-        + QStringLiteral("stepper_motor[1].name=摄像头前后电机\n")
-        + QStringLiteral("stepper_motor[1].role=camera_forward\n")
+        + QStringLiteral("stepper_motor[1].name=摄像头左右电机\n")
+        + QStringLiteral("stepper_motor[1].role=camera_lateral\n")
         + QStringLiteral("stepper_motor[1].serial=USART6 PC6/PC7\n")
-        + QStringLiteral("stepper_motor[1].address=2\n")
+        + QStringLiteral("stepper_motor[1].address=3\n")
         + QStringLiteral("stepper_motor[1].min_step=5\n")
         + QStringLiteral("stepper_motor[1].normal_speed_rpm=137\n")
         + QStringLiteral("stepper_motor[1].direction=1 (正向)\n")
         + QStringLiteral("stepper_motor[2].name=摄像头上下电机\n")
         + QStringLiteral("stepper_motor[2].role=camera_z\n")
         + QStringLiteral("stepper_motor[2].serial=USART6 PC6/PC7\n")
-        + QStringLiteral("stepper_motor[2].address=3\n")
+        + QStringLiteral("stepper_motor[2].address=2\n")
         + QStringLiteral("stepper_motor[2].min_step=5\n")
         + QStringLiteral("stepper_motor[2].normal_speed_rpm=5000\n")
         + QStringLiteral("stepper_motor[2].direction=1 (正向)\n")

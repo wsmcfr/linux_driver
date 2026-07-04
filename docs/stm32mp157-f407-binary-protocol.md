@@ -136,9 +136,9 @@ SOF0 SOF1 VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H EOF
 | `0x31` | `ARM_JOB_START` | MP157 -> F4 | 是 | 要求 F4 通过 ESP32 机械臂执行称重、电感检测和分拣动作组。 |
 | `0x40` | `QUERY_STATUS` | MP157 -> F4 | 否 | 查询 F4 协议状态和传送带结构化状态，成功直接返回 `STATUS_REPORT`。 |
 | `0x41` | `BELT_MANUAL_CONTROL` | MP157 -> F4 | 是 | 手动调试传送带扫描/停止，成功返回 `ACK`。 |
-| `0x50` | `ACTUATOR_POS_MOVE` | MP157 -> F4 | 是 | 执行器相对位置运动，首版用于传送带、摄像头前后轴和摄像头上下轴。 |
+| `0x50` | `ACTUATOR_POS_MOVE` | MP157 -> F4 | 是 | 执行器相对位置运动，首版用于传送带、摄像头左右轴和摄像头上下轴。 |
 | `0x51` | `ACTUATOR_STOP` | MP157 -> F4 | 是 | 停止指定执行器；`actuator=0xFF` 表示停止全部可停止执行器。 |
-| `0x52` | `ACTUATOR_VEL_MOVE` | MP157 -> F4 | 是 | 手动调试连续速度运动，当前只允许传送带和摄像头前后轴，直到收到 `ACTUATOR_STOP`。 |
+| `0x52` | `ACTUATOR_VEL_MOVE` | MP157 -> F4 | 是 | 手动调试连续速度运动，当前只允许传送带和摄像头左右轴，直到收到 `ACTUATOR_STOP`。 |
 | `0x53` | `ACTUATOR_HOME` | MP157 -> F4 | 是 | 参数页把指定执行器当前位置设为新的零点；不做主动回零运动。 |
 | `0x80` | `ACK` | 双向 | 否 | 确认命令已收到并被接受。 |
 | `0x81` | `NACK` | 双向 | 否 | 拒绝命令，并说明错误原因。 |
@@ -164,7 +164,7 @@ SOF0 SOF1 VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H EOF
 | 场景 | F4 返回帧 | 负载长度 | MP157 处理规则 |
 |---|---|---:|---|
 | `HELLO/HEARTBEAT` 成功 | `ACK 0x80` | 7 | `acked_seq` 和 `acked_cmd` 匹配，`status=0`，F4 显示接入。 |
-| `START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/BELT_MANUAL_CONTROL/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 成功 | `ACK 0x80` | 7 | `cycle_id`、`acked_seq`、`acked_cmd` 匹配，`status=0`，Qt 才推进本地自动流程、手动页或参数页状态；F4 不允许把 `actuator` 填进 ACK `status`，否则前后轴会显示 `status=1`、上下轴会显示 `status=2` 并被 Qt 判定失败。 |
+| `START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/BELT_MANUAL_CONTROL/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 成功 | `ACK 0x80` | 7 | `cycle_id`、`acked_seq`、`acked_cmd` 匹配，`status=0`，Qt 才推进本地自动流程、手动页或参数页状态；F4 不允许把 `actuator` 填进 ACK `status`，否则左右轴会显示 `status=1`、上下轴会显示 `status=2` 并被 Qt 判定失败。 |
 | `QUERY_STATUS` 成功 | `STATUS_REPORT 0x82` | 24 | `cycle_id`、`replied_seq`、`replied_cmd=QUERY_STATUS` 匹配，Qt 显示 F4 状态、传送带模式、速度、误差和故障位。 |
 | 命令不支持、CRC 错、长度错、字段越界、状态不允许、cycle 不匹配、硬件队列未就绪 | `NACK 0x81` | 9 | Qt 显示 `error_code/state/detail`，不再查找文本中的 `ERROR`。 |
 | LDC 未接、称重异常、传送带不可用、摄像头电机异常、机械臂链路异常等模块故障 | `FAULT_REPORT 0x87` | 16 | Qt 解析 `fault_source/severity/fault_code/detail_i32/fault_bits`，作为故障提示和云端 `sensor_context` 来源。 |
@@ -453,8 +453,8 @@ F4 接收后的动作：
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `cycle_id` | `u16` | 当前自动流程 ID；手动调试时可填 `0`。 |
-| `actuator` | `u8` | `0=传送带`，`1=摄像头前后轴`，`2=摄像头上下轴`。 |
-| `direction` | `u8` | `0=后退/下降`，`1=前进/上升`；具体正反方向由 F4 运行时映射到电机方向。 |
+| `actuator` | `u8` | `0=传送带`，`1=摄像头左右轴`，`2=摄像头上下轴`。 |
+| `direction` | `u8` | 传送带 `0=后退/1=前进`，左右轴 `0=左移/1=右移`，上下轴 `0=下降/1=上升`；具体正反方向由 F4 运行时映射到电机方向。 |
 | `mode` | `u8` | 首版只支持 `0=相对位置模式`；其它值 F4 必须回 `NACK ERR_PARAM_RANGE`。 |
 | `speed_rpm` | `u16` | 本次位置运动速度，单位 rpm；F4 需要按电机服务限幅。 |
 | `steps` | `u32` | 本次相对移动步数，范围 `0~4294967295 step`；`0` 表示不移动，应回 `NACK` 或忽略并明确回包。 |
@@ -465,7 +465,8 @@ F4 接收后的动作：
 | 场景 | 处理 |
 |---|---|
 | 首页自动流程 Z 轴下探 | `actuator=2`，`direction=0`，`steps=z_down_fixed_steps`，收到 ACK 后 MP157 复查 ROI。 |
-| 首页自动流程前后微调 | `actuator=1`，按 ROI 偏差选择 `direction=0/1`，`steps=min_step`，每次动作后重新读取 `LOCATE`。 |
+| 首页自动流程前后/Y 方向微调 | `actuator=0`，按 ROI 的 `errorY` 选择 `direction=0/1`，`steps=min_step`，由传送带做短步前后补偿，每次动作后重新读取 `LOCATE`。 |
+| 首页自动流程左右/X 方向微调 | `actuator=1`，按 ROI 的 `errorX` 选择 `direction=0/1`，`steps=min_step`，由摄像头左右轴做短步补偿，每次动作后重新读取 `LOCATE`。 |
 | 首页模型检测后 Z 轴回升 | `actuator=2`，`direction=1`，`steps=z_up_fixed_steps`，由 MP157 在模型检测完成回调中自动发送。 |
 | 手动上下轴弹窗 | `actuator=2`，下降按钮使用 `zDownFixedSteps`，上升按钮使用 `zUpFixedSteps`；每次点击只发一次高层位置命令，不在 MP157 直接拼 Emm42 帧。 |
 
@@ -476,7 +477,7 @@ F4 接收后的动作：
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `cycle_id` | `u16` | 当前自动流程 ID；手动调试和模拟急停时可填 `0`。 |
-| `actuator` | `u8` | `0=传送带`，`1=摄像头前后轴`，`2=摄像头上下轴`，`0xFF=全部可停止执行器`。 |
+| `actuator` | `u8` | `0=传送带`，`1=摄像头左右轴`，`2=摄像头上下轴`，`0xFF=全部可停止执行器`。 |
 | `flags` | `u8` | 保留位，首版填 `0`。 |
 
 使用边界：
@@ -484,7 +485,7 @@ F4 接收后的动作：
 | 场景 | 处理 |
 |---|---|
 | 手动页停止某一轴 | MP157 填对应 `actuator`，F4 只停该执行器。 |
-| 模拟急停 | MP157 填 `actuator=0xFF`，F4 停传送带、摄像头前后轴和摄像头上下轴。 |
+| 模拟急停 | MP157 填 `actuator=0xFF`，F4 停传送带、摄像头左右轴和摄像头上下轴。 |
 | 自动流程停止 | 仍优先使用 `STOP_CYCLE` 作废流程；`ACTUATOR_STOP` 只作为运动层补充制动。 |
 
 ### 9.14 ACTUATOR_VEL_MOVE `0x52`
@@ -494,8 +495,8 @@ F4 接收后的动作：
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `cycle_id` | `u16` | 当前自动流程 ID；手动调试时可填 `0`。 |
-| `actuator` | `u8` | 当前只允许 `0=传送带`、`1=摄像头前后轴`；`2=摄像头上下轴` 必须回 `NACK ERR_PARAM_RANGE`。 |
-| `direction` | `u8` | `0=后退`，`1=前进`；具体正反方向由 F4 运行时映射到电机方向。 |
+| `actuator` | `u8` | 当前只允许 `0=传送带`、`1=摄像头左右轴`；`2=摄像头上下轴` 必须回 `NACK ERR_PARAM_RANGE`。 |
+| `direction` | `u8` | 传送带 `0=后退/1=前进`，左右轴 `0=左移/1=右移`；具体正反方向由 F4 运行时映射到电机方向。 |
 | `speed_rpm` | `u16` | 持续运动速度，单位 rpm，范围 `1~5000`。 |
 | `flags` | `u8` | 保留位，首版填 `0`。 |
 
@@ -504,7 +505,7 @@ F4 接收后的动作：
 | 场景 | 处理 |
 |---|---|
 | 手动传送带 | 正反按钮发送 `ACTUATOR_VEL_MOVE actuator=0 direction=0/1`，停止按钮发送 `ACTUATOR_STOP actuator=0`。 |
-| 手动前后轴 | 正反按钮发送 `ACTUATOR_VEL_MOVE actuator=1 direction=0/1`，停止按钮发送 `ACTUATOR_STOP actuator=1`。 |
+| 手动左右轴 | 左移/右移按钮发送 `ACTUATOR_VEL_MOVE actuator=1 direction=0/1`，停止按钮发送 `ACTUATOR_STOP actuator=1`。 |
 | 手动上下轴 | 不使用速度连续运动；下降/上升按钮仍使用 `ACTUATOR_POS_MOVE actuator=2` 和对应固定步数。 |
 
 ### 9.15 ACTUATOR_HOME `0x53`
@@ -514,7 +515,7 @@ F4 接收后的动作：
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `cycle_id` | `u16` | 当前自动流程 ID；参数页标定时可填 `0`。 |
-| `actuator` | `u8` | `0=传送带`，`1=摄像头前后轴`，`2=摄像头上下轴`；不支持 `0xFF` 全部设零。 |
+| `actuator` | `u8` | `0=传送带`，`1=摄像头左右轴`，`2=摄像头上下轴`；不支持 `0xFF` 全部设零。 |
 | `flags` | `u8` | 保留位，首版填 `0`。 |
 
 使用边界：
@@ -714,7 +715,7 @@ F4 接收后的动作：
 | 2 | MP157 采集摄像头画面，等待零件进入视野。 | F4 启动传送带低速扫描。 | `EVENT_SCAN_STARTED` |
 | 3 | MP157 发现零件，周期发送坐标。 | F4 根据坐标控制传送带调速。 | `VISION_POS` |
 | 4 | MP157 发现零件进入中心 ROI，发送居中停机。 | F4 停止传送带并保持。 | `BELT_STOP_CENTERED` -> `EVENT_TARGET_CENTERED` |
-| 5 | MP157 下发摄像头上下轴下降固定步数，收到下降 ACK 后等待约 `3s` 让摄像头对焦稳定，再重新读取 ROI；若仍有轻微偏移，再下发摄像头前后轴短步微调。 | F4 用 Emm42 位置模式移动 `addr=0x02` 上下轴和 `addr=0x03` 前后轴，每条命令都返回 ACK/NACK。 | `ACTUATOR_POS_MOVE` -> `ACK` |
+| 5 | MP157 下发摄像头上下轴下降固定步数，收到下降 ACK 后等待约 `3s` 让摄像头对焦稳定，再重新读取 ROI；若 `errorY` 仍偏离中心，则下发传送带短步前后微调；若 `errorX` 仍偏离中心，则下发摄像头左右轴短步微调。 | F4 用 Emm42 位置模式移动 `addr=0x02` 上下轴、`addr=0x03` 左右轴和 `addr=0x01` 传送带，每条命令都返回 ACK/NACK。 | `ACTUATOR_POS_MOVE` -> `ACK` |
 | 6 | ROI 复查通过后，MP157 运行模型检测；检测完成后自动下发上下轴回升固定步数。 | F4 保持传送带静止，执行 Z 轴回升位置命令，等待模型结果或机械臂任务。 | `MODEL_READY` / `ACTUATOR_POS_MOVE` |
 | 7 | MP157 下发机械臂检测任务。 | F4 通过 ESP32 控制机械臂取件。 | `ARM_JOB_START` |
 | 8 | MP157 等待重量。 | F4 收到 ESP32 “已放到称重模块”后自动读取 HX711。 | `EVENT_ARM_WEIGHT_PLACED` -> `WEIGHT_RESULT` |
@@ -817,18 +818,18 @@ F4 当前有 3 个张大头 Emm42 步进电机，其中摄像头两个电机共�
 | 执行器编号 | Emm42 地址 | F4 串口 | F4 引脚 | 设备 | 控制原则 |
 |---:|---:|---|---|---|---|
 | `0` | `0x01` | `UART4` | `PC10(TX) / PC11(RX)` | 传送带电机 | 负责把零件送入相机视野，并根据 `VISION_POS.axis_px-target_px` 做主要对中。 |
-| `1` | `0x02` | `USART6` | `PC6(TX) / PC7(RX)` | 摄像头前进/后退电机 | 只用于中心附近的微调补偿，不能替代传送带输送。 |
-| `2` | `0x03` | `USART6` | `PC6(TX) / PC7(RX)` | 摄像头上下电机 | 用于高度或焦距标定，首版自动流程不频繁动作。 |
+| `1` | `0x03` | `USART6` | `PC6(TX) / PC7(RX)` | 摄像头左右电机 | 用于 Z 轴下降后 ROI 的 X 方向左右微调，不能替代传送带前后输送。 |
+| `2` | `0x02` | `USART6` | `PC6(TX) / PC7(RX)` | 摄像头上下电机 | 用于高度或焦距标定，首版自动流程按固定下探/回升步数动作。 |
 
 硬件和代码必须同步满足下面规则：
 
 | 规则 | 说明 |
 |---|---|
 | 传送带必须绑定 `huart4` | 现有 F4 代码若仍把传送带绑定 `huart6`，需要改成 `EMM42_MotorLoadDefaultConfig(&motor, &huart4)`，否则会和摄像头电机串口冲突。 |
-| 摄像头两个电机必须不同地址 | 当前现场前后电机设为 `0x03`，上下电机设为 `0x02`；设置地址时建议只接一个电机上电，设置完成后贴标签，避免两个电机同时响应同一命令。 |
+| 摄像头两个电机必须不同地址 | 当前现场左右电机设为 `0x03`，上下电机设为 `0x02`；设置地址时建议只接一个电机上电，设置完成后贴标签，避免两个电机同时响应同一命令。 |
 | `USART6` 上禁止广播运动命令 | 摄像头两个电机共线，广播速度/停止/回零可能导致两个轴一起动作；自动流程只允许按地址单独控制。 |
 | F4 驱动层保持通用 | `emm42_motor.c/.h` 只保存 `UART_HandleTypeDef *huart + address`，不要写死“传送带=USART6”。 |
-| 应拆分服务模块 | 传送带继续放在 `conveyor_motor_service.c/.h`；摄像头前后/上下建议新增 `camera_motor_service.c/.h`，内部维护现场地址 `0x03` 和 `0x02` 两个句柄。 |
+| 应拆分服务模块 | 传送带继续放在 `conveyor_motor_service.c/.h`；摄像头左右/上下建议放在 `camera_motor_service.c/.h`，内部维护现场地址 `0x03` 和 `0x02` 两个句柄。 |
 
 视觉对中时的执行器分工：
 
@@ -836,16 +837,17 @@ F4 当前有 3 个张大头 Emm42 步进电机，其中摄像头两个电机共�
 |---|---|---|
 | 零件还没有进入相机视野 | F4 只运行传送带扫描。 | MP157 不发送有效 `VISION_POS`，或发送 `VISION_LOST reason=1`。 |
 | 零件已进入视野但离 ROI 中心较远 | F4 主要控制传送带。 | 使用 `axis_px-target_px` 决定传送带方向和速度。 |
-| 零件已经接近 ROI，只剩轻微偏移 | F4 可短步点动摄像头前后轴。 | 每次点动后等待 MP157 下一帧坐标确认，不能连续盲动。 |
-| 摄像头前后点动后画面坐标不再改善 | F4 标记该轴达到有效行程边界。 | 停止继续尝试摄像头前后对齐，改用传送带微调或接受当前偏差。 |
+| 零件已经接近 ROI，但 Y 方向仍有偏差 | F4 可短步点动传送带。 | 传送带承担前后方向微调，每次点动后等待 MP157 下一帧坐标确认，不能连续盲动。 |
+| 零件已经接近 ROI，但 X 方向仍有偏差 | F4 可短步点动摄像头左右轴。 | 左右轴只承担横向微调，每次点动后等待 MP157 下一帧坐标确认，不能连续盲动。 |
+| 摄像头左右点动后画面 X 坐标不再改善 | F4 或 MP157 标记该轴达到有效行程边界。 | 停止继续尝试同方向左右对齐，改用传送带 Y 方向微调或接受当前偏差进入复核。 |
 | ROI 居中后需要降低零件高度进行模型检测 | MP157 用 `ACTUATOR_POS_MOVE actuator=ACT_CAMERA_Z direction=DOWN` 让上下轴下降固定步数。 | 下降 ACK 后必须等待约 3 秒让摄像头对焦稳定，再重新读取 ROI；检测完成后再用 `direction=UP` 回升固定步数。 |
 
-摄像头前后轴“到边界”的判断建议：
+摄像头左右轴“到边界”的判断建议：
 
 | 判断输入 | 边界判定 |
 |---|---|
-| F4 已向 `addr=0x03` 下发前进/后退短步命令。 | 记录动作方向、动作时间、动作前视觉误差。 |
-| MP157 后续 `N` 帧坐标中 `abs(error_px)` 没有减小。 | 认为这次摄像头微调无效，累计一次无效计数。 |
+| F4 已向 `addr=0x03` 下发左移/右移短步命令。 | 记录动作方向、动作时间、动作前 X 方向视觉误差。 |
+| MP157 后续 `N` 帧坐标中 `abs(errorX_px)` 没有减小。 | 认为这次左右轴微调无效，累计一次无效计数。 |
 | 连续 `2~3` 次同方向微调无效，或电机驱动返回异常/超时。 | 标记该方向已到有效边界，本轮不再继续该方向微调。 |
 | 后续反方向微调恢复有效。 | 可清除该方向边界标记，但必须限制最大尝试次数，避免来回振荡。 |
 
@@ -854,7 +856,7 @@ F4 当前有 3 个张大头 Emm42 步进电机，其中摄像头两个电机共�
 | 设备编号 | 设备 | 建议用途 |
 |---:|---|---|
 | `0` | `ACT_CONVEYOR` | 传送带张大头步进电机。 |
-| `1` | `ACT_CAMERA_FORWARD` | 摄像头前进/后退电机。 |
+| `1` | `ACT_CAMERA_LATERAL` | 摄像头左右电机；协议编号保持 `1`，旧代码里的 `ACT_CAMERA_FORWARD` 只作为兼容别名。 |
 | `2` | `ACT_CAMERA_Z` | 摄像头上/下电机。 |
 | `0xFF` | `ACT_ALL` | 仅用于 `ACTUATOR_STOP`，表示全部可停止执行器。 |
 
@@ -862,12 +864,12 @@ F4 当前有 3 个张大头 Emm42 步进电机，其中摄像头两个电机共�
 
 | CMD | 名称 | 方向 | 用途 |
 |---:|---|---|---|
-| `0x50` | `ACTUATOR_POS_MOVE` | MP157 -> F4 | 按相对位置模式移动传送带、摄像头前后轴或摄像头上下轴。 |
+| `0x50` | `ACTUATOR_POS_MOVE` | MP157 -> F4 | 按相对位置模式移动传送带、摄像头左右轴或摄像头上下轴。 |
 | `0x51` | `ACTUATOR_STOP` | MP157 -> F4 | 停止某个执行器，或用 `actuator=0xFF` 停止全部可停止执行器。 |
-| `0x52` | `ACTUATOR_VEL_MOVE` | MP157 -> F4 | 手动速度模式持续运动，当前只用于传送带和摄像头前后轴。 |
+| `0x52` | `ACTUATOR_VEL_MOVE` | MP157 -> F4 | 手动速度模式持续运动，当前只用于传送带和摄像头左右轴。 |
 | `0x53` | `ACTUATOR_HOME` | MP157 -> F4 | 参数页把当前位置设为新的零点，不主动运动。 |
 
-首版自动流程已经使用 `ACTUATOR_POS_MOVE` 完成“居中停机 -> 上下轴下降 -> 等待约 3 秒对焦稳定 -> ROI 复查/前后轴微调 -> 模型检测 -> 上下轴回升”。手动调试中，传送带和前后轴用 `ACTUATOR_VEL_MOVE` 持续运动；上下轴用 `ACTUATOR_POS_MOVE` 的固定下探/回升步数，避免无限升降。
+首版自动流程已经使用 `ACTUATOR_POS_MOVE` 完成“居中停机 -> 上下轴下降 -> 等待约 3 秒对焦稳定 -> ROI 复查 -> 传送带前后微调或左右轴微调 -> 模型检测 -> 上下轴回升”。手动调试中，传送带和左右轴用 `ACTUATOR_VEL_MOVE` 持续运动；上下轴用 `ACTUATOR_POS_MOVE` 的固定下探/回升步数，避免无限升降。
 
 ## 15. 云端 sensor_context 映射
 
@@ -893,7 +895,7 @@ MP157 收到 F4 的二进制结果后，再组装云端 JSON。F4 不直接拼 J
 | `sensor_context.conveyor_motor.uart_tx_gpio` | F4 硬件资源表或本协议固定配置 | 当前传送带填写 `PC10`。 |
 | `sensor_context.conveyor_motor.uart_rx_gpio` | F4 硬件资源表或本协议固定配置 | 当前传送带填写 `PC11`。 |
 | `sensor_context.conveyor_motor.slave_address` | F4 Emm42 地址配置 | 当前传送带填写 `1`。 |
-| `sensor_context.camera_motion.forward_motor_address` | F4 Emm42 地址配置 | 摄像头前进/后退电机填写 `3`，串口为 `USART6 PC6/PC7`。 |
+| `sensor_context.camera_motion.lateral_motor_address` | F4 Emm42 地址配置 | 摄像头左右电机填写 `3`，串口为 `USART6 PC6/PC7`；旧字段 `forward_motor_address` 只可作为兼容字段。 |
 | `sensor_context.camera_motion.z_motor_address` | F4 Emm42 地址配置 | 摄像头上下电机填写 `2`，串口为 `USART6 PC6/PC7`。 |
 | `sensor_context.f4_control_state.last_command` | MP157 最近发送命令 | 例如 `START_CYCLE`、`BELT_STOP_CENTERED`、`ARM_JOB_START`。 |
 | `sensor_context.f4_control_state.last_command_seq` | MP157 最近发送命令 `SEQ` | 用于云端排查串口时序。 |
@@ -918,7 +920,7 @@ MP157 收到 F4 的二进制结果后，再组装云端 JSON。F4 不直接拼 J
 |---|---|
 | 上电自动扫描 | 如果希望只有 MP157 首页按“开始”后传送带才动，F4 `CONVEYOR_MOTOR_STARTUP_SCAN_ENABLE` 应改为 `0`。 |
 | 传送带串口 | `START_CYCLE/VISION_POS/BELT_MANUAL_CONTROL/ACTUATOR_POS_MOVE actuator=0` 必须走 F4 `UART4 PC10/PC11` 控制传送带 Emm42 地址 `0x01`，不能继续走 `USART6`。 |
-| 摄像头电机串口 | `USART6 PC6/PC7` 同时挂现场前后轴 `addr=0x03`、上下轴 `addr=0x02`，调试时先单独用 `ACTUATOR_POS_MOVE` 小步确认不会两个轴同时动。 |
+| 摄像头电机串口 | `USART6 PC6/PC7` 同时挂现场左右轴 `addr=0x03`、上下轴 `addr=0x02`，调试时先单独用 `ACTUATOR_POS_MOVE` 小步确认不会两个轴同时动。 |
 | 自动流程 | ASCII 命令只用于单模块调试；正式连续自动流程以二进制 `START_CYCLE/VISION_POS/BELT_STOP_CENTERED/ACTUATOR_POS_MOVE/CYCLE_DONE` 为准。 |
 
 ## 17. 调试和验证建议
@@ -931,13 +933,13 @@ MP157 收到 F4 的二进制结果后，再组装云端 JSON。F4 不直接拼 J
 | 验证重复开始 | Qt 首页或 MP157 串口工具 | 在 F4 未清旧流程时再次发送同一 `cycle_id` 的 `START_CYCLE`。 | 新固件日志应出现 `START_CYCLE repeat rescan`，Qt 只有收到 `ACK status=0 state=SCANNING` 才显示成功。 | 如果 Qt 显示 `ACK重复帧`，说明 F4 仍按旧语义只回 `status=1`；如果 status=0 但电机不动，查 UART4 接线、电机地址和使能。 |
 | 验证传送带方向 | MP157 或串口助手 | 发送 `VISION_POS axis_px > target_px` 和 `axis_px < target_px`。 | 传送带方向相反，误差进入死区后停止。 | 如果越调越远，反转 F4 误差到方向的映射。 |
 | 验证传送带串口 | Qt 手动页或 MP157 二进制串口工具 | 发送 `BELT_MANUAL_CONTROL action=1` 或 `START_CYCLE`。 | `UART4 PC10/PC11` 上的传送带电机动作，`USART6` 摄像头电机不动，F4 返回 `ACK status=0`。 | 检查 `conveyor_motor_service.c` 是否仍绑定 `huart6`，再查 PC10/PC11 接线、共地、电机地址 `0x01`。 |
-| 验证摄像头双 ID | 串口助手或 F4 调试命令 | 分别向 `USART6` 地址 `0x02` 和 `0x03` 发送点动。 | 前后轴和上下轴分别动作，互不影响。 | 检查两个电机是否都还是默认地址 `0x01`，或是否误用了广播命令。 |
-| 验证手动连续运动 | Qt 手动三轴弹窗或 MP157 二进制串口工具 | 分别发送 `ACTUATOR_VEL_MOVE actuator=0/1 direction=0/1 speed_rpm>0`，再发送对应 `ACTUATOR_STOP`。 | 传送带和前后轴按方向持续运动，直到停止命令；F4 返回 `ACK status=0`，不能返回 `status=actuator`。 | 查 `binary_protocol_service.c` 分发、`conveyor_motor_service.c` JOG 模式、`camera_motor_service.c` JOG 命令和 Emm42 `0xF6` 速度模式帧。 |
+| 验证摄像头双 ID | 串口助手或 F4 调试命令 | 分别向 `USART6` 地址 `0x02` 和 `0x03` 发送点动。 | 上下轴和左右轴分别动作，互不影响。 | 检查两个电机是否都还是默认地址 `0x01`，或是否误用了广播命令。 |
+| 验证手动连续运动 | Qt 手动三轴弹窗或 MP157 二进制串口工具 | 分别发送 `ACTUATOR_VEL_MOVE actuator=0/1 direction=0/1 speed_rpm>0`，再发送对应 `ACTUATOR_STOP`。 | 传送带和左右轴按方向持续运动，直到停止命令；F4 返回 `ACK status=0`，不能返回 `status=actuator`。 | 查 `binary_protocol_service.c` 分发、`conveyor_motor_service.c` JOG 模式、`camera_motor_service.c` JOG 命令和 Emm42 `0xF6` 速度模式帧。 |
 | 验证上下轴固定步数 | Qt 手动三轴弹窗或 MP157 二进制串口工具 | 分别发送 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN/UP steps=zDownFixedSteps/zUpFixedSteps`。 | 上下轴每点一次只移动对应固定步数，F4 返回 `ACK status=0`。 | 查 `zDownFixedSteps/zUpFixedSteps` 是否为 0、上下轴地址 `0x02`、方向映射和 Emm42 `0xFD` 位置模式帧。 |
 | 验证当前位置设零 | Qt 参数设置页步进电机弹窗 | 切到任一电机页，点击 `设当前位置为零点`。 | MP157 发送 `ACTUATOR_HOME actuator=<当前页>`，F4 返回 `ACK status=0`，对应电机不运动但当前位置被设为零点。 | 查 `emm42_motor.c` 是否发送 `[addr 0A 6D 6B]`，并确认不是 `ACTUATOR_STOP actuator=0xFF` 或运动回零流程。 |
-| 验证模拟急停 | Qt 手动页点击模拟急停 | MP157 发送 `ACTUATOR_STOP actuator=0xFF`。 | 传送带、前后轴、上下轴都收到停止动作，F4 返回 ACK 或明确 NACK。 | 查 `ACT_ALL` 分支、各服务停止函数和故障位。 |
+| 验证模拟急停 | Qt 手动页点击模拟急停 | MP157 发送 `ACTUATOR_STOP actuator=0xFF`。 | 传送带、左右轴、上下轴都收到停止动作，F4 返回 ACK 或明确 NACK。 | 查 `ACT_ALL` 分支、各服务停止函数和故障位。 |
 | 验证 Z 轴下探/回升 | Qt 首页自动流程或参数页调小步数后实测 | 居中 ACK 后观察 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN`，下降 ACK 后观察界面提示等待约 3 秒对焦稳定，模型检测完成后观察 `direction=UP`。 | 上下轴先下降固定步数，等待对焦稳定后才 ROI 复查和模型检测，检测完成后回升固定步数。 | 查 `zDownFixedSteps/zUpFixedSteps` 是否为 0、方向是否反、上下轴地址是否为 `0x02`，再查 QML `autoVisionZFocusSettleMs` 是否仍为 `3000`。 |
-| 验证摄像头微调极限 | MP157 视觉闭环 | 在 ROI 附近让 F4 点动摄像头前后轴，再观察连续坐标。 | 坐标改善时继续小步；连续无改善后停止该方向微调。 | 查点动方向、相机坐标轴定义、机械行程和电机地址。 |
+| 验证摄像头左右微调极限 | MP157 视觉闭环 | 在 ROI 附近让 F4 点动摄像头左右轴，再观察连续 X 坐标。 | X 坐标改善时继续小步；连续无改善后停止该方向微调。 | 查点动方向、相机坐标轴定义、机械行程和电机地址。 |
 | 验证居中停止 | MP157 | 发送 `BELT_STOP_CENTERED hold_ms=2000`。 | F4 停传送带并上报 `EVENT_TARGET_CENTERED`。 | 查 ACK、F4 状态和 Emm42 停止命令。 |
 | 验证称重结果 | F4 自动流程 | ESP32 放到称重模块后，F4 上报 `WEIGHT_RESULT`。 | MP157 得到 `net_weight_mg` 和 `stable=1`。 | 查 HX711 接线、去皮、稳定窗口和采样超时。 |
 | 验证电感结果 | F4 自动流程 | ESP32 放到电感模块后，F4 上报 `LDC_RESULT`。 | MP157 得到 4 通道原始码和差值。 | 查 I2C、LDC1614 地址、基线和模块供电。 |
@@ -1028,7 +1030,7 @@ A5 5A 01 10 06 34 00 12 00 00 07 00 00 CRC_L CRC_H 6B
 | F4 | `User/App/binary_protocol_service.c/.h` | 帧解析、CRC、ACK/NACK 组帧和命令分发。 |
 | F4 | `User/App/auto_inspection_service.c/.h` | 保存 `cycle_id`、主状态机、暂停继续停止语义和自动检测流程。 |
 | F4 | `User/App/conveyor_motor_service.c/.h` | 继续负责传送带 Emm42 控制；必须绑定 `huart4`，使用 Emm42 地址 `0x01`，新增从 `VISION_POS` 更新误差的入口。 |
-| F4 | `User/App/camera_motor_service.c/.h` | 新增摄像头运动电机服务；绑定 `huart6`，当前现场前后轴地址 `0x03`，上下轴地址 `0x02`，提供点动、停止、边界状态接口。 |
+| F4 | `User/App/camera_motor_service.c/.h` | 新增摄像头运动电机服务；绑定 `huart6`，当前现场左右轴地址 `0x03`，上下轴地址 `0x02`，提供点动、停止、边界状态接口。 |
 | F4 | `User/App/robot_arm_service.c/.h` | 继续负责 F4 到 ESP32 机械臂桥接，新增动作组完成事件回调。 |
 | F4 | `User/App/weight_service.c/.h` | 读取 HX711 后生成 `WEIGHT_RESULT`。 |
 | F4 | `User/App/ldc1614_service.c/.h` | 读取 LDC1614 后生成 `LDC_RESULT`。 |
@@ -1039,9 +1041,9 @@ A5 5A 01 10 06 34 00 12 00 00 07 00 00 CRC_L CRC_H 6B
 
 | 优先级 | 内容 | 原因 |
 |---:|---|---|
-| 1 | 先修正 F4 硬件映射：传送带 `huart4/addr=0x01`，摄像头电机 `huart6` 上现场前后轴 `addr=0x03`、上下轴 `addr=0x02`。 | 先避免两个摄像头电机和传送带串口混用。 |
+| 1 | 先修正 F4 硬件映射：传送带 `huart4/addr=0x01`，摄像头电机 `huart6` 上现场左右轴 `addr=0x03`、上下轴 `addr=0x02`。 | 先避免两个摄像头电机和传送带串口混用。 |
 | 2 | 实现 `START_CYCLE`、`VISION_POS`、`BELT_STOP_CENTERED`、`STATUS_REPORT`。 | 先打通传送带居中闭环。 |
-| 3 | 加入摄像头前后轴微调和极限判断。 | 解决 ROI 附近微小偏移，但避免到机械边界后继续硬顶。 |
+| 3 | 加入传送带前后短步微调、摄像头左右轴微调和极限判断。 | 解决 Z 轴下降后 ROI 附近的 X/Y 微小偏移，但避免到机械边界后继续硬顶。 |
 | 4 | 实现 `MODEL_READY`、`ARM_JOB_START`、`WEIGHT_RESULT`、`LDC_RESULT`、`CYCLE_DONE`。 | 接机械臂和传感器链路，并让 F4 在结果 ACK 后自动启动下一件扫描。 |
 | 5 | 完善 `PAUSE_CYCLE`、`RESUME_CYCLE`、`STOP_CYCLE` 在机械臂和传感器阶段的安全点边界。 | F4 首版已接入传送带阶段的暂停、继续和停止，后续还要结合 ESP32 机械臂安全点细调。 |
 | 6 | 保留 ASCII 调试命令。 | 现场排查时串口助手能直接验证单模块。 |

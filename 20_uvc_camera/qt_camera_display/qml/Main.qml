@@ -103,17 +103,17 @@ Rectangle {
     /* autoVisionLastText 保存自动视觉闭环最近一次可读状态，底部提示和调试日志会复用它。 */
     property string autoVisionLastText: "视觉闭环待开始"
 
-    /* autoVisionLocatePurpose 标记当前 LOCATE 用途：center 用于传送带居中，fine-tune 用于 Z 轴下降后的前后轴微调复查。 */
+    /* autoVisionLocatePurpose 标记当前 LOCATE 用途：center 用于传送带前后居中，fine-tune 用于 Z 轴下降后的前后/左右复查。 */
     property string autoVisionLocatePurpose: "center"
 
     /* autoVisionActuatorPhase 保存正在等待 ACK 或等待稳定的执行器阶段，空字符串表示当前没有自动执行器动作。 */
     property string autoVisionActuatorPhase: ""
 
-    /* autoVisionFineTuneAttempts 保存 Z 轴下降后已经尝试的前后轴微调次数，避免定位抖动导致无限移动。 */
+    /* autoVisionFineTuneAttempts 保存 Z 轴下降后已经尝试的前后/左右微调次数，避免定位抖动导致无限移动。 */
     property int autoVisionFineTuneAttempts: 0
 
-    /* autoVisionFineTuneMaxAttempts 是前后轴微调次数上限，超过后进入模型检测并把结果交给人工复核。 */
-    property int autoVisionFineTuneMaxAttempts: 3
+    /* autoVisionFineTuneMaxAttempts 是前后/左右微调次数上限，超过后进入模型检测并把结果交给人工复核。 */
+    property int autoVisionFineTuneMaxAttempts: 6
 
     /* autoVisionFineTuneTolerancePx 是 Z 轴下降后 ROI 复查的中心死区，默认复用视觉居中死区。 */
     property int autoVisionFineTuneTolerancePx: 24
@@ -127,7 +127,7 @@ Rectangle {
     /* autoVisionDefaultDetectDelayMs 是没有执行 Z 轴下探时保留的默认静止检测延时。 */
     property int autoVisionDefaultDetectDelayMs: 2000
 
-    /* autoVisionShortSettleMs 是跳过下探或前后轴微调后的短机械稳定等待时间，单位 ms。 */
+    /* autoVisionShortSettleMs 是跳过下探或短步微调后的短机械稳定等待时间，单位 ms。 */
     property int autoVisionShortSettleMs: 450
 
     /* autoVisionZFocusSettled 表示本轮已经完成 Z 轴下降后的 3 秒对焦等待。 */
@@ -232,7 +232,7 @@ Rectangle {
     /* manualMotorPopup 表示三轴手动电机控制弹窗是否打开，marker 用于静态测试确认手动控制不再只有传送带。 */
     property bool manualMotorPopup: false
 
-    /* manualMotorPageIndex 保存三轴手动弹窗当前页，0=传送带，1=摄像头前后，2=摄像头上下。 */
+    /* manualMotorPageIndex 保存三轴手动弹窗当前页，0=传送带，1=摄像头左右，2=摄像头上下。 */
     property int manualMotorPageIndex: 0
 
     /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
@@ -278,12 +278,12 @@ Rectangle {
     property var stepperMotorSettings: detectSettings.stepperMotorSettings
 
     /* stepperMotorPageNames 保存三页固定名称，也作为 QML 资源 marker，便于部署后用 strings 验证。 */
-    property var stepperMotorPageNames: ["传送带电机", "摄像头前后电机", "摄像头上下电机"]
+    property var stepperMotorPageNames: ["传送带电机", "摄像头左右电机", "摄像头上下电机"]
 
     /* stepperMotorPopupVisible 表示步进电机参数弹窗是否打开，避免把完整表单塞进参数页小卡片。 */
     property bool stepperMotorPopupVisible: false
 
-    /* stepperMotorPageIndex 保存步进电机弹窗当前页，0=传送带，1=摄像头前后，2=摄像头上下。 */
+    /* stepperMotorPageIndex 保存步进电机弹窗当前页，0=传送带，1=摄像头左右，2=摄像头上下。 */
     property int stepperMotorPageIndex: 0
 
     /* stepperMotorResultText 保存最近一次修改提示，提醒用户点击“保存并下发”后同时写 JSON 和通知 F4。 */
@@ -1017,7 +1017,7 @@ Rectangle {
      *
      * 主要流程：
      *   1. 从参数页第三台电机读取 zDownFixedSteps 和 normalSpeedRpm。
-     *   2. 如果用户把下探步数设为 0，则跳过 Z 轴运动，直接进入前后轴复查。
+     *   2. 如果用户把下探步数设为 0，则跳过 Z 轴运动，直接进入前后/左右复查。
      *   3. 下发 ACTUATOR_POS_MOVE，方向 0 代表下降，实际电机正反由 F4 运行时方向映射负责。
      *
      * 返回值：
@@ -1062,7 +1062,7 @@ Rectangle {
 
     /*
      * autoVisionRequestFineTuneLocate 的作用：
-     *   在 Z 轴下降对焦稳定或前后轴微调后重新请求 overlay LOCATE，确认零件是否仍在 ROI 中央。
+     *   在 Z 轴下降对焦稳定或短步微调后重新请求 overlay LOCATE，确认零件是否仍在 ROI 中央。
      *
      * 返回值：
      *   true 表示 LOCATE 请求已启动；false 表示 overlay 请求被拒绝。
@@ -1111,24 +1111,25 @@ Rectangle {
 
     /*
      * handleAutoVisionFineTuneLocateFinished 的作用：
-     *   处理 Z 轴下降后的 ROI 复查结果，必要时用摄像头前后电机做固定步数微调。
+     *   处理 Z 轴下降后的 ROI 复查结果，必要时用传送带做前后短步微调、用摄像头左右电机做左右短步微调。
      *
      * 主要流程：
      *   1. 定位失败或无目标时不继续移动，直接检测并把风险写到底部状态。
-     *   2. 如果中心误差已经进入死区，启动模型检测延时。
-     *   3. 如果误差超出死区且未超过次数上限，发送前后轴 ACTUATOR_POS_MOVE 微调一次。
-     *   4. 达到次数上限后停止继续微调，进入模型检测，避免现场机械反复抖动。
+     *   2. 同时计算 X/Y 两个方向误差，Y 代表传送带前后方向，X 代表左右电机方向。
+     *   3. 如果 Y 误差超出死区，优先发送传送带 ACTUATOR_POS_MOVE 微调一次。
+     *   4. 如果 Y 已经进死区但 X 误差超出死区，发送左右轴 ACTUATOR_POS_MOVE 微调一次。
+     *   5. 达到次数上限后停止继续微调，进入模型检测，避免现场机械反复抖动。
      *
      * 参数：
      *   ok/result/detail 来自 autoVisionLocateFinished。
      *
      * 返回值：
-     *   无返回值；函数会继续发前后轴命令或启动模型检测延时。
+     *   无返回值；函数会继续发传送带/左右轴命令或启动模型检测延时。
      */
     function handleAutoVisionFineTuneLocateFinished(ok, result, detail) {
         autoVisionLocateBusy = false
 
-        if (!ok || !result || Number(result.has_target) !== 1 || Number(result.height) <= 0) {
+        if (!ok || !result || Number(result.has_target) !== 1 || Number(result.width) <= 0 || Number(result.height) <= 0) {
             workflowState = "模型检测"
             autoVisionLastText = "ROI复查未稳定返回目标，先进入模型检测：" + detail
             storageState = autoVisionLastText
@@ -1137,18 +1138,26 @@ Rectangle {
             return
         }
 
+        var centerX = Number(result.center_x)
         var centerY = Number(result.center_y)
+        var width = Number(result.width)
         var height = Number(result.height)
+        var targetX = Math.round(width / 2)
         var targetY = Math.round(height / 2)
+        var errorX = Math.round(centerX - targetX)
         var errorY = Math.round(centerY - targetY)
+        var absErrorX = Math.abs(errorX)
         var absErrorY = Math.abs(errorY)
+        var xCentered = absErrorX <= autoVisionFineTuneTolerancePx
+        var yCentered = absErrorY <= autoVisionFineTuneTolerancePx
 
-        dxPixels = errorY
+        dxPixels = yCentered ? errorX : errorY
         dxPixelsValid = true
 
-        if (absErrorY <= autoVisionFineTuneTolerancePx) {
+        if (xCentered && yCentered) {
             workflowState = "模型检测"
-            autoVisionLastText = "ROI复查通过：error=" + errorY + "，进入模型检测"
+            autoVisionLastText = "ROI复查通过：errorY=" + errorY
+                    + "，errorX=" + errorX + "，进入模型检测"
             storageState = autoVisionLastText
             autoVisionStartDetectDelay()
             showStorageToast()
@@ -1157,7 +1166,8 @@ Rectangle {
 
         if (autoVisionFineTuneAttempts >= autoVisionFineTuneMaxAttempts) {
             workflowState = "模型检测"
-            autoVisionLastText = "ROI复查仍偏移 error=" + errorY
+            autoVisionLastText = "ROI复查仍偏移 errorY=" + errorY
+                    + "，errorX=" + errorX
                     + "，已达到微调上限 " + autoVisionFineTuneMaxAttempts + " 次，进入模型检测"
             storageState = autoVisionLastText
             autoVisionStartDetectDelay()
@@ -1165,12 +1175,17 @@ Rectangle {
             return
         }
 
-        autoVisionFineTuneForward(errorY)
+        if (!yCentered) {
+            autoVisionFineTuneConveyor(errorY)
+            return
+        }
+
+        autoVisionFineTuneLateral(errorX)
     }
 
     /*
-     * autoVisionFineTuneForward 的作用：
-     *   根据 ROI 复查误差请求摄像头前后电机做一次固定步数微调。
+     * autoVisionFineTuneConveyor 的作用：
+     *   根据 ROI 复查的 Y 方向误差请求传送带电机做一次固定步数前后微调。
      *
      * 参数：
      *   errorY 是零件中心 Y 与 ROI 中心的像素差，正值表示零件在画面中心下方。
@@ -1178,17 +1193,55 @@ Rectangle {
      * 返回值：
      *   true 表示微调命令已启动；false 表示命令未能启动并改为进入模型检测。
      */
-    function autoVisionFineTuneForward(errorY) {
-        var motor = cameraForwardMotorSetting()
+    function autoVisionFineTuneConveyor(errorY) {
+        var motor = conveyorMotorSetting()
         var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
         var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
         var direction = errorY > 0 ? 0 : 1
 
         autoVisionFineTuneAttempts += 1
-        autoVisionActuatorPhase = "fine-tune"
-        workflowState = "前后微调"
-        autoVisionLastText = "自动视觉：前后轴微调第 " + autoVisionFineTuneAttempts
-                + " 次，error=" + errorY + "，steps=" + steps
+        autoVisionActuatorPhase = "fine-tune-conveyor"
+        workflowState = "传送带微调"
+        autoVisionLastText = "自动视觉：传送带前后微调第 " + autoVisionFineTuneAttempts
+                + " 次，errorY=" + errorY + "，steps=" + steps
+        storageState = autoVisionLastText
+        showStorageToast()
+
+        if (deviceHealth.sendF4ActuatorPositionMove(0, direction, 0, speed, steps, 0)) {
+            autoVisionCommandBusy = true
+            return true
+        }
+
+        autoVisionActuatorPhase = ""
+        workflowState = "模型检测"
+        autoVisionLastText = "传送带前后微调命令未启动，进入模型检测"
+        storageState = autoVisionLastText
+        autoVisionStartDetectDelay()
+        showStorageToast()
+        return false
+    }
+
+    /*
+     * autoVisionFineTuneLateral 的作用：
+     *   根据 ROI 复查的 X 方向误差请求摄像头左右电机做一次固定步数微调。
+     *
+     * 参数：
+     *   errorX 是零件中心 X 与 ROI 中心的像素差，正值表示零件在画面中心右侧。
+     *
+     * 返回值：
+     *   true 表示微调命令已启动；false 表示命令未能启动并改为进入模型检测。
+     */
+    function autoVisionFineTuneLateral(errorX) {
+        var motor = cameraLateralMotorSetting()
+        var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var direction = errorX > 0 ? 0 : 1
+
+        autoVisionFineTuneAttempts += 1
+        autoVisionActuatorPhase = "fine-tune-lateral"
+        workflowState = "左右微调"
+        autoVisionLastText = "自动视觉：左右轴微调第 " + autoVisionFineTuneAttempts
+                + " 次，errorX=" + errorX + "，steps=" + steps
         storageState = autoVisionLastText
         showStorageToast()
 
@@ -1199,7 +1252,7 @@ Rectangle {
 
         autoVisionActuatorPhase = ""
         workflowState = "模型检测"
-        autoVisionLastText = "前后轴微调命令未启动，进入模型检测"
+        autoVisionLastText = "左右轴微调命令未启动，进入模型检测"
         storageState = autoVisionLastText
         autoVisionStartDetectDelay()
         showStorageToast()
@@ -1661,7 +1714,7 @@ Rectangle {
      *   打开三轴手动电机控制弹窗，并切换到指定电机页。
      *
      * 参数：
-     *   pageIndex 是三轴页号，0=传送带，1=摄像头前后，2=摄像头上下。
+     *   pageIndex 是三轴页号，0=传送带，1=摄像头左右，2=摄像头上下。
      *
      * 返回值：
      *   无返回值；函数只更新弹窗显示状态。
@@ -1696,7 +1749,7 @@ Rectangle {
      *   根据当前三轴手动页生成按钮模型，避免上下轴新增“回原位”后仍按固定三按钮宽度布局。
      *
      * 主要流程：
-     *   1. 传送带和摄像头前后轴保持后退/停止/前进三按钮。
+     *   1. 传送带保持后退/停止/前进三按钮，摄像头左右轴保持左移/停止/右移三按钮。
      *   2. 摄像头上下轴增加“回原位”，该按钮复用上升固定步数，便于下降后快速回到识别高度。
      *
      * 返回值：
@@ -1721,7 +1774,7 @@ Rectangle {
 
     /*
      * sendManualActuatorVelocityMove 的作用：
-     *   把手动弹窗中传送带和摄像头前后轴的方向按钮转换为 ACTUATOR_VEL_MOVE 连续速度命令。
+     *   把手动弹窗中传送带和摄像头左右轴的方向按钮转换为 ACTUATOR_VEL_MOVE 连续速度命令。
      *
      * 主要流程：
      *   1. 从当前页读取 normalSpeedRpm，速度为 0 时不下发，避免界面显示运动但电机保持停止。
@@ -1729,8 +1782,8 @@ Rectangle {
      *   3. 调用 C++ sendF4ActuatorVelocityMove()，F4 收到后保持速度模式运行，直到停止按钮下发 ACTUATOR_STOP。
      *
      * 参数：
-     *   actuator 是执行器编号，0=传送带，1=摄像头前后；上下轴不允许连续速度模式。
-     *   direction 是方向编号，0=后退，1=前进。
+     *   actuator 是执行器编号，0=传送带，1=摄像头左右；上下轴不允许连续速度模式。
+     *   direction 是方向编号，传送带 0=后退/1=前进，左右轴 0=左移/1=右移。
      *   label 是按钮文本，用于命令日志显示。
      *
      * 返回值：
@@ -1839,7 +1892,7 @@ Rectangle {
      *   统一处理手动弹窗方向按钮，并按执行器类型选择连续速度模式或固定步数位置模式。
      *
      * 分流规则：
-     *   1. 传送带和摄像头前后轴使用 ACTUATOR_VEL_MOVE，按一次持续运动，停止键结束。
+     *   1. 传送带和摄像头左右轴使用 ACTUATOR_VEL_MOVE，按一次持续运动，停止键结束。
      *   2. 摄像头上下轴使用 ACTUATOR_POS_MOVE，下降取 zDownFixedSteps，上升取 zUpFixedSteps。
      */
     function sendManualActuatorMove(actuator, direction, label) {
@@ -2140,13 +2193,28 @@ Rectangle {
     }
 
     /*
-     * cameraForwardMotorSetting 的作用：
-     *   读取参数页第二台摄像头前后电机配置，供自动 ROI 微调和手动三轴弹窗复用。
+     * conveyorMotorSetting 的作用：
+     *   读取参数页第一台传送带电机配置，供自动 ROI 前后微调和手动三轴弹窗复用。
      *
      * 返回值：
-     *   返回摄像头前后电机配置对象；配置缺失时返回空对象，调用方会使用保守默认值。
+     *   返回传送带电机配置对象；配置缺失时返回空对象，调用方会使用保守默认值。
      */
-    function cameraForwardMotorSetting() {
+    function conveyorMotorSetting() {
+        var motors = detectSettings.stepperMotorSettings
+        if (!motors || motors.length < 1) {
+            return {}
+        }
+        return motors[0]
+    }
+
+    /*
+     * cameraLateralMotorSetting 的作用：
+     *   读取参数页第二台摄像头左右电机配置，供自动 ROI 左右微调和手动三轴弹窗复用。
+     *
+     * 返回值：
+     *   返回摄像头左右电机配置对象；配置缺失时返回空对象，调用方会使用保守默认值。
+     */
+    function cameraLateralMotorSetting() {
         var motors = detectSettings.stepperMotorSettings
         if (!motors || motors.length < 2) {
             return {}
@@ -2225,16 +2293,16 @@ Rectangle {
      *   生成保存并下发时展示给现场的三台电机角色地址，避免只看到 F4 ACK 但不知道本次发了哪个 ID。
      *
      * 返回值：
-     *   返回 `传送带=1，前后=3，上下=2` 这种摘要；配置缺失时返回占位文本。
+     *   返回 `传送带=1，左右=3，上下=2` 这种摘要；配置缺失时返回占位文本。
      */
     function stepperMotorRoleAddressSummary() {
         var motors = detectSettings.stepperMotorSettings
         if (!motors || motors.length < 3) {
-            return "传送带/前后/上下=--"
+            return "传送带/左右/上下=--"
         }
 
         return "传送带=" + motors[0].address
-                + "，前后=" + motors[1].address
+                + "，左右=" + motors[1].address
                 + "，上下=" + motors[2].address
     }
 
@@ -2243,7 +2311,7 @@ Rectangle {
      *   参数设置页请求 F4 把当前页步进电机的当前位置设为新的零点。
      *
      * 主要流程：
-     *   1. 使用 stepperMotorPageIndex 作为 actuator 编号，和协议定义 0=传送带、1=前后轴、2=上下轴一致。
+     *   1. 使用 stepperMotorPageIndex 作为 actuator 编号，和协议定义 0=传送带、1=左右轴、2=上下轴一致。
      *   2. 设置 stepperHomeSending 和 stepperHomePendingCommand，防止重复点击导致同一电机多次清零。
      *   3. 调用 C++ sendF4ActuatorHome() 发送 ACTUATOR_HOME 0x53，等待 ACK/NACK 后更新参数页提示。
      *
@@ -2682,7 +2750,7 @@ Rectangle {
         var lines = [
             "[串口接入]",
             "1. MP157 当前通过 /dev/ttySTM2、115200 波特率访问传送带/称重 F407 USART1。",
-            "2. 摄像头前后轴和上下轴已通过 F407 ACTUATOR/STEPPER 二进制协议接入，当前主链路设备节点为 /dev/ttySTM2。",
+            "2. 摄像头左右轴和上下轴已通过 F407 ACTUATOR/STEPPER 二进制协议接入，当前主链路设备节点为 /dev/ttySTM2。",
             "3. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
             "4. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
             "",
@@ -4920,7 +4988,7 @@ Rectangle {
         }
     }
 
-    /* autoVisionActuatorSettleTimer 给 Z 轴下降对焦或前后轴微调留出稳定时间，然后再复查 ROI。 */
+    /* autoVisionActuatorSettleTimer 给 Z 轴下降对焦或短步微调留出稳定时间，然后再复查 ROI。 */
     Timer {
         id: autoVisionActuatorSettleTimer
         interval: 450
@@ -4930,7 +4998,7 @@ Rectangle {
         onTriggered: {
             if (root.autoVisionActuatorPhase === "z-down"
                     || root.autoVisionActuatorPhase === "z-down-skip"
-                    || root.autoVisionActuatorPhase === "fine-tune") {
+                    || root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                 if (root.autoVisionActuatorPhase === "z-down") {
                     root.autoVisionZFocusSettled = true
                 }
@@ -5291,7 +5359,7 @@ Rectangle {
                         root.showStorageToast()
                         autoVisionActuatorSettleTimer.interval = root.autoVisionZFocusSettleMs
                         autoVisionActuatorSettleTimer.restart()
-                    } else if (root.autoVisionActuatorPhase === "fine-tune") {
+                    } else if (root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                         autoVisionActuatorSettleTimer.interval = root.autoVisionShortSettleMs
                         autoVisionActuatorSettleTimer.restart()
                     } else if (root.autoVisionActuatorPhase === "z-up") {
@@ -7621,7 +7689,7 @@ Rectangle {
                     anchors.leftMargin: 8
                     anchors.rightMargin: 8
                     verticalAlignment: Text.AlignVCenter
-                    text: "协议：ACTUATOR_POS_MOVE/STOP；传送带/前后/上下三页操作"
+                    text: "协议：ACTUATOR_POS_MOVE/STOP；传送带/左右/上下三页操作"
                     color: "#9aa5ab"
                     font.pixelSize: 11
                     elide: Text.ElideRight
@@ -7754,7 +7822,7 @@ Rectangle {
                             {"name": "急停", "value": root.manualEmergencyStop ? "已按下" : "释放", "color": root.manualEmergencyStop ? root.accentRed : root.accentGreen},
                             {"name": "限位", "value": "未触发", "color": root.accentGreen},
                             {"name": "传送带", "value": root.manualBeltState, "color": root.manualBeltState === "停止" ? root.accentGreen : root.accentAmber},
-                            {"name": "前后轴", "value": "位置模式待命", "color": root.accentGreen},
+                            {"name": "左右轴", "value": "位置模式待命", "color": root.accentGreen},
                             {"name": "上下轴", "value": root.autoVisionNeedsZUp ? "等待回升" : "位置模式待命", "color": root.autoVisionNeedsZUp ? root.accentAmber : root.accentGreen},
                             {"name": "复核标记", "value": root.manualReviewMark, "color": "#dce3e6"}
                         ]
@@ -8025,8 +8093,8 @@ Rectangle {
 
             property var motorConfig: root.manualMotorSetting()
             property int actuatorId: root.manualMotorPageIndex
-            property string negativeLabel: root.manualMotorPageIndex === 2 ? "下降" : "后退"
-            property string positiveLabel: root.manualMotorPageIndex === 2 ? "上升" : "前进"
+            property string negativeLabel: root.manualMotorPageIndex === 2 ? "下降" : (root.manualMotorPageIndex === 1 ? "左移" : "后退")
+            property string positiveLabel: root.manualMotorPageIndex === 2 ? "上升" : (root.manualMotorPageIndex === 1 ? "右移" : "前进")
 
             MouseArea {
                 anchors.fill: parent
@@ -8220,7 +8288,7 @@ Rectangle {
                 text: root.manualEmergencyStop
                       ? "急停已按下：只允许停止和清故障；释放后仍需确认 F4/现场联锁。"
                       : (root.manualMode
-                         ? "手动模式已允许：传送带/前后轴按一次持续运动；上下轴按一次走固定步数。"
+                         ? "手动模式已允许：传送带/左右轴按一次持续运动；上下轴按一次走固定步数。"
                          : "请先点击手动页“进入手动”，再执行三轴手动动作。")
                 color: root.manualEmergencyStop ? "#ffd6dc" : "#dce3e6"
                 font.pixelSize: 13

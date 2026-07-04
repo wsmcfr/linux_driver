@@ -16,6 +16,7 @@
 set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
 
 fail()
 {
@@ -34,6 +35,13 @@ require_grep()
     pattern="$1"
     file="$2"
     grep -Eq -- "$pattern" "$SCRIPT_DIR/$file" || fail "$file 缺少模式：$pattern"
+}
+
+require_repo_grep()
+{
+    pattern="$1"
+    file="$2"
+    grep -Eq -- "$pattern" "$REPO_ROOT/$file" || fail "$file 缺少模式：$pattern"
 }
 
 require_fixed_grep()
@@ -176,7 +184,7 @@ require_grep "F4:" "qml/Main.qml"
 require_grep "manualMotorActionButtons" "qml/Main.qml"
 require_grep "回原位" "qml/Main.qml"
 require_grep "stepperMotorRoleAddressSummary" "qml/Main.qml"
-require_grep "cameraForwardMotor.address = 3" "main.cpp"
+require_grep "cameraLateralMotor.address = 3" "main.cpp"
 require_grep "cameraZMotor.address = 2" "main.cpp"
 f4_command_finished_block="$(sed -n '/onF4CommandFinished:/,/onF4ManualCommandFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$f4_command_finished_block" | grep -q 'formatF4ToastText'; then
@@ -388,7 +396,8 @@ require_grep "manualMotorPopup" "qml/Main.qml"
 require_grep "manualMotorPageIndex" "qml/Main.qml"
 require_grep "manualSafetyFlickable" "qml/Main.qml"
 require_grep "autoVisionRequestZDown" "qml/Main.qml"
-require_grep "autoVisionFineTuneForward" "qml/Main.qml"
+require_grep "autoVisionFineTuneLateral" "qml/Main.qml"
+require_grep "autoVisionFineTuneConveyor" "qml/Main.qml"
 require_grep "autoVisionRequestZUp" "qml/Main.qml"
 require_grep "autoVisionZFocusSettleMs" "qml/Main.qml"
 require_grep "autoVisionPostFocusDetectDelayMs" "qml/Main.qml"
@@ -613,7 +622,7 @@ require_grep "0~5000 rpm" "qml/Main.qml"
 require_grep "id: stepperMotorPageTabs" "qml/Main.qml"
 require_grep "步进电机参数" "qml/Main.qml"
 require_grep "传送带电机" "qml/Main.qml"
-require_grep "摄像头前后电机" "qml/Main.qml"
+require_grep "摄像头左右电机" "qml/Main.qml"
 require_grep "摄像头上下电机" "qml/Main.qml"
 require_grep "最小步长" "qml/Main.qml"
 require_grep "常规速度" "qml/Main.qml"
@@ -622,6 +631,7 @@ require_grep "方向" "qml/Main.qml"
 require_grep "地址" "qml/Main.qml"
 require_grep "clampedInt\\(source.normalSpeedRpm, 0, 5000\\)" "main.cpp"
 require_grep "步进电机参数弹窗" "README.md"
+require_grep "摄像头左右" "README.md"
 require_grep "stepper_motors" "README.md"
 require_grep "0~5000 rpm" "README.md"
 require_grep "STEPPER_PARAM_SET 0x42" "README.md"
@@ -645,6 +655,20 @@ require_grep "--min-defect-pixels" "defect_segment.cpp"
 require_grep "min_defect_pixels" "defect_segment.cpp"
 if grep -Eq '尚未写JSON|尚未下发F4|UI目标值|F4 参数下发协议未落地|当前没有向 F407 下发|只保存不下发 F4|只保存 MP157 参数 JSON|当前只是 MP157 配置保存' "$SCRIPT_DIR/qml/Main.qml" "$SCRIPT_DIR/README.md"; then
     fail "参数设置页已经要求真实配置并下发 F4，不能继续显示“UI目标值/尚未写JSON/尚未下发F4/只保存不下发F4/只保存MP157参数JSON”这类旧占位文案"
+fi
+if grep -Eq '摄像头前后电机|前后轴|前进/后退轴|前进/后退电机' "$SCRIPT_DIR/qml/Main.qml" "$SCRIPT_DIR/README.md"; then
+    fail "MP157 当前硬件语义已改为摄像头左右轴，QML/README 不能继续显示旧的前后轴或前进/后退轴文案"
+fi
+require_repo_grep "ACT_CAMERA_LATERAL" "docs/stm32mp157-f407-binary-protocol.md"
+require_repo_grep "lateral_motor_address" "docs/stm32mp157-f407-binary-protocol.md"
+require_repo_grep "摄像头左右电机填写 \`3\`" "docs/stm32mp157-f407-binary-protocol.md"
+require_repo_grep "传送带前后微调或左右轴微调" "docs/stm32mp157-f407-binary-protocol.md"
+require_repo_grep "lateral_addr=3" "docs/stm32mp157-f407-auto-detect-debug-roadmap.md"
+require_repo_grep "传送带做前后/Y 微调、用左右轴做 X 微调" "docs/stm32mp157-f407-auto-detect-debug-roadmap.md"
+if grep -Eq '摄像头前后轴|前进/后退轴|前进/后退电机|forward_addr' \
+    "$REPO_ROOT/docs/stm32mp157-f407-binary-protocol.md" \
+    "$REPO_ROOT/docs/stm32mp157-f407-auto-detect-debug-roadmap.md"; then
+    fail "核心联调文档必须使用摄像头左右轴语义；旧前后轴或 forward_addr 只能留在 F4 兼容接口文档里"
 fi
 if grep -Eq '背光|补光|光源' "$SCRIPT_DIR/README.md"; then
     fail "README 当前也不能继续保留背光、补光或光源文案，避免文档和界面再次漂移"
@@ -835,12 +859,13 @@ if [ -f "$F4_UART_COMMAND_SOURCE" ]; then
 fi
 F4_CAMERA_MOTOR_SOURCE="/e/hal/bisai_f407_project/User/App/camera_motor_service.c"
 if [ -f "$F4_CAMERA_MOTOR_SOURCE" ]; then
-    grep -q 'CAMERA_MOTOR_FORWARD_ADDRESS[[:space:]]*(3U)' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头前后轴默认地址必须是现场 ID 0x03"
+    grep -q 'CAMERA_MOTOR_LATERAL_ADDRESS[[:space:]]*(3U)' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头左右轴默认地址必须是现场 ID 0x03"
     grep -q 'CAMERA_MOTOR_Z_ADDRESS[[:space:]]*(2U)' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头上下轴默认地址必须是现场 ID 0x02"
     grep -q 'CAMERA_MOTOR_COMMAND_QUEUE_LENGTH[[:space:]]*(4U)' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头电机队列不能再是长度 1 的覆盖队列"
     grep -q 'xQueueSendToBack' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头普通命令必须进入 FIFO，避免 STEPPER_PARAM_SET 被覆盖"
     grep -q 'xQueueSendToFront' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头 STOP 必须队首优先，避免连续运动停不下来"
     grep -q 'Runtime config applied' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 摄像头运行时配置应用后必须有可核对日志"
+    grep -q 'CAMLAT' "$F4_CAMERA_MOTOR_SOURCE" || fail "F407 USART1 调试命令必须提供 CAMLAT 左右轴入口"
 fi
 if grep -Eq 'reply\.left\(96\)|reply\.left\(48\)' "$SCRIPT_DIR/main.cpp"; then
     fail "F4 标定回包不能只截取 96/48 字节，否则 [OK][WEIGHT] Calibration success 详情可能在弹窗中显示不完整"
