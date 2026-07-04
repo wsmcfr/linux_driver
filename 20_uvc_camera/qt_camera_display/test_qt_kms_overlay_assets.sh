@@ -943,6 +943,10 @@ require_grep "storage-self-test" "main.cpp"
 require_grep "storage action save-image" "main.cpp"
 require_grep "std::fopen\\(\"/proc/mounts\", \"r\"\\)" "main.cpp"
 require_grep "sdcard-safe-remove" "main.cpp"
+safe_remove_block="$(sed -n '/Q_INVOKABLE QString safeRemoveSdCard()/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$safe_remove_block" | grep -q 'setArguments(QStringList() << QStringLiteral("safe-remove"))'; then
+    fail "safeRemoveSdCard() 必须调用 sdcard-safe-remove safe-remove，不能只启动裸命令导致板端返回 Usage"
+fi
 
 device_health_block="$(sed -n '/^class DeviceHealthController : public QObject$/,/^};$/p' "$SCRIPT_DIR/main.cpp")"
 if printf '%s\n' "$device_health_block" | grep -q 'waitForStarted'; then

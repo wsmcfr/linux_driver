@@ -4672,6 +4672,8 @@ public:
 
         process.setProcessEnvironment(env);
         process.setProgram(QStringLiteral("sdcard-safe-remove"));
+        /* 板端 /usr/bin/sdcard-safe-remove 当前复用 S85sdcard-mount 入口，必须显式传入 safe-remove 子命令；裸命令只会打印 Usage。 */
+        process.setArguments(QStringList() << QStringLiteral("safe-remove"));
         process.start();
 
         if (!process.waitForStarted(2000)) {
