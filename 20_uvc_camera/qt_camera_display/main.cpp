@@ -174,6 +174,12 @@ static const int DEFAULT_F4_SERIAL_BAUD = 115200;
 /* F4 心跳发送间隔，单位毫秒；120000ms 等于 2 分钟，避免 Qt 每 8 秒健康刷新都占用 RS485 串口。 */
 static const int F4_HEARTBEAT_INTERVAL_MS = 120000;
 
+/* 自动视觉居中死区，单位像素；需要与 QML 和 F4 当前中心死区保持同量级。 */
+static const int AUTO_VISION_CENTER_TOLERANCE_PX = 24;
+
+/* 自动视觉居中后建议 F4 保持静止时间，单位毫秒；给相机对焦和模型检测留出稳定窗口。 */
+static const int AUTO_VISION_CENTER_HOLD_MS = 2000;
+
 /* 二进制协议帧头第 1 字节，固定 0xA5，用于从串口字节流中快速寻找帧起点。 */
 static const quint8 BINARY_PROTOCOL_SOF0 = 0xA5U;
 
@@ -203,6 +209,15 @@ static const quint8 BINARY_PROTOCOL_CMD_RESUME_CYCLE = 0x12U;
 
 /* 自动流程停止命令：F4 收到后停止传送带和可停止执行器，并作废本轮 cycle_id。 */
 static const quint8 BINARY_PROTOCOL_CMD_STOP_CYCLE = 0x13U;
+
+/* 视觉坐标命令：MP157 周期发送零件在原始帧中的位置，F4 据此调节传送带速度和方向。 */
+static const quint8 BINARY_PROTOCOL_CMD_VISION_POS = 0x20U;
+
+/* 视觉丢失命令：MP157 暂时没看到零件或置信度不足时通知 F4 回扫描或停机保护。 */
+static const quint8 BINARY_PROTOCOL_CMD_VISION_LOST = 0x21U;
+
+/* 居中停止命令：MP157 判断零件已稳定进入中心 ROI 后要求 F4 停传送带并保持。 */
+static const quint8 BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED = 0x22U;
 
 /* 二进制心跳命令：MP157 周期确认 F4 在线，成功只看 ACK，不再解析 STATUS 文本。 */
 static const quint8 BINARY_PROTOCOL_CMD_HEARTBEAT = 0x02U;
@@ -6587,6 +6602,7 @@ public:
           m_f4ProbeRunning(false),
           m_f4CommandRunning(false),
           m_overlayProbeRunning(false),
+          m_autoVisionLocateRunning(false),
           m_networkProbeTimedOut(false),
           m_locationProbeTimedOut(false),
           m_locationBootProbeDone(false),
@@ -7152,6 +7168,218 @@ public:
         return true;
     }
 
+    /*
+     * requestAutoVisionLocate 的作用：
+     *   请求 KMS overlay 进程在当前原始 YUYV 帧中定位零件，供首页自动流程做传送带闭环。
+     *
+     * 主要流程：
+     *   1. 只允许 kms-overlay 后端使用该接口，因为 Qt 自身没有直接拿到 overlay 的原始帧。
+     *   2. 后台线程通过 Unix socket 发送 `LOCATE`，避免 socket 超时阻塞 QML 触摸线程。
+     *   3. 主线程解析 `OK LOCATE key=value...` 并通过 autoVisionLocateFinished 返回 QVariantMap。
+     *
+     * 返回值：
+     *   true 表示后台定位请求已启动；false 表示后端不匹配、请求重入或线程创建失败。
+     */
+    Q_INVOKABLE bool requestAutoVisionLocate()
+    {
+        if (m_videoBackend != QString::fromLatin1(BACKEND_KMS_OVERLAY)) {
+            QVariantMap emptyResult;
+
+            emit autoVisionLocateFinished(false,
+                                          emptyResult,
+                                          QStringLiteral("当前视频后端不是 kms-overlay，无法读取 overlay 原始帧"));
+            return false;
+        }
+
+        if (m_autoVisionLocateRunning) {
+            return false;
+        }
+
+        m_autoVisionLocateRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        const QString socketPath = m_overlaySocket;
+
+        QThread *workerThread = QThread::create([self, socketPath]() {
+            const QString reply = queryOverlayControlCommand(socketPath, QByteArrayLiteral("LOCATE\n"));
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleAutoVisionLocateReply",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, reply));
+        });
+
+        if (workerThread == nullptr) {
+            QVariantMap emptyResult;
+
+            m_autoVisionLocateRunning = false;
+            emit autoVisionLocateFinished(false,
+                                          emptyResult,
+                                          QStringLiteral("自动视觉定位线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
+     * sendF4VisionPosition 的作用：
+     *   把 overlay LOCATE 返回的零件坐标编码为 F4 `VISION_POS` 二进制命令。
+     *
+     * 关键说明：
+     *   用户已经确认零件从画面上方进入，所以首版把 `center_y` 作为传送带控制轴，
+     *   目标线固定为 `height / 2`。F4 侧继续用 `axis_px - target_px` 计算速度和方向。
+     *
+     * 参数：
+     *   locateResult 是 autoVisionLocateFinished 返回的 QVariantMap。
+     *
+     * 返回值：
+     *   true 表示后台串口发送任务已启动；false 表示流程未运行、坐标无效或串口忙。
+     */
+    Q_INVOKABLE bool sendF4VisionPosition(const QVariantMap &locateResult)
+    {
+        const quint16 cycleId = m_f4AutoCycleId;
+        const int hasTarget = locateResult.value(QStringLiteral("has_target")).toInt();
+        const int frameWidth = locateResult.value(QStringLiteral("width")).toInt();
+        const int frameHeight = locateResult.value(QStringLiteral("height")).toInt();
+        const int centerX = locateResult.value(QStringLiteral("center_x")).toInt();
+        const int centerY = locateResult.value(QStringLiteral("center_y")).toInt();
+        const int bboxX = locateResult.value(QStringLiteral("bbox_x")).toInt();
+        const int bboxY = locateResult.value(QStringLiteral("bbox_y")).toInt();
+        const int bboxW = locateResult.value(QStringLiteral("bbox_w")).toInt();
+        const int bboxH = locateResult.value(QStringLiteral("bbox_h")).toInt();
+        const int confidence = clampedInt(locateResult.value(QStringLiteral("confidence")).toInt(), 0, 100);
+        const quint16 frameId = static_cast<quint16>(locateResult.value(QStringLiteral("frame_id")).toUInt());
+        const int targetY = frameHeight / 2;
+        const int errorY = centerY - targetY;
+        const bool centered = (errorY >= -AUTO_VISION_CENTER_TOLERANCE_PX
+                               && errorY <= AUTO_VISION_CENTER_TOLERANCE_PX);
+        const quint32 captureMs = static_cast<quint32>(
+                    QDateTime::currentMSecsSinceEpoch() & 0xFFFFFFFFLL);
+        QByteArray payload;
+
+        if (!m_f4AutoRunning || m_f4AutoPaused || cycleId == 0U) {
+            emit f4VisionCommandFinished(false,
+                                         QStringLiteral("VISION_POS"),
+                                         cycleId,
+                                         QStringLiteral("自动流程未运行，不能发送视觉坐标"));
+            return false;
+        }
+
+        if (hasTarget != 1 || frameWidth <= 0 || frameHeight <= 0) {
+            emit f4VisionCommandFinished(false,
+                                         QStringLiteral("VISION_POS"),
+                                         cycleId,
+                                         QStringLiteral("视觉定位结果无目标或图像尺寸无效"));
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                                      /* cycle_id：归属当前首页自动流程。 */
+        appendLe16(&payload, frameId);                                      /* frame_id：overlay 当前帧序号低 16 位。 */
+        payload.append(static_cast<char>(centered ? 0x03U : 0x01U));        /* flags bit0=坐标有效，bit1=已进入中心死区。 */
+        payload.append(static_cast<char>(0x00U));                           /* part_type=0，运动阶段只定位不分类。 */
+        appendLeI16(&payload, centerY);                                     /* axis_px：上方来料时沿传送带方向使用 Y 坐标。 */
+        appendLeI16(&payload, targetY);                                     /* target_px：当前帧高度的一半。 */
+        appendLeI16(&payload, clampedInt(centerX, -32768, 32767));          /* center_x_px：零件中心 X。 */
+        appendLeI16(&payload, clampedInt(centerY, -32768, 32767));          /* center_y_px：零件中心 Y。 */
+        appendLeI16(&payload, clampedInt(bboxX, -32768, 32767));            /* bbox_x_px：定位框左上角 X。 */
+        appendLeI16(&payload, clampedInt(bboxY, -32768, 32767));            /* bbox_y_px：定位框左上角 Y。 */
+        appendLeI16(&payload, clampedInt(bboxW, -32768, 32767));            /* bbox_w_px：定位框宽度。 */
+        appendLeI16(&payload, clampedInt(bboxH, -32768, 32767));            /* bbox_h_px：定位框高度。 */
+        payload.append(static_cast<char>(confidence));                      /* confidence：overlay 定位置信度 0~100。 */
+        payload.append(static_cast<char>(0x00U));                           /* reserved：协议保留字段首版填 0。 */
+        appendLe32(&payload, captureMs);                                    /* capture_ms：MP157 当前毫秒计数低 32 位。 */
+
+        return startF4VisionCommand(QStringLiteral("VISION_POS"),
+                                    BINARY_PROTOCOL_CMD_VISION_POS,
+                                    cycleId,
+                                    payload);
+    }
+
+    /*
+     * sendF4VisionLost 的作用：
+     *   在当前帧未找到零件或相机异常时通知 F4，避免 F4 使用上一帧坐标继续运动。
+     *
+     * 参数：
+     *   reason 是视觉丢失原因：1=未找到目标，2=多目标，3=置信度低，4=相机离线。
+     *
+     * 返回值：
+     *   true 表示后台串口发送任务已启动；false 表示 reason 非法、流程未运行或串口忙。
+     */
+    Q_INVOKABLE bool sendF4VisionLost(int reason)
+    {
+        const quint16 cycleId = m_f4AutoCycleId;
+        QByteArray payload;
+
+        if (!m_f4AutoRunning || m_f4AutoPaused || cycleId == 0U) {
+            emit f4VisionCommandFinished(false,
+                                         QStringLiteral("VISION_LOST"),
+                                         cycleId,
+                                         QStringLiteral("自动流程未运行，不能发送视觉丢失"));
+            return false;
+        }
+
+        if (reason < 1 || reason > 4) {
+            emit f4VisionCommandFinished(false,
+                                         QStringLiteral("VISION_LOST"),
+                                         cycleId,
+                                         QStringLiteral("视觉丢失 reason 必须是 1~4"));
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                /* cycle_id：归属当前首页自动流程。 */
+        appendLe16(&payload, 0U);                     /* frame_id：接口未传帧号时填 0，表示最近一次定位失败。 */
+        payload.append(static_cast<char>(reason));    /* reason：1 未找到、2 多目标、3 低置信度、4 相机离线。 */
+        payload.append(static_cast<char>(0U));        /* confidence：丢失时填 0。 */
+        appendLe16(&payload, 0U);                     /* ms_since_seen：首版由 QML 节流，不在 C++ 里累计。 */
+
+        return startF4VisionCommand(QStringLiteral("VISION_LOST"),
+                                    BINARY_PROTOCOL_CMD_VISION_LOST,
+                                    cycleId,
+                                    payload);
+    }
+
+    /*
+     * sendF4BeltStopCentered 的作用：
+     *   当 QML 连续多帧确认零件已处于中心 ROI 时，要求 F4 停止传送带并保持静止。
+     *
+     * 参数：
+     *   frameId 是触发居中停止的 overlay 帧号；协议只取低 16 位。
+     *
+     * 返回值：
+     *   true 表示后台串口发送任务已启动；false 表示流程未运行或串口忙。
+     */
+    Q_INVOKABLE bool sendF4BeltStopCentered(int frameId)
+    {
+        const quint16 cycleId = m_f4AutoCycleId;
+        QByteArray payload;
+
+        if (!m_f4AutoRunning || m_f4AutoPaused || cycleId == 0U) {
+            emit f4VisionCommandFinished(false,
+                                         QStringLiteral("BELT_STOP_CENTERED"),
+                                         cycleId,
+                                         QStringLiteral("自动流程未运行，不能发送居中停止"));
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                                      /* cycle_id：归属当前首页自动流程。 */
+        appendLe16(&payload, static_cast<quint16>(frameId));                /* frame_id：触发停止的视觉帧号低 16 位。 */
+        payload.append(static_cast<char>(0x00U));                           /* reason=0，表示进入中心 ROI。 */
+        appendLe16(&payload, static_cast<quint16>(AUTO_VISION_CENTER_HOLD_MS)); /* hold_ms：建议静止 2 秒再检测。 */
+        payload.append(static_cast<char>(0x00U));                           /* reserved：协议保留字段首版填 0。 */
+
+        return startF4VisionCommand(QStringLiteral("BELT_STOP_CENTERED"),
+                                    BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED,
+                                    cycleId,
+                                    payload);
+    }
+
 signals:
     /* networkStatusChanged 通知 QML 网络状态和颜色已更新。 */
     void networkStatusChanged();
@@ -7185,6 +7413,12 @@ signals:
 
     /* f4AutoControlFinished 通知 QML 首页自动流程命令发送完成，并带回动作、流程号和 ACK/NACK 详情。 */
     void f4AutoControlFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
+
+    /* autoVisionLocateFinished 通知 QML overlay LOCATE 定位完成，并返回零件坐标或失败原因。 */
+    void autoVisionLocateFinished(bool ok, const QVariantMap &result, const QString &detail);
+
+    /* f4VisionCommandFinished 通知 QML 视觉闭环命令发送完成，并带回 ACK/NACK 详情。 */
+    void f4VisionCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
 
 private slots:
     /*
@@ -7431,6 +7665,49 @@ private slots:
     }
 
     /*
+     * handleAutoVisionLocateReply 的作用：
+     *   接收后台 overlay `LOCATE` 回复，解析成 QML 可直接访问的 QVariantMap。
+     *
+     * 主要流程：
+     *   1. 释放 m_autoVisionLocateRunning，允许下一次 100ms 定位请求继续执行。
+     *   2. 校验回复必须以 `OK LOCATE` 开头；socket 或 overlay 错误直接通知 QML。
+     *   3. 逐项提取 has_target、frame_id、width、height、center、bbox 和 confidence。
+     *
+     * 参数：
+     *   reply 是后台线程从 overlay 控制 socket 读取的一行文本。
+     *
+     * 返回值：
+     *   无返回值；通过 autoVisionLocateFinished 通知 QML。
+     */
+    void handleAutoVisionLocateReply(const QString &reply)
+    {
+        QVariantMap result;
+
+        m_autoVisionLocateRunning = false;
+
+        if (!reply.startsWith(QStringLiteral("OK LOCATE "))) {
+            emit autoVisionLocateFinished(false, result, reply.isEmpty()
+                                          ? QStringLiteral("overlay LOCATE 无回复")
+                                          : reply);
+            return;
+        }
+
+        result.insert(QStringLiteral("has_target"), tokenValue(reply, QStringLiteral("has_target")).toInt());
+        result.insert(QStringLiteral("frame_id"), tokenValue(reply, QStringLiteral("frame_id")).toUInt());
+        result.insert(QStringLiteral("width"), tokenValue(reply, QStringLiteral("width")).toInt());
+        result.insert(QStringLiteral("height"), tokenValue(reply, QStringLiteral("height")).toInt());
+        result.insert(QStringLiteral("center_x"), tokenValue(reply, QStringLiteral("center_x")).toInt());
+        result.insert(QStringLiteral("center_y"), tokenValue(reply, QStringLiteral("center_y")).toInt());
+        result.insert(QStringLiteral("bbox_x"), tokenValue(reply, QStringLiteral("bbox_x")).toInt());
+        result.insert(QStringLiteral("bbox_y"), tokenValue(reply, QStringLiteral("bbox_y")).toInt());
+        result.insert(QStringLiteral("bbox_w"), tokenValue(reply, QStringLiteral("bbox_w")).toInt());
+        result.insert(QStringLiteral("bbox_h"), tokenValue(reply, QStringLiteral("bbox_h")).toInt());
+        result.insert(QStringLiteral("confidence"), tokenValue(reply, QStringLiteral("confidence")).toInt());
+
+        emit autoVisionLocateFinished(true, result, reply);
+    }
+
+    /*
      * handleF4ProbeFinished 的作用：
      *   接收后台 F4 串口握手结果，并在 Qt 主线程更新 F4 接入状态。
      *
@@ -7527,6 +7804,33 @@ private slots:
         }
 
         emit f4StepperSettingsFinished(ok, detail);
+    }
+
+    /*
+     * handleF4VisionCommandFinished 的作用：
+     *   接收后台视觉闭环命令发送结果，并释放 F4 串口忙标志。
+     *
+     * 参数：
+     *   ok 为 true 表示 F4 返回了匹配当前命令、SEQ 和 cycle_id 的 ACK。
+     *   action 是视觉闭环动作名称，例如 VISION_POS 或 BELT_STOP_CENTERED。
+     *   cycleId 是本次命令所属自动流程号。
+     *   detail 是 ACK/NACK 解析结果或串口失败原因。
+     *
+     * 返回值：
+     *   无返回值；结果通过 f4VisionCommandFinished 通知 QML 自动流程状态机。
+     */
+    void handleF4VisionCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail)
+    {
+        m_f4CommandRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4视觉闭环命令完成：") + action + QStringLiteral(" ") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4视觉闭环命令失败：") + action + QStringLiteral(" ") + detail);
+        }
+
+        emit f4VisionCommandFinished(ok, action, cycleId, detail);
     }
 
     /*
@@ -7642,6 +7946,44 @@ private:
     {
         payload->append(static_cast<char>(value & 0x00FFU));
         payload->append(static_cast<char>((value >> 8) & 0x00FFU));
+    }
+
+    /*
+     * appendLeI16 的作用：
+     *   按二进制协议小端序向负载追加一个 16 位有符号整数。
+     *
+     * 参数：
+     *   payload 是要追加字段的负载缓冲，不能为 NULL。
+     *   value 是像素坐标或误差类字段，函数会先限幅到 int16 范围。
+     *
+     * 返回值：
+     *   无返回值；函数直接修改 payload。
+     */
+    static void appendLeI16(QByteArray *payload, int value)
+    {
+        const qint16 signedValue = static_cast<qint16>(clampedInt(value, -32768, 32767));
+        const quint16 rawValue = static_cast<quint16>(signedValue);
+
+        appendLe16(payload, rawValue);
+    }
+
+    /*
+     * appendLe32 的作用：
+     *   按二进制协议小端序向负载追加一个 32 位无符号整数。
+     *
+     * 参数：
+     *   payload 是要追加字段的负载缓冲，不能为 NULL。
+     *   value 是要写入的 32 位数，例如 capture_ms。
+     *
+     * 返回值：
+     *   无返回值；函数直接修改 payload。
+     */
+    static void appendLe32(QByteArray *payload, quint32 value)
+    {
+        payload->append(static_cast<char>(value & 0x000000FFU));
+        payload->append(static_cast<char>((value >> 8) & 0x000000FFU));
+        payload->append(static_cast<char>((value >> 16) & 0x000000FFU));
+        payload->append(static_cast<char>((value >> 24) & 0x000000FFU));
     }
 
     /*
@@ -7796,6 +8138,12 @@ private:
             return QStringLiteral("RESUME_CYCLE");
         case BINARY_PROTOCOL_CMD_STOP_CYCLE:
             return QStringLiteral("STOP_CYCLE");
+        case BINARY_PROTOCOL_CMD_VISION_POS:
+            return QStringLiteral("VISION_POS");
+        case BINARY_PROTOCOL_CMD_VISION_LOST:
+            return QStringLiteral("VISION_LOST");
+        case BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED:
+            return QStringLiteral("BELT_STOP_CENTERED");
         case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:
             return QStringLiteral("WEIGHT_CALIBRATE");
         case BINARY_PROTOCOL_CMD_QUERY_STATUS:
@@ -8502,6 +8850,83 @@ private:
     }
 
     /*
+     * startF4VisionCommand 的作用：
+     *   统一发送自动视觉闭环相关的 F4 二进制命令。
+     *
+     * 主要流程：
+     *   1. 复用 m_f4CommandRunning，避免视觉坐标、手动命令、标定和首页自动控制同时抢串口。
+     *   2. 使用当前全局二进制 sequence 组帧，保证 F4 ACK/NACK 能精确匹配本次命令。
+     *   3. 后台线程调用 sendF4BinaryCommand 等待匹配 ACK/NACK，完成后回到主线程释放忙标志。
+     *
+     * 参数：
+     *   action 是给 QML 和日志看的动作名，例如 VISION_POS。
+     *   command 是要写入协议 CMD 字段的命令字。
+     *   cycleId 是本次命令归属的自动流程号。
+     *   payload 是已经按协议编码好的负载。
+     *
+     * 返回值：
+     *   true 表示后台发送任务已启动；false 表示串口忙或线程创建失败。
+     */
+    bool startF4VisionCommand(const QString &action,
+                              quint8 command,
+                              quint16 cycleId,
+                              const QByteArray &payload)
+    {
+        if (m_f4CommandRunning) {
+            emit f4VisionCommandFinished(false,
+                                         action,
+                                         cycleId,
+                                         QStringLiteral("上一条F4串口命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4VisionCommandFinished(false,
+                                         action,
+                                         cycleId,
+                                         QStringLiteral("F4状态刷新仍在进行，请稍后再发送视觉闭环命令"));
+            return false;
+        }
+
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(command, sequence, payload);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+        m_f4CommandRunning = true;
+
+        QPointer<DeviceHealthController> self(this);
+        QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId]() {
+            QString detail;
+            const bool ok = sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4VisionCommandFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, action),
+                                      Q_ARG(quint16, cycleId),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            emit f4VisionCommandFinished(false,
+                                         action,
+                                         cycleId,
+                                         QStringLiteral("F4视觉闭环命令线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
      * refreshSdcardStatus 的作用：
      *   读取 /proc/mounts 判断 SD 卡挂载状态；这是轻量本地读取，可以同步执行。
      */
@@ -8594,21 +9019,21 @@ private:
     }
 
     /*
-     * queryOverlayStatus 的作用：
-     *   发送 overlay `STATUS` 查询并读取回复。
+     * queryOverlayControlCommand 的作用：
+     *   连接 overlay 控制 socket，发送一条短命令并读取一行回复。
      *
      * 参数：
      *   socketPath 是 overlay 控制 socket 路径。
+     *   commandBytes 是带换行的 overlay 命令，例如 `STATUS\n` 或 `LOCATE\n`。
      *
      * 返回值：
-     *   成功返回 `OK STATUS ...`；失败返回 `ERR ...`，由主线程统一转为离线状态。
+     *   成功返回 overlay 的 `OK ...` 文本；失败返回 `ERR ...`，由调用方决定如何显示。
      */
-    static QString queryOverlayStatus(const QString &socketPath)
+    static QString queryOverlayControlCommand(const QString &socketPath, const QByteArray &commandBytes)
     {
         int fd = -1;
         struct sockaddr_un addr;
         QByteArray socketPathBytes = socketPath.toLocal8Bit();
-        QByteArray commandBytes = QByteArrayLiteral("STATUS\n");
         char buffer[256];
         QByteArray reply;
         fd_set wfds;
@@ -8616,6 +9041,10 @@ private:
         struct timeval tv;
         int optError = 0;
         socklen_t optLen = sizeof(optError);
+
+        if (commandBytes.isEmpty()) {
+            return QStringLiteral("ERR overlay命令为空");
+        }
 
         if (socketPathBytes.size() >= static_cast<int>(sizeof(addr.sun_path))) {
             return QStringLiteral("ERR socket路径过长");
@@ -8684,6 +9113,21 @@ private:
         buffer[nread] = '\0';
         reply = QByteArray(buffer, static_cast<int>(nread)).trimmed();
         return QString::fromLocal8Bit(reply);
+    }
+
+    /*
+     * queryOverlayStatus 的作用：
+     *   发送 overlay `STATUS` 查询并读取回复。
+     *
+     * 参数：
+     *   socketPath 是 overlay 控制 socket 路径。
+     *
+     * 返回值：
+     *   成功返回 `OK STATUS ...`；失败返回 `ERR ...`，由主线程统一转为离线状态。
+     */
+    static QString queryOverlayStatus(const QString &socketPath)
+    {
+        return queryOverlayControlCommand(socketPath, QByteArrayLiteral("STATUS\n"));
     }
 
     /*
@@ -9411,6 +9855,7 @@ private:
     bool m_f4ProbeRunning;              /* m_f4ProbeRunning 防止串口检测线程堆积。 */
     bool m_f4CommandRunning;            /* m_f4CommandRunning 防止 CAL 标定等手动命令并发写同一个 RS485 串口。 */
     bool m_overlayProbeRunning;         /* m_overlayProbeRunning 防止 overlay socket 查询重入。 */
+    bool m_autoVisionLocateRunning;     /* m_autoVisionLocateRunning 防止自动视觉 LOCATE 请求线程重入。 */
     bool m_networkProbeTimedOut;        /* m_networkProbeTimedOut 标记当前 4G 进程已超时，finished 时不再覆盖超时状态。 */
     bool m_locationProbeTimedOut;       /* m_locationProbeTimedOut 标记开机定位进程已超时，finished 时不再覆盖超时状态。 */
     bool m_locationBootProbeDone;       /* m_locationBootProbeDone 标记本 Qt 进程已经调度过一次 IP 定位，后续周期刷新不再调用。 */

@@ -80,6 +80,30 @@
 /* ROI 观察框 RGB565 颜色；用于实验性 RGB565 输出格式，颜色来源同上面的绿色。 */
 #define DETECT_ROI_COLOR_RGB565 0x368fU
 
+/* 自动视觉定位的横向搜索宽度，保持和模型检测 ROI 宽度一致，避免左右支架误入定位。 */
+#define AUTO_LOCATE_SEARCH_WIDTH DEFAULT_DETECT_ROI_SIZE
+
+/* 自动视觉定位的最小连通域面积，过滤相机噪声、反光点和压缩杂点。 */
+#define AUTO_LOCATE_MIN_COMPONENT_AREA 40U
+
+/* 自动视觉定位的最大连通域面积比例分母，避免把整片背景误判成零件。 */
+#define AUTO_LOCATE_MAX_COMPONENT_AREA_DIVISOR 2U
+
+/* 自动视觉定位的最小外接框边长，太窄的亮线或暗线不作为完整零件。 */
+#define AUTO_LOCATE_MIN_BBOX_SIDE 6U
+
+/* 自动视觉定位的最大外接框边长，首版零件必须小于中心 ROI 的大部分区域。 */
+#define AUTO_LOCATE_MAX_BBOX_SIDE 260U
+
+/*
+ * 自动视觉定位的基础亮度差阈值。
+ *
+ * 黑色波形零件在传送带、亚克力反光或曝光变化下，边缘亮度差有时低于 18，
+ * 会造成“肉眼已经入画，但 LOCATE 间歇返回 has_target=0”的漏检。
+ * 这里先降到 12，优先提高黑色零件的连续识别概率；若现场误检背景，再回调到 15~18。
+ */
+#define AUTO_LOCATE_MIN_LUMA_DELTA 12U
+
 /* V4L2 mmap 缓冲区数量；4 个缓冲区能避免偶发抖动。 */
 #define CAMERA_BUFFER_COUNT 4U
 
@@ -197,6 +221,26 @@ struct latest_frame {
     unsigned int serial;
     enum output_format output_format;
     int has_frame;
+};
+
+/*
+ * locate_result 保存一次内存级零件定位的结果。
+ * has_target 表示是否找到可信连通域；frame_id 对应 latest_frame.serial，便于 Qt 和 F4 对齐日志。
+ * frame_width/frame_height 是原始摄像头尺寸；center/bbox 都使用原始 YUYV 帧坐标，不含 KMS 居中偏移。
+ * confidence 是 0~100 的粗略置信度，供 MP157 下发给 F4 和现场调参时观察。
+ */
+struct locate_result {
+    int has_target;
+    unsigned int frame_id;
+    unsigned int frame_width;
+    unsigned int frame_height;
+    int center_x;
+    int center_y;
+    int bbox_x;
+    int bbox_y;
+    int bbox_w;
+    int bbox_h;
+    unsigned int confidence;
 };
 
 /*
@@ -1905,6 +1949,344 @@ out:
 }
 
 /*
+ * yuyv_luma_at 的作用：
+ *   从 YUYV422 原始帧中读取指定像素的 Y 亮度分量。
+ *
+ * 主要流程：
+ *   1. 按 `y * width * 2 + x * 2` 定位当前像素的 Y 字节。
+ *   2. 不读取 U/V 色度，因为自动居中阶段只需要稳定的几何坐标。
+ *
+ * 参数：
+ *   frame 是最新摄像头帧。
+ *   x/y 是原始摄像头坐标。
+ *
+ * 返回值：
+ *   返回 0~255 的亮度值；调用者必须保证坐标已经在帧范围内。
+ */
+static unsigned int yuyv_luma_at(const struct latest_frame *frame,
+                                 unsigned int x,
+                                 unsigned int y)
+{
+    const uint8_t *line = frame->yuyv_map + (size_t)y * frame->frame_width * 2U;
+
+    return (unsigned int)line[x * 2U];
+}
+
+/*
+ * clamp_luma_threshold 的作用：
+ *   把均值加减阈值后的结果限制到 0~255，避免无符号计算下溢或越界。
+ *
+ * 参数：
+ *   value 是可能超出亮度范围的临时整数。
+ *
+ * 返回值：
+ *   返回可以与 Y 分量直接比较的 0~255 阈值。
+ */
+static unsigned int clamp_luma_threshold(int value)
+{
+    if (value < 0) {
+        return 0U;
+    }
+    if (value > 255) {
+        return 255U;
+    }
+    return (unsigned int)value;
+}
+
+/*
+ * auto_locate_is_candidate_luma 的作用：
+ *   判断一个像素亮度是否属于零件候选区域。
+ *
+ * 关键说明：
+ *   金属零件在现场可能表现为亮边，也可能因为角度和阴影表现为暗边。
+ *   因此首版同时接受“明显亮于背景”和“明显暗于背景”的像素，
+ *   后续再通过连通域面积、边框尺寸和长宽比过滤误检。
+ *
+ * 参数：
+ *   luma 是当前像素亮度。
+ *   bright_threshold 是亮候选阈值。
+ *   dark_threshold 是暗候选阈值。
+ *
+ * 返回值：
+ *   属于候选像素返回 1；否则返回 0。
+ */
+static int auto_locate_is_candidate_luma(unsigned int luma,
+                                         unsigned int bright_threshold,
+                                         unsigned int dark_threshold)
+{
+    if (luma >= bright_threshold || luma <= dark_threshold) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * locate_part_in_yuyv_frame 的作用：
+ *   在最新 YUYV 原始帧的中心 ROI 内定位传送带上的零件。
+ *
+ * 主要流程：
+ *   1. 初始化输出结果，把 frame_id 和图像尺寸先写入 result，保证无目标时也能回传上下文。
+ *   2. 只扫描水平居中的竖向搜索带，提前发现从画面上方进入的零件，同时避开左右支架干扰。
+ *   3. 统计 ROI 的亮度均值、最暗值和最亮值，得到当前背景的自适应阈值。
+ *   4. 对明显亮于或暗于背景的像素做四邻域连通域搜索。
+ *   5. 选择面积、外接框和长宽比都合理的最佳连通域，输出中心点、bbox 和置信度。
+ *
+ * 参数：
+ *   frame 是最新摄像头帧，必须包含原始 YUYV 指针。
+ *   result 是输出定位结果，函数会完整写入该结构。
+ *
+ * 返回值：
+ *   成功完成定位流程返回 0；内存申请失败或帧数据尺寸异常返回 -1。
+ *   没找到目标不算错误，此时返回 0 且 result->has_target 为 0。
+ */
+static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
+                                     struct locate_result *result)
+{
+    unsigned int roi_w;
+    unsigned int roi_h;
+    unsigned int roi_x;
+    unsigned int roi_y;
+    unsigned int pixel_count;
+    uint64_t luma_sum = 0U;
+    unsigned int min_luma = 255U;
+    unsigned int max_luma = 0U;
+    unsigned int mean_luma;
+    unsigned int contrast_span;
+    unsigned int luma_delta;
+    unsigned int bright_threshold;
+    unsigned int dark_threshold;
+    unsigned char *visited = NULL;
+    unsigned int *queue = NULL;
+    unsigned int best_score = 0U;
+    unsigned int max_component_area;
+    unsigned int y;
+    int ret = 0;
+
+    if (result == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(result, 0, sizeof(*result));
+
+    if (frame != NULL) {
+        result->frame_id = frame->serial;
+        result->frame_width = frame->frame_width;
+        result->frame_height = frame->frame_height;
+    }
+
+    if (frame == NULL || !frame->has_frame || frame->yuyv_map == NULL) {
+        return 0;
+    }
+
+    if (frame->frame_width == 0U || frame->frame_height == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (frame->yuyv_size < (size_t)frame->frame_width * frame->frame_height * 2U) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    roi_w = frame->frame_width < AUTO_LOCATE_SEARCH_WIDTH ? frame->frame_width : AUTO_LOCATE_SEARCH_WIDTH;
+    roi_h = frame->frame_height;
+    roi_x = (frame->frame_width - roi_w) / 2U;
+    roi_y = 0U;
+    pixel_count = roi_w * roi_h;
+
+    if (pixel_count == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (y = 0; y < roi_h; y++) {
+        unsigned int x;
+
+        for (x = 0; x < roi_w; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+
+            luma_sum += luma;
+            if (luma < min_luma) {
+                min_luma = luma;
+            }
+            if (luma > max_luma) {
+                max_luma = luma;
+            }
+        }
+    }
+
+    mean_luma = (unsigned int)(luma_sum / pixel_count);
+    contrast_span = max_luma > min_luma ? max_luma - min_luma : 0U;
+    if (contrast_span < AUTO_LOCATE_MIN_LUMA_DELTA) {
+        return 0;
+    }
+
+    luma_delta = contrast_span / 3U;
+    if (luma_delta < AUTO_LOCATE_MIN_LUMA_DELTA) {
+        luma_delta = AUTO_LOCATE_MIN_LUMA_DELTA;
+    }
+
+    bright_threshold = clamp_luma_threshold((int)mean_luma + (int)luma_delta);
+    dark_threshold = clamp_luma_threshold((int)mean_luma - (int)luma_delta);
+
+    visited = calloc(pixel_count, sizeof(*visited));
+    queue = malloc((size_t)pixel_count * sizeof(*queue));
+    if (visited == NULL || queue == NULL) {
+        errno = ENOMEM;
+        ret = -1;
+        goto out;
+    }
+
+    max_component_area = pixel_count / AUTO_LOCATE_MAX_COMPONENT_AREA_DIVISOR;
+    if (max_component_area < AUTO_LOCATE_MIN_COMPONENT_AREA) {
+        max_component_area = AUTO_LOCATE_MIN_COMPONENT_AREA;
+    }
+
+    for (y = 0; y < roi_h; y++) {
+        unsigned int x;
+
+        for (x = 0; x < roi_w; x++) {
+            unsigned int start_index = y * roi_w + x;
+            unsigned int start_luma;
+            unsigned int head = 0U;
+            unsigned int tail = 0U;
+            unsigned int area = 0U;
+            unsigned int contrast_sum = 0U;
+            unsigned int min_x = x;
+            unsigned int max_x = x;
+            unsigned int min_y = y;
+            unsigned int max_y = y;
+            unsigned int bbox_w;
+            unsigned int bbox_h;
+            unsigned int bbox_area;
+            unsigned int contrast_avg;
+            unsigned int density;
+            unsigned int score;
+            unsigned int confidence;
+
+            if (visited[start_index]) {
+                continue;
+            }
+
+            start_luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+            if (!auto_locate_is_candidate_luma(start_luma, bright_threshold, dark_threshold)) {
+                visited[start_index] = 1U;
+                continue;
+            }
+
+            visited[start_index] = 1U;
+            queue[tail++] = start_index;
+
+            while (head < tail) {
+                unsigned int index = queue[head++];
+                unsigned int local_x = index % roi_w;
+                unsigned int local_y = index / roi_w;
+                unsigned int luma = yuyv_luma_at(frame, roi_x + local_x, roi_y + local_y);
+                static const int neighbor_dx[4] = { -1, 1, 0, 0 };
+                static const int neighbor_dy[4] = { 0, 0, -1, 1 };
+                unsigned int neighbor_index;
+                unsigned int i;
+
+                area++;
+                contrast_sum += (unsigned int)abs((int)luma - (int)mean_luma);
+
+                if (local_x < min_x) {
+                    min_x = local_x;
+                }
+                if (local_x > max_x) {
+                    max_x = local_x;
+                }
+                if (local_y < min_y) {
+                    min_y = local_y;
+                }
+                if (local_y > max_y) {
+                    max_y = local_y;
+                }
+
+                for (i = 0; i < 4U; i++) {
+                    int next_x = (int)local_x + neighbor_dx[i];
+                    int next_y = (int)local_y + neighbor_dy[i];
+                    unsigned int next_luma;
+
+                    if (next_x < 0 || next_y < 0 ||
+                        next_x >= (int)roi_w || next_y >= (int)roi_h) {
+                        continue;
+                    }
+
+                    neighbor_index = (unsigned int)next_y * roi_w + (unsigned int)next_x;
+                    if (visited[neighbor_index]) {
+                        continue;
+                    }
+
+                    next_luma = yuyv_luma_at(frame,
+                                             roi_x + (unsigned int)next_x,
+                                             roi_y + (unsigned int)next_y);
+                    if (!auto_locate_is_candidate_luma(next_luma,
+                                                       bright_threshold,
+                                                       dark_threshold)) {
+                        visited[neighbor_index] = 1U;
+                        continue;
+                    }
+
+                    visited[neighbor_index] = 1U;
+                    queue[tail++] = neighbor_index;
+                }
+            }
+
+            bbox_w = max_x - min_x + 1U;
+            bbox_h = max_y - min_y + 1U;
+            bbox_area = bbox_w * bbox_h;
+
+            if (area < AUTO_LOCATE_MIN_COMPONENT_AREA || area > max_component_area) {
+                continue;
+            }
+
+            if (bbox_w < AUTO_LOCATE_MIN_BBOX_SIDE ||
+                bbox_h < AUTO_LOCATE_MIN_BBOX_SIDE ||
+                bbox_w > AUTO_LOCATE_MAX_BBOX_SIDE ||
+                bbox_h > AUTO_LOCATE_MAX_BBOX_SIDE) {
+                continue;
+            }
+
+            if (bbox_w * 100U < bbox_h * 25U ||
+                bbox_h * 100U < bbox_w * 25U) {
+                continue;
+            }
+
+            contrast_avg = contrast_sum / area;
+            density = bbox_area > 0U ? (area * 100U) / bbox_area : 0U;
+            score = area + bbox_area / 4U + contrast_avg * 8U;
+
+            if (score <= best_score) {
+                continue;
+            }
+
+            confidence = contrast_avg * 2U + density / 2U + area / 20U;
+            if (confidence > 100U) {
+                confidence = 100U;
+            }
+
+            best_score = score;
+            result->has_target = 1;
+            result->center_x = (int)(roi_x + (min_x + max_x) / 2U);
+            result->center_y = (int)(roi_y + (min_y + max_y) / 2U);
+            result->bbox_x = (int)(roi_x + min_x);
+            result->bbox_y = (int)(roi_y + min_y);
+            result->bbox_w = (int)bbox_w;
+            result->bbox_h = (int)bbox_h;
+            result->confidence = confidence;
+        }
+    }
+
+out:
+    free(queue);
+    free(visited);
+    return ret;
+}
+
+/*
  * init_control_server 的作用：
  *   创建 Unix domain socket 监听端点，供 Qt UI 请求保存当前帧。
  *
@@ -2138,6 +2520,60 @@ static void handle_visible_command(int client_fd,
     send_control_reply(client_fd,
                        "OK",
                        visible ? "视频层已显示" : "视频层已隐藏");
+}
+
+/*
+ * handle_locate_command 的作用：
+ *   响应 Qt 自动流程的 LOCATE 命令，只计算当前帧零件坐标，不保存图片、不运行模型。
+ *
+ * 主要流程：
+ *   1. 调用 locate_part_in_yuyv_frame 从原始 YUYV 帧中提取零件 bbox 和中心点。
+ *   2. 把结果整理成 key=value 文本，保持与 STATUS/SAVE_DETECT 同一条 socket 通道。
+ *   3. 无目标时仍返回 OK，并把 has_target 置 0，让 Qt 可以按“暂时未入画”处理。
+ *
+ * 参数：
+ *   client_fd 是 Qt 客户端连接。
+ *   frame 是最新显示帧。
+ *
+ * 返回值：
+ *   无返回值；通过 socket 回复 `OK LOCATE ...` 或 `ERR ...`。
+ */
+static void handle_locate_command(int client_fd, const struct latest_frame *frame)
+{
+    struct locate_result result;
+    char detail[320];
+    int len;
+
+    if (locate_part_in_yuyv_frame(frame, &result) != 0) {
+        char error_text[160];
+
+        snprintf(error_text, sizeof(error_text), "LOCATE 定位失败: %s", strerror(errno));
+        send_control_reply(client_fd, "ERR", error_text);
+        return;
+    }
+
+    len = snprintf(detail,
+                   sizeof(detail),
+                   "LOCATE has_target=%d frame_id=%u width=%u height=%u "
+                   "center_x=%d center_y=%d bbox_x=%d bbox_y=%d "
+                   "bbox_w=%d bbox_h=%d confidence=%u",
+                   result.has_target,
+                   result.frame_id,
+                   result.frame_width,
+                   result.frame_height,
+                   result.center_x,
+                   result.center_y,
+                   result.bbox_x,
+                   result.bbox_y,
+                   result.bbox_w,
+                   result.bbox_h,
+                   result.confidence);
+    if (len < 0 || (size_t)len >= sizeof(detail)) {
+        send_control_reply(client_fd, "ERR", "LOCATE 回复过长");
+        return;
+    }
+
+    send_control_reply(client_fd, "OK", detail);
 }
 
 /*
@@ -2383,6 +2819,7 @@ static void handle_save_detect_command(int client_fd,
  *   VISIBLE 0
  *   VISIBLE 1
  *   STATUS
+ *   LOCATE
  *
  * 参数：
  *   client_fd 是客户端连接。
@@ -2427,6 +2864,11 @@ static void service_control_client(int client_fd, const struct latest_frame *fra
 
     if (strcmp(command, "STATUS") == 0) {
         handle_status_command(client_fd, frame);
+        return;
+    }
+
+    if (strcmp(command, "LOCATE") == 0) {
+        handle_locate_command(client_fd, frame);
         return;
     }
 

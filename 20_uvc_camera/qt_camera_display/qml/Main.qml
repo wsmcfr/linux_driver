@@ -64,6 +64,51 @@ Rectangle {
     /* autoLastAckText 保存最近一次 F4 二进制自动流程 ACK/NACK 文本，便于现场串口调试核对。 */
     property string autoLastAckText: "自动流程待开始"
 
+    /* autoVisionRunning 表示开始 ACK 后 MP157 正在周期读取 overlay LOCATE 并驱动 F4 对中。 */
+    property bool autoVisionRunning: false
+
+    /* autoVisionLocateBusy 表示当前 overlay LOCATE 请求尚未返回，避免 100ms 定时器重复创建线程。 */
+    property bool autoVisionLocateBusy: false
+
+    /* autoVisionCommandBusy 表示当前 VISION_POS/VISION_LOST/BELT_STOP_CENTERED 仍在等待 F4 ACK。 */
+    property bool autoVisionCommandBusy: false
+
+    /* autoVisionStableFrames 保存连续进入中心死区的帧数，达到 3 帧才发送居中停止。 */
+    property int autoVisionStableFrames: 0
+
+    /* autoVisionCenteredSent 表示 BELT_STOP_CENTERED 已经下发，防止同一零件重复停机命令。 */
+    property bool autoVisionCenteredSent: false
+
+    /* autoVisionHasSeenTarget 表示本轮自动流程已经至少识别到一次零件，用于区分“等待上料”和“定位中短暂漏检”。 */
+    property bool autoVisionHasSeenTarget: false
+
+    /* autoVisionLostFrames 保存已经见过目标后连续漏检的 LOCATE 帧数，用于黑色波形零件短暂漏检防抖。 */
+    property int autoVisionLostFrames: 0
+
+    /* autoVisionLostHoldFrames 是短暂漏检保持帧数，100ms 定时下 8 帧约等于 0.8 秒。 */
+    property int autoVisionLostHoldFrames: 8
+
+    /* autoVisionLostWarnFrames 是连续漏检告警帧数，超过后仍保持停机等待，但提示现场检查光照和零件位置。 */
+    property int autoVisionLostWarnFrames: 18
+
+    /* autoVisionLastFrameId 保存最近一次 LOCATE 帧号，用于居中停止和现场日志对齐。 */
+    property int autoVisionLastFrameId: 0
+
+    /* autoVisionLastLostMs 保存最近一次 VISION_LOST 下发时间戳，避免目标未入画时每 100ms 刷屏。 */
+    property real autoVisionLastLostMs: 0
+
+    /* autoVisionLastErrorY 保存最近一次真实识别到目标时的 Y 轴偏差，漏检提示会显示它帮助现场判断。 */
+    property int autoVisionLastErrorY: 0
+
+    /* autoVisionLastText 保存自动视觉闭环最近一次可读状态，底部提示和调试日志会复用它。 */
+    property string autoVisionLastText: "视觉闭环待开始"
+
+    /* autoVisionCenterTolerancePx 是 MP157 侧居中判定死区，必须和 F4 死区保持同量级。 */
+    property int autoVisionCenterTolerancePx: 24
+
+    /* autoVisionStableRequiredFrames 是连续居中帧数门槛，过滤单帧误检或运动模糊。 */
+    property int autoVisionStableRequiredFrames: 3
+
     /* storageState 表示检测流程、SD 卡安全卸载和告警快照的最近一次执行结果。 */
     property string storageState: "SD卡就绪"
 
@@ -277,8 +322,14 @@ Rectangle {
     /* historyAnalysisDetailVisible 表示是否打开检测信息完整说明浮层，解决云端长文在小面板中显示不全。 */
     property bool historyAnalysisDetailVisible: false
 
-    /* dxPixels 表示视觉中心偏差演示值，后续由 tracking_service 写入。 */
-    property int dxPixels: 3
+    /* dxPixels 表示最近一次真实 LOCATE 计算出的 Y 轴视觉偏差，单位像素，正数表示零件中心在目标线下方。 */
+    property int dxPixels: 0
+
+    /* dxPixelsValid 表示 dxPixels 是否来自当前有效目标；漏检或等待上料时为 false，界面显示 -- px。 */
+    property bool dxPixelsValid: false
+
+    /* dxPixelsText 统一生成首页偏差文案，避免多个卡片各自拼接导致显示不一致。 */
+    property string dxPixelsText: dxPixelsValid ? ((dxPixels >= 0 ? "+" : "") + dxPixels + " px") : "-- px"
 
     /* dailyTotal/dailyGood/dailyBad 是底部统计演示值，后续由记录服务写入。 */
     property int dailyTotal: 1256
@@ -696,6 +747,192 @@ Rectangle {
         storageState = "正在检测当前帧..."
         storageController.requestDetectCurrentFrame()
         showStorageToast()
+    }
+
+    /*
+     * startAutoVisionLoop 的作用：
+     *   在 F4 START_CYCLE 或 RESUME_CYCLE ACK 成功后启动 MP157 视觉闭环。
+     *
+     * 主要流程：
+     *   1. 清空上一轮居中帧数、居中停机标志和丢失节流时间。
+     *   2. 设置 workflowState 和底部提示，让现场知道当前进入“找零件并居中”阶段。
+     *   3. 启动 autoVisionTimer，每 100ms 请求一次 overlay LOCATE。
+     *
+     * 返回值：
+     *   无返回值；状态通过 autoVisionTimer 和后续信号推进。
+     */
+    function startAutoVisionLoop() {
+        autoVisionRunning = true
+        autoVisionLocateBusy = false
+        autoVisionCommandBusy = false
+        autoVisionStableFrames = 0
+        autoVisionCenteredSent = false
+        autoVisionHasSeenTarget = false
+        autoVisionLostFrames = 0
+        autoVisionLastFrameId = 0
+        autoVisionLastLostMs = 0
+        autoVisionLastErrorY = 0
+        dxPixels = 0
+        dxPixelsValid = false
+        autoVisionLastText = "自动视觉：等待零件从上方进入 ROI"
+        workflowState = "视觉居中"
+        storageState = autoVisionLastText
+        autoVisionDetectDelayTimer.stop()
+        autoVisionTimer.restart()
+        showStorageToast()
+    }
+
+    /*
+     * stopAutoVisionLoop 的作用：
+     *   在暂停、停止、居中完成或异常时关闭 MP157 视觉闭环定时器。
+     *
+     * 参数：
+     *   reason 是停止原因，写入 autoVisionLastText 便于现场排查。
+     *
+     * 返回值：
+     *   无返回值；函数只更新本地状态，不直接发送 F4 命令。
+     */
+    function stopAutoVisionLoop(reason) {
+        autoVisionTimer.stop()
+        autoVisionDetectDelayTimer.stop()
+        autoVisionRunning = false
+        autoVisionLocateBusy = false
+        autoVisionCommandBusy = false
+        autoVisionStableFrames = 0
+        autoVisionCenteredSent = false
+        autoVisionHasSeenTarget = false
+        autoVisionLostFrames = 0
+        dxPixelsValid = false
+        if (reason && reason.length > 0) {
+            autoVisionLastText = reason
+        }
+    }
+
+    /*
+     * handleAutoVisionLocateFinished 的作用：
+     *   接收 C++ `requestAutoVisionLocate()` 返回的定位结果，并决定下发 VISION_POS、VISION_LOST 或居中停止。
+     *
+     * 主要流程：
+     *   1. 从未识别到目标时，按 500ms 节流发送 VISION_LOST reason=1，让 F4 保持扫描等待上料。
+     *   2. 找到目标时用 center_y 对齐 height/2，因为零件从画面上方进入。
+     *   3. 已经识别过目标后，如果黑色波形零件短暂漏检，不再发送 VISION_LOST，避免 F4 重新扫描把零件送走。
+     *   4. 未连续居中时发送 VISION_POS，让 F4 根据 Y 轴误差调速。
+     *   5. 连续 3 帧进入 ±24px 死区后发送 BELT_STOP_CENTERED，并等待 F4 ACK 后再启动 2 秒检测延时。
+     *
+     * 参数：
+     *   ok 表示 overlay LOCATE 是否成功返回。
+     *   result 是 C++ 解析出的定位结果 map。
+     *   detail 是 overlay 原始回复或错误文本。
+     *
+     * 返回值：
+     *   无返回值；函数通过 deviceHealth 的二进制命令接口继续推进。
+     */
+    function handleAutoVisionLocateFinished(ok, result, detail) {
+        autoVisionLocateBusy = false
+
+        if (!autoVisionRunning || autoWorkflowPaused || autoVisionCenteredSent) {
+            return
+        }
+
+        if (!ok) {
+            autoVisionStableFrames = 0
+            dxPixelsValid = false
+            autoVisionLastText = "自动视觉定位失败：" + detail
+            storageState = autoVisionLastText
+            showStorageToast()
+            return
+        }
+
+        var hasTarget = result && Number(result.has_target) === 1
+        var frameId = result ? Number(result.frame_id) : 0
+        var width = result ? Number(result.width) : 0
+        var height = result ? Number(result.height) : 0
+        var centerX = result ? Number(result.center_x) : 0
+        var centerY = result ? Number(result.center_y) : 0
+        var confidence = result ? Number(result.confidence) : 0
+
+        autoVisionLastFrameId = frameId
+
+        if (!hasTarget || height <= 0) {
+            var nowMs = new Date().getTime()
+            autoVisionStableFrames = 0
+            dxPixelsValid = false
+
+            if (autoVisionHasSeenTarget) {
+                autoVisionLostFrames += 1
+                workflowState = autoVisionLostFrames >= autoVisionLostWarnFrames ? "等待重识别" : "视觉保持"
+                autoVisionLastText = autoVisionLostFrames <= autoVisionLostHoldFrames
+                        ? "自动视觉：目标短暂丢失 "
+                        : "自动视觉：目标连续丢失但保持停机 "
+                autoVisionLastText = autoVisionLastText
+                        + autoVisionLostFrames + " 帧，保持停机等待重新识别"
+                        + "，上次error=" + autoVisionLastErrorY
+                if (autoVisionLostFrames >= autoVisionLostWarnFrames) {
+                    autoVisionLastText += "；请检查光照、黑色波形零件边缘和搜索带位置"
+                }
+                storageState = autoVisionLastText
+                return
+            }
+
+            autoVisionLostFrames = 0
+            autoVisionLastText = "自动视觉：尚未识别到零件，继续等待上方来料"
+            storageState = autoVisionLastText
+
+            if (!autoVisionCommandBusy && nowMs - autoVisionLastLostMs >= 500) {
+                autoVisionLastLostMs = nowMs
+                if (deviceHealth.sendF4VisionLost(1)) {
+                    autoVisionCommandBusy = true
+                }
+            }
+            return
+        }
+
+        var targetY = Math.round(height / 2)
+        var errorY = Math.round(centerY - targetY)
+        var absErrorY = Math.abs(errorY)
+
+        autoVisionHasSeenTarget = true
+        autoVisionLostFrames = 0
+        autoVisionLastErrorY = errorY
+        dxPixels = errorY
+        dxPixelsValid = true
+        workflowState = "视觉居中"
+
+        if (absErrorY <= autoVisionCenterTolerancePx) {
+            autoVisionStableFrames += 1
+        } else {
+            autoVisionStableFrames = 0
+        }
+
+        autoVisionLastText = "自动视觉：x=" + Math.round(centerX)
+                + " y=" + Math.round(centerY)
+                + " target=" + targetY
+                + " error=" + errorY
+                + " stable=" + autoVisionStableFrames
+                + "/" + autoVisionStableRequiredFrames
+                + " conf=" + Math.round(confidence)
+        storageState = autoVisionLastText
+
+        if (autoVisionCommandBusy) {
+            return
+        }
+
+        if (autoVisionStableFrames >= autoVisionStableRequiredFrames) {
+            autoVisionCenteredSent = true
+            autoVisionTimer.stop()
+            workflowState = "居中停机"
+            if (deviceHealth.sendF4BeltStopCentered(frameId)) {
+                autoVisionCommandBusy = true
+            } else {
+                autoVisionCenteredSent = false
+                autoVisionTimer.restart()
+            }
+            return
+        }
+
+        if (deviceHealth.sendF4VisionPosition(result)) {
+            autoVisionCommandBusy = true
+        }
     }
 
     /*
@@ -3824,7 +4061,7 @@ Rectangle {
         }
     }
 
-    /* clockTimer 每秒更新时间，同时轻微改变 dx 演示值，让界面保持实时感。 */
+    /* clockTimer 每秒更新时间；视觉偏差由 LOCATE 回调写入，不能再用演示值滚动。 */
     Timer {
         id: clockTimer
         interval: 1000
@@ -3833,7 +4070,6 @@ Rectangle {
 
         onTriggered: {
             currentTimeText = Qt.formatDateTime(new Date(), "hh:mm:ss")
-            dxPixels = ((dxPixels + 5) % 19) - 9
         }
     }
 
@@ -3846,6 +4082,44 @@ Rectangle {
 
         onTriggered: {
             storageToastVisible = false
+        }
+    }
+
+    /* autoVisionTimer 周期请求 overlay LOCATE；真正串口发送由定位结果回调决定。 */
+    Timer {
+        id: autoVisionTimer
+        interval: 100
+        repeat: true
+        running: false
+
+        onTriggered: {
+            if (!root.autoVisionRunning
+                    || root.autoWorkflowPaused
+                    || root.autoVisionCenteredSent
+                    || root.autoVisionLocateBusy
+                    || root.autoVisionCommandBusy) {
+                return
+            }
+
+            root.autoVisionLocateBusy = true
+            if (!deviceHealth.requestAutoVisionLocate()) {
+                root.autoVisionLocateBusy = false
+            }
+        }
+    }
+
+    /* autoVisionDetectDelayTimer 等 F4 居中停机 ACK 后延时 2 秒，再复用现有当前帧检测链路。 */
+    Timer {
+        id: autoVisionDetectDelayTimer
+        interval: 2000
+        repeat: false
+        running: false
+
+        onTriggered: {
+            root.workflowState = "模型检测"
+            root.storageState = "零件已居中，开始模型检测"
+            root.showStorageToast()
+            root.handleDetectAction()
         }
     }
 
@@ -4073,18 +4347,22 @@ Rectangle {
                     root.autoWorkflowRunning = true
                     root.autoWorkflowPaused = false
                     root.workflowState = "定位预览"
+                    root.startAutoVisionLoop()
                 } else if (action === "pause") {
                     root.autoWorkflowRunning = true
                     root.autoWorkflowPaused = true
                     root.workflowState = "暂停"
+                    root.stopAutoVisionLoop("自动视觉已暂停")
                 } else if (action === "resume") {
                     root.autoWorkflowRunning = true
                     root.autoWorkflowPaused = false
                     root.workflowState = "继续检测"
+                    root.startAutoVisionLoop()
                 } else if (action === "stop") {
                     root.autoWorkflowRunning = false
                     root.autoWorkflowPaused = false
                     root.workflowState = "停止"
+                    root.stopAutoVisionLoop("自动视觉已停止")
                 }
 
                 if (!root.usingKmsOverlay && !root.usingGstVideo) {
@@ -4098,6 +4376,9 @@ Rectangle {
                 root.autoLastAckText = "自动流程ACK：cycle=" + cycleId + "，" + detail
             } else {
                 root.autoLastAckText = "自动流程失败：" + detail
+                if (action === "start" || action === "resume") {
+                    root.stopAutoVisionLoop("自动视觉未启动：" + detail)
+                }
                 if (root.autoWorkflowPaused) {
                     root.workflowState = "暂停"
                 } else if (root.autoWorkflowRunning) {
@@ -4109,6 +4390,64 @@ Rectangle {
 
             root.storageState = root.formatF4ToastText(root.autoLastAckText)
             root.showStorageToast()
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onAutoVisionLocateFinished 的作用：
+         *   接收 C++ overlay LOCATE 定位结果，并推进 MP157->F4 视觉坐标下发。
+         *
+         * 参数：
+         *   ok 表示 overlay 是否成功返回 LOCATE 行。
+         *   result 是 C++ 解析后的坐标 map。
+         *   detail 是 overlay 原始回复或错误原因。
+         */
+        onAutoVisionLocateFinished: {
+            root.handleAutoVisionLocateFinished(ok, result, detail)
+        }
+
+        /*
+         * onF4VisionCommandFinished 的作用：
+         *   接收 VISION_POS、VISION_LOST 和 BELT_STOP_CENTERED 的 ACK/NACK，释放视觉闭环串口忙标志。
+         *
+         * 参数：
+         *   ok 表示 F4 是否 ACK 本次视觉闭环命令。
+         *   action 是视觉命令名称。
+         *   cycleId 是当前自动流程号。
+         *   detail 是 ACK/NACK 解析结果或串口失败原因。
+         */
+        onF4VisionCommandFinished: {
+            root.autoVisionCommandBusy = false
+            root.autoCycleId = cycleId
+
+            if (ok) {
+                root.autoVisionLastText = "视觉闭环ACK：" + action + " " + detail
+            } else {
+                root.autoVisionLastText = "视觉闭环失败：" + action + " " + detail
+                if (action === "VISION_POS") {
+                    root.autoVisionStableFrames = 0
+                }
+            }
+
+            if (action === "BELT_STOP_CENTERED") {
+                if (ok) {
+                    root.autoVisionRunning = false
+                    autoVisionTimer.stop()
+                    root.workflowState = "居中保持"
+                    root.storageState = "F4已确认居中停机，2秒后开始模型检测"
+                    autoVisionDetectDelayTimer.restart()
+                } else {
+                    root.autoVisionCenteredSent = false
+                    root.autoVisionStableFrames = 0
+                    root.storageState = root.autoVisionLastText
+                    if (root.autoWorkflowRunning && !root.autoWorkflowPaused) {
+                        root.autoVisionRunning = true
+                        autoVisionTimer.restart()
+                    }
+                }
+                root.showStorageToast()
+            }
+
             root.evaluateRuntimeAlarms()
         }
 
@@ -4537,8 +4876,8 @@ Rectangle {
             anchors.rightMargin: 14
             anchors.bottom: parent.bottom
             anchors.bottomMargin: 12
-            text: "dx=" + (dxPixels >= 0 ? "+" : "") + dxPixels + " px"
-            color: Math.abs(dxPixels) <= 5 ? root.accentGreen : root.accentAmber
+            text: "dy=" + root.dxPixelsText
+            color: root.dxPixelsValid && Math.abs(dxPixels) <= root.autoVisionCenterTolerancePx ? root.accentGreen : root.accentAmber
             font.pixelSize: 18
             font.bold: true
             visible: !root.usingKmsOverlay
@@ -4578,14 +4917,14 @@ Rectangle {
                 model: root.usingKmsOverlay ? [
                     {"name": "零件", "value": root.detectPartName},
                     {"name": "状态", "value": root.workflowState},
-                    {"name": "偏差", "value": (root.dxPixels >= 0 ? "+" : "") + root.dxPixels + " px"},
+                    {"name": "偏差", "value": root.dxPixelsText},
                     {"name": "类别", "value": root.compactHomeClassText(root.detectClassName)},
                     {"name": "模型", "value": root.compactHomeModelText(root.detectState)},
                     {"name": "耗时", "value": root.detectTimeText}
                 ] : [
                     {"name": "当前零件", "value": root.detectPartName},
                     {"name": "流程状态", "value": root.workflowState},
-                    {"name": "视觉偏差", "value": (root.dxPixels >= 0 ? "+" : "") + root.dxPixels + " px"},
+                    {"name": "视觉偏差", "value": root.dxPixelsText},
                     {"name": "模型类别", "value": root.compactHomeClassText(root.detectClassName)},
                     {"name": "检测状态", "value": root.compactHomeModelText(root.detectState)},
                     {"name": "推理耗时", "value": root.detectTimeText}
@@ -4803,7 +5142,7 @@ Rectangle {
                     width: (overlayControls.width - overlayControls.columnSpacing) / 2
                     height: 24
                     radius: 6
-                    property bool actionEnabled: !root.autoControlBusy
+                    property bool actionEnabled: !root.autoControlBusy && !root.autoVisionCommandBusy
                                                  && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
                                                      || (modelData.action === "pause" && root.autoWorkflowRunning && !root.autoWorkflowPaused)
                                                      || (modelData.action === "resume" && root.autoWorkflowPaused)
@@ -9943,7 +10282,7 @@ Rectangle {
                     width: 64
                     height: 48
                     radius: 8
-                    property bool actionEnabled: !root.autoControlBusy
+                    property bool actionEnabled: !root.autoControlBusy && !root.autoVisionCommandBusy
                                                  && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
                                                      || (modelData.action === "pause" && root.autoWorkflowRunning && !root.autoWorkflowPaused)
                                                      || (modelData.action === "resume" && root.autoWorkflowPaused)
