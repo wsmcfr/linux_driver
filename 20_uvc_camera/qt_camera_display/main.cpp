@@ -7354,6 +7354,53 @@ public:
     }
 
     /*
+     * sendF4ActuatorStopNow 的作用：
+     *   给手动停止键和模拟急停提供安全优先的 ACTUATOR_STOP 写入通道。
+     *
+     * 主要流程：
+     *   1. 校验 actuator 和 flags，仍然只允许 0/1/2 或 0xFF。
+     *   2. 组装 ACTUATOR_STOP 负载，协议内容和 sendF4ActuatorStop() 完全一致。
+     *   3. 不检查 m_f4CommandRunning，也不等待 ACK，只要求后台线程把完整帧写入串口并 tcdrain。
+     *
+     * 关键原因：
+     *   手动前后轴采用 ACTUATOR_VEL_MOVE 连续速度模式。若上一条运动命令线程正在等待 ACK，
+     *   普通 startF4ActuatorCommand() 会拒绝 STOP，现场就会表现为“停止键没有反应”。
+     *   这里不抢读 ACK，避免两个后台线程同时读取 `/dev/ttySTM2` 导致回包被错误线程消费；
+     *   F4 收到 STOP 后会在自己的摄像头电机队列中插队停止。
+     *
+     * 返回值：
+     *   true 表示强制停止写入线程已启动；false 表示参数非法或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4ActuatorStopNow(int actuator, int flags)
+    {
+        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
+        QByteArray payload;        /* payload 保存 ACTUATOR_STOP 的固定 4 字节负载。 */
+        QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
+
+        if (!((actuator >= 0 && actuator <= 2) || actuator == 0xFF)) {
+            rejectText = QStringLiteral("强制停止执行器编号必须是 0/1/2 或 0xFF");
+        } else if (flags < 0 || flags > 255) {
+            rejectText = QStringLiteral("强制停止 flags 必须是 0~255");
+        }
+
+        if (!rejectText.isEmpty()) {
+            emit f4ActuatorCommandFinished(false,
+                                           QStringLiteral("ACTUATOR_STOP_NOW"),
+                                           cycleId,
+                                           rejectText);
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                         /* cycle_id：自动流程中用于和本轮检测绑定，手动调试通常为 0。 */
+        payload.append(static_cast<char>(actuator & 0xFF));    /* actuator：0/1/2 指定轴，0xFF 表示全部执行器。 */
+        payload.append(static_cast<char>(flags & 0xFF));       /* flags：首版保留，当前填 0。 */
+
+        return startF4ActuatorStopNowCommand(QStringLiteral("ACTUATOR_STOP_NOW"),
+                                             cycleId,
+                                             payload);
+    }
+
+    /*
      * sendF4ActuatorHome 的作用：
      *   让参数设置页通过二进制协议请求 F4 把某个执行器当前位置设为新的零点。
      *
@@ -8220,6 +8267,32 @@ private slots:
             setDetailText(QStringLiteral("F4执行器命令完成：") + action + QStringLiteral(" ") + detail);
         } else {
             setDetailText(QStringLiteral("F4执行器命令失败：") + action + QStringLiteral(" ") + detail);
+        }
+
+        emit f4ActuatorCommandFinished(ok, action, cycleId, detail);
+    }
+
+    /*
+     * handleF4ActuatorStopNowFinished 的作用：
+     *   接收手动强制 STOP 写入线程结果，并通知 QML 更新按钮反馈。
+     *
+     * 关键说明：
+     *   该槽不能修改 m_f4CommandRunning。强制 STOP 是安全旁路，可能在上一条普通执行器命令
+     *   仍等待 ACK 时并行写入；如果这里清除普通 busy 标志，后续普通命令可能再次并发抢串口。
+     *
+     * 参数：
+     *   ok 为 true 表示 STOP 二进制帧已完整写入并通过 tcdrain 排空内核发送队列。
+     *   action 固定为 ACTUATOR_STOP_NOW。
+     *   cycleId 是本次 STOP 使用的 cycle_id，手动通常为 0。
+     *   detail 是写入结果或失败原因。
+     */
+    void handleF4ActuatorStopNowFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail)
+    {
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4强制停止帧已写入：") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4强制停止帧写入失败：") + detail);
         }
 
         emit f4ActuatorCommandFinished(ok, action, cycleId, detail);
@@ -9409,6 +9482,67 @@ private:
     }
 
     /*
+     * startF4ActuatorStopNowCommand 的作用：
+     *   为手动停止键启动一个不占用普通 F4 命令 busy 标志的强制 STOP 写入线程。
+     *
+     * 主要流程：
+     *   1. 生成新的二进制 sequence，组装 ACTUATOR_STOP 完整帧。
+     *   2. 后台线程调用 writeF4BinaryFrameWithoutReply()，只负责把 STOP 帧写入并 tcdrain。
+     *   3. 回到主线程调用 handleF4ActuatorStopNowFinished()，该槽不清 m_f4CommandRunning。
+     *
+     * 参数：
+     *   action 固定为 ACTUATOR_STOP_NOW，用于 QML 区分这是强制停止写入结果。
+     *   cycleId 是本次 STOP 使用的流程号，手动调试通常为 0。
+     *   payload 是已经编码好的 ACTUATOR_STOP 负载。
+     *
+     * 返回值：
+     *   true 表示后台线程已启动；false 表示线程创建失败。
+     */
+    bool startF4ActuatorStopNowCommand(const QString &action,
+                                       quint16 cycleId,
+                                       const QByteArray &payload)
+    {
+        const quint16 sequence = m_f4BinarySequence++;
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_ACTUATOR_STOP, sequence, payload);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+
+        QPointer<DeviceHealthController> self(this);
+        QThread *workerThread = QThread::create([self, dev, baud, frame, action, cycleId, sequence]() {
+            QString detail;        /* detail 保存写入线程生成的结果说明，回到主线程后显示到 QML。 */
+            const bool ok = writeF4BinaryFrameWithoutReply(dev, baud, frame, &detail);
+
+            if (!detail.isEmpty()) {
+                detail += QStringLiteral(" seq=") + QString::number(sequence);
+            }
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4ActuatorStopNowFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, action),
+                                      Q_ARG(quint16, cycleId),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) {
+            emit f4ActuatorCommandFinished(false,
+                                           action,
+                                           cycleId,
+                                           QStringLiteral("F4强制停止线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
      * refreshSdcardStatus 的作用：
      *   读取 /proc/mounts 判断 SD 卡挂载状态；这是轻量本地读取，可以同步执行。
      */
@@ -9823,6 +9957,104 @@ private:
         }
 
         ::close(fd);
+        return true;
+    }
+
+    /*
+     * writeF4BinaryFrameWithoutReply 的作用：
+     *   只向 F4 串口写入一帧二进制协议，不读取 ACK/NACK。
+     *
+     * 主要流程：
+     *   1. 打开 `/dev/ttySTM2` 并配置为 115200 8N1 raw 模式。
+     *   2. 写入完整二进制帧，并调用 tcdrain() 等待内核发送队列排空。
+     *   3. 不调用 readF4BinaryReply()，避免强制 STOP 和上一条普通命令线程同时抢读回包。
+     *
+     * 参数：
+     *   device 是 Linux 串口节点。
+     *   baud 是串口波特率。
+     *   frame 是要写入的完整二进制帧。
+     *   detail 返回写入结果或失败原因，可为 NULL。
+     *
+     * 返回值：
+     *   完整写入并排空发送队列返回 true；打开、配置、写入或 tcdrain 失败返回 false。
+     */
+    static bool writeF4BinaryFrameWithoutReply(const QString &device,
+                                               int baud,
+                                               const QByteArray &frame,
+                                               QString *detail)
+    {
+        const QByteArray devBytes = device.toLocal8Bit();
+        int fd = -1;              /* fd 保存本次强制 STOP 独立打开的串口文件描述符。 */
+        struct termios tio;       /* tio 保存串口 raw 配置，保证二进制帧不会被行规程改写。 */
+
+        if (frame.isEmpty()) {
+            if (detail) {
+                *detail = QStringLiteral("F4强制停止帧为空");
+            }
+            return false;
+        }
+
+        fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0) {
+            if (detail) {
+                *detail = QStringLiteral("无法打开 ") + device;
+            }
+            return false;
+        }
+
+        if (tcgetattr(fd, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("读取串口属性失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        cfmakeraw(&tio);
+        cfsetispeed(&tio, baudToSpeed(baud));
+        cfsetospeed(&tio, baudToSpeed(baud));
+        tio.c_cflag |= CLOCAL | CREAD;
+#ifdef CRTSCTS
+        tio.c_cflag &= ~CRTSCTS;
+#endif
+        tio.c_cc[VMIN] = 0;
+        tio.c_cc[VTIME] = 0;
+
+        if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("配置串口失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        /*
+         * 只清理本 fd 的待发送输出队列，不使用 TCIOFLUSH。
+         * TCIOFLUSH 会丢弃输入数据，可能影响上一条普通命令线程正在等待的 ACK。
+         */
+        tcflush(fd, TCOFLUSH);
+        if (!writeAllToFd(fd, frame)) {
+            if (detail) {
+                *detail = QStringLiteral("写入 F4 强制停止帧失败：") + hexByteString(frame);
+            }
+            ::close(fd);
+            return false;
+        }
+
+        if (tcdrain(fd) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("等待 F4 强制停止帧发送完成失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        ::close(fd);
+        if (detail) {
+            *detail = QStringLiteral("ACTUATOR_STOP 已写入串口，bytes=")
+                    + QString::number(frame.size())
+                    + QStringLiteral("，不等待ACK");
+        }
         return true;
     }
 

@@ -226,12 +226,6 @@ Rectangle {
     /* manualPendingF4Command 保存正在等待 F4 回复的手动命令名，空字符串表示当前没有手动串口命令在途。 */
     property string manualPendingF4Command: ""
 
-    /* manualQueuedStopActuator 保存等待普通手动命令 ACK 后必须补发停止的执行器编号，-1 表示没有排队停止。 */
-    property int manualQueuedStopActuator: -1
-
-    /* manualQueuedStopLabel 保存排队停止按钮的原始文案，方便 ACK 返回后日志仍能看出是哪个按钮触发。 */
-    property string manualQueuedStopLabel: ""
-
     /* manualEmergencyStop 表示急停模拟状态；为 true 时禁止除停止、刷新和清故障外的手动动作。 */
     property bool manualEmergencyStop: false
 
@@ -1872,27 +1866,9 @@ Rectangle {
     }
 
     /*
-     * flushManualQueuedStop 的作用：
-     *   在普通手动命令 ACK/NACK 返回后，补发用户刚才点击但被串口互斥延后的 STOP。
-     *
-     * 返回值：
-     *   true 表示成功启动补发停止；false 表示没有排队停止或当前仍有命令在途。
-     */
-    function flushManualQueuedStop() {
-        if (manualQueuedStopActuator < 0 || manualPendingF4Command !== "") {
-            return false
-        }
-
-        var actuator = manualQueuedStopActuator
-        var label = manualQueuedStopLabel.length > 0 ? manualQueuedStopLabel : "停止"
-        manualQueuedStopActuator = -1
-        manualQueuedStopLabel = ""
-        return sendManualActuatorStop(actuator, label)
-    }
-
-    /*
      * sendManualActuatorStop 的作用：
      *   把三轴手动停止或模拟急停转换为 ACTUATOR_STOP 二进制命令。
+     *   STOP 是安全动作，不等待上一条普通运动 ACK，直接走 C++ 写入即返回通道。
      *
      * 参数：
      *   actuator 是执行器编号，0/1/2 表示单轴，255 表示全部。
@@ -1905,26 +1881,12 @@ Rectangle {
         var commandText = actuator === 255 ? "ACTUATOR_STOP_ALL" : ("ACTUATOR_STOP_" + actuator)
         var targetText = actuator === 255 ? "全部执行器" : stepperMotorPageNames[Math.max(0, Math.min(2, actuator))]
 
-        if (manualPendingF4Command !== "") {
-            manualQueuedStopActuator = actuator
-            manualQueuedStopLabel = label
-            manualLastAckText = "停止已排队：等待 " + manualPendingF4Command + " 回执后立即下发 " + commandText
-            storageState = formatF4ToastText(manualLastAckText)
-            appendManualCommandLog(label, targetText, manualLastAckText)
-            showStorageToast()
-            return true
-        }
-
-        manualQueuedStopActuator = -1
-        manualQueuedStopLabel = ""
-        manualPendingF4Command = commandText
-        manualLastAckText = "正在下发 " + commandText + " 到 F407"
+        manualLastAckText = "正在立即写入 " + commandText + " 到 F407，不等待上一条运动ACK"
         storageState = formatF4ToastText(manualLastAckText)
         appendManualCommandLog(label, targetText, manualLastAckText)
         showStorageToast()
 
-        if (!deviceHealth.sendF4ActuatorStop(actuator, 0)) {
-            manualPendingF4Command = ""
+        if (!deviceHealth.sendF4ActuatorStopNow(actuator, 0)) {
             manualLastAckText = "F4拒绝启动停止命令：" + commandText
             storageState = formatF4ToastText(manualLastAckText)
             appendManualCommandLog(label, targetText, manualLastAckText)
@@ -5361,33 +5323,41 @@ Rectangle {
                         ? ("F4已将当前位置设为零点：" + detail)
                         : ("F4当前位置设零失败：" + detail)
                 root.stepperHomeSending = false
-                root.stepperHomePendingCommand = ""
-                root.stepperMotorResultText = homeResult
-                root.settingsLastActionText = homeResult
-                root.storageState = root.formatF4ToastText(homeResult + " [" + finishedHomeCommand + "]")
-                root.showStorageToast()
-                root.evaluateRuntimeAlarms()
-                return
-            }
+            root.stepperHomePendingCommand = ""
+            root.stepperMotorResultText = homeResult
+            root.settingsLastActionText = homeResult
+            root.storageState = root.formatF4ToastText(homeResult + " [" + finishedHomeCommand + "]")
+            root.showStorageToast()
+            root.evaluateRuntimeAlarms()
+            return
+        }
 
-            if (root.manualPendingF4Command !== "") {
-                var finishedManualCommand = root.manualPendingF4Command
-                var manualResult = ok ? ("F4执行器回执：" + detail) : ("F4执行器失败：" + detail)
-                if (ok && finishedManualCommand.indexOf("ACTUATOR_VEL_MOVE") === 0) {
-                    manualResult = "F4执行器回执：" + detail + "；持续运动中，按停止结束"
+        if (action === "ACTUATOR_STOP_NOW") {
+            var stopNowResult = ok
+                    ? ("F4强制停止帧已写入：" + detail)
+                    : ("F4强制停止帧写入失败：" + detail)
+            root.manualLastAckText = stopNowResult
+            root.storageState = root.formatF4ToastText(stopNowResult)
+            root.appendManualCommandLog(action, "三轴电机", stopNowResult)
+            root.showStorageToast()
+            root.evaluateRuntimeAlarms()
+            return
+        }
+
+        if (root.manualPendingF4Command !== "") {
+            var finishedManualCommand = root.manualPendingF4Command
+            var manualResult = ok ? ("F4执行器回执：" + detail) : ("F4执行器失败：" + detail)
+            if (ok && finishedManualCommand.indexOf("ACTUATOR_VEL_MOVE") === 0) {
+                manualResult = "F4执行器回执：" + detail + "；持续运动中，按停止结束"
                 } else if (ok && finishedManualCommand.indexOf("ACTUATOR_POS_MOVE_Z") === 0) {
                     manualResult = "F4执行器回执：" + detail + "；上下轴固定步数已下发"
                 }
                 root.manualLastAckText = manualResult
                 root.manualPendingF4Command = ""
-                root.storageState = root.formatF4ToastText(manualResult)
-                root.appendManualCommandLog(action, "三轴电机", manualResult)
-                root.showStorageToast()
-                if (root.manualQueuedStopActuator >= 0
-                        && finishedManualCommand.indexOf("ACTUATOR_STOP") !== 0) {
-                    Qt.callLater(root.flushManualQueuedStop)
-                }
-            }
+            root.storageState = root.formatF4ToastText(manualResult)
+            root.appendManualCommandLog(action, "三轴电机", manualResult)
+            root.showStorageToast()
+        }
 
             root.evaluateRuntimeAlarms()
         }
