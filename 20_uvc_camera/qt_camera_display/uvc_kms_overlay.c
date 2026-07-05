@@ -107,6 +107,18 @@
 /* 自动视觉定位的中心孔背景占比阈值，中央采样区至少 35% 不是候选亮度才认为像垫圈孔。 */
 #define AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT 35U
 
+/* 自动视觉定位的暗候选占比上限；暗像素过多时更像黑色传送带或阴影，不像带孔零件。 */
+#define AUTO_LOCATE_MAX_DARK_FILL_PERCENT 82U
+
+/* 自动视觉定位的暗色贴边判断边距；贴近搜索带边缘的大暗区通常是传送带背景。 */
+#define AUTO_LOCATE_DARK_EDGE_MARGIN_PX 8U
+
+/* 自动视觉定位的暗色面积上限；暗候选面积超过搜索区域 18% 时优先按背景误检处理。 */
+#define AUTO_LOCATE_MAX_DARK_EDGE_AREA_PERCENT 18U
+
+/* 自动视觉定位的中心孔背景最小对比度；孔区域与候选实体太接近时不认为是垫圈孔。 */
+#define AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST 10U
+
 /*
  * 自动视觉定位的基础亮度差阈值。
  *
@@ -2034,19 +2046,60 @@ static int auto_locate_is_candidate_luma(unsigned int luma,
 }
 
 /*
+ * auto_locate_component_touches_search_edge 的作用：
+ *   判断一个候选连通域是否贴近自动定位搜索带边缘。
+ *
+ * 主要流程：
+ *   1. 使用 AUTO_LOCATE_DARK_EDGE_MARGIN_PX 作为边缘保护带。
+ *   2. 候选 bbox 左、右、上、下任意一侧落入保护带，就认为它与搜索边缘相连。
+ *   3. 该判断只作为“大暗区误检过滤”的条件，不会单独拒绝正常零件。
+ *
+ * 参数：
+ *   min_x/max_x/min_y/max_y 是候选 bbox 在搜索 ROI 内的范围。
+ *   roi_w/roi_h 是搜索 ROI 的宽度和高度。
+ *
+ * 返回值：
+ *   贴近搜索边缘返回 1；否则返回 0。
+ */
+static int auto_locate_component_touches_search_edge(unsigned int min_x,
+                                                     unsigned int max_x,
+                                                     unsigned int min_y,
+                                                     unsigned int max_y,
+                                                     unsigned int roi_w,
+                                                     unsigned int roi_h)
+{
+    if (min_x <= AUTO_LOCATE_DARK_EDGE_MARGIN_PX) {
+        return 1;
+    }
+    if (min_y <= AUTO_LOCATE_DARK_EDGE_MARGIN_PX) {
+        return 1;
+    }
+    if (max_x + AUTO_LOCATE_DARK_EDGE_MARGIN_PX + 1U >= roi_w) {
+        return 1;
+    }
+    if (max_y + AUTO_LOCATE_DARK_EDGE_MARGIN_PX + 1U >= roi_h) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
  * auto_locate_component_has_ring_hole 的作用：
  *   判断候选连通域中心是否存在垫圈类零件常见的“孔/背景”区域。
  *
  * 主要流程：
  *   1. 在候选 bbox 中央取一个小窗口，窗口尺寸约为 bbox 的 1/4。
  *   2. 统计窗口内不属于候选亮度的像素占比。
- *   3. 背景占比足够高时认为该连通域具有中心孔结构。
+ *   3. 统计孔背景与候选实体的亮度差，避免把黑色传送带纹理误判成中心孔。
+ *   4. 背景占比和背景对比度都足够高时，才认为该连通域具有中心孔结构。
  *
  * 参数：
  *   frame 是原始 YUYV 帧。
  *   roi_x/roi_y 是搜索 ROI 在整帧中的起点。
  *   min_x/max_x/min_y/max_y 是候选 bbox 在 ROI 内的范围。
  *   bright_threshold/dark_threshold 是本帧自适应候选阈值。
+ *   component_mean_luma 是候选连通域平均亮度，用于判断孔背景与实体的对比。
  *
  * 返回值：
  *   像垫圈中心孔返回 1；否则返回 0。
@@ -2059,7 +2112,8 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
                                                unsigned int min_y,
                                                unsigned int max_y,
                                                unsigned int bright_threshold,
-                                               unsigned int dark_threshold)
+                                               unsigned int dark_threshold,
+                                               unsigned int component_mean_luma)
 {
     unsigned int bbox_w = max_x - min_x + 1U;
     unsigned int bbox_h = max_y - min_y + 1U;
@@ -2071,6 +2125,8 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
     unsigned int y;
     unsigned int total = 0U;
     unsigned int background = 0U;
+    unsigned int background_contrast_avg;
+    uint64_t background_contrast_sum = 0U;
 
     if (sample_w < 1U) {
         sample_w = 1U;
@@ -2091,15 +2147,21 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
             total++;
             if (!auto_locate_is_candidate_luma(luma, bright_threshold, dark_threshold)) {
                 background++;
+                background_contrast_sum += (unsigned int)abs((int)luma - (int)component_mean_luma);
             }
         }
     }
 
-    if (total == 0U) {
+    if (total == 0U || background == 0U) {
         return 0;
     }
 
-    return (background * 100U / total) >= AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT ? 1 : 0;
+    background_contrast_avg = (unsigned int)(background_contrast_sum / background);
+    if ((background * 100U / total) < AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT) {
+        return 0;
+    }
+
+    return background_contrast_avg >= AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST ? 1 : 0;
 }
 
 /*
@@ -2110,8 +2172,9 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
  *   1. 初始化输出结果，把 frame_id 和图像尺寸先写入 result，保证无目标时也能回传上下文。
  *   2. 只扫描水平居中的竖向搜索带，提前发现从画面上方进入的零件，同时避开左右支架干扰。
  *   3. 统计 ROI 的亮度均值、最暗值和最亮值，得到当前背景的自适应阈值。
- *   4. 对明显亮于或暗于背景的像素做四邻域连通域搜索。
- *   5. 选择面积、外接框和长宽比都合理的最佳连通域，输出中心点、bbox 和置信度。
+ *   4. 对明显亮于或暗于背景的像素做四邻域连通域搜索，并统计亮/暗像素比例。
+ *   5. 拒绝大面积贴边暗区，避免把黑色传送带背景误识别成零件。
+ *   6. 选择面积、外接框和长宽比都合理的最佳连通域，输出中心点、bbox 和置信度。
  *
  * 参数：
  *   frame 是最新摄像头帧，必须包含原始 YUYV 指针。
@@ -2235,6 +2298,9 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             unsigned int tail = 0U;
             unsigned int area = 0U;
             unsigned int contrast_sum = 0U;
+            uint64_t component_luma_sum = 0U;
+            unsigned int dark_pixels = 0U;
+            unsigned int bright_pixels = 0U;
             unsigned int min_x = x;
             unsigned int max_x = x;
             unsigned int min_y = y;
@@ -2243,6 +2309,9 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             unsigned int bbox_h;
             unsigned int bbox_area;
             unsigned int contrast_avg;
+            unsigned int component_mean_luma;
+            unsigned int dark_fill_percent;
+            unsigned int dark_area_percent;
             unsigned int density;
             unsigned int score;
             unsigned int confidence;
@@ -2272,6 +2341,12 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
 
                 area++;
                 contrast_sum += (unsigned int)abs((int)luma - (int)mean_luma);
+                component_luma_sum += luma;
+                if (luma <= dark_threshold) {
+                    dark_pixels++;
+                } else if (luma >= bright_threshold) {
+                    bright_pixels++;
+                }
 
                 if (local_x < min_x) {
                     min_x = local_x;
@@ -2337,10 +2412,31 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             }
 
             contrast_avg = contrast_sum / area;
+            component_mean_luma = (unsigned int)(component_luma_sum / area);
+            dark_fill_percent = area > 0U ? (dark_pixels * 100U) / area : 0U;
+            dark_area_percent = pixel_count > 0U ? (dark_pixels * 100U) / pixel_count : 0U;
             density = bbox_area > 0U ? (area * 100U) / bbox_area : 0U;
 
             if (density < AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT ||
                 density > AUTO_LOCATE_MAX_SOLID_DENSITY_PERCENT) {
+                continue;
+            }
+
+            /*
+             * 黑色零件需要保留暗候选，但黑色传送带通常表现为：
+             * 1. 连通域里绝大多数像素都是暗候选；
+             * 2. bbox 贴近搜索带边缘，或者暗像素面积已经很大。
+             * 同时满足这些条件时拒绝该候选，避免零件还没到时把传送带背景当成零件。
+             */
+            if (dark_pixels > bright_pixels &&
+                dark_fill_percent >= AUTO_LOCATE_MAX_DARK_FILL_PERCENT &&
+                (dark_area_percent >= AUTO_LOCATE_MAX_DARK_EDGE_AREA_PERCENT ||
+                 auto_locate_component_touches_search_edge(min_x,
+                                                           max_x,
+                                                           min_y,
+                                                           max_y,
+                                                           roi_w,
+                                                           roi_h))) {
                 continue;
             }
 
@@ -2352,7 +2448,8 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                                                      min_y,
                                                      max_y,
                                                      bright_threshold,
-                                                     dark_threshold)) {
+                                                     dark_threshold,
+                                                     component_mean_luma)) {
                 continue;
             }
 

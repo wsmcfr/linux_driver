@@ -268,11 +268,17 @@ static const quint8 BINARY_PROTOCOL_CMD_STATUS_REPORT = 0x82U;
 /* 二进制事件上报命令：F4 主动告诉 MP157 当前机械臂、称重或电感流程阶段。 */
 static const quint8 BINARY_PROTOCOL_CMD_EVENT_REPORT = 0x83U;
 
-/* 执行器位置运动真实到位事件：F4 只有收到张大头 Emm42 `[addr FD 9F 6B]` 后才允许发送。 */
+/* 执行器位置运动完成事件：F4 收到张大头主动到位回包或估算运动完成后发送，status 字段区分来源。 */
 static const quint8 BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE = 0x14U;
 
 /* 执行器位置运动超时事件：Response 未配置、RX 接线异常、地址错误或堵转时由 F4 发送。 */
 static const quint8 BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT = 0x15U;
+
+/* 执行器位置运动完成状态：0 表示 F4 收到张大头 Emm42 主动到位回包 `[addr FD 9F 6B]`。 */
+static const quint16 F4_ACTUATOR_MOVE_STATUS_REACHED_ACK = 0x0000U;
+
+/* 执行器位置运动完成状态：5 表示 F4 未等到主动回包，但按速度、步数和安全余量估算运动已经结束。 */
+static const quint16 F4_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE = 0x0005U;
 
 /* 二进制称重结果命令：F4 读取 HX711 稳定结果后主动上报给 MP157。 */
 static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U;
@@ -9798,7 +9804,7 @@ private:
      *   eventCode 是 EVENT_REPORT payload[2] 事件编号。
      *
      * 返回值：
-     *   对执行器真实到位和超时返回固定 marker；其它事件返回 EVENT_<数字>。
+     *   对执行器完成和超时返回固定 marker；其它事件返回 EVENT_<数字>。
      */
     static QString f4EventCodeName(quint8 eventCode)
     {
@@ -9809,6 +9815,33 @@ private:
             return QStringLiteral("actuator-move-timeout");
         default:
             return QStringLiteral("EVENT_") + QString::number(eventCode);
+        }
+    }
+
+    /*
+     * f4ActuatorMoveStatusName 的作用：
+     *   把执行器完成事件 detail 低 16 位 status_code 转换成现场可读的完成来源。
+     *
+     * 主要流程：
+     *   1. status=0 表示 F4 确实收到了张大头 Emm42 的主动到位回包。
+     *   2. status=5 表示官方位置模式未主动返回完成帧时，F4 按运动时间估算完成并继续流程。
+     *   3. 其它状态保留原始数字，避免未来 F4 增加状态后 MP157 日志丢信息。
+     *
+     * 参数：
+     *   statusCode 是 EVENT_REPORT detail 低 16 位状态码。
+     *
+     * 返回值：
+     *   返回 reached-ack、estimated-done 或 status-N，用于 QML、日志和静态检查定位问题。
+     */
+    static QString f4ActuatorMoveStatusName(quint16 statusCode)
+    {
+        switch (statusCode) {
+        case F4_ACTUATOR_MOVE_STATUS_REACHED_ACK:
+            return QStringLiteral("reached-ack");
+        case F4_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE:
+            return QStringLiteral("estimated-done");
+        default:
+            return QStringLiteral("status-") + QString::number(statusCode);
         }
     }
 
@@ -9857,6 +9890,7 @@ private:
                 + QStringLiteral(" actuator=") + QString::number(actuator)
                 + QStringLiteral(" direction=") + QString::number(direction)
                 + QStringLiteral(" status=") + QString::number(statusCode)
+                + QStringLiteral("(") + f4ActuatorMoveStatusName(statusCode) + QStringLiteral(")")
                 + QStringLiteral(" related_seq=") + QString::number(relatedSequence)
                 + QStringLiteral(" fault=0x") + QString::number(faultBits, 16).toUpper()
                 + QStringLiteral(" reserved=") + QString::number(reserved);
@@ -11327,13 +11361,13 @@ private:
 
     /*
      * runF4ActuatorPositionMoveAndWaitDone 的作用：
-     *   专门发送 ACTUATOR_POS_MOVE，并在同一个串口连接中等待“ACK + 真实到位事件”。
+     *   专门发送 ACTUATOR_POS_MOVE，并在同一个串口连接中等待“ACK + 完成事件”。
      *
      * 主要流程：
      *   1. 打开并配置 F4 串口，写入完整二进制位置运动帧。
      *   2. 先等待匹配本 sequence 的 ACK/NACK；ACK 只说明 F4 接收并入队。
      *   3. ACK 成功后继续读取 EVENT_REPORT，必须匹配同一个 cycle_id 和 related_seq。
-     *   4. 收到 actuator-move-done 返回成功；收到 actuator-move-timeout 或本地保护超时返回失败。
+     *   4. 收到 actuator-move-done 返回成功，status 会说明主动到位或估算完成；收到 actuator-move-timeout 或本地保护超时返回失败。
      *
      * 参数：
      *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
@@ -11345,7 +11379,7 @@ private:
      *
      * 返回值：
      *   只有收到同一 sequence 的 `actuator-move-done` 才返回 true。
-     *   这能避免 MP157 在 Z 轴还没真实下降/上升完成时提前检测或启动机械臂。
+     *   这能避免 MP157 在 F4 没确认 Z 轴下降/上升完成时提前检测或启动机械臂。
      */
     static bool runF4ActuatorPositionMoveAndWaitDone(const QString &device,
                                                      int baud,

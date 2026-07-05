@@ -121,7 +121,7 @@ Rectangle {
     /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
     property int autoVisionZFocusSettleMs: 3000
 
-    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护超时的每圈步数；真实完成以 F4 ACTUATOR_MOVE_DONE 事件为准。 */
+    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护超时的每圈步数；正常完成以 F4 ACTUATOR_MOVE_DONE 事件为准。 */
     property int autoVisionZMoveStepsPerRev: 200
 
     /* autoVisionZMotionSafetyMs 是 Z 轴估算运动时间之外的安全余量，用于覆盖 F4 转发、驱动器加减速和机构惯性。 */
@@ -1161,7 +1161,7 @@ Rectangle {
         workflowState = movingDown ? "Z轴下降到位等待" : "Z轴回升到位等待"
         autoVisionLastText = "等待 F4 ACTUATOR_MOVE_DONE 确认上下电机"
                 + (movingDown ? "下降" : "回升")
-                + "真实到位，本地保护 " + waitSeconds + " 秒，steps=" + stepsValue
+                + "动作完成，本地保护 " + waitSeconds + " 秒，steps=" + stepsValue
                 + "，speed=" + speedRpm + "rpm"
         storageState = autoVisionLastText
         showStorageToast()
@@ -1174,18 +1174,20 @@ Rectangle {
      *   在 MP157 C++ 已确认收到 F4 ACTUATOR_MOVE_DONE 后推进自动流程。
      *
      * 主要流程：
-     *   1. 停止 Z 轴本地保护定时器，说明正常完成来自 F4 到位事件而不是固定 sleep。
+     *   1. 停止 Z 轴本地保护定时器，说明正常完成来自 F4 完成事件而不是固定 sleep。
      *   2. Z 下降完成后，先用传送带和左右轴继续复查/微调 ROI 中心。
      *   3. Z 回升完成后，才允许通知 F4/ESP32S3 机械臂抓取零件并进入称重、电感流程。
      *
      * 参数：
-     *   detail 是 C++ 返回的 ACK + EVENT_REPORT 诊断文本，必须包含 actuator-move-done。
+     *   detail 是 C++ 返回的 ACK + EVENT_REPORT 诊断文本，必须包含 actuator-move-done；
+     *   当 detail 包含 estimated-done 时，表示 F4 使用运动时间估算完成兜底。
      *
      * 返回值：
      *   true 表示当前阶段已处理；false 表示当前阶段不是 Z 轴完成等待。
      */
     function autoVisionHandleActuatorMoveDone(detail) {
         var eventText = String(detail || "")
+        var estimatedDone = eventText.indexOf("estimated-done") >= 0
 
         if (eventText.indexOf("actuator-move-timeout") >= 0) {
             autoVisionActuatorSettleTimer.stop()
@@ -1207,7 +1209,9 @@ Rectangle {
             autoVisionPendingZMoveSteps = 0
             autoVisionPendingZMoveSpeedRpm = 0
             autoVisionPendingZMoveDirection = 0
-            autoVisionLastText = "F4已确认Z轴下降真实到位，开始ROI复查并用传送带/左右轴微调：" + eventText
+            autoVisionLastText = (estimatedDone
+                    ? "F4估算Z轴下降完成，开始ROI复查并用传送带/左右轴微调："
+                    : "F4收到Z轴下降主动到位回包，开始ROI复查并用传送带/左右轴微调：") + eventText
             storageState = autoVisionLastText
             showStorageToast()
             autoVisionRequestFineTuneLocate()
@@ -1224,7 +1228,9 @@ Rectangle {
             autoVisionPendingZMoveDirection = 0
             autoVisionActuatorPhase = ""
             workflowState = "高度已恢复"
-            storageState = "F4已确认Z轴回升真实到位，开始通知F4/ESP32S3机械臂流程"
+            storageState = (estimatedDone
+                    ? "F4估算Z轴回升完成，开始通知F4/ESP32S3机械臂流程："
+                    : "F4收到Z轴回升主动到位回包，开始通知F4/ESP32S3机械臂流程：") + eventText
             showStorageToast()
             autoVisionStartF4ArmInspectionAfterZUp()
             return true
@@ -5740,7 +5746,7 @@ Rectangle {
 
         /*
          * onF4ActuatorCommandFinished 的作用：
-         *   接收 ACTUATOR_POS_MOVE 的真实到位结果或其它执行器命令 ACK/NACK，并按阶段推进。
+         *   接收 ACTUATOR_POS_MOVE 的完成事件结果或其它执行器命令 ACK/NACK，并按阶段推进。
          *
          * 参数：
          *   ok 对 ACTUATOR_POS_MOVE 表示已经收到 F4 ACTUATOR_MOVE_DONE；对其它命令表示 ACK 成功。
