@@ -226,6 +226,15 @@ static const quint8 BINARY_PROTOCOL_CMD_HEARTBEAT = 0x02U;
 /* 二进制称重标定命令：MP157 发送已知砝码克重，F407 调用 HX711 标定入口并返回 ACK/NACK。 */
 static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE = 0x30U;
 
+/* 机械臂任务命令：Z 轴回升完成后，MP157 请求 F4 通知 ESP32S3 把零件依次放到称重和电感模块。 */
+static const quint8 BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U;
+
+/* 模型完成命令：MP157 模型检测和 SD 卡保存完成后下发，F4 只缓存模型结果，不触发最终分拣。 */
+static const quint8 BINARY_PROTOCOL_CMD_MODEL_READY = 0x32U;
+
+/* 最终分拣命令：MP157 完整上传图片、模型、重量和电感数据后下发，F4 才通知 ESP32S3 放入对应盘。 */
+static const quint8 BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT = 0x33U;
+
 /* 二进制状态查询命令：F4 成功时返回 STATUS_REPORT，失败时返回 NACK。 */
 static const quint8 BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U;
 
@@ -255,6 +264,24 @@ static const quint8 BINARY_PROTOCOL_CMD_NACK = 0x81U;
 
 /* 二进制状态回包命令：F4 用固定 24 字节负载返回协议状态和传送带状态。 */
 static const quint8 BINARY_PROTOCOL_CMD_STATUS_REPORT = 0x82U;
+
+/* 二进制事件上报命令：F4 主动告诉 MP157 当前机械臂、称重或电感流程阶段。 */
+static const quint8 BINARY_PROTOCOL_CMD_EVENT_REPORT = 0x83U;
+
+/* 执行器位置运动真实到位事件：F4 只有收到张大头 Emm42 `[addr FD 9F 6B]` 后才允许发送。 */
+static const quint8 BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE = 0x14U;
+
+/* 执行器位置运动超时事件：Response 未配置、RX 接线异常、地址错误或堵转时由 F4 发送。 */
+static const quint8 BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT = 0x15U;
+
+/* 二进制称重结果命令：F4 读取 HX711 稳定结果后主动上报给 MP157。 */
+static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U;
+
+/* 二进制电感结果命令：F4 读取 LDC1614 电磁感应结果后主动上报给 MP157。 */
+static const quint8 BINARY_PROTOCOL_CMD_LDC_RESULT = 0x85U;
+
+/* 二进制整轮完成命令：F4 最终分拣完成后主动上报给 MP157，并等待 ACK。 */
+static const quint8 BINARY_PROTOCOL_CMD_CYCLE_DONE = 0x86U;
 
 /* 二进制故障上报命令：F4 用固定 16 字节负载返回 LDC、称重、电机等结构化错误。 */
 static const quint8 BINARY_PROTOCOL_CMD_FAULT_REPORT = 0x87U;
@@ -308,7 +335,8 @@ static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
  *   serialName 是 F4 侧串口归属，帮助现场确认 UART4 或 USART6 接线。
  *   address 是 Emm42 从机地址，也就是用户口语里的电机 ID 地址。
  *   minStep 是单次点动或闭环微调的最小步长，单位为 step。
- *   normalSpeedRpm 是常规运动速度，单位为 rpm，允许 0~5000 的现场任意整数配置。
+ *   normalSpeedRpm 是常规/对中运动速度，单位为 rpm，允许 0~5000 的现场任意整数配置。
+ *   scanSpeedRpm 是传送带专用上料扫描速度，单位为 rpm；零件尚未入画时 F4 用它驱动传送带。
  *   direction 是方向映射，1 表示正向，-1 表示反向，用于现场坐标越调越远时快速反转。
  *   zDownFixedSteps 是上下电机自动检测前下探的固定相对位置步数，单位为 step。
  *   zUpFixedSteps 是上下电机模型检测后回升的固定相对位置步数，单位为 step。
@@ -320,7 +348,8 @@ struct StepperMotorSettings
     QString serialName;
     int address = 1;
     int minStep = 10;
-    int normalSpeedRpm = 300;
+    int normalSpeedRpm = 40;
+    int scanSpeedRpm = 40;
     int direction = 1;
     quint32 zDownFixedSteps = 0U;
     quint32 zUpFixedSteps = 0U;
@@ -348,7 +377,8 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     beltMotor.serialName = QStringLiteral("UART4 PC10/PC11");
     beltMotor.address = 1;
     beltMotor.minStep = 20;
-    beltMotor.normalSpeedRpm = 300;
+    beltMotor.normalSpeedRpm = 40;
+    beltMotor.scanSpeedRpm = 40;
     beltMotor.direction = 1;
     motors.append(beltMotor);
 
@@ -359,6 +389,7 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraLateralMotor.address = 3;
     cameraLateralMotor.minStep = 5;
     cameraLateralMotor.normalSpeedRpm = 120;
+    cameraLateralMotor.scanSpeedRpm = 0;
     cameraLateralMotor.direction = 1;
     motors.append(cameraLateralMotor);
 
@@ -369,6 +400,7 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraZMotor.address = 2;
     cameraZMotor.minStep = 5;
     cameraZMotor.normalSpeedRpm = 80;
+    cameraZMotor.scanSpeedRpm = 0;
     cameraZMotor.direction = 1;
     cameraZMotor.zDownFixedSteps = 800U;
     cameraZMotor.zUpFixedSteps = 800U;
@@ -416,6 +448,7 @@ static QVariantMap stepperMotorToVariantMap(const StepperMotorSettings &motor, i
         .arg(motor.address, 2, 16, QLatin1Char('0')).toUpper());
     map.insert(QStringLiteral("minStep"), motor.minStep);
     map.insert(QStringLiteral("normalSpeedRpm"), motor.normalSpeedRpm);
+    map.insert(QStringLiteral("scanSpeedRpm"), motor.scanSpeedRpm);
     map.insert(QStringLiteral("direction"), motor.direction);
     map.insert(QStringLiteral("directionText"), stepperDirectionText(motor.direction));
     map.insert(QStringLiteral("zDownFixedSteps"), static_cast<double>(motor.zDownFixedSteps));
@@ -786,6 +819,180 @@ static bool isUploadStatusFailure(const QString &uploadStatus)
 }
 
 /*
+ * modelResultCodeFromCloudResult 的作用：
+ *   把云端 result 字符串映射为 MP157-F4 二进制协议里的最终结果枚举。
+ *
+ * 参数：
+ *   cloudResult 是云端记录 result，允许 good、bad、review、uncertain。
+ *
+ * 返回值：
+ *   1 表示 good，2 表示 bad，3 表示 review/uncertain，0 表示无法识别。
+ */
+static quint8 modelResultCodeFromCloudResult(const QString &cloudResult)
+{
+    const QString normalized = cloudResult.trimmed().toLower();
+
+    if (normalized == QStringLiteral("good")) {
+        return 1U;
+    }
+    if (normalized == QStringLiteral("bad")) {
+        return 2U;
+    }
+    if (normalized == QStringLiteral("review") || normalized == QStringLiteral("uncertain")) {
+        return 3U;
+    }
+    return 0U;
+}
+
+/*
+ * modelResultCodeFromText 的作用：
+ *   从模型 RESULT 行中解析 F4 需要缓存的模型结果枚举。
+ *
+ * 主要流程：
+ *   1. 优先读取 fused_result，因为它已经综合 MobileNetV3-Small 和 UNet。
+ *   2. 旧 RESULT 缺少 fused_result 时，回退读取 fused_status/status。
+ *   3. 无法识别时返回 0，让调用方拒绝下发 MODEL_READY。
+ */
+static quint8 modelResultCodeFromText(const QString &modelResultText)
+{
+    const QString fusedResult = uploadStatusTokenValue(modelResultText, QStringLiteral("fused_result"));
+    const quint8 cloudCode = modelResultCodeFromCloudResult(fusedResult);
+
+    if (cloudCode != 0U) {
+        return cloudCode;
+    }
+
+    const QString fusedStatus = uploadStatusTokenValue(modelResultText, QStringLiteral("fused_status")).toUpper();
+    const QString status = fusedStatus.isEmpty()
+        ? uploadStatusTokenValue(modelResultText, QStringLiteral("status")).toUpper()
+        : fusedStatus;
+
+    if (status == QStringLiteral("GOOD")) {
+        return 1U;
+    }
+    if (status == QStringLiteral("BAD")) {
+        return 2U;
+    }
+    if (status == QStringLiteral("REVIEW") || status == QStringLiteral("WAIT")) {
+        return 3U;
+    }
+    return 0U;
+}
+
+/*
+ * finalBinFromModelResult 的作用：
+ *   把模型/云端最终结果映射成机械臂分拣盘编号。
+ *
+ * 返回值：
+ *   1=良品盘，2=不良品盘，3=待复核盘，0=未知。
+ */
+static quint8 finalBinFromModelResult(quint8 modelResult)
+{
+    if (modelResult == 1U) {
+        return 1U;
+    }
+    if (modelResult == 2U) {
+        return 2U;
+    }
+    if (modelResult == 3U) {
+        return 3U;
+    }
+    return 0U;
+}
+
+/*
+ * confidencePercentFromModelText 的作用：
+ *   从 RESULT 行提取分类置信度并转换成 0~100 的整数百分比。
+ *
+ * 说明：
+ *   defect-classify 当前输出通常是 0~1 小数；兼容旧输出 0~100。
+ */
+static quint8 confidencePercentFromModelText(const QString &modelResultText)
+{
+    const QString confidenceText = uploadStatusTokenValue(modelResultText, QStringLiteral("confidence"));
+    bool ok = false;
+    double confidence = confidenceText.toDouble(&ok);
+
+    if (!ok) {
+        return 50U;
+    }
+
+    if (confidence <= 1.0) {
+        confidence *= 100.0;
+    }
+
+    return static_cast<quint8>(clampedInt(qRound(confidence), 0, 100));
+}
+
+/*
+ * partTypeCodeFromModelText 的作用：
+ *   把分类标签归一到 F4/ESP32S3 可使用的轻量零件类型编号。
+ *
+ * 返回值：
+ *   1=波形垫圈/历史 gasket，2=平垫圈 washer，3=弹性垫圈 splitwasher，0=未知。
+ */
+static quint8 partTypeCodeFromModelText(const QString &modelResultText)
+{
+    QString classLabel = uploadStatusTokenValue(modelResultText, QStringLiteral("class")).toLower();
+
+    classLabel.remove(QStringLiteral("_good"));
+    classLabel.remove(QStringLiteral("_bad"));
+    classLabel.remove(QStringLiteral("-good"));
+    classLabel.remove(QStringLiteral("-bad"));
+
+    if (classLabel == QStringLiteral("gasket") || classLabel == QStringLiteral("wave_washer")) {
+        return 1U;
+    }
+    if (classLabel == QStringLiteral("washer") || classLabel == QStringLiteral("flat_washer")) {
+        return 2U;
+    }
+    if (classLabel == QStringLiteral("splitwasher") || classLabel == QStringLiteral("split_washer")) {
+        return 3U;
+    }
+    return 0U;
+}
+
+/*
+ * defectTypeCodeFromModelText 的作用：
+ *   把模型类别中的缺陷关键词映射成 F4 侧保留缺陷类型编号。
+ *
+ * 返回值：
+ *   0=未知或无缺陷，1=分类/UNet 判坏，2=划痕，3=凹坑，4=污渍。
+ */
+static quint8 defectTypeCodeFromModelText(const QString &modelResultText)
+{
+    const QString classLabel = uploadStatusTokenValue(modelResultText, QStringLiteral("class")).toLower();
+    const quint8 modelResult = modelResultCodeFromText(modelResultText);
+
+    if (classLabel.contains(QStringLiteral("scratch"))) {
+        return 2U;
+    }
+    if (classLabel.contains(QStringLiteral("dent"))) {
+        return 3U;
+    }
+    if (classLabel.contains(QStringLiteral("stain"))) {
+        return 4U;
+    }
+    return modelResult == 2U ? 1U : 0U;
+}
+
+/*
+ * compactJsonString 的作用：
+ *   把一个 JSON 对象压缩成单行 UTF-8 文本，便于作为环境变量传给 defect-cos-upload。
+ *
+ * 参数：
+ *   object 是要传递给上传脚本的结构化上下文。
+ *
+ * 返回值：
+ *   返回无换行、无缩进的 JSON 字符串；空对象返回 "{}"。
+ */
+static QString compactJsonString(const QJsonObject &object)
+{
+    const QJsonDocument document(object);
+    return QString::fromUtf8(document.toJson(QJsonDocument::Compact));
+}
+
+/*
  * SetGstPipelineStateJob 的作用：
  *   把 GStreamer 管线状态切换放到 Qt Quick 渲染同步阶段执行。
  *
@@ -847,6 +1054,9 @@ private:
  *   jpgPath/pngPath/jpgSizeBytes/pngSizeBytes 是旧历史 JSON 兼容字段，新记录会同步写入 source/首张 annotated。
  *   uploadStatus 保存上传脚本返回的一行结果，成功和失败都要保留，便于追查云端问题。
  *   recordId/recordNo 是云端检测记录身份，用于和后台详情页、日志、COS 对象对账。
+ *   cloudResult/partCode/classLabel 保存云端重传所需的检测结果和零件身份，避免历史重发时重新猜测。
+ *   weightContextJson/ldcContextJson/f4FlowContextJson 保存 F4 传感器和机械臂流程上下文，上传失败后仍能完整重放本次记录。
+ *   decisionContextJson/visionContextJson 保存 MP157 判定和视觉模型上下文，历史重传时继续按原始检测证据上报。
  *   boardResultText 保存板端原始双模型结论，云端修正后仍用于追溯误判来源。
  *   cloudReviewResult/cloudReviewText/cloudReviewTime/cloudReviewOperator/cloudReviewSource 保存云端按钮回写的复核信息。
  */
@@ -866,6 +1076,14 @@ struct UploadHistoryEntry
     QString uploadStatus;
     QString recordId;
     QString recordNo;
+    QString cloudResult;
+    QString partCode;
+    QString classLabel;
+    QString weightContextJson;
+    QString ldcContextJson;
+    QString f4FlowContextJson;
+    QString decisionContextJson;
+    QString visionContextJson;
     QString boardResultText;
     QString cloudReviewResult;
     QString cloudReviewText;
@@ -1139,6 +1357,26 @@ public:
     }
 
     /*
+     * appendRecordAndReturnRow 的作用：
+     *   追加一条历史记录，并把追加后的行号返回给调用方。
+     *
+     * 主要流程：
+     *   1. 复用 appendRecord() 的插入、countChanged 和磁盘保存逻辑，避免维护两套写历史路径。
+     *   2. 追加完成后返回 count()-1，供自动检测完成后原地更新同一条记录的上传状态。
+     *
+     * 参数：
+     *   entry 是已经填好的本地检测历史记录。
+     *
+     * 返回值：
+     *   返回新记录所在行号；如果追加后模型为空，返回 -1。
+     */
+    int appendRecordAndReturnRow(const UploadHistoryEntry &entry)
+    {
+        appendRecord(entry);
+        return m_entries.isEmpty() ? -1 : (m_entries.size() - 1);
+    }
+
+    /*
      * removeRecord 的作用：
      *   删除 QML 指定的一条上传历史记录，并同步删除该记录对应的 JPG/PNG 图片文件。
      *
@@ -1198,6 +1436,10 @@ public:
      *   annotatedPaths 用于返回云端 file_kind=annotated 的结果图路径列表。
      *   classificationResult 用于返回分类模型 RESULT 行，可为空。
      *   segmentationResult 用于返回 UNet 分割模型 RESULT_SEG 行，可为空。
+     *   cloudResult 用于返回创建云端记录时使用的 good/bad/review，旧记录为空时由调用方重新综合。
+     *   partCode/classLabel 用于返回零件身份和模型原始标签，避免重传时按当前配置重新猜测。
+     *   weightContextJson/ldcContextJson/f4FlowContextJson/decisionContextJson/visionContextJson
+     *   用于返回第一次自动检测时已经保存的完整上下文，保证断网重传仍是同一条检测证据。
      *   errorText 用于返回中文失败原因。
      *
      * 返回值：
@@ -1208,6 +1450,14 @@ public:
                         QStringList *annotatedPaths,
                         QString *classificationResult,
                         QString *segmentationResult,
+                        QString *cloudResult,
+                        QString *partCode,
+                        QString *classLabel,
+                        QString *weightContextJson,
+                        QString *ldcContextJson,
+                        QString *f4FlowContextJson,
+                        QString *decisionContextJson,
+                        QString *visionContextJson,
                         QString *errorText) const
     {
         if (row < 0 || row >= m_entries.size()) {
@@ -1247,7 +1497,91 @@ public:
         if (segmentationResult) {
             *segmentationResult = entry.segmentationResult;
         }
+        if (cloudResult) {
+            *cloudResult = entry.cloudResult;
+        }
+        if (partCode) {
+            *partCode = entry.partCode;
+        }
+        if (classLabel) {
+            *classLabel = entry.classLabel;
+        }
+        if (weightContextJson) {
+            *weightContextJson = entry.weightContextJson;
+        }
+        if (ldcContextJson) {
+            *ldcContextJson = entry.ldcContextJson;
+        }
+        if (f4FlowContextJson) {
+            *f4FlowContextJson = entry.f4FlowContextJson;
+        }
+        if (decisionContextJson) {
+            *decisionContextJson = entry.decisionContextJson;
+        }
+        if (visionContextJson) {
+            *visionContextJson = entry.visionContextJson;
+        }
 
+        return true;
+    }
+
+    /*
+     * updateRecordInspectionContexts 的作用：
+     *   在自动流程收齐称重、电感和 F4/ESP32S3 流程上下文后，先把这些证据写回同一条历史记录。
+     *
+     * 主要流程：
+     *   1. 校验 row，避免上传线程还没启动时历史记录已经被删除。
+     *   2. 写入云端结果、零件身份、称重、电感、F4 流程、视觉和决策上下文。
+     *   3. 立即保存到每日 `upload_history_YYYYMMDD.json`，保证后续网络失败也能从历史页完整重传。
+     *   4. 保存失败时回滚旧记录，避免内存和 SD 卡 JSON 状态不一致。
+     *
+     * 参数：
+     *   row 是当前自动检测对应的历史记录行号。
+     *   后续字符串参数都是本次云端上传需要的上下文字段，允许为空，空值表示旧记录或该阶段未产生。
+     *   errorText 用于返回中文失败原因。
+     *
+     * 返回值：
+     *   写入并 fsync 成功返回 true；索引非法或写盘失败返回 false。
+     */
+    bool updateRecordInspectionContexts(int row,
+                                        const QString &cloudResult,
+                                        const QString &partCode,
+                                        const QString &classLabel,
+                                        const QString &weightContextJson,
+                                        const QString &ldcContextJson,
+                                        const QString &f4FlowContextJson,
+                                        const QString &decisionContextJson,
+                                        const QString &visionContextJson,
+                                        QString *errorText)
+    {
+        if (row < 0 || row >= m_entries.size()) {
+            if (errorText) {
+                *errorText = QStringLiteral("记录不存在");
+            }
+            return false;
+        }
+
+        const UploadHistoryEntry oldEntry = m_entries.at(row);
+
+        m_entries[row].cloudResult = cloudResult;
+        m_entries[row].partCode = partCode;
+        m_entries[row].classLabel = classLabel;
+        m_entries[row].weightContextJson = weightContextJson;
+        m_entries[row].ldcContextJson = ldcContextJson;
+        m_entries[row].f4FlowContextJson = f4FlowContextJson;
+        m_entries[row].decisionContextJson = decisionContextJson;
+        m_entries[row].visionContextJson = visionContextJson;
+
+        if (!saveToDisk()) {
+            m_entries[row] = oldEntry;
+            emit dataChanged(index(row, 0), index(row, 0));
+            if (errorText) {
+                *errorText = QStringLiteral("历史完整上下文写入失败");
+            }
+            return false;
+        }
+
+        emit dataChanged(index(row, 0), index(row, 0));
         return true;
     }
 
@@ -1739,6 +2073,14 @@ private:
         object.insert(QStringLiteral("upload_status"), entry.uploadStatus);
         object.insert(QStringLiteral("record_id"), entry.recordId);
         object.insert(QStringLiteral("record_no"), entry.recordNo);
+        object.insert(QStringLiteral("cloud_result"), entry.cloudResult);
+        object.insert(QStringLiteral("part_code"), entry.partCode);
+        object.insert(QStringLiteral("class_label"), entry.classLabel);
+        object.insert(QStringLiteral("weight_context_json"), entry.weightContextJson);
+        object.insert(QStringLiteral("ldc_context_json"), entry.ldcContextJson);
+        object.insert(QStringLiteral("f4_flow_context_json"), entry.f4FlowContextJson);
+        object.insert(QStringLiteral("decision_context_json"), entry.decisionContextJson);
+        object.insert(QStringLiteral("vision_context_json"), entry.visionContextJson);
         object.insert(QStringLiteral("board_result_text"), normalizedBoardResultText(entry));
         object.insert(QStringLiteral("cloud_review_result"), entry.cloudReviewResult);
         object.insert(QStringLiteral("cloud_review_text"), entry.cloudReviewText);
@@ -1789,6 +2131,14 @@ private:
         entry.uploadStatus = object.value(QStringLiteral("upload_status")).toString();
         entry.recordId = object.value(QStringLiteral("record_id")).toString();
         entry.recordNo = object.value(QStringLiteral("record_no")).toString();
+        entry.cloudResult = object.value(QStringLiteral("cloud_result")).toString();
+        entry.partCode = object.value(QStringLiteral("part_code")).toString();
+        entry.classLabel = object.value(QStringLiteral("class_label")).toString();
+        entry.weightContextJson = object.value(QStringLiteral("weight_context_json")).toString();
+        entry.ldcContextJson = object.value(QStringLiteral("ldc_context_json")).toString();
+        entry.f4FlowContextJson = object.value(QStringLiteral("f4_flow_context_json")).toString();
+        entry.decisionContextJson = object.value(QStringLiteral("decision_context_json")).toString();
+        entry.visionContextJson = object.value(QStringLiteral("vision_context_json")).toString();
         entry.boardResultText = object.value(QStringLiteral("board_result_text")).toString();
         entry.cloudReviewResult = object.value(QStringLiteral("cloud_review_result")).toString();
         entry.cloudReviewText = object.value(QStringLiteral("cloud_review_text")).toString();
@@ -1877,6 +2227,14 @@ private:
         map.insert(QStringLiteral("uploadStatus"), entry.uploadStatus);
         map.insert(QStringLiteral("recordId"), entry.recordId);
         map.insert(QStringLiteral("recordNo"), entry.recordNo);
+        map.insert(QStringLiteral("cloudResult"), entry.cloudResult);
+        map.insert(QStringLiteral("partCode"), entry.partCode);
+        map.insert(QStringLiteral("classLabel"), entry.classLabel);
+        map.insert(QStringLiteral("weightContextJson"), entry.weightContextJson);
+        map.insert(QStringLiteral("ldcContextJson"), entry.ldcContextJson);
+        map.insert(QStringLiteral("f4FlowContextJson"), entry.f4FlowContextJson);
+        map.insert(QStringLiteral("decisionContextJson"), entry.decisionContextJson);
+        map.insert(QStringLiteral("visionContextJson"), entry.visionContextJson);
         map.insert(QStringLiteral("boardResultText"), normalizedBoardResultText(entry));
         map.insert(QStringLiteral("cloudReviewResult"), entry.cloudReviewResult);
         map.insert(QStringLiteral("cloudReviewText"), entry.cloudReviewText);
@@ -3497,7 +3855,7 @@ public:
      *   返回三台步进电机当前参数，供 QML 弹窗按页展示。
      *
      * 返回值：
-     *   返回 QVariantList；每个元素包含 name/address/minStep/normalSpeedRpm/direction 等字段。
+     *   返回 QVariantList；每个元素包含 name/address/minStep/normalSpeedRpm/scanSpeedRpm/direction 等字段。
      */
     QVariantList stepperMotorSettings() const
     {
@@ -3645,7 +4003,7 @@ public:
      *
      * 参数：
      *   index 是弹窗页序号，0=传送带，1=摄像头左右，2=摄像头上下。
-     *   key 是字段名，支持 address/minStep/normalSpeedRpm/direction。
+     *   key 是字段名，支持 address/minStep/normalSpeedRpm/scanSpeedRpm/direction。
      *   value 是字段新值，函数内部会再次限幅。
      *
      * 返回值：
@@ -3667,6 +4025,8 @@ public:
             motor.minStep = value;
         } else if (key == QStringLiteral("normalSpeedRpm")) {
             motor.normalSpeedRpm = value;
+        } else if (key == QStringLiteral("scanSpeedRpm")) {
+            motor.scanSpeedRpm = value;
         } else if (key == QStringLiteral("direction")) {
             motor.direction = value >= 0 ? 1 : -1;
         } else {
@@ -3793,6 +4153,8 @@ public:
                 motorObject.value(QStringLiteral("minStep")).toInt(motor.minStep));
             motor.normalSpeedRpm = motorObject.value(QStringLiteral("normal_speed_rpm")).toInt(
                 motorObject.value(QStringLiteral("normalSpeedRpm")).toInt(motor.normalSpeedRpm));
+            motor.scanSpeedRpm = motorObject.value(QStringLiteral("scan_speed_rpm")).toInt(
+                motorObject.value(QStringLiteral("scanSpeedRpm")).toInt(motor.normalSpeedRpm));
             motor.direction = motorObject.value(QStringLiteral("direction")).toInt(motor.direction);
             motor.zDownFixedSteps = clampedUInt32FromDouble(
                 motorObject.value(QStringLiteral("z_down_fixed_steps")).toDouble(
@@ -3855,6 +4217,7 @@ public:
             motorObject.insert(QStringLiteral("address"), motor.address);
             motorObject.insert(QStringLiteral("min_step"), motor.minStep);
             motorObject.insert(QStringLiteral("normal_speed_rpm"), motor.normalSpeedRpm);
+            motorObject.insert(QStringLiteral("scan_speed_rpm"), motor.scanSpeedRpm);
             motorObject.insert(QStringLiteral("direction"), motor.direction);
             motorObject.insert(QStringLiteral("z_down_fixed_steps"), static_cast<double>(motor.zDownFixedSteps));
             motorObject.insert(QStringLiteral("z_up_fixed_steps"), static_cast<double>(motor.zUpFixedSteps));
@@ -3964,7 +4327,7 @@ private:
      *
      * 主要流程：
      *   1. 以 defaultStepperMotorSettings() 为基准，确保始终只有三台已知电机。
-     *   2. 只继承用户可调的 address/minStep/normalSpeedRpm/direction，不允许 JSON 改写 name/role/serialName。
+     *   2. 只继承用户可调的 address/minStep/normalSpeedRpm/scanSpeedRpm/direction，不允许 JSON 改写 name/role/serialName。
      *   3. 对地址、步长、速度和方向做统一限幅；速度允许 0~5000，0 表示配置为常规停止速度。
      *
      * 参数：
@@ -3985,6 +4348,7 @@ private:
             motor.address = clampedInt(source.address, 1, 247);
             motor.minStep = clampedInt(source.minStep, 1, 10000);
             motor.normalSpeedRpm = clampedInt(source.normalSpeedRpm, 0, 5000);
+            motor.scanSpeedRpm = clampedInt(source.scanSpeedRpm, 0, 5000);
             motor.direction = source.direction >= 0 ? 1 : -1;
             motor.zDownFixedSteps = source.zDownFixedSteps;
             motor.zUpFixedSteps = source.zUpFixedSteps;
@@ -4018,6 +4382,7 @@ private:
             if (leftMotor.address != rightMotor.address
                     || leftMotor.minStep != rightMotor.minStep
                     || leftMotor.normalSpeedRpm != rightMotor.normalSpeedRpm
+                    || leftMotor.scanSpeedRpm != rightMotor.scanSpeedRpm
                     || leftMotor.direction != rightMotor.direction
                     || leftMotor.zDownFixedSteps != rightMotor.zDownFixedSteps
                     || leftMotor.zUpFixedSteps != rightMotor.zUpFixedSteps) {
@@ -4163,10 +4528,12 @@ public:
           m_logDir(QString::fromLatin1(DEFAULT_SDCARD_LOG_DIR)),
           m_historyModel(nullptr),
           m_detectSettingsController(nullptr),
+          m_latestDetectHistoryRow(-1),
           m_appendHistoryInSave(true),
           m_saveInProgress(false),
           m_detectInProgress(false),
-          m_retryUploadInProgress(false)
+          m_retryUploadInProgress(false),
+          m_hasLatestDetectBundle(false)
     {
     }
 
@@ -4606,7 +4973,13 @@ public:
         connect(workerThread, &QThread::finished, this, [this, workerResult, workerBundle]() {
             if (workerResult->startsWith(QStringLiteral("RESULT "))
                     && !workerBundle->sourcePath.isEmpty()) {
-                appendDetectHistoryRecord(*workerBundle);
+                m_latestDetectHistoryRow = appendDetectHistoryRecord(*workerBundle);
+                m_latestDetectBundle = *workerBundle;
+                m_hasLatestDetectBundle = true;
+                qInfo() << "detect latest bundle cached"
+                        << "row" << m_latestDetectHistoryRow
+                        << "source" << m_latestDetectBundle.sourcePath
+                        << "annotated" << m_latestDetectBundle.annotatedPaths.size();
             }
 
             setDetectInProgress(false);
@@ -4646,7 +5019,9 @@ public:
 
         if (result.startsWith(QStringLiteral("RESULT "))
                 && !bundle.sourcePath.isEmpty()) {
-            appendDetectHistoryRecord(bundle);
+            m_latestDetectHistoryRow = appendDetectHistoryRecord(bundle);
+            m_latestDetectBundle = bundle;
+            m_hasLatestDetectBundle = true;
         }
 
         return result;
@@ -4806,9 +5181,10 @@ public:
      *
      * 主要流程：
      *   1. 校验历史模型和 row，读取该记录原始图片、结果图和分类结果。
-     *   2. 根据分类 RESULT 恢复云端 good/bad/review 判定；旧记录缺少模型结果时保守使用 review。
-     *   3. 后台线程复用 defect-cos-upload 执行网络上传，避免阻塞 Qt 主线程。
-     *   4. 上传结束后回到主线程原地更新同一条历史记录的 upload_status、record_id 和 record_no。
+     *   2. 优先读取历史中保存的 cloud_result、零件身份和传感器上下文，保证断网重传仍是同一条完整记录。
+     *   3. 旧记录缺少完整上下文时，根据分类 RESULT 恢复云端 good/bad/review 判定，证据不足时保守使用 review。
+     *   4. 后台线程复用 defect-cos-upload 执行网络上传，避免阻塞 Qt 主线程。
+     *   5. 上传结束后回到主线程原地更新同一条历史记录的 upload_status、record_id 和 record_no。
      *
      * 参数：
      *   row 是 QML 当前详情页对应的历史记录索引。
@@ -4822,6 +5198,14 @@ public:
         QStringList annotatedPaths;
         QString classificationResult;
         QString segmentationResult;
+        QString storedCloudResult;
+        QString storedPartCode;
+        QString storedClassLabel;
+        QString weightContextJson;
+        QString ldcContextJson;
+        QString f4FlowContextJson;
+        QString decisionContextJson;
+        QString visionContextJson;
         QString errorText;
 
         if (m_retryUploadInProgress) {
@@ -4840,6 +5224,14 @@ public:
                                             &annotatedPaths,
                                             &classificationResult,
                                             &segmentationResult,
+                                            &storedCloudResult,
+                                            &storedPartCode,
+                                            &storedClassLabel,
+                                            &weightContextJson,
+                                            &ldcContextJson,
+                                            &f4FlowContextJson,
+                                            &decisionContextJson,
+                                            &visionContextJson,
                                             &errorText)) {
             emit retryUploadFinished(row, QStringLiteral("重新发送失败：") + errorText);
             return;
@@ -4853,7 +5245,12 @@ public:
             fusedResultFromModelResults(classificationResult, segmentationResult, detectSettings());
 
         /* cloudResult 保存云端 records.result 字段，必须来自综合判定而不是单个分类模型。 */
-        const QString cloudResult = cloudResultFromFusedResult(fusedResult);
+        const QString fallbackCloudResult = cloudResultFromFusedResult(fusedResult);
+        const QString cloudResult = (storedCloudResult == QStringLiteral("good")
+                                     || storedCloudResult == QStringLiteral("bad")
+                                     || storedCloudResult == QStringLiteral("review"))
+            ? storedCloudResult
+            : fallbackCloudResult;
 
         /* workerResult 保存后台上传脚本返回的完整中文状态，线程结束后主线程读取并更新历史记录。 */
         const QSharedPointer<QString> workerResult(new QString(QStringLiteral("上传失败：后台重新发送线程没有返回结果")));
@@ -4864,20 +5261,34 @@ public:
                                                  annotatedPaths,
                                                  classificationResult,
                                                  cloudResult,
+                                                 storedPartCode,
+                                                 storedClassLabel,
+                                                 weightContextJson,
+                                                 ldcContextJson,
+                                                 f4FlowContextJson,
+                                                 decisionContextJson,
+                                                 visionContextJson,
                                                  workerResult]() {
             CameraStorageController workerController;
 
             workerController.setAppendHistoryInSave(false);
-            const QString retryPartCode =
-                workerController.partCodeFromClassificationResult(classificationResult);
-            const QString retryClassLabel =
-                workerController.parseTokenValue(classificationResult, QStringLiteral("class"));
+            const QString retryPartCode = storedPartCode.trimmed().isEmpty()
+                ? workerController.partCodeFromClassificationResult(classificationResult)
+                : storedPartCode.trimmed();
+            const QString retryClassLabel = storedClassLabel.trimmed().isEmpty()
+                ? workerController.parseTokenValue(classificationResult, QStringLiteral("class"))
+                : storedClassLabel.trimmed();
 
             *workerResult = workerController.uploadDetectImagesToCos(sourcePath,
                                                                      annotatedPaths,
                                                                      cloudResult,
                                                                      retryPartCode,
-                                                                     retryClassLabel);
+                                                                     retryClassLabel,
+                                                                     weightContextJson,
+                                                                     ldcContextJson,
+                                                                     f4FlowContextJson,
+                                                                     decisionContextJson,
+                                                                     visionContextJson);
         });
 
         if (workerThread == nullptr) {
@@ -4920,6 +5331,149 @@ public:
         workerThread->start();
     }
 
+    /*
+     * uploadCompletedInspectionBundle 的作用：
+     *   自动流程在收齐模型、称重、电感和 F4/ESP32 流程上下文后，一次性上传完整检测记录。
+     *
+     * 主要流程：
+     *   1. 校验最近一次模型检测 bundle 已经保存到 SD 卡，且没有其它上传线程正在运行。
+     *   2. 根据 bundle 中的分类、UNet 和参数快照生成云端 `vision_context` 与 `decision_context`。
+     *   3. 把 F4 主动上报转换出的称重、电感和流程 JSON 通过环境变量传给 `defect-cos-upload`。
+     *   4. 上传完成后回到主线程，更新刚才那条本地历史记录的 upload_status、record_id 和 record_no。
+     *
+     * 参数：
+     *   weightContextJson 是 `WEIGHT_RESULT` 解析后的称重上下文 JSON。
+     *   ldcContextJson 是 `LDC_RESULT` 解析后的电感上下文 JSON。
+     *   f4FlowContextJson 是 F4/ESP32 阶段事件和完成状态上下文 JSON。
+     *
+     * 返回值：
+     *   true 表示后台完整上传任务已启动；false 表示缺少本地检测结果或当前已有上传任务。
+     */
+    Q_INVOKABLE bool uploadCompletedInspectionBundle(const QString &weightContextJson,
+                                                     const QString &ldcContextJson,
+                                                     const QString &f4FlowContextJson)
+    {
+        if (m_retryUploadInProgress) {
+            emit completedInspectionBundleUploaded(false,
+                                                   QStringLiteral("完整上传失败：已有上传任务正在运行"),
+                                                   QStringLiteral("review"));
+            return false;
+        }
+
+        if (!m_hasLatestDetectBundle || m_latestDetectBundle.sourcePath.isEmpty()) {
+            emit completedInspectionBundleUploaded(false,
+                                                   QStringLiteral("完整上传失败：没有可上传的最近检测结果"),
+                                                   QStringLiteral("review"));
+            return false;
+        }
+
+        const DetectResultBundle bundle = m_latestDetectBundle;
+        const int historyRow = m_latestDetectHistoryRow;
+        const QString decisionContextJson = buildDecisionContextJson(bundle);
+        const QString visionContextJson = buildVisionContextJson(bundle);
+        const FusedDetectResult fusedResult =
+            fusedResultFromModelResults(bundle.classificationResult,
+                                        bundle.segmentationResult,
+                                        bundle.settings);
+        const QString cloudResult = cloudResultFromFusedResult(fusedResult);
+        const QString partCode = partCodeFromClassificationResult(bundle.classificationResult);
+        const QString classLabel = parseTokenValue(bundle.classificationResult, QStringLiteral("class"));
+        QString persistError;
+
+        if (m_historyModel == nullptr || historyRow < 0) {
+            emit completedInspectionBundleUploaded(false,
+                                                   QStringLiteral("完整上传失败：没有可写入完整上下文的历史记录"),
+                                                   cloudResult);
+            return false;
+        }
+
+        const bool contextPersisted = m_historyModel->updateRecordInspectionContexts(historyRow,
+                                                                                     cloudResult,
+                                                                                     partCode,
+                                                                                     classLabel,
+                                                                                     weightContextJson,
+                                                                                     ldcContextJson,
+                                                                                     f4FlowContextJson,
+                                                                                     decisionContextJson,
+                                                                                     visionContextJson,
+                                                                                     &persistError);
+        if (!contextPersisted) {
+            qWarning() << "completed inspection context persist failed before upload" << persistError;
+            emit completedInspectionBundleUploaded(false,
+                                                   QStringLiteral("完整上传失败：") + persistError,
+                                                   cloudResult);
+            return false;
+        }
+
+        setRetryUploadInProgress(true);
+
+        const QSharedPointer<QString> workerResult(new QString(QStringLiteral("上传失败：完整自动检测上传线程没有返回结果")));
+        QThread *workerThread = QThread::create([bundle,
+                                                 cloudResult,
+                                                 partCode,
+                                                 classLabel,
+                                                 weightContextJson,
+                                                 ldcContextJson,
+                                                 f4FlowContextJson,
+                                                 decisionContextJson,
+                                                 visionContextJson,
+                                                 workerResult]() {
+            CameraStorageController workerController;
+
+            workerController.setAppendHistoryInSave(false);
+            *workerResult = workerController.uploadDetectImagesToCos(bundle.sourcePath,
+                                                                     bundle.annotatedPaths,
+                                                                     cloudResult,
+                                                                     partCode,
+                                                                     classLabel,
+                                                                     weightContextJson,
+                                                                     ldcContextJson,
+                                                                     f4FlowContextJson,
+                                                                     decisionContextJson,
+                                                                     visionContextJson);
+        });
+
+        if (workerThread == nullptr) {
+            setRetryUploadInProgress(false);
+            emit completedInspectionBundleUploaded(false,
+                                                   QStringLiteral("完整上传失败：无法创建后台上传线程"),
+                                                   cloudResult);
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, this, [this, workerResult, historyRow, cloudResult]() {
+            QString resultText = *workerResult;
+            const QString recordId = parseTokenValue(resultText, QStringLiteral("record_id"));
+            const QString recordNo = parseTokenValue(resultText, QStringLiteral("record_no"));
+            const QString compactStatus = compactUploadStatus(resultText);
+            QString historyError;
+            bool historyUpdated = true;
+
+            if (m_historyModel != nullptr && historyRow >= 0) {
+                historyUpdated = m_historyModel->updateRecordUploadResult(historyRow,
+                                                                          compactStatus,
+                                                                          recordId,
+                                                                          recordNo,
+                                                                          &historyError);
+            }
+
+            if (!historyUpdated) {
+                resultText += QStringLiteral(" history_update_error=") + historyError;
+                qWarning() << "completed inspection upload history update failed" << historyError;
+            }
+
+            setRetryUploadInProgress(false);
+            emit completedInspectionBundleUploaded(isUploadStatusSuccess(*workerResult),
+                                                   resultText,
+                                                   cloudResult);
+        }, Qt::QueuedConnection);
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+
+        workerThread->start();
+        return true;
+    }
+
 signals:
     /* saveInProgressChanged 在后台保存开始或结束时通知 QML 刷新按钮状态。 */
     void saveInProgressChanged();
@@ -4944,6 +5498,9 @@ signals:
 
     /* retryUploadFinished 在历史图片重新发送结束后发送 row 和结果文本，QML 用它刷新当前详情页。 */
     void retryUploadFinished(int row, const QString &resultText);
+
+    /* completedInspectionBundleUploaded 在自动流程完整上传结束后通知 QML，再由 QML 下发 FINAL_SORT_RESULT。 */
+    void completedInspectionBundleUploaded(bool ok, const QString &resultText, const QString &cloudResult);
 
 private:
     /*
@@ -5548,6 +6105,110 @@ private:
     }
 
     /*
+     * buildVisionContextJson 的作用：
+     *   把最近一次本地模型检测结果转换成云端 `vision_context` JSON。
+     *
+     * 主要流程：
+     *   1. 保存 source/annotated 本地路径，便于云端记录和板端 SD 卡文件对应。
+     *   2. 保存 MobileNetV3-Small 的 top1 标签、状态和置信度。
+     *   3. 保存 UNet 的缺陷像素、阈值、结果图和推理耗时。
+     *
+     * 参数：
+     *   bundle 是 detectCurrentFrameOnce() 产出的本地检测结果集合。
+     *
+     * 返回值：
+     *   返回压缩 JSON 字符串；字段缺失时写空字符串或 0，避免上传脚本解析失败。
+     */
+    QString buildVisionContextJson(const DetectResultBundle &bundle) const
+    {
+        QJsonArray annotatedFiles;
+        for (int i = 0; i < bundle.annotatedPaths.size(); ++i) {
+            QJsonObject image;
+
+            image.insert(QStringLiteral("path"), bundle.annotatedPaths.at(i));
+            image.insert(QStringLiteral("label"),
+                         i < bundle.annotatedLabels.size()
+                         ? bundle.annotatedLabels.at(i)
+                         : QStringLiteral("annotated"));
+            annotatedFiles.append(image);
+        }
+
+        QJsonObject mobileNet;
+        mobileNet.insert(QStringLiteral("model_name"), QStringLiteral("MobileNetV3-Small"));
+        mobileNet.insert(QStringLiteral("status"), parseTokenValue(bundle.classificationResult, QStringLiteral("status")));
+        mobileNet.insert(QStringLiteral("top1_label"), parseTokenValue(bundle.classificationResult, QStringLiteral("class")));
+        mobileNet.insert(QStringLiteral("top1_score"), parseTokenValue(bundle.classificationResult, QStringLiteral("confidence")).toDouble());
+        mobileNet.insert(QStringLiteral("time_ms"), parseTokenValue(bundle.classificationResult, QStringLiteral("time_ms")).toInt());
+        mobileNet.insert(QStringLiteral("raw_result"), bundle.classificationResult);
+
+        QJsonObject unet;
+        unet.insert(QStringLiteral("model_name"), QStringLiteral("UNet"));
+        unet.insert(QStringLiteral("status"), parseTokenValue(bundle.segmentationResult, QStringLiteral("status")));
+        unet.insert(QStringLiteral("threshold"), 0.5);
+        unet.insert(QStringLiteral("min_defect_pixels"), bundle.settings.segmentMinPixels);
+        unet.insert(QStringLiteral("defect_pixels"), parseTokenValue(bundle.segmentationResult, QStringLiteral("defect_pixels")).toInt());
+        unet.insert(QStringLiteral("time_ms"), parseTokenValue(bundle.segmentationResult, QStringLiteral("time_ms")).toInt());
+        unet.insert(QStringLiteral("raw_path"), parseTokenValue(bundle.segmentationResult, QStringLiteral("raw_path")));
+        unet.insert(QStringLiteral("overlay_path"), parseTokenValue(bundle.segmentationResult, QStringLiteral("overlay_path")));
+        unet.insert(QStringLiteral("mask_path"), parseTokenValue(bundle.segmentationResult, QStringLiteral("mask_path")));
+        unet.insert(QStringLiteral("raw_result"), bundle.segmentationResult);
+
+        QJsonObject roi;
+        roi.insert(QStringLiteral("size_px"), bundle.settings.roiSize);
+        roi.insert(QStringLiteral("source"), QStringLiteral("center_crop"));
+
+        QJsonObject context;
+        context.insert(QStringLiteral("source_path"), bundle.sourcePath);
+        context.insert(QStringLiteral("annotated_files"), annotatedFiles);
+        context.insert(QStringLiteral("roi"), roi);
+        context.insert(QStringLiteral("mobilenetv3_small"), mobileNet);
+        context.insert(QStringLiteral("unet"), unet);
+        return compactJsonString(context);
+    }
+
+    /*
+     * buildDecisionContextJson 的作用：
+     *   把分类、UNet 和参数阈值转换成云端 `decision_context` JSON。
+     *
+     * 主要流程：
+     *   1. 复用 fusedResultFromModelResults() 保证 UI、历史和云端最终结果一致。
+     *   2. 记录分类阈值、复核阈值、UNet 最小缺陷像素和模型耗时。
+     *   3. 明确本次上传发生在 F4 称重/电感完成之后，便于云端追溯自动流程时序。
+     *
+     * 参数：
+     *   bundle 是本次检测的本地缓存。
+     *
+     * 返回值：
+     *   返回压缩 JSON 字符串。
+     */
+    QString buildDecisionContextJson(const DetectResultBundle &bundle) const
+    {
+        const FusedDetectResult fusedResult =
+            fusedResultFromModelResults(bundle.classificationResult,
+                                        bundle.segmentationResult,
+                                        bundle.settings);
+        const int classifyMs = parseTokenValue(bundle.classificationResult, QStringLiteral("time_ms")).toInt();
+        const int segmentMs = parseTokenValue(bundle.segmentationResult, QStringLiteral("time_ms")).toInt();
+
+        QJsonObject context;
+        context.insert(QStringLiteral("pipeline"), QStringLiteral("UNet + MobileNetV3-Small"));
+        context.insert(QStringLiteral("decision_rule"), QStringLiteral("bad if classification or UNet reaches defect threshold; review if confidence or sensor context is incomplete"));
+        context.insert(QStringLiteral("result"), cloudResultFromFusedResult(fusedResult));
+        context.insert(QStringLiteral("ui_status"), uiStatusFromFusedResult(fusedResult));
+        context.insert(QStringLiteral("need_ai_review"), cloudResultFromFusedResult(fusedResult) == QStringLiteral("review"));
+        context.insert(QStringLiteral("decision_reason"), fusedResult.reason);
+        context.insert(QStringLiteral("classification_threshold"), bundle.settings.modelThreshold);
+        context.insert(QStringLiteral("classification_review_threshold"), bundle.settings.reviewThreshold);
+        context.insert(QStringLiteral("unet_threshold"), 0.5);
+        context.insert(QStringLiteral("unet_min_defect_pixels"), bundle.settings.segmentMinPixels);
+        context.insert(QStringLiteral("classification_ms"), classifyMs);
+        context.insert(QStringLiteral("unet_ms"), segmentMs);
+        context.insert(QStringLiteral("cycle_ms"), classifyMs + segmentMs);
+        context.insert(QStringLiteral("upload_gate"), QStringLiteral("after_weight_and_ldc"));
+        return compactJsonString(context);
+    }
+
+    /*
      * segmentationHasDefect 的作用：
      *   判断 defect-segment 的 RESULT_SEG 行是否输出了非背景缺陷像素。
      *
@@ -5802,11 +6463,11 @@ private:
      * 返回值：
      *   无返回值；没有历史模型时只输出日志。
      */
-    void appendDetectHistoryRecord(const DetectResultBundle &bundle)
+    int appendDetectHistoryRecord(const DetectResultBundle &bundle)
     {
         if (m_historyModel == nullptr) {
             qWarning() << "detect history model missing, skip append";
-            return;
+            return -1;
         }
 
         UploadHistoryEntry entry;
@@ -5815,6 +6476,7 @@ private:
             fusedResultFromModelResults(bundle.classificationResult,
                                         bundle.segmentationResult,
                                         bundle.settings);
+        const QString cloudResult = cloudResultFromFusedResult(fusedResult);
 
         entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
         entry.resultText = historyTextFromFusedResult(fusedResult);
@@ -5836,6 +6498,11 @@ private:
         entry.recordId = parseTokenValue(bundle.uploadResult, QStringLiteral("record_id"));
         entry.recordNo = parseTokenValue(bundle.uploadResult, QStringLiteral("record_no"));
         entry.uploadStatus = compactUploadStatus(bundle.uploadResult);
+        entry.cloudResult = cloudResult;
+        entry.partCode = partCodeFromClassificationResult(bundle.classificationResult);
+        entry.classLabel = parseTokenValue(bundle.classificationResult, QStringLiteral("class"));
+        entry.decisionContextJson = buildDecisionContextJson(bundle);
+        entry.visionContextJson = buildVisionContextJson(bundle);
         entry.sourceSizeBytes = sourceInfo.exists() ? sourceInfo.size() : 0;
         entry.jpgSizeBytes = entry.sourceSizeBytes;
 
@@ -5849,7 +6516,7 @@ private:
             }
         }
 
-        m_historyModel->appendRecord(entry);
+        return m_historyModel->appendRecordAndReturnRow(entry);
     }
 
     /*
@@ -5969,7 +6636,8 @@ private:
      *   3. 通过 CLOUD_RESULT 把本次模型 GOOD/BAD/REVIEW 显式传给上传脚本。
      *   4. 通过 CLOUD_PART_CODE 把本次零件类型传给上传脚本；好坏后缀已提前剥离。
      *   5. 通过 CLOUD_CLASS_LABEL 保留模型原始标签，便于云端排查零件映射。
-     *   6. 捕获 stdout/stderr，返回适合界面提示和历史记录的一行结果。
+     *   6. 自动流程收齐 F4 称重/电感后，可额外通过 CLOUD_*_CONTEXT 传入 JSON 上下文。
+     *   7. 捕获 stdout/stderr，返回适合界面提示和历史记录的一行结果。
      *
      * 参数：
      *   sourcePath 是云端 file_kind=source 的原始检测图。
@@ -5977,6 +6645,11 @@ private:
      *   cloudResult 是云端记录 result 字段，只允许 good、bad 或 review。
      *   partCode 是云端零件类型候选，例如 gasket；同一零件 good/bad 必须传同一个值。
      *   classLabel 是模型原始分类标签，例如 gasket_good；只用于 device_context 排障。
+     *   weightContextJson 是 F4 WEIGHT_RESULT 转换后的称重 JSON。
+     *   ldcContextJson 是 F4 LDC_RESULT 转换后的电感 JSON。
+     *   f4FlowContextJson 是自动检测过程中 F4/ESP32 阶段和流程 JSON。
+     *   decisionContextJson 是 MP157 综合判定、阈值和耗时 JSON。
+     *   visionContextJson 是模型原始输出、图片路径和 ROI JSON。
      *
      * 返回值：
      *   上传成功返回“上传成功：...”；失败返回“上传失败：...”。
@@ -5985,7 +6658,12 @@ private:
                                     const QStringList &annotatedPaths,
                                     const QString &cloudResult = QStringLiteral("review"),
                                     const QString &partCode = QString(),
-                                    const QString &classLabel = QString()) const
+                                    const QString &classLabel = QString(),
+                                    const QString &weightContextJson = QString(),
+                                    const QString &ldcContextJson = QString(),
+                                    const QString &f4FlowContextJson = QString(),
+                                    const QString &decisionContextJson = QString(),
+                                    const QString &visionContextJson = QString()) const
     {
         QProcess process;
         QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -6017,7 +6695,10 @@ private:
                 << "annotated" << annotatedPaths
                 << "cloudResult" << normalizedCloudResult
                 << "partCode" << partCode
-                << "classLabel" << classLabel;
+                << "classLabel" << classLabel
+                << "hasWeightContext" << !weightContextJson.trimmed().isEmpty()
+                << "hasLdcContext" << !ldcContextJson.trimmed().isEmpty()
+                << "hasF4FlowContext" << !f4FlowContextJson.trimmed().isEmpty();
 
         env.insert(QStringLiteral("CLOUD_RESULT"), normalizedCloudResult);
         if (!partCode.trimmed().isEmpty()) {
@@ -6025,6 +6706,21 @@ private:
         }
         if (!classLabel.trimmed().isEmpty()) {
             env.insert(QStringLiteral("CLOUD_CLASS_LABEL"), classLabel.trimmed());
+        }
+        if (!weightContextJson.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_WEIGHT_CONTEXT"), weightContextJson.trimmed());
+        }
+        if (!ldcContextJson.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_LDC_CONTEXT"), ldcContextJson.trimmed());
+        }
+        if (!f4FlowContextJson.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_F4_FLOW_CONTEXT"), f4FlowContextJson.trimmed());
+        }
+        if (!decisionContextJson.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_DECISION_CONTEXT"), decisionContextJson.trimmed());
+        }
+        if (!visionContextJson.trimmed().isEmpty()) {
+            env.insert(QStringLiteral("CLOUD_VISION_CONTEXT"), visionContextJson.trimmed());
         }
         process.setProcessEnvironment(env);
         process.setProgram(scriptPath);
@@ -6114,14 +6810,15 @@ private:
 
     /*
      * detectCurrentFrameOnce 的作用：
-     *   在后台线程中完成“一次当前帧保存 + 分类模型推理 + UNet 分割推理 + 云端上传”。
+     *   在后台线程中完成“一次当前帧保存 + 分类模型推理 + UNet 分割推理 + 本地结果缓存”。
      *
      * 主要流程：
      *   1. 确认 /mnt/sdcard 已挂载，并创建图片历史目录。
      *   2. 发送 SAVE_DETECT 命令，让 overlay 保存当前帧 JPG 作为 source。
      *   3. 调用 defect-classify，得到 MobileNetV3-Small GOOD/BAD 结果。
      *   4. 调用 defect-segment，得到 UNet raw/overlay/mask 结果图和缺陷像素。
-     *   5. 把 source 和所有结果图上传到 COS，并把 bundle 交给主线程写历史记录。
+     *   5. 把 source 和所有结果图保存到 bundle，先写 SD 卡历史，不在模型刚结束时上传云端。
+     *   6. 自动流程后续必须等待 F4 回传 WEIGHT_RESULT/LDC_RESULT，再一次性上传完整数据。
      *
      * 参数：
      *   mountPoint 是 SD 卡挂载点。
@@ -6155,7 +6852,6 @@ private:
         QString classificationResult;
         QString segmentationResult;
         QString modelResult;
-        QString uploadResult;
         QString cloudResult;
         FusedDetectResult fusedResult;
         qint64 totalModelTimeMs = 0;
@@ -6173,7 +6869,8 @@ private:
                 << "reviewThreshold" << settings.reviewThreshold
                 << "segmentMinPixels" << settings.segmentMinPixels
                 << "overlayAlpha" << settings.overlayAlpha
-                << "autoUpload" << settings.autoUploadEnabled;
+                << "autoUpload" << settings.autoUploadEnabled
+                << "uploadMode" << "LOCAL_READY";
 
         if (bundle == nullptr) {
             return QStringLiteral("检测失败：内部结果缓存为空");
@@ -6245,22 +6942,13 @@ private:
             modelsReadyCallback(modelResult);
         }
         cloudResult = cloudResultFromFusedResult(fusedResult);
-        if (settings.autoUploadEnabled) {
-            uploadResult = uploadDetectImagesToCos(bundle->sourcePath,
-                                                   bundle->annotatedPaths,
-                                                   cloudResult,
-                                                   partCodeFromClassificationResult(classificationResult),
-                                                   parseTokenValue(classificationResult, QStringLiteral("class")));
-        } else {
-            uploadResult = QStringLiteral("manualUploadDisabled upload_status=SKIP 本地已保存，自动上传已关闭");
-        }
-        bundle->uploadResult = uploadResult;
+        bundle->uploadResult = QStringLiteral("本地已保存：upload_status=LOCAL_READY cloud_result=")
+            + cloudResult
+            + QStringLiteral(" 等待F4称重和电感结果后统一上传");
 
         return modelResult
             + QStringLiteral(" upload_status=")
-            + (settings.autoUploadEnabled
-               ? (isUploadStatusSuccess(uploadResult) ? QStringLiteral("OK") : QStringLiteral("FAIL"))
-               : QStringLiteral("SKIP"));
+            + QStringLiteral("LOCAL_READY");
     }
 
     /*
@@ -6661,10 +7349,13 @@ private:
     UploadHistoryModel *m_historyModel; /* m_historyModel 指向 QML 使用的上传历史模型，保存成功后会追加记录。 */
     DetectSettingsController *m_detectSettingsController; /* m_detectSettingsController 指向真实检测参数控制器，不拥有生命周期。 */
     DetectSettingsSnapshot m_detectSettingsSnapshot; /* m_detectSettingsSnapshot 保存后台线程或自检路径使用的检测配置快照。 */
+    DetectResultBundle m_latestDetectBundle; /* m_latestDetectBundle 缓存最近一次模型检测的本地图片、模型输出和参数快照，供自动流程完整上传。 */
+    int m_latestDetectHistoryRow; /* m_latestDetectHistoryRow 保存最近一次检测追加到历史模型的行号，完整上传后原地更新该行。 */
     bool m_appendHistoryInSave; /* m_appendHistoryInSave 控制同步保存函数是否立即追加历史记录。 */
     bool m_saveInProgress; /* m_saveInProgress 只在 Qt 主线程维护，用于防止保存图片任务重复启动。 */
     bool m_detectInProgress; /* m_detectInProgress 只在 Qt 主线程维护，用于防止检测任务重复启动。 */
     bool m_retryUploadInProgress; /* m_retryUploadInProgress 只在 Qt 主线程维护，用于防止历史重发任务重复启动。 */
+    bool m_hasLatestDetectBundle; /* m_hasLatestDetectBundle 表示 m_latestDetectBundle 已经来自一次成功 RESULT，而不是默认空结构。 */
 };
 
 /*
@@ -6756,7 +7447,12 @@ public:
           m_f4AutoCycleId(0U),
           m_f4BinarySequence(0U),
           m_f4AutoRunning(false),
-          m_f4AutoPaused(false)
+          m_f4AutoPaused(false),
+          m_f4ArmFlowRunning(false),
+          m_f4FinalSortRunning(false),
+          m_f4LastArmJobId(0U),
+          m_f4LastModelResult(0U),
+          m_f4LastFinalBin(0U)
     {
         /*
          * m_f4HeartbeatElapsed 只用于控制周期心跳节奏。
@@ -7791,6 +8487,281 @@ public:
                                     payload);
     }
 
+    /*
+     * requestF4ArmInspectionFlow 的作用：
+     *   在 Z 轴回升完成后通知 F4/ESP32S3 执行“抓取到称重、转移到电感”的机械臂检测流程。
+     *
+     * 主要流程：
+     *   1. 从模型 RESULT 行解析 good/bad/review、置信度、模型耗时和零件类别。
+     *   2. 先发送 MODEL_READY，让 F4 缓存模型结果，但不触发最终分拣。
+     *   3. 再发送 ARM_JOB_START，让 F4 通知 ESP32S3 机械臂把零件放到称重和电感模块。
+     *   4. 后台线程持续读取 F4 主动 WEIGHT_RESULT/LDC_RESULT，并逐帧 ACK，收齐后回传 JSON 给 QML。
+     *
+     * 参数：
+     *   modelResultText 是 storageController 检测完成返回的 RESULT 行。
+     *
+     * 返回值：
+     *   true 表示长流程后台线程已启动；false 表示当前 cycle、串口或模型结果不满足启动条件。
+     */
+    Q_INVOKABLE bool requestF4ArmInspectionFlow(const QString &modelResultText)
+    {
+        const quint16 cycleId = m_f4AutoCycleId;
+        const quint8 modelResult = modelResultCodeFromText(modelResultText);
+        const quint8 finalBinHint = finalBinFromModelResult(modelResult);
+        const quint8 top1Confidence = confidencePercentFromModelText(modelResultText);
+        const quint16 modelMs = static_cast<quint16>(
+                    clampedInt(tokenValue(modelResultText, QStringLiteral("total_time_ms")).toInt(), 0, 65535));
+        const quint8 partType = partTypeCodeFromModelText(modelResultText);
+        const quint8 defectType = defectTypeCodeFromModelText(modelResultText);
+        const quint16 modelSequence = m_f4BinarySequence++;
+        const quint16 armSequence = m_f4BinarySequence++;
+        const quint16 ackSequenceBase = m_f4BinarySequence;
+        QByteArray modelPayload;
+        QByteArray armPayload;
+
+        if (m_f4CommandRunning || m_f4ArmFlowRunning || m_f4FinalSortRunning) {
+            emit f4ArmInspectionFlowFinished(false,
+                                             QStringLiteral("F4串口已有命令或机械臂流程正在运行"),
+                                             QString(),
+                                             QString(),
+                                             QString());
+            return false;
+        }
+
+        if (m_f4ProbeRunning) {
+            emit f4ArmInspectionFlowFinished(false,
+                                             QStringLiteral("F4状态刷新仍在进行，请稍后再启动机械臂检测流程"),
+                                             QString(),
+                                             QString(),
+                                             QString());
+            return false;
+        }
+
+        if (!m_f4AutoRunning || m_f4AutoPaused || cycleId == 0U) {
+            emit f4ArmInspectionFlowFinished(false,
+                                             QStringLiteral("自动检测 cycle 未运行，不能启动机械臂检测流程"),
+                                             QString(),
+                                             QString(),
+                                             QString());
+            return false;
+        }
+
+        if (modelResult == 0U) {
+            emit f4ArmInspectionFlowFinished(false,
+                                             QStringLiteral("模型结果无法解析，不能下发 MODEL_READY"),
+                                             QString(),
+                                             QString(),
+                                             QString());
+            return false;
+        }
+
+        /*
+         * 一次长流程最多需要 ACK WEIGHT_RESULT、ACK LDC_RESULT 和若干保留 ACK。
+         * 这里提前预留 8 个 sequence，避免长线程里复用主线程随后发出的普通命令序号。
+         */
+        m_f4BinarySequence = static_cast<quint16>(m_f4BinarySequence + 8U);
+
+        appendLe16(&modelPayload, cycleId);              /* cycle_id：归属当前自动检测件。 */
+        modelPayload.append(static_cast<char>(modelResult)); /* model_result：1 good、2 bad、3 review。 */
+        modelPayload.append(static_cast<char>(partType));    /* part_type：由模型类别映射，未知为 0。 */
+        modelPayload.append(static_cast<char>(defectType));  /* defect_type：当前先用轻量枚举，未知为 0。 */
+        modelPayload.append(static_cast<char>(top1Confidence)); /* top1_confidence：0~100 百分比。 */
+        appendLe16(&modelPayload, 0U);                    /* image_seq：首版没有单独图像序号，填 0。 */
+        appendLe16(&modelPayload, modelMs);               /* model_ms：分类+UNet 本地耗时。 */
+        appendLe16(&modelPayload, 0x0001U);               /* option_bits bit0=图片和模型结果已落 SD 卡。 */
+
+        const quint16 jobId = cycleId;
+        appendLe16(&armPayload, cycleId);                 /* cycle_id：机械臂任务绑定当前检测件。 */
+        appendLe16(&armPayload, jobId);                   /* job_id：首版直接复用 cycle_id，便于对账。 */
+        armPayload.append(static_cast<char>(0U));         /* job_profile=0，使用默认动作组。 */
+        armPayload.append(static_cast<char>(partType));   /* part_type：传给 F4/ESP32S3 做动作细节选择。 */
+        armPayload.append(static_cast<char>(finalBinHint)); /* final_bin_hint：只作提示，最终以 FINAL_SORT_RESULT 为准。 */
+        appendLe16(&armPayload, 0x0007U);                 /* option_bits bit0称重、bit1电感、bit2最终分拣均启用。 */
+
+        const QByteArray modelFrame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_MODEL_READY,
+                                                         modelSequence,
+                                                         modelPayload);
+        const QByteArray armFrame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_ARM_JOB_START,
+                                                       armSequence,
+                                                       armPayload);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+
+        m_f4CommandRunning = true;
+        m_f4ArmFlowRunning = true;
+        m_f4LastArmJobId = jobId;
+        m_f4LastModelResult = modelResult;
+        m_f4LastFinalBin = finalBinHint;
+
+        QPointer<DeviceHealthController> self(this);
+        QThread *workerThread = QThread::create([self,
+                                                 dev,
+                                                 baud,
+                                                 modelFrame,
+                                                 armFrame,
+                                                 modelSequence,
+                                                 armSequence,
+                                                 ackSequenceBase,
+                                                 cycleId,
+                                                 jobId]() {
+            QString detail;
+            QString weightContextJson;
+            QString ldcContextJson;
+            QString f4FlowContextJson;
+            const bool ok = runF4ArmInspectionFlow(dev,
+                                                   baud,
+                                                   modelFrame,
+                                                   modelSequence,
+                                                   armFrame,
+                                                   armSequence,
+                                                   ackSequenceBase,
+                                                   cycleId,
+                                                   jobId,
+                                                   &detail,
+                                                   &weightContextJson,
+                                                   &ldcContextJson,
+                                                   &f4FlowContextJson);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4ArmInspectionFlowFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, detail),
+                                      Q_ARG(QString, weightContextJson),
+                                      Q_ARG(QString, ldcContextJson),
+                                      Q_ARG(QString, f4FlowContextJson));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            m_f4ArmFlowRunning = false;
+            emit f4ArmInspectionFlowFinished(false,
+                                             QStringLiteral("F4机械臂检测流程线程创建失败"),
+                                             QString(),
+                                             QString(),
+                                             QString());
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
+    /*
+     * requestF4FinalSortResult 的作用：
+     *   MP157 完整上传图片、模型、重量和电感数据后，再通知 F4 执行最终分拣。
+     *
+     * 主要流程：
+     *   1. 上传成功时按云端最终结果映射良品盘、不良品盘或待复核盘。
+     *   2. 上传失败但本地历史已经保存时，强制 final_result=review、final_bin=待复核盘。
+     *   3. 发送 FINAL_SORT_RESULT，等待 F4 ACK 后继续等待 CYCLE_DONE 主动帧。
+     *
+     * 参数：
+     *   cloudResult 是本次云端记录 result，取值 good/bad/review。
+     *   uploadResultText 是上传脚本返回的一行状态，必须包含成功语义。
+     *
+     * 返回值：
+     *   true 表示最终分拣线程已启动；false 表示上传未成功或 F4 当前状态不允许。
+     */
+    Q_INVOKABLE bool requestF4FinalSortResult(const QString &cloudResult,
+                                              const QString &uploadResultText)
+    {
+        const quint16 cycleId = m_f4AutoCycleId;
+        const quint16 jobId = m_f4LastArmJobId;
+        const bool uploadSucceeded = isUploadStatusSuccess(uploadResultText);
+        const quint8 uploadStatusCode = uploadSucceeded ? 1U : 2U;
+        const quint8 finalResult = uploadSucceeded ? modelResultCodeFromCloudResult(cloudResult) : 3U;
+        const quint8 finalBin = uploadSucceeded ? finalBinFromModelResult(finalResult) : 3U;
+        const quint16 finalSequence = m_f4BinarySequence++;
+        const quint16 ackSequenceBase = m_f4BinarySequence;
+        QByteArray payload;
+
+        if (m_f4CommandRunning || m_f4ArmFlowRunning || m_f4FinalSortRunning) {
+            emit f4FinalSortFinished(false,
+                                     QStringLiteral("F4串口已有命令或机械臂流程正在运行"),
+                                     QString());
+            return false;
+        }
+
+        if (cycleId == 0U || jobId == 0U || finalResult == 0U || finalBin == 0U) {
+            emit f4FinalSortFinished(false,
+                                     QStringLiteral("最终分拣缺少 cycle/job/model 结果上下文"),
+                                     QString());
+            return false;
+        }
+
+        m_f4BinarySequence = static_cast<quint16>(m_f4BinarySequence + 4U);
+
+        appendLe16(&payload, cycleId);                       /* cycle_id：当前检测件。 */
+        appendLe16(&payload, jobId);                         /* job_id：前一阶段 ARM_JOB_START 的任务号。 */
+        payload.append(static_cast<char>(finalResult));      /* final_result：1 good、2 bad、3 review。 */
+        payload.append(static_cast<char>(finalBin));         /* final_bin：1 良品盘、2 不良品盘、3 待复核盘。 */
+        payload.append(static_cast<char>(uploadStatusCode)); /* upload_status=1 表示云端成功，2 表示上传失败但本地已保存。 */
+        payload.append(static_cast<char>((finalResult == 3U || !uploadSucceeded) ? 50U : 100U)); /* final_confidence：复核件保守填 50。 */
+        appendLe16(&payload, uploadSucceeded ? 0x0001U : 0x0003U); /* bit0=允许分拣，bit1=上传失败待复核。 */
+
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT,
+                                                    finalSequence,
+                                                    payload);
+        const QString dev = m_f4Device;
+        const int baud = m_f4Baud;
+
+        m_f4CommandRunning = true;
+        m_f4FinalSortRunning = true;
+        m_f4LastFinalBin = finalBin;
+
+        QPointer<DeviceHealthController> self(this);
+        QThread *workerThread = QThread::create([self,
+                                                 dev,
+                                                 baud,
+                                                 frame,
+                                                 finalSequence,
+                                                 ackSequenceBase,
+                                                 cycleId,
+                                                 jobId]() {
+            QString detail;
+            QString cycleDoneContextJson;
+            const bool ok = runF4FinalSortAndWaitCycleDone(dev,
+                                                           baud,
+                                                           frame,
+                                                           finalSequence,
+                                                           ackSequenceBase,
+                                                           cycleId,
+                                                           jobId,
+                                                           &detail,
+                                                           &cycleDoneContextJson);
+
+            if (!self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4FinalSortFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(QString, detail),
+                                      Q_ARG(QString, cycleDoneContextJson));
+        });
+
+        if (workerThread == nullptr) {
+            m_f4CommandRunning = false;
+            m_f4FinalSortRunning = false;
+            emit f4FinalSortFinished(false,
+                                     QStringLiteral("F4最终分拣线程创建失败"),
+                                     QString());
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater);
+        workerThread->start();
+        return true;
+    }
+
 signals:
     /* networkStatusChanged 通知 QML 网络状态和颜色已更新。 */
     void networkStatusChanged();
@@ -7833,6 +8804,16 @@ signals:
 
     /* f4ActuatorCommandFinished 通知 QML 执行器位置运动或停止命令完成，并带回 ACK/NACK 详情。 */
     void f4ActuatorCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
+
+    /* f4ArmInspectionFlowFinished 通知 QML 已收齐称重和电感上下文，可以启动云端完整上传。 */
+    void f4ArmInspectionFlowFinished(bool ok,
+                                     const QString &detail,
+                                     const QString &weightContextJson,
+                                     const QString &ldcContextJson,
+                                     const QString &f4FlowContextJson);
+
+    /* f4FinalSortFinished 通知 QML 最终分拣命令和 CYCLE_DONE 是否完成。 */
+    void f4FinalSortFinished(bool ok, const QString &detail, const QString &cycleDoneContextJson);
 
 private slots:
     /*
@@ -8196,6 +9177,66 @@ private slots:
     }
 
     /*
+     * handleF4ArmInspectionFlowFinished 的作用：
+     *   接收 MODEL_READY/ARM_JOB_START 后台长流程结果，释放串口互斥并把称重、电感上下文发给 QML。
+     *
+     * 参数：
+     *   ok 表示是否已经收到本轮 WEIGHT_RESULT 和 LDC_RESULT。
+     *   detail 是串口 ACK、主动帧和等待过程摘要。
+     *   weightContextJson 是称重结果 JSON，供完整上传写入 sensor_context.weighing。
+     *   ldcContextJson 是电感结果 JSON，供完整上传写入 sensor_context.ldc1614_eddy_current。
+     *   f4FlowContextJson 是 F4/ESP32S3 阶段流程 JSON，供云端追踪本轮动作链路。
+     */
+    void handleF4ArmInspectionFlowFinished(bool ok,
+                                           const QString &detail,
+                                           const QString &weightContextJson,
+                                           const QString &ldcContextJson,
+                                           const QString &f4FlowContextJson)
+    {
+        m_f4CommandRunning = false;
+        m_f4ArmFlowRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4 机械臂检测流程完成：") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4 机械臂检测流程失败：") + detail);
+        }
+
+        emit f4ArmInspectionFlowFinished(ok,
+                                         detail,
+                                         weightContextJson,
+                                         ldcContextJson,
+                                         f4FlowContextJson);
+    }
+
+    /*
+     * handleF4FinalSortFinished 的作用：
+     *   接收 FINAL_SORT_RESULT 后台长流程结果，释放串口互斥并把 CYCLE_DONE 上下文发给 QML。
+     *
+     * 参数：
+     *   ok 表示 F4 是否 ACK 最终分拣并主动回传 CYCLE_DONE。
+     *   detail 是最终分拣 ACK 和完成等待摘要。
+     *   cycleDoneContextJson 是 F4 最终完成负载解析出的 JSON。
+     */
+    void handleF4FinalSortFinished(bool ok,
+                                   const QString &detail,
+                                   const QString &cycleDoneContextJson)
+    {
+        m_f4CommandRunning = false;
+        m_f4FinalSortRunning = false;
+
+        if (ok) {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText(QStringLiteral("F4 最终分拣完成：") + detail);
+        } else {
+            setDetailText(QStringLiteral("F4 最终分拣失败：") + detail);
+        }
+
+        emit f4FinalSortFinished(ok, detail, cycleDoneContextJson);
+    }
+
+    /*
      * handleF4StepperSettingsFinished 的作用：
      *   接收后台步进电机参数下发结果，并把 ACK/NACK 详情同步给 QML 参数弹窗。
      *
@@ -8483,7 +9524,8 @@ private:
      *
      * 主要流程：
      *   1. 校验 QML 传来的数组必须正好包含三台电机，避免 F4 和 MP157 页序错位。
-     *   2. 每台电机编码 role_id、address、min_step、normal_speed_rpm 和 direction。
+     *   2. 每台电机编码 role_id、address、min_step、normal_speed_rpm、scan_speed_rpm 和 direction。
+     *      record_size=9，固定记录长度让 F4 能按版本化协议解析传送带双速度。
      *   3. 地址、步长、速度和方向在 MP157 再做一次限幅，F4 收到后还会重复校验。
      *
      * 参数：
@@ -8530,6 +9572,7 @@ private:
             const int address = clampedInt(motor.value(QStringLiteral("address")).toInt(), 1, 247);
             const int minStep = clampedInt(motor.value(QStringLiteral("minStep")).toInt(), 1, 10000);
             const int normalSpeed = clampedInt(motor.value(QStringLiteral("normalSpeedRpm")).toInt(), 0, 5000);
+            const int scanSpeed = clampedInt(motor.value(QStringLiteral("scanSpeedRpm")).toInt(), 0, 5000);
             /* directionRaw 保存 QML 传来的方向数值，Qt 5.12 的 QVariant::toInt() 不能传默认整数。 */
             const int directionRaw = motor.value(QStringLiteral("direction")).toInt();
             const int direction = directionRaw >= 0 ? 1 : -1;
@@ -8538,6 +9581,7 @@ private:
             payload->append(static_cast<char>(address & 0xFF));
             appendLe16(payload, static_cast<quint16>(minStep));
             appendLe16(payload, static_cast<quint16>(normalSpeed));
+            appendLe16(payload, static_cast<quint16>(scanSpeed));
             payload->append(static_cast<char>(direction));
         }
 
@@ -8613,6 +9657,12 @@ private:
             return QStringLiteral("BELT_STOP_CENTERED");
         case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:
             return QStringLiteral("WEIGHT_CALIBRATE");
+        case BINARY_PROTOCOL_CMD_ARM_JOB_START:
+            return QStringLiteral("ARM_JOB_START");
+        case BINARY_PROTOCOL_CMD_MODEL_READY:
+            return QStringLiteral("MODEL_READY");
+        case BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT:
+            return QStringLiteral("FINAL_SORT_RESULT");
         case BINARY_PROTOCOL_CMD_QUERY_STATUS:
             return QStringLiteral("QUERY_STATUS");
         case BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL:
@@ -8635,6 +9685,14 @@ private:
             return QStringLiteral("STATUS_REPORT");
         case BINARY_PROTOCOL_CMD_FAULT_REPORT:
             return QStringLiteral("FAULT_REPORT");
+        case BINARY_PROTOCOL_CMD_EVENT_REPORT:
+            return QStringLiteral("EVENT_REPORT");
+        case BINARY_PROTOCOL_CMD_WEIGHT_RESULT:
+            return QStringLiteral("WEIGHT_RESULT");
+        case BINARY_PROTOCOL_CMD_LDC_RESULT:
+            return QStringLiteral("LDC_RESULT");
+        case BINARY_PROTOCOL_CMD_CYCLE_DONE:
+            return QStringLiteral("CYCLE_DONE");
         default:
             return QStringLiteral("UNKNOWN_0x") + QString::number(command, 16).toUpper();
         }
@@ -8730,6 +9788,78 @@ private:
                 + QStringLiteral(" detail=") + QString::number(detailValue)
                 + QStringLiteral(" related_seq=") + QString::number(relatedSequence)
                 + QStringLiteral(" fault=0x") + QString::number(faultBits, 16).toUpper();
+    }
+
+    /*
+     * f4EventCodeName 的作用：
+     *   把 F4 EVENT_REPORT 中的事件编号转换成界面、日志和测试脚本都能识别的短名称。
+     *
+     * 参数：
+     *   eventCode 是 EVENT_REPORT payload[2] 事件编号。
+     *
+     * 返回值：
+     *   对执行器真实到位和超时返回固定 marker；其它事件返回 EVENT_<数字>。
+     */
+    static QString f4EventCodeName(quint8 eventCode)
+    {
+        switch (eventCode) {
+        case BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE:
+            return QStringLiteral("actuator-move-done");
+        case BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT:
+            return QStringLiteral("actuator-move-timeout");
+        default:
+            return QStringLiteral("EVENT_") + QString::number(eventCode);
+        }
+    }
+
+    /*
+     * describeF4EventReport 的作用：
+     *   把 F4 异步 EVENT_REPORT 二进制负载转换成自动流程可读摘要。
+     *
+     * 主要流程：
+     *   1. 校验固定 16 字节负载长度。
+     *   2. 解析 cycle、event、state、step、source、detail、related_seq 和 fault_bits。
+     *   3. 对执行器运动事件，把 detail_i32 拆成 actuator、direction 和 status_code。
+     *
+     * 返回值：
+     *   返回包含 actuator-move-done 或 actuator-move-timeout marker 的摘要；
+     *   负载错误时返回长度错误和原始帧，便于串口排查。
+     */
+    static QString describeF4EventReport(const F4BinaryReply &reply)
+    {
+        if (reply.payload.size() != 16) {
+            return QStringLiteral("EVENT_REPORT负载长度错误：")
+                    + QString::number(reply.payload.size())
+                    + QStringLiteral(" raw=")
+                    + hexByteString(reply.rawFrame);
+        }
+
+        const quint16 cycleId = readLe16(reply.payload, 0);
+        const quint8 eventCode = static_cast<quint8>(reply.payload.at(2));
+        const quint8 state = static_cast<quint8>(reply.payload.at(3));
+        const quint8 stepCode = static_cast<quint8>(reply.payload.at(4));
+        const quint8 source = static_cast<quint8>(reply.payload.at(5));
+        const qint32 detailValue = readLe32Signed(reply.payload, 6);
+        const quint32 detailBits = static_cast<quint32>(detailValue);
+        const quint16 relatedSequence = readLe16(reply.payload, 10);
+        const quint16 faultBits = readLe16(reply.payload, 12);
+        const quint16 reserved = readLe16(reply.payload, 14);
+        const quint8 actuator = static_cast<quint8>((detailBits >> 24) & 0xFFU);
+        const quint8 direction = static_cast<quint8>((detailBits >> 16) & 0xFFU);
+        const quint16 statusCode = static_cast<quint16>(detailBits & 0xFFFFU);
+
+        return QStringLiteral("EVENT_REPORT ")
+                + f4EventCodeName(eventCode)
+                + QStringLiteral(" cycle=") + QString::number(cycleId)
+                + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                + QStringLiteral(" step=") + QString::number(stepCode)
+                + QStringLiteral(" source=") + f4FaultSourceName(source)
+                + QStringLiteral(" actuator=") + QString::number(actuator)
+                + QStringLiteral(" direction=") + QString::number(direction)
+                + QStringLiteral(" status=") + QString::number(statusCode)
+                + QStringLiteral(" related_seq=") + QString::number(relatedSequence)
+                + QStringLiteral(" fault=0x") + QString::number(faultBits, 16).toUpper()
+                + QStringLiteral(" reserved=") + QString::number(reserved);
     }
 
     /*
@@ -9376,7 +10506,9 @@ private:
         QPointer<DeviceHealthController> self(this);
         QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId]() {
             QString detail;
-            const bool ok = sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
+            const bool ok = (command == BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE)
+                    ? runF4ActuatorPositionMoveAndWaitDone(dev, baud, frame, sequence, cycleId, &detail)
+                    : sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
 
             if (!self) {
                 return;
@@ -10194,6 +11326,714 @@ private:
     }
 
     /*
+     * runF4ActuatorPositionMoveAndWaitDone 的作用：
+     *   专门发送 ACTUATOR_POS_MOVE，并在同一个串口连接中等待“ACK + 真实到位事件”。
+     *
+     * 主要流程：
+     *   1. 打开并配置 F4 串口，写入完整二进制位置运动帧。
+     *   2. 先等待匹配本 sequence 的 ACK/NACK；ACK 只说明 F4 接收并入队。
+     *   3. ACK 成功后继续读取 EVENT_REPORT，必须匹配同一个 cycle_id 和 related_seq。
+     *   4. 收到 actuator-move-done 返回成功；收到 actuator-move-timeout 或本地保护超时返回失败。
+     *
+     * 参数：
+     *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
+     *   baud 是串口波特率，当前默认 115200。
+     *   frame 是已经组好的 ACTUATOR_POS_MOVE 完整帧。
+     *   expectedSequence 是本次位置运动命令序号。
+     *   expectedCycleId 是自动流程 ID，手动命令允许为 0。
+     *   detail 返回 ACK 和 DONE/TIMEOUT 的完整诊断文本。
+     *
+     * 返回值：
+     *   只有收到同一 sequence 的 `actuator-move-done` 才返回 true。
+     *   这能避免 MP157 在 Z 轴还没真实下降/上升完成时提前检测或启动机械臂。
+     */
+    static bool runF4ActuatorPositionMoveAndWaitDone(const QString &device,
+                                                     int baud,
+                                                     const QByteArray &frame,
+                                                     quint16 expectedSequence,
+                                                     quint16 expectedCycleId,
+                                                     QString *detail)
+    {
+        const QByteArray devBytes = device.toLocal8Bit();
+        int fd = -1;                         /* fd 保存本次位置运动专用串口连接，ACK 和 DONE 都从这里读取。 */
+        struct termios tio;                  /* tio 保存 raw 串口配置，避免二进制协议被行规程改写。 */
+        QString ackDetail;                   /* ackDetail 保存 F4 接收命令后的 ACK 文本。 */
+        QString lastReadDetail;              /* lastReadDetail 保存等待过程中最近一次非目标帧或读失败原因。 */
+        bool ackMatched = false;             /* ackMatched 标记是否已经收到本命令对应的 ACK。 */
+        QElapsedTimer ackTimer;              /* ackTimer 限制 ACK 阶段等待时间。 */
+        QElapsedTimer moveTimer;             /* moveTimer 限制到位事件阶段等待时间。 */
+
+        if (frame.isEmpty()) {
+            if (detail) {
+                *detail = QStringLiteral("ACTUATOR_POS_MOVE帧为空");
+            }
+            return false;
+        }
+
+        fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0) {
+            if (detail) {
+                *detail = QStringLiteral("无法打开 ") + device;
+            }
+            return false;
+        }
+
+        if (tcgetattr(fd, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("读取串口属性失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        cfmakeraw(&tio);
+        cfsetispeed(&tio, baudToSpeed(baud));
+        cfsetospeed(&tio, baudToSpeed(baud));
+        tio.c_cflag |= CLOCAL | CREAD;
+#ifdef CRTSCTS
+        tio.c_cflag &= ~CRTSCTS;
+#endif
+        tio.c_cc[VMIN] = 0;
+        tio.c_cc[VTIME] = 0;
+
+        if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("配置串口失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        tcflush(fd, TCIOFLUSH);
+        if (!writeAllToFd(fd, frame)) {
+            if (detail) {
+                *detail = QStringLiteral("写入 ACTUATOR_POS_MOVE 失败：") + hexByteString(frame);
+            }
+            ::close(fd);
+            return false;
+        }
+        tcdrain(fd);
+
+        ackTimer.start();
+        while (ackTimer.elapsed() < 2500) {
+            F4BinaryReply reply;
+            QString readErrorText;
+
+            if (!readF4BinaryReply(fd, &reply, &readErrorText)) {
+                lastReadDetail = readErrorText;
+                continue;
+            }
+
+            if (reply.command == BINARY_PROTOCOL_CMD_ACK) {
+                if (reply.payload.size() != 7) {
+                    if (detail) {
+                        *detail = QStringLiteral("ACK负载长度错误：") + QString::number(reply.payload.size());
+                    }
+                    ::close(fd);
+                    return false;
+                }
+
+                const quint16 cycleId = readLe16(reply.payload, 0);
+                const quint16 ackedSequence = readLe16(reply.payload, 2);
+                const quint8 ackedCommand = static_cast<quint8>(reply.payload.at(4));
+                const quint8 status = static_cast<quint8>(reply.payload.at(5));
+                const quint8 state = static_cast<quint8>(reply.payload.at(6));
+
+                if (cycleId != expectedCycleId
+                        || ackedSequence != expectedSequence
+                        || ackedCommand != BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE) {
+                    lastReadDetail = QStringLiteral("跳过非本次位置命令ACK：cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                            + QStringLiteral(" cmd=") + f4BinaryCommandName(ackedCommand);
+                    continue;
+                }
+
+                ackDetail = QStringLiteral("ACK ACTUATOR_POS_MOVE cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                        + QStringLiteral(" status=") + QString::number(status)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state);
+
+                if (status != 0U) {
+                    if (detail) {
+                        *detail = QStringLiteral("ACK未确认执行：") + ackDetail;
+                    }
+                    ::close(fd);
+                    return false;
+                }
+
+                ackMatched = true;
+                break;
+            }
+
+            if (reply.command == BINARY_PROTOCOL_CMD_NACK) {
+                if (reply.payload.size() != 9) {
+                    if (detail) {
+                        *detail = QStringLiteral("NACK负载长度错误：") + QString::number(reply.payload.size());
+                    }
+                    ::close(fd);
+                    return false;
+                }
+
+                const quint16 cycleId = readLe16(reply.payload, 0);
+                const quint16 rejectedSequence = readLe16(reply.payload, 2);
+                const quint8 rejectedCommand = static_cast<quint8>(reply.payload.at(4));
+                const quint8 errorCode = static_cast<quint8>(reply.payload.at(5));
+                const quint8 state = static_cast<quint8>(reply.payload.at(6));
+                const quint16 nackDetail = readLe16(reply.payload, 7);
+
+                if (detail) {
+                    *detail = QStringLiteral("NACK ")
+                            + f4BinaryCommandName(rejectedCommand)
+                            + QStringLiteral(" cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" seq=") + QString::number(rejectedSequence)
+                            + QStringLiteral(" error=") + f4NackErrorName(errorCode)
+                            + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                            + QStringLiteral(" detail=") + QString::number(nackDetail);
+                }
+                ::close(fd);
+                return false;
+            }
+
+            if (reply.command == BINARY_PROTOCOL_CMD_EVENT_REPORT) {
+                lastReadDetail = QStringLiteral("ACK前收到事件：") + describeF4EventReport(reply);
+            } else {
+                lastReadDetail = QStringLiteral("ACK前收到非ACK回复：")
+                        + f4BinaryCommandName(reply.command)
+                        + QStringLiteral(" raw=")
+                        + hexByteString(reply.rawFrame);
+            }
+        }
+
+        if (!ackMatched) {
+            if (detail) {
+                *detail = QStringLiteral("ACTUATOR_POS_MOVE未收到匹配ACK seq=")
+                        + QString::number(expectedSequence)
+                        + QStringLiteral(" last=")
+                        + lastReadDetail;
+            }
+            ::close(fd);
+            return false;
+        }
+
+        moveTimer.start();
+        lastReadDetail.clear();
+        while (moveTimer.elapsed() < 70000) {
+            F4BinaryReply reply;
+            QString readErrorText;
+
+            if (!readF4BinaryReply(fd, &reply, &readErrorText)) {
+                lastReadDetail = readErrorText;
+                continue;
+            }
+
+            if (reply.command != BINARY_PROTOCOL_CMD_EVENT_REPORT) {
+                lastReadDetail = QStringLiteral("等待到位时收到其它回复：")
+                        + f4BinaryCommandName(reply.command)
+                        + QStringLiteral(" raw=")
+                        + hexByteString(reply.rawFrame);
+                continue;
+            }
+
+            if (reply.payload.size() != 16) {
+                lastReadDetail = describeF4EventReport(reply);
+                continue;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);
+            const quint8 eventCode = static_cast<quint8>(reply.payload.at(2));
+            const quint16 relatedSequence = readLe16(reply.payload, 10);
+            const QString eventDetail = describeF4EventReport(reply);
+
+            if (cycleId != expectedCycleId || relatedSequence != expectedSequence) {
+                lastReadDetail = QStringLiteral("跳过非本次运动事件：") + eventDetail;
+                continue;
+            }
+
+            if (eventCode == BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE) {
+                if (detail) {
+                    *detail = ackDetail + QStringLiteral("；") + eventDetail;
+                }
+                ::close(fd);
+                return true;
+            }
+
+            if (eventCode == BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT) {
+                if (detail) {
+                    *detail = ackDetail + QStringLiteral("；") + eventDetail;
+                }
+                ::close(fd);
+                return false;
+            }
+
+            lastReadDetail = QStringLiteral("等待到位时收到其它事件：") + eventDetail;
+        }
+
+        if (detail) {
+            *detail = ackDetail
+                    + QStringLiteral("；等待 actuator-move-done 超时 seq=")
+                    + QString::number(expectedSequence)
+                    + QStringLiteral(" last=")
+                    + lastReadDetail;
+        }
+        ::close(fd);
+        return false;
+    }
+
+    /*
+     * readLe32Unsigned 的作用：
+     *   从二进制协议负载中按小端序读取 32 位无符号整数。
+     *
+     * 参数：
+     *   data 是源负载。
+     *   offset 是最低字节下标，调用方必须保证 offset+3 未越界。
+     *
+     * 返回值：
+     *   返回解析出的 32 位无符号值。
+     */
+    static quint32 readLe32Unsigned(const QByteArray &data, int offset)
+    {
+        const quint32 b0 = static_cast<quint8>(data.at(offset));
+        const quint32 b1 = static_cast<quint8>(data.at(offset + 1));
+        const quint32 b2 = static_cast<quint8>(data.at(offset + 2));
+        const quint32 b3 = static_cast<quint8>(data.at(offset + 3));
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    /*
+     * f4DecisionName 的作用：
+     *   把 F4 称重/电感判定枚举转换成云端 JSON 中可读的短字符串。
+     */
+    static QString f4DecisionName(quint8 decision)
+    {
+        switch (decision) {
+        case 1U:
+            return QStringLiteral("pass");
+        case 2U:
+            return QStringLiteral("fail");
+        case 3U:
+            return QStringLiteral("review");
+        default:
+            return QStringLiteral("unknown");
+        }
+    }
+
+    /*
+     * weightResultContextJson 的作用：
+     *   把 F4 主动 WEIGHT_RESULT 负载转换成云端 sensor_context.weighing JSON。
+     *
+     * 参数：
+     *   reply 是 readF4BinaryReply() 已解析出的 WEIGHT_RESULT 帧。
+     *
+     * 返回值：
+     *   返回压缩 JSON；负载长度错误时返回空对象。
+     */
+    static QString weightResultContextJson(const F4BinaryReply &reply)
+    {
+        if (reply.payload.size() != 28) {
+            return QStringLiteral("{}");
+        }
+
+        QJsonObject context;
+        context.insert(QStringLiteral("module_type"), QStringLiteral("hx711"));
+        context.insert(QStringLiteral("module_name"), QStringLiteral("HX711称重模块"));
+        context.insert(QStringLiteral("cycle_id"), static_cast<int>(readLe16(reply.payload, 0)));
+        context.insert(QStringLiteral("sample_id"), static_cast<int>(readLe16(reply.payload, 2)));
+        context.insert(QStringLiteral("stable"), static_cast<quint8>(reply.payload.at(4)) != 0U);
+        context.insert(QStringLiteral("decision_code"), static_cast<int>(static_cast<quint8>(reply.payload.at(5))));
+        context.insert(QStringLiteral("decision"), f4DecisionName(static_cast<quint8>(reply.payload.at(5))));
+        context.insert(QStringLiteral("gross_weight_g"), readLe32Signed(reply.payload, 6) / 1000.0);
+        context.insert(QStringLiteral("net_weight_g"), readLe32Signed(reply.payload, 10) / 1000.0);
+        context.insert(QStringLiteral("raw_adc"), static_cast<int>(readLe32Signed(reply.payload, 14)));
+        context.insert(QStringLiteral("sample_count"), static_cast<int>(readLe16(reply.payload, 18)));
+        context.insert(QStringLiteral("stable_window_g"), readLe16(reply.payload, 20) / 1000.0);
+        context.insert(QStringLiteral("duration_ms"), static_cast<int>(readLe16(reply.payload, 22)));
+        context.insert(QStringLiteral("option_bits"), static_cast<int>(readLe32Unsigned(reply.payload, 24)));
+        return compactJsonString(context);
+    }
+
+    /*
+     * ldcResultContextJson 的作用：
+     *   把 F4 主动 LDC_RESULT 负载转换成云端 sensor_context.ldc1614_eddy_current JSON。
+     */
+    static QString ldcResultContextJson(const F4BinaryReply &reply)
+    {
+        if (reply.payload.size() != 28) {
+            return QStringLiteral("{}");
+        }
+
+        QJsonArray channels;
+        QJsonObject ch0;
+        QJsonObject ch1;
+        QJsonObject context;
+
+        ch0.insert(QStringLiteral("channel"), 0);
+        ch0.insert(QStringLiteral("enabled"), (static_cast<quint8>(reply.payload.at(4)) & 0x01U) != 0U);
+        ch0.insert(QStringLiteral("raw_code"), static_cast<int>(readLe32Unsigned(reply.payload, 8)));
+        ch0.insert(QStringLiteral("delta_raw_code"), static_cast<int>(readLe32Signed(reply.payload, 12)));
+        ch0.insert(QStringLiteral("decision"), f4DecisionName(static_cast<quint8>(reply.payload.at(5))));
+        channels.append(ch0);
+
+        ch1.insert(QStringLiteral("channel"), 1);
+        ch1.insert(QStringLiteral("enabled"), (static_cast<quint8>(reply.payload.at(4)) & 0x02U) != 0U);
+        ch1.insert(QStringLiteral("raw_code"), static_cast<int>(readLe32Unsigned(reply.payload, 16)));
+        ch1.insert(QStringLiteral("delta_raw_code"), static_cast<int>(readLe32Signed(reply.payload, 20)));
+        ch1.insert(QStringLiteral("decision"), f4DecisionName(static_cast<quint8>(reply.payload.at(5))));
+        channels.append(ch1);
+
+        context.insert(QStringLiteral("module_name"), QStringLiteral("LDC1614电感检测模块"));
+        context.insert(QStringLiteral("chip_vendor"), QStringLiteral("TI"));
+        context.insert(QStringLiteral("chip_model"), QStringLiteral("LDC1614"));
+        context.insert(QStringLiteral("cycle_id"), static_cast<int>(readLe16(reply.payload, 0)));
+        context.insert(QStringLiteral("sample_id"), static_cast<int>(readLe16(reply.payload, 2)));
+        context.insert(QStringLiteral("channel_mask"), static_cast<int>(static_cast<quint8>(reply.payload.at(4))));
+        context.insert(QStringLiteral("decision_code"), static_cast<int>(static_cast<quint8>(reply.payload.at(5))));
+        context.insert(QStringLiteral("overall_decision"), f4DecisionName(static_cast<quint8>(reply.payload.at(5))));
+        context.insert(QStringLiteral("status"), static_cast<int>(static_cast<quint8>(reply.payload.at(6))));
+        context.insert(QStringLiteral("duration_ms"), static_cast<int>(readLe16(reply.payload, 24)));
+        context.insert(QStringLiteral("option_bits"), static_cast<int>(readLe16(reply.payload, 26)));
+        context.insert(QStringLiteral("channels"), channels);
+        return compactJsonString(context);
+    }
+
+    /*
+     * cycleDoneContextJson 的作用：
+     *   把 F4 主动 CYCLE_DONE 负载转换成云端和 QML 都能展示的流程完成 JSON。
+     */
+    static QString cycleDoneContextJson(const F4BinaryReply &reply)
+    {
+        if (reply.payload.size() != 16) {
+            return QStringLiteral("{}");
+        }
+
+        QJsonObject context;
+        context.insert(QStringLiteral("cycle_id"), static_cast<int>(readLe16(reply.payload, 0)));
+        context.insert(QStringLiteral("job_id"), static_cast<int>(readLe16(reply.payload, 2)));
+        context.insert(QStringLiteral("final_bin"), static_cast<int>(static_cast<quint8>(reply.payload.at(4))));
+        context.insert(QStringLiteral("model_result"), static_cast<int>(static_cast<quint8>(reply.payload.at(5))));
+        context.insert(QStringLiteral("weight_decision"), f4DecisionName(static_cast<quint8>(reply.payload.at(6))));
+        context.insert(QStringLiteral("ldc_decision"), f4DecisionName(static_cast<quint8>(reply.payload.at(7))));
+        context.insert(QStringLiteral("f4_state"), static_cast<int>(static_cast<quint8>(reply.payload.at(8))));
+        context.insert(QStringLiteral("fault_level"), static_cast<int>(static_cast<quint8>(reply.payload.at(9))));
+        context.insert(QStringLiteral("fault_bits"), static_cast<int>(readLe16(reply.payload, 10)));
+        context.insert(QStringLiteral("duration_ms"), static_cast<int>(readLe16(reply.payload, 12)));
+        context.insert(QStringLiteral("option_bits"), static_cast<int>(readLe16(reply.payload, 14)));
+        return compactJsonString(context);
+    }
+
+    /*
+     * waitForF4ActiveFrame 的作用：
+     *   在长流程中等待 F4 主动上报的 WEIGHT_RESULT、LDC_RESULT 或 CYCLE_DONE。
+     *
+     * 主要流程：
+     *   1. 打开并配置 F4 串口 raw 模式。
+     *   2. 复用 readF4BinaryReply() 循环读取合法二进制帧。
+     *   3. 忽略非目标主动帧，但把 FAULT_REPORT 写入 detail 便于现场排查。
+     *   4. 收到目标命令且 cycle_id 匹配后返回对应 JSON。
+     *
+     * 参数：
+     *   expectedCommand 是要等待的主动帧命令。
+     *   timeoutMs 是总等待时间，称重/电感/机械臂动作现场可能需要数秒。
+     *
+     * 返回值：
+     *   收到目标主动帧返回 true；超时、串口错误或负载错误返回 false。
+     */
+    static bool waitForF4ActiveFrame(const QString &device,
+                                     int baud,
+                                     quint8 expectedCommand,
+                                     quint16 expectedCycleId,
+                                     int timeoutMs,
+                                     QString *detail,
+                                     QString *contextJson)
+    {
+        const QByteArray devBytes = device.toLocal8Bit();
+        int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        struct termios tio;
+        QElapsedTimer elapsed;
+        QString lastReadError;
+
+        if (contextJson) {
+            *contextJson = QStringLiteral("{}");
+        }
+
+        if (fd < 0) {
+            if (detail) {
+                *detail = QStringLiteral("无法打开 ") + device + QStringLiteral(" 等待主动帧");
+            }
+            return false;
+        }
+
+        if (tcgetattr(fd, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("读取串口属性失败，无法等待主动帧");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        cfmakeraw(&tio);
+        cfsetispeed(&tio, baudToSpeed(baud));
+        cfsetospeed(&tio, baudToSpeed(baud));
+        tio.c_cflag |= CLOCAL | CREAD;
+#ifdef CRTSCTS
+        tio.c_cflag &= ~CRTSCTS;
+#endif
+        tio.c_cc[VMIN] = 0;
+        tio.c_cc[VTIME] = 0;
+
+        if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+            if (detail) {
+                *detail = QStringLiteral("配置串口失败，无法等待主动帧");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        elapsed.start();
+        while (elapsed.elapsed() < timeoutMs) {
+            F4BinaryReply reply;
+
+            if (!readF4BinaryReply(fd, &reply, &lastReadError)) {
+                continue;
+            }
+
+            if (reply.command == BINARY_PROTOCOL_CMD_FAULT_REPORT) {
+                if (detail) {
+                    *detail += QStringLiteral(" fault=") + describeF4FaultReport(reply);
+                }
+                continue;
+            }
+
+            if (reply.command != expectedCommand) {
+                if (detail) {
+                    *detail += QStringLiteral(" ignore=") + f4BinaryCommandName(reply.command);
+                }
+                continue;
+            }
+
+            if (reply.payload.size() < 2 || readLe16(reply.payload, 0) != expectedCycleId) {
+                if (detail) {
+                    *detail += QStringLiteral(" cycle_mismatch=") + hexByteString(reply.rawFrame);
+                }
+                continue;
+            }
+
+            if (expectedCommand == BINARY_PROTOCOL_CMD_WEIGHT_RESULT) {
+                if (reply.payload.size() != 28) {
+                    if (detail) {
+                        *detail += QStringLiteral(" WEIGHT_RESULT长度错误=") + QString::number(reply.payload.size());
+                    }
+                    ::close(fd);
+                    return false;
+                }
+                if (contextJson) {
+                    *contextJson = weightResultContextJson(reply);
+                }
+            } else if (expectedCommand == BINARY_PROTOCOL_CMD_LDC_RESULT) {
+                if (reply.payload.size() != 28) {
+                    if (detail) {
+                        *detail += QStringLiteral(" LDC_RESULT长度错误=") + QString::number(reply.payload.size());
+                    }
+                    ::close(fd);
+                    return false;
+                }
+                if (contextJson) {
+                    *contextJson = ldcResultContextJson(reply);
+                }
+            } else if (expectedCommand == BINARY_PROTOCOL_CMD_CYCLE_DONE) {
+                if (reply.payload.size() != 16) {
+                    if (detail) {
+                        *detail += QStringLiteral(" CYCLE_DONE长度错误=") + QString::number(reply.payload.size());
+                    }
+                    ::close(fd);
+                    return false;
+                }
+                if (contextJson) {
+                    *contextJson = cycleDoneContextJson(reply);
+                }
+            }
+
+            if (detail) {
+                *detail += QStringLiteral(" got=")
+                        + f4BinaryCommandName(expectedCommand)
+                        + QStringLiteral(" seq=")
+                        + QString::number(reply.sequence);
+            }
+            ::close(fd);
+            return true;
+        }
+
+        if (detail) {
+            *detail += QStringLiteral(" timeout_wait=")
+                    + f4BinaryCommandName(expectedCommand)
+                    + QStringLiteral(" last=")
+                    + lastReadError;
+        }
+
+        ::close(fd);
+        return false;
+    }
+
+    /*
+     * runF4ArmInspectionFlow 的作用：
+     *   完成 MODEL_READY、ARM_JOB_START，并等待 F4 回传称重和电感结果。
+     */
+    static bool runF4ArmInspectionFlow(const QString &device,
+                                       int baud,
+                                       const QByteArray &modelFrame,
+                                       quint16 modelSequence,
+                                       const QByteArray &armFrame,
+                                       quint16 armSequence,
+                                       quint16 ackSequenceBase,
+                                       quint16 cycleId,
+                                       quint16 jobId,
+                                       QString *detail,
+                                       QString *weightContextJson,
+                                       QString *ldcContextJson,
+                                       QString *f4FlowContextJson)
+    {
+        QString modelAck;
+        QString armAck;
+        QString waitDetail;
+        QString weightJson;
+        QString ldcJson;
+
+        Q_UNUSED(ackSequenceBase);
+
+        if (!sendF4BinaryCommand(device,
+                                 baud,
+                                 modelFrame,
+                                 BINARY_PROTOCOL_CMD_MODEL_READY,
+                                 modelSequence,
+                                 cycleId,
+                                 &modelAck)) {
+            if (detail) {
+                *detail = QStringLiteral("MODEL_READY失败：") + modelAck;
+            }
+            return false;
+        }
+
+        if (!sendF4BinaryCommand(device,
+                                 baud,
+                                 armFrame,
+                                 BINARY_PROTOCOL_CMD_ARM_JOB_START,
+                                 armSequence,
+                                 cycleId,
+                                 &armAck)) {
+            if (detail) {
+                *detail = QStringLiteral("ARM_JOB_START失败：") + armAck;
+            }
+            return false;
+        }
+
+        if (!waitForF4ActiveFrame(device,
+                                  baud,
+                                  BINARY_PROTOCOL_CMD_WEIGHT_RESULT,
+                                  cycleId,
+                                  45000,
+                                  &waitDetail,
+                                  &weightJson)) {
+            if (detail) {
+                *detail = QStringLiteral("等待称重结果失败：") + waitDetail;
+            }
+            return false;
+        }
+
+        if (!waitForF4ActiveFrame(device,
+                                  baud,
+                                  BINARY_PROTOCOL_CMD_LDC_RESULT,
+                                  cycleId,
+                                  45000,
+                                  &waitDetail,
+                                  &ldcJson)) {
+            if (detail) {
+                *detail = QStringLiteral("等待电感结果失败：") + waitDetail;
+            }
+            return false;
+        }
+
+        QJsonObject flow;
+        flow.insert(QStringLiteral("cycle_id"), static_cast<int>(cycleId));
+        flow.insert(QStringLiteral("job_id"), static_cast<int>(jobId));
+        flow.insert(QStringLiteral("model_ready_ack"), modelAck);
+        flow.insert(QStringLiteral("arm_job_start_ack"), armAck);
+        flow.insert(QStringLiteral("weight_result_received"), true);
+        flow.insert(QStringLiteral("ldc_result_received"), true);
+        flow.insert(QStringLiteral("next_step"), QStringLiteral("upload_then_final_sort"));
+
+        if (weightContextJson) {
+            *weightContextJson = weightJson;
+        }
+        if (ldcContextJson) {
+            *ldcContextJson = ldcJson;
+        }
+        if (f4FlowContextJson) {
+            *f4FlowContextJson = compactJsonString(flow);
+        }
+        if (detail) {
+            *detail = QStringLiteral("MODEL_READY和ARM_JOB_START已ACK，称重/电感已收齐");
+        }
+        return true;
+    }
+
+    /*
+     * runF4FinalSortAndWaitCycleDone 的作用：
+     *   下发 FINAL_SORT_RESULT，并等待 F4 主动回传 CYCLE_DONE 作为本轮闭环完成标志。
+     */
+    static bool runF4FinalSortAndWaitCycleDone(const QString &device,
+                                               int baud,
+                                               const QByteArray &frame,
+                                               quint16 finalSequence,
+                                               quint16 ackSequenceBase,
+                                               quint16 cycleId,
+                                               quint16 jobId,
+                                               QString *detail,
+                                               QString *cycleDoneContextJson)
+    {
+        QString finalAck;
+        QString waitDetail;
+        QString doneJson;
+
+        Q_UNUSED(ackSequenceBase);
+
+        if (!sendF4BinaryCommand(device,
+                                 baud,
+                                 frame,
+                                 BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT,
+                                 finalSequence,
+                                 cycleId,
+                                 &finalAck)) {
+            if (detail) {
+                *detail = QStringLiteral("FINAL_SORT_RESULT失败：") + finalAck;
+            }
+            return false;
+        }
+
+        if (!waitForF4ActiveFrame(device,
+                                  baud,
+                                  BINARY_PROTOCOL_CMD_CYCLE_DONE,
+                                  cycleId,
+                                  45000,
+                                  &waitDetail,
+                                  &doneJson)) {
+            if (detail) {
+                *detail = QStringLiteral("等待CYCLE_DONE失败：") + waitDetail;
+            }
+            return false;
+        }
+
+        if (cycleDoneContextJson) {
+            *cycleDoneContextJson = doneJson;
+        }
+        if (detail) {
+            *detail = QStringLiteral("FINAL_SORT_RESULT已ACK，CYCLE_DONE已收到 job_id=")
+                    + QString::number(jobId)
+                    + QStringLiteral(" ack=")
+                    + finalAck;
+        }
+        return true;
+    }
+
+    /*
      * sendF4BinaryHeartbeat 的作用：
      *   发送 HEARTBEAT 二进制帧，只确认 F4 在线和协议链路正常。
      *
@@ -10580,6 +12420,11 @@ private:
     quint16 m_f4BinarySequence;         /* m_f4BinarySequence 保存 MP157 二进制协议发送帧序号，每下发一帧自动流程命令自增一次。 */
     bool m_f4AutoRunning;               /* m_f4AutoRunning 表示 MP157 本地认为 F4 当前存在运行中的自动检测流程。 */
     bool m_f4AutoPaused;                /* m_f4AutoPaused 表示当前自动检测流程已暂停，只有继续或停止能改变该状态。 */
+    bool m_f4ArmFlowRunning;            /* m_f4ArmFlowRunning 表示 MODEL_READY/ARM_JOB_START 后正在等待 WEIGHT_RESULT 和 LDC_RESULT。 */
+    bool m_f4FinalSortRunning;          /* m_f4FinalSortRunning 表示 FINAL_SORT_RESULT 已下发，正在等待 F4 CYCLE_DONE。 */
+    quint16 m_f4LastArmJobId;           /* m_f4LastArmJobId 保存最近一次 ARM_JOB_START 的 job_id，最终分拣必须带同一编号。 */
+    quint8 m_f4LastModelResult;         /* m_f4LastModelResult 保存最近一次模型综合结果，供最终分拣和日志追踪。 */
+    quint8 m_f4LastFinalBin;            /* m_f4LastFinalBin 保存最近一次最终分拣盘编号，便于 CYCLE_DONE 对账。 */
     QTimer m_healthTimer;               /* m_healthTimer 周期性调度整轮健康检测。 */
     QTimer m_networkTimeout;            /* m_networkTimeout 是 4G 测试短超时。 */
     QTimer m_locationTimeout;           /* m_locationTimeout 是开机单次高德 IP 定位超时。 */
@@ -11062,6 +12907,7 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("stepper_motor[0].address=1\n")
         + QStringLiteral("stepper_motor[0].min_step=20\n")
         + QStringLiteral("stepper_motor[0].normal_speed_rpm=300\n")
+        + QStringLiteral("stepper_motor[0].scan_speed_rpm=40\n")
         + QStringLiteral("stepper_motor[0].direction=1 (正向)\n")
         + QStringLiteral("stepper_motor[1].name=摄像头左右电机\n")
         + QStringLiteral("stepper_motor[1].role=camera_lateral\n")
@@ -11069,6 +12915,7 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("stepper_motor[1].address=3\n")
         + QStringLiteral("stepper_motor[1].min_step=5\n")
         + QStringLiteral("stepper_motor[1].normal_speed_rpm=137\n")
+        + QStringLiteral("stepper_motor[1].scan_speed_rpm=0\n")
         + QStringLiteral("stepper_motor[1].direction=1 (正向)\n")
         + QStringLiteral("stepper_motor[2].name=摄像头上下电机\n")
         + QStringLiteral("stepper_motor[2].role=camera_z\n")
@@ -11076,6 +12923,7 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("stepper_motor[2].address=2\n")
         + QStringLiteral("stepper_motor[2].min_step=5\n")
         + QStringLiteral("stepper_motor[2].normal_speed_rpm=5000\n")
+        + QStringLiteral("stepper_motor[2].scan_speed_rpm=0\n")
         + QStringLiteral("stepper_motor[2].direction=1 (正向)\n")
         + QStringLiteral("classify_args=--roi 352 --bad-threshold 0.650\n")
         + QStringLiteral("segment_args=--roi 352 --alpha 0.45 --min-defect-pixels 120\n");

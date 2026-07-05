@@ -106,7 +106,7 @@ Rectangle {
     /* autoVisionLocatePurpose 标记当前 LOCATE 用途：center 用于传送带前后居中，fine-tune 用于 Z 轴下降后的前后/左右复查。 */
     property string autoVisionLocatePurpose: "center"
 
-    /* autoVisionActuatorPhase 保存正在等待 ACK 或等待稳定的执行器阶段，空字符串表示当前没有自动执行器动作。 */
+    /* autoVisionActuatorPhase 保存正在等待 F4 到位事件或等待稳定的执行器阶段，空字符串表示当前没有自动执行器动作。 */
     property string autoVisionActuatorPhase: ""
 
     /* autoVisionFineTuneAttempts 保存 Z 轴下降后已经尝试的前后/左右微调次数，避免定位抖动导致无限移动。 */
@@ -121,8 +121,23 @@ Rectangle {
     /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
     property int autoVisionZFocusSettleMs: 3000
 
+    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护超时的每圈步数；真实完成以 F4 ACTUATOR_MOVE_DONE 事件为准。 */
+    property int autoVisionZMoveStepsPerRev: 200
+
+    /* autoVisionZMotionSafetyMs 是 Z 轴估算运动时间之外的安全余量，用于覆盖 F4 转发、驱动器加减速和机构惯性。 */
+    property int autoVisionZMotionSafetyMs: 900
+
+    /* autoVisionZMotionMinimumWaitMs 是 Z 轴 ACK 后最短物理等待时间，避免小步数或配置异常时立刻进入 ROI 复查。 */
+    property int autoVisionZMotionMinimumWaitMs: 1200
+
+    /* autoVisionZMotionMaximumWaitMs 是 Z 轴 ACK 后最长物理等待时间，避免错误步数把自动流程长时间卡住。 */
+    property int autoVisionZMotionMaximumWaitMs: 30000
+
     /* autoVisionPostFocusDetectDelayMs 是已经完成 Z 轴对焦等待后的短检测延时，给 overlay 刷新一帧。 */
     property int autoVisionPostFocusDetectDelayMs: 300
+
+    /* autoVisionFallbackSpeedRpm 是参数缺失或被设为 0 时的自动流程兜底速度；正常情况直接使用参数页速度。 */
+    property int autoVisionFallbackSpeedRpm: 40
 
     /* autoVisionDefaultDetectDelayMs 是没有执行 Z 轴下探时保留的默认静止检测延时。 */
     property int autoVisionDefaultDetectDelayMs: 2000
@@ -138,6 +153,15 @@ Rectangle {
 
     /* autoVisionDetectFromZFlow 表示当前检测由“居中后下探”自动链路触发，检测完成后需要进入 Z 轴回升阶段。 */
     property bool autoVisionDetectFromZFlow: false
+
+    /* autoVisionPendingZMoveSteps 保存刚下发给 F4 的 Z 轴相对位置步数，ACK 后用于估算物理运动完成时间。 */
+    property int autoVisionPendingZMoveSteps: 0
+
+    /* autoVisionPendingZMoveSpeedRpm 保存刚下发给 F4 的 Z 轴速度，ACK 后用于估算物理运动完成时间。 */
+    property int autoVisionPendingZMoveSpeedRpm: 0
+
+    /* autoVisionPendingZMoveDirection 保存刚下发给 F4 的 Z 轴方向，0=下降，1=回升，便于日志和等待阶段判断。 */
+    property int autoVisionPendingZMoveDirection: 0
 
     /* autoVisionCenterTolerancePx 是 MP157 侧居中判定死区，必须和 F4 死区保持同量级。 */
     property int autoVisionCenterTolerancePx: 24
@@ -183,6 +207,15 @@ Rectangle {
 
     /* detectTimeText 保存两个模型串行完成后的总检测耗时。 */
     property string detectTimeText: "耗时 -- ms"
+
+    /* latestModelResultText 保存最近一次模型 RESULT 行，Z 轴回升后要原样下发给 F4 缓存模型结果。 */
+    property string latestModelResultText: ""
+
+    /* latestCompletedUploadResultText 保存完整上传脚本结果，上传失败时也要让 F4 分拣到待复核盘。 */
+    property string latestCompletedUploadResultText: ""
+
+    /* latestCompletedCloudResult 保存本轮模型综合结果，上传成功时用于最终分拣，上传失败时仅作为历史追踪。 */
+    property string latestCompletedCloudResult: "review"
 
     /* storageToastVisible 表示底部 SD 卡操作提示是否显示；Timer 到时后自动隐藏。 */
     property bool storageToastVisible: false
@@ -298,11 +331,14 @@ Rectangle {
     /* stepperHomePendingCommand 保存正在等待回执的设零命令名，空字符串表示当前没有设零命令在途。 */
     property string stepperHomePendingCommand: ""
 
-    /* stepperSpeedEditorVisible 表示常规速度数字键盘是否打开，用于输入 0~5000 rpm 任意整数。 */
+    /* stepperSpeedEditorVisible 表示速度数字键盘是否打开，用于输入 0~5000 rpm 任意整数。 */
     property bool stepperSpeedEditorVisible: false
 
-    /* stepperSpeedInputText 保存速度数字键盘当前输入文本，点击应用后写入 normalSpeedRpm。 */
+    /* stepperSpeedInputText 保存速度数字键盘当前输入文本，点击应用后写入 normalSpeedRpm 或 scanSpeedRpm。 */
     property string stepperSpeedInputText: "0"
+
+    /* stepperSpeedEditKey 保存当前速度键盘正在编辑的字段：normalSpeedRpm 或 scanSpeedRpm。 */
+    property string stepperSpeedEditKey: "normalSpeedRpm"
 
     /* stepperStepEditorVisible 表示上下电机固定位置步数数字键盘是否打开。 */
     property bool stepperStepEditorVisible: false
@@ -801,6 +837,7 @@ Rectangle {
         detectBadTotalText = "坏品 --%"
         detectGoodTotalText = "良品 --%"
         detectTimeText = "耗时 -- ms"
+        latestModelResultText = ""
         storageState = "正在检测当前帧..."
         storageController.requestDetectCurrentFrame()
         showStorageToast()
@@ -835,6 +872,9 @@ Rectangle {
         autoVisionZFocusSettled = false
         autoVisionNeedsZUp = false
         autoVisionDetectFromZFlow = false
+        autoVisionPendingZMoveSteps = 0
+        autoVisionPendingZMoveSpeedRpm = 0
+        autoVisionPendingZMoveDirection = 0
         dxPixels = 0
         dxPixelsValid = false
         autoVisionLastText = "自动视觉：等待零件从上方进入 ROI"
@@ -871,6 +911,9 @@ Rectangle {
         autoVisionFineTuneAttempts = 0
         autoVisionZFocusSettled = false
         autoVisionDetectFromZFlow = false
+        autoVisionPendingZMoveSteps = 0
+        autoVisionPendingZMoveSpeedRpm = 0
+        autoVisionPendingZMoveDirection = 0
         autoVisionActuatorSettleTimer.stop()
         dxPixelsValid = false
         if (reason && reason.length > 0) {
@@ -1012,6 +1055,185 @@ Rectangle {
     }
 
     /*
+     * autoVisionNormalizeSpeedRpm 的作用：
+     *   自动检测链路中把参数页速度整理成可下发 F4 的 1~5000 rpm。
+     *
+     * 主要流程：
+     *   1. 读取调用方给出的 speedRpm，并转成整数。
+     *   2. 小于等于 0 时回退到 fallbackRpm，避免把 0 传给 F4 后让执行器保持停止。
+     *   3. 大于 5000 时只按协议上限截断，不再固定限制到 40rpm。
+     *
+     * 参数：
+     *   speedRpm 是参数页保存的电机速度，单位 rpm。
+     *   fallbackRpm 是参数缺失或为 0 时使用的兜底速度。
+     *
+     * 返回值：
+     *   返回 1~5000 的协议合法速度。
+     */
+    function autoVisionNormalizeSpeedRpm(speedRpm, fallbackRpm) {
+        var fallbackSpeed = Math.max(1, Math.min(5000, Math.floor(Number(fallbackRpm || autoVisionFallbackSpeedRpm))))
+        var speed = Math.floor(Number(speedRpm || 0))
+
+        if (speed <= 0) {
+            return fallbackSpeed
+        }
+
+        return Math.max(1, Math.min(speed, 5000))
+    }
+
+    /*
+     * conveyorScanSpeedRpm 的作用：
+     *   返回传送带自动上料扫描速度，也就是尚未检测到零件时 F4 SCAN 阶段使用的速度。
+     *
+     * 返回值：
+     *   返回 1~5000 rpm；如果旧 JSON 没有 scanSpeedRpm，则回退到传送带常规速度。
+     */
+    function conveyorScanSpeedRpm() {
+        var motor = conveyorMotorSetting()
+        var fallback = motor.normalSpeedRpm || autoVisionFallbackSpeedRpm
+        return autoVisionNormalizeSpeedRpm(motor.scanSpeedRpm || fallback, fallback)
+    }
+
+    /*
+     * conveyorTrackSpeedRpm 的作用：
+     *   返回传送带检测到零件后的视觉对中和短步微调速度。
+     *
+     * 返回值：
+     *   返回 1~5000 rpm，直接来自参数页传送带常规速度。
+     */
+    function conveyorTrackSpeedRpm() {
+        var motor = conveyorMotorSetting()
+        return autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+    }
+
+    /*
+     * autoVisionEstimateZMoveMs 的作用：
+     *   根据本次 Z 轴相对位置运动的 step 数和 rpm，估算 MP157 在收到 F4 ACK 后还要等待多久。
+     *
+     * 主要流程：
+     *   1. 把 steps、speedRpm 和每圈步数都转成安全整数，避免异常配置导致除零或负等待。
+     *   2. 用“步数 / 每圈步数 / rpm”换算基础运动时间，单位从分钟转换为毫秒。
+     *   3. 叠加安全余量和短机械稳定时间，因为 F4 ACK 只代表命令已接收，不能代表 Emm42 已经走到位。
+     *   4. 最后用最小/最大等待时间限幅，保证小动作不会过早继续，大异常不会无限卡住流程。
+     *
+     * 参数：
+     *   stepsValue 是本次 Z 轴相对位置运动步数，来自 zDownFixedSteps 或 zUpFixedSteps。
+     *   speedRpm 是本次 Z 轴运动速度，单位 rpm，来自参数页上下电机常规速度。
+     *
+     * 返回值：
+     *   返回需要等待的毫秒数；这个值是保守估算，不是 F4 确认完成事件。
+     */
+    function autoVisionEstimateZMoveMs(stepsValue, speedRpm) {
+        var steps = Math.max(0, Math.floor(Number(stepsValue || 0)))
+        var speed = autoVisionNormalizeSpeedRpm(speedRpm, autoVisionFallbackSpeedRpm)
+        var stepsPerRev = Math.max(1, Math.floor(Number(autoVisionZMoveStepsPerRev || 1)))
+        var moveMs = Math.ceil((steps * 60000.0) / (stepsPerRev * speed))
+        var waitMs = moveMs + autoVisionZMotionSafetyMs + autoVisionShortSettleMs
+
+        waitMs = Math.max(autoVisionZMotionMinimumWaitMs, waitMs)
+        waitMs = Math.min(autoVisionZMotionMaximumWaitMs, waitMs)
+        return waitMs
+    }
+
+    /*
+     * autoVisionStartZMotionWait 的作用：
+     *   在 Z 轴位置命令发出后启动本地超时保护，避免 F4 到位事件丢失时自动流程永久卡住。
+     *
+     * 主要流程：
+     *   1. 按 direction 选择 z-motion-down-wait 或 z-motion-up-wait 阶段。
+     *   2. 用 autoVisionEstimateZMoveMs() 估算保护超时时间，并重启 autoVisionActuatorSettleTimer。
+     *   3. 正常路径不靠该定时器推进，必须由 autoVisionHandleActuatorMoveDone() 收到 F4 完成事件后推进。
+     *
+     * 参数：
+     *   direction 为 0 时表示下降，为 1 时表示回升。
+     *   stepsValue 是本次 Z 轴移动步数。
+     *   speedRpm 是本次 Z 轴移动速度。
+     *
+     * 返回值：
+     *   无返回值；函数只设置阶段和本地保护定时器。
+     */
+    function autoVisionStartZMotionWait(direction, stepsValue, speedRpm) {
+        var movingDown = Math.floor(Number(direction || 0)) === 0
+        var waitMs = autoVisionEstimateZMoveMs(stepsValue, speedRpm)
+        var waitSeconds = (waitMs / 1000.0).toFixed(1)
+
+        autoVisionActuatorPhase = movingDown ? "z-motion-down-wait" : "z-motion-up-wait"
+        workflowState = movingDown ? "Z轴下降到位等待" : "Z轴回升到位等待"
+        autoVisionLastText = "等待 F4 ACTUATOR_MOVE_DONE 确认上下电机"
+                + (movingDown ? "下降" : "回升")
+                + "真实到位，本地保护 " + waitSeconds + " 秒，steps=" + stepsValue
+                + "，speed=" + speedRpm + "rpm"
+        storageState = autoVisionLastText
+        showStorageToast()
+        autoVisionActuatorSettleTimer.interval = waitMs
+        autoVisionActuatorSettleTimer.restart()
+    }
+
+    /*
+     * autoVisionHandleActuatorMoveDone 的作用：
+     *   在 MP157 C++ 已确认收到 F4 ACTUATOR_MOVE_DONE 后推进自动流程。
+     *
+     * 主要流程：
+     *   1. 停止 Z 轴本地保护定时器，说明正常完成来自 F4 到位事件而不是固定 sleep。
+     *   2. Z 下降完成后，先用传送带和左右轴继续复查/微调 ROI 中心。
+     *   3. Z 回升完成后，才允许通知 F4/ESP32S3 机械臂抓取零件并进入称重、电感流程。
+     *
+     * 参数：
+     *   detail 是 C++ 返回的 ACK + EVENT_REPORT 诊断文本，必须包含 actuator-move-done。
+     *
+     * 返回值：
+     *   true 表示当前阶段已处理；false 表示当前阶段不是 Z 轴完成等待。
+     */
+    function autoVisionHandleActuatorMoveDone(detail) {
+        var eventText = String(detail || "")
+
+        if (eventText.indexOf("actuator-move-timeout") >= 0) {
+            autoVisionActuatorSettleTimer.stop()
+            autoVisionLastText = "F4执行器到位超时：" + eventText
+            storageState = autoVisionLastText
+            workflowState = "执行器超时"
+            autoVisionActuatorPhase = ""
+            showStorageToast()
+            return true
+        }
+
+        if (eventText.indexOf("actuator-move-done") < 0) {
+            return false
+        }
+
+        if (autoVisionActuatorPhase === "z-motion-down-wait") {
+            autoVisionActuatorSettleTimer.stop()
+            autoVisionNeedsZUp = true
+            autoVisionPendingZMoveSteps = 0
+            autoVisionPendingZMoveSpeedRpm = 0
+            autoVisionPendingZMoveDirection = 0
+            autoVisionLastText = "F4已确认Z轴下降真实到位，开始ROI复查并用传送带/左右轴微调：" + eventText
+            storageState = autoVisionLastText
+            showStorageToast()
+            autoVisionRequestFineTuneLocate()
+            return true
+        }
+
+        if (autoVisionActuatorPhase === "z-motion-up-wait") {
+            autoVisionActuatorSettleTimer.stop()
+            autoVisionNeedsZUp = false
+            autoVisionZFocusSettled = false
+            autoVisionDetectFromZFlow = false
+            autoVisionPendingZMoveSteps = 0
+            autoVisionPendingZMoveSpeedRpm = 0
+            autoVisionPendingZMoveDirection = 0
+            autoVisionActuatorPhase = ""
+            workflowState = "高度已恢复"
+            storageState = "F4已确认Z轴回升真实到位，开始通知F4/ESP32S3机械臂流程"
+            showStorageToast()
+            autoVisionStartF4ArmInspectionAfterZUp()
+            return true
+        }
+
+        return false
+    }
+
+    /*
      * autoVisionRequestZDown 的作用：
      *   在 F4 确认传送带居中停机后，请求上下电机按固定步数下降到模型检测高度。
      *
@@ -1026,11 +1248,14 @@ Rectangle {
     function autoVisionRequestZDown() {
         var motor = cameraZMotorSetting()
         var steps = Math.floor(Number(motor.zDownFixedSteps || 0))
-        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
 
         autoVisionFineTuneAttempts = 0
         autoVisionZFocusSettled = false
         autoVisionDetectFromZFlow = false
+        autoVisionPendingZMoveSteps = 0
+        autoVisionPendingZMoveSpeedRpm = 0
+        autoVisionPendingZMoveDirection = 0
 
         if (steps <= 0) {
             autoVisionLastText = "上下电机下探步数为0，跳过Z轴下降，进入ROI复查"
@@ -1044,7 +1269,10 @@ Rectangle {
 
         workflowState = "Z轴下降"
         autoVisionActuatorPhase = "z-down"
-        autoVisionLastText = "自动视觉：上下电机下降 " + steps + " step，等待 F4 ACK"
+        autoVisionPendingZMoveSteps = steps
+        autoVisionPendingZMoveSpeedRpm = speed
+        autoVisionPendingZMoveDirection = 0
+        autoVisionLastText = "自动视觉：上下电机下降 " + steps + " step，等待 F4 到位事件"
         storageState = autoVisionLastText
         showStorageToast()
 
@@ -1054,6 +1282,9 @@ Rectangle {
         }
 
         autoVisionActuatorPhase = ""
+        autoVisionPendingZMoveSteps = 0
+        autoVisionPendingZMoveSpeedRpm = 0
+        autoVisionPendingZMoveDirection = 0
         autoVisionLastText = "上下电机下降命令未启动"
         storageState = autoVisionLastText
         showStorageToast()
@@ -1071,9 +1302,7 @@ Rectangle {
         autoVisionLocatePurpose = "fine-tune"
         autoVisionLocateBusy = true
         workflowState = "ROI复查"
-        autoVisionLastText = autoVisionZFocusSettled
-                ? "自动视觉：Z轴下降后已等待对焦稳定，复查ROI中心"
-                : "自动视觉：复查ROI中心"
+        autoVisionLastText = "自动视觉：Z轴下降或短步微调后复查ROI中心"
         storageState = autoVisionLastText
         showStorageToast()
 
@@ -1088,6 +1317,28 @@ Rectangle {
         autoVisionStartDetectDelay()
         showStorageToast()
         return false
+    }
+
+    /*
+     * autoVisionStartFocusSettleBeforeDetect 的作用：
+     *   ROI 二次对中已经通过后，单独等待 3 秒让摄像头稳定和对焦，然后再进入模型检测。
+     *
+     * 主要流程：
+     *   1. 把自动执行器阶段切到 focus-settle，和 z-down/fine-tune 阶段区分开。
+     *   2. 使用 autoVisionZFocusSettleMs 作为聚焦稳定时间，当前固定为 3000ms。
+     *   3. 定时器到期后由 autoVisionActuatorSettleTimer 调用 autoVisionStartDetectDelay()。
+     *
+     * 返回值：
+     *   无返回值；函数只启动聚焦稳定定时器。
+     */
+    function autoVisionStartFocusSettleBeforeDetect() {
+        autoVisionActuatorPhase = "focus-settle"
+        workflowState = "对焦稳定"
+        autoVisionLastText = "ROI已在检测中心，等待约3秒让摄像头对焦稳定后再检测模型"
+        storageState = autoVisionLastText
+        showStorageToast()
+        autoVisionActuatorSettleTimer.interval = autoVisionZFocusSettleMs
+        autoVisionActuatorSettleTimer.restart()
     }
 
     /*
@@ -1155,11 +1406,10 @@ Rectangle {
         dxPixelsValid = true
 
         if (xCentered && yCentered) {
-            workflowState = "模型检测"
             autoVisionLastText = "ROI复查通过：errorY=" + errorY
-                    + "，errorX=" + errorX + "，进入模型检测"
+                    + "，errorX=" + errorX + "，进入3秒聚焦稳定"
             storageState = autoVisionLastText
-            autoVisionStartDetectDelay()
+            autoVisionStartFocusSettleBeforeDetect()
             showStorageToast()
             return
         }
@@ -1196,7 +1446,7 @@ Rectangle {
     function autoVisionFineTuneConveyor(errorY) {
         var motor = conveyorMotorSetting()
         var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
-        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var speed = conveyorTrackSpeedRpm()
         var direction = errorY > 0 ? 0 : 1
 
         autoVisionFineTuneAttempts += 1
@@ -1234,7 +1484,7 @@ Rectangle {
     function autoVisionFineTuneLateral(errorX) {
         var motor = cameraLateralMotorSetting()
         var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
-        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
         var direction = errorX > 0 ? 0 : 1
 
         autoVisionFineTuneAttempts += 1
@@ -1260,6 +1510,38 @@ Rectangle {
     }
 
     /*
+     * autoVisionStartF4ArmInspectionAfterZUp 的作用：
+     *   模型检测完成且上下轴已经回升后，通知 F4 启动 ESP32S3 机械臂称重/电感流程。
+     *
+     * 主要流程：
+     *   1. 校验最近一次模型 RESULT 已缓存，否则不能让 F4 记录空模型结果。
+     *   2. 调用 requestF4ArmInspectionFlow() 下发 MODEL_READY 和 ARM_JOB_START。
+     *   3. 后续等待 onF4ArmInspectionFlowFinished，再执行完整云端上传。
+     *
+     * 返回值：
+     *   true 表示 F4 长流程已启动；false 表示缺少模型结果或 F4 忙。
+     */
+    function autoVisionStartF4ArmInspectionAfterZUp() {
+        if (!latestModelResultText || latestModelResultText.indexOf("RESULT ") !== 0) {
+            storageState = "模型结果未缓存，不能启动F4机械臂称重/电感流程"
+            showStorageToast()
+            return false
+        }
+
+        workflowState = "机械臂检测"
+        storageState = "Z轴已回升，通知F4/ESP32S3抓取零件并放到称重、电感模块"
+        showStorageToast()
+
+        if (!deviceHealth.requestF4ArmInspectionFlow(latestModelResultText)) {
+            storageState = "F4机械臂检测流程未启动"
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
      * autoVisionRequestZUp 的作用：
      *   模型检测完成后请求上下电机按固定回升步数返回识别高度。
      *
@@ -1273,25 +1555,33 @@ Rectangle {
      */
     function autoVisionRequestZUp() {
         if (!autoVisionNeedsZUp) {
+            autoVisionStartF4ArmInspectionAfterZUp()
             return true
         }
 
         var motor = cameraZMotorSetting()
         var steps = Math.floor(Number(motor.zUpFixedSteps || 0))
-        var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
+        var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
 
         if (steps <= 0) {
             autoVisionNeedsZUp = false
             autoVisionActuatorPhase = ""
+            autoVisionPendingZMoveSteps = 0
+            autoVisionPendingZMoveSpeedRpm = 0
+            autoVisionPendingZMoveDirection = 0
             autoVisionLastText = "上下电机回升步数为0，本轮不回升"
             storageState = autoVisionLastText
             showStorageToast()
+            autoVisionStartF4ArmInspectionAfterZUp()
             return true
         }
 
         workflowState = "Z轴回升"
         autoVisionActuatorPhase = "z-up"
-        autoVisionLastText = "模型检测完成，上下电机回升 " + steps + " step"
+        autoVisionPendingZMoveSteps = steps
+        autoVisionPendingZMoveSpeedRpm = speed
+        autoVisionPendingZMoveDirection = 1
+        autoVisionLastText = "模型检测完成，上下电机回升 " + steps + " step，等待 F4 到位事件"
         storageState = autoVisionLastText
         showStorageToast()
 
@@ -1301,6 +1591,9 @@ Rectangle {
         }
 
         autoVisionActuatorPhase = ""
+        autoVisionPendingZMoveSteps = 0
+        autoVisionPendingZMoveSpeedRpm = 0
+        autoVisionPendingZMoveDirection = 0
         autoVisionLastText = "上下电机回升命令未启动，请手动复位"
         storageState = autoVisionLastText
         showStorageToast()
@@ -2117,6 +2410,7 @@ Rectangle {
                 + "  ROI" + settingsRoiSize
                 + "  UNet>" + settingsSegmentMinPixels + "px"
                 + "  电机ID" + stepperMotorCompactSummary()
+                + "  带" + conveyorScanSpeedRpm() + "/" + conveyorTrackSpeedRpm() + "rpm"
                 + "  上传" + (settingsUploadEnabled ? "自动" : "手动")
     }
 
@@ -2380,6 +2674,7 @@ Rectangle {
             lines.push(prefix + ".address=" + motor.address)
             lines.push(prefix + ".min_step=" + motor.minStep)
             lines.push(prefix + ".normal_speed_rpm=" + motor.normalSpeedRpm)
+            lines.push(prefix + ".scan_speed_rpm=" + (motor.scanSpeedRpm || 0))
             lines.push(prefix + ".direction=" + motor.direction + " (" + root.stepperMotorDirectionText(motor.direction) + ")")
             lines.push(prefix + ".z_down_fixed_steps=" + (motor.zDownFixedSteps || 0))
             lines.push(prefix + ".z_up_fixed_steps=" + (motor.zUpFixedSteps || 0))
@@ -2403,6 +2698,7 @@ Rectangle {
         stepperMotorPageIndex = Math.max(0, Math.min(maxIndex, pageIndex))
         stepperMotorResultText = "保存并下发后会写入 JSON，并发送 STEPPER_PARAM_SET 给 F4；F4 只更新运行内存"
         stepperSpeedEditorVisible = false
+        stepperSpeedEditKey = "normalSpeedRpm"
         stepperStepEditorVisible = false
         stepperStepEditKey = ""
         stepperSpeedInputText = "" + (currentStepperMotorSetting().normalSpeedRpm || 0)
@@ -2411,14 +2707,27 @@ Rectangle {
 
     /*
      * openStepperSpeedEditor 的作用：
-     *   打开常规速度数字键盘，并把当前电机速度拷贝到输入框。
+     *   打开速度数字键盘，并把当前电机的目标速度字段拷贝到输入框。
+     *
+     * 参数：
+     *   key 是 normalSpeedRpm 或 scanSpeedRpm；scanSpeedRpm 只在传送带页使用。
      *
      * 返回值：
      *   无返回值；函数只更新 stepperSpeedInputText 和 stepperSpeedEditorVisible。
      */
-    function openStepperSpeedEditor() {
+    function openStepperSpeedEditor(key) {
         var motor = currentStepperMotorSetting()
-        stepperSpeedInputText = "" + (motor.normalSpeedRpm || 0)
+        var editKey = key || "normalSpeedRpm"
+
+        if (editKey !== "normalSpeedRpm" && editKey !== "scanSpeedRpm") {
+            stepperMotorResultText = "速度字段无效：" + editKey
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+
+        stepperSpeedEditKey = editKey
+        stepperSpeedInputText = "" + Math.floor(Number(motor[editKey] || 0))
         stepperStepEditorVisible = false
         stepperSpeedEditorVisible = true
     }
@@ -2509,7 +2818,7 @@ Rectangle {
 
     /*
      * applyStepperSpeedInput 的作用：
-     *   校验速度输入框并写入当前页电机的 normalSpeedRpm。
+     *   校验速度输入框并写入当前页电机的 normalSpeedRpm 或 scanSpeedRpm。
      *
      * 主要流程：
      *   1. 只接受 0~5000 的十进制整数。
@@ -2530,7 +2839,7 @@ Rectangle {
             return
         }
 
-        if (!detectSettings.setStepperMotorValue(stepperMotorPageIndex, "normalSpeedRpm", parsedSpeed)) {
+        if (!detectSettings.setStepperMotorValue(stepperMotorPageIndex, stepperSpeedEditKey, parsedSpeed)) {
             stepperMotorResultText = detectSettings.lastStatusText
             storageState = stepperMotorResultText
             showStorageToast()
@@ -2539,8 +2848,10 @@ Rectangle {
 
         stepperSpeedEditorVisible = false
         stepperSpeedInputText = "" + parsedSpeed
-        stepperMotorResultText = currentStepperMotorSetting().name + "：常规速度 " + parsedSpeed + " rpm，点击保存并下发写入JSON并通知F4"
-        settingsLastActionText = "步进电机速度已更新为 " + parsedSpeed + " rpm"
+        var speedLabel = stepperSpeedEditKey === "scanSpeedRpm" ? "上料速度" : "常规/对中速度"
+        stepperMotorResultText = currentStepperMotorSetting().name + "：" + speedLabel
+                + " " + parsedSpeed + " rpm，点击保存并下发写入JSON并通知F4"
+        settingsLastActionText = "步进电机" + speedLabel + "已更新为 " + parsedSpeed + " rpm"
         storageState = settingsLastActionText
         showStorageToast()
     }
@@ -2637,11 +2948,58 @@ Rectangle {
     }
 
     /*
+     * syncStepperSettingsToF4 的作用：
+     *   把当前 MP157 参数页里的三台电机参数通过 STEPPER_PARAM_SET 统一同步到 F4 运行内存。
+     *
+     * 主要流程：
+     *   1. 检查是否已有步进参数下发在途，避免重复占用 `/dev/ttySTM2`。
+     *   2. 记录触发原因，例如开机自动下发、保存配置或步进弹窗保存并下发。
+     *   3. 调用 C++ sendF4StepperSettings() 发送二进制帧，等待 onF4StepperSettingsFinished 更新结果。
+     *
+     * 参数：
+     *   reason 是本次同步来源，写入底部提示，方便现场判断是不是开机同步。
+     *
+     * 返回值：
+     *   true 表示后台发送已启动；false 表示串口忙、参数非法或命令未启动。
+     */
+    function syncStepperSettingsToF4(reason) {
+        var reasonText = reason && reason.length > 0 ? reason : "参数同步"
+
+        if (stepperSettingsSending) {
+            stepperMotorResultText = "步进参数正在下发 F4，请等待上一次回执"
+            settingsLastActionText = stepperMotorResultText
+            storageState = formatF4ToastText(stepperMotorResultText)
+            showStorageToast()
+            return false
+        }
+
+        stepperSettingsSending = true
+        stepperMotorResultText = reasonText + "：正在下发三台电机参数，"
+                + "上料速度=" + conveyorScanSpeedRpm() + "rpm，"
+                + "对中速度=" + conveyorTrackSpeedRpm() + "rpm，"
+                + root.stepperMotorRoleAddressSummary()
+        settingsLastActionText = stepperMotorResultText
+        storageState = formatF4ToastText(stepperMotorResultText)
+        showStorageToast()
+
+        if (!deviceHealth.sendF4StepperSettings(detectSettings.stepperMotorSettings)) {
+            stepperSettingsSending = false
+            stepperMotorResultText = reasonText + "：F4步进参数命令未启动"
+            settingsLastActionText = stepperMotorResultText
+            storageState = formatF4ToastText(stepperMotorResultText)
+            showStorageToast()
+            return false
+        }
+
+        return true
+    }
+
+    /*
      * changeStepperMotorValue 的作用：
      *   处理步进电机弹窗内的加减按钮，把修改写入 C++ 检测配置控制器。
      *
      * 参数：
-     *   key 是 address、minStep、normalSpeedRpm 或 direction。
+     *   key 是 address、minStep、normalSpeedRpm、scanSpeedRpm 或 direction。
      *   delta 是要增加或减少的数值；direction 会被当作目标方向值使用。
      *
      * 返回值：
@@ -2664,6 +3022,8 @@ Rectangle {
             nextValue = motor.minStep + delta
         } else if (key === "normalSpeedRpm") {
             nextValue = motor.normalSpeedRpm + delta
+        } else if (key === "scanSpeedRpm") {
+            nextValue = (motor.scanSpeedRpm || 0) + delta
         } else if (key === "direction") {
             nextValue = delta >= 0 ? 1 : -1
         } else {
@@ -2681,12 +3041,13 @@ Rectangle {
         }
 
         motor = currentStepperMotorSetting()
-        if (key === "normalSpeedRpm") {
-            stepperSpeedInputText = "" + motor.normalSpeedRpm
+        if (key === "normalSpeedRpm" || key === "scanSpeedRpm") {
+            stepperSpeedInputText = "" + Math.floor(Number(motor[key] || 0))
         }
         stepperMotorResultText = motor.name + "：地址 " + motor.addressHex
                 + "，最小步长 " + motor.minStep + " step"
                 + "，常规速度 " + motor.normalSpeedRpm + " rpm"
+                + "，上料速度 " + (motor.scanSpeedRpm || 0) + " rpm"
                 + "，方向 " + root.stepperMotorDirectionText(motor.direction)
         settingsLastActionText = "步进电机参数已更新，点击保存配置写入JSON"
         storageState = settingsLastActionText
@@ -2741,7 +3102,7 @@ Rectangle {
      * 主要流程：
      *   1. 说明 MP157 与 F4 的串口状态字段，包括设备节点、波特率、心跳、CRC 和帧序号。
      *   2. 说明 F4 负责采集或上报的光电、急停、限位、LDC1614、HX711 和 Emm42_V5.0 状态。
-     *   3. 明确 Qt 当前不直接下发速度、位置、剔除或联锁解除命令。
+     *   3. 明确 Qt 只通过 F4 高层协议下发步进运行参数，不直接拼 Emm42 底层帧。
      *
      * 返回值：
      *   返回多行中文说明，供 settingsDetailFlickable 滚动显示。
@@ -2764,8 +3125,8 @@ Rectangle {
             "1. MP157 负责视觉推理、图片保存、COS 上传、历史补传和云端记录创建。",
             "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
             "3. 传送带开放 BELT_MANUAL_CONTROL/QUERY_STATUS，摄像头轴开放 ACTUATOR_POS_MOVE、ACTUATOR_STOP、ACTUATOR_VEL_MOVE 和 ACTUATOR_HOME。",
-            "4. 步进电机参数弹窗保存三台 Emm42 的地址、最小步长、常规速度和方向，保存并下发会发送 STEPPER_PARAM_SET 给 F407。",
-            "5. 当前 Qt 不直接拼 Emm42 帧，不绕过 F407 下发速度、位置、剔除动作、急停解除或联锁时序。",
+            "4. 步进电机参数弹窗保存三台 Emm42 的地址、最小步长、常规/对中速度、传送带上料速度和方向，保存或开机都会发送 STEPPER_PARAM_SET 给 F407。",
+            "5. 当前 Qt 不直接拼 Emm42 帧，不绕过 F407 执行速度、位置、剔除动作、急停解除或联锁时序。",
             "6. F4 ACK 表示命令被协议层接收，现场仍要用 CAMINFO、QUERY_STATUS 或实际动作确认运行时参数和电机地址。"
         ]
         return lines.join("\n")
@@ -3005,6 +3366,7 @@ Rectangle {
                         settingsLogText("保存配置", saveResult))
             settingsLastActionText = saveResult + "；" + saveLogResult
             refreshLogFileList()
+            syncStepperSettingsToF4("保存配置同步F4")
         } else if (action === "reset") {
             settingsLastActionText = detectSettings.resetToDefaults()
         } else if (action === "export") {
@@ -4980,7 +5342,7 @@ Rectangle {
         running: false
 
         onTriggered: {
-            root.autoVisionDetectFromZFlow = root.autoVisionNeedsZUp
+            root.autoVisionDetectFromZFlow = true
             root.workflowState = "模型检测"
             root.storageState = "零件已在检测高度，开始模型检测"
             root.showStorageToast()
@@ -4988,7 +5350,7 @@ Rectangle {
         }
     }
 
-    /* autoVisionActuatorSettleTimer 给 Z 轴下降对焦或短步微调留出稳定时间，然后再复查 ROI。 */
+    /* autoVisionActuatorSettleTimer 统一承载 Z 轴物理等待、短步微调稳定和 3 秒对焦稳定等异步阶段。 */
     Timer {
         id: autoVisionActuatorSettleTimer
         interval: 450
@@ -4996,13 +5358,34 @@ Rectangle {
         running: false
 
         onTriggered: {
-            if (root.autoVisionActuatorPhase === "z-down"
-                    || root.autoVisionActuatorPhase === "z-down-skip"
+            if (root.autoVisionActuatorPhase === "z-motion-down-wait") {
+                root.autoVisionPendingZMoveSteps = 0
+                root.autoVisionPendingZMoveSpeedRpm = 0
+                root.autoVisionPendingZMoveDirection = 0
+                root.autoVisionActuatorPhase = ""
+                root.workflowState = "Z轴下降超时"
+                root.storageState = "未收到F4 ACTUATOR_MOVE_DONE，禁止进入ROI复查和模型检测，请检查Emm42 Response/RX/地址"
+                root.autoVisionLastText = root.storageState
+                root.showStorageToast()
+            } else if (root.autoVisionActuatorPhase === "z-motion-up-wait") {
+                root.autoVisionNeedsZUp = true
+                root.autoVisionZFocusSettled = false
+                root.autoVisionDetectFromZFlow = false
+                root.autoVisionPendingZMoveSteps = 0
+                root.autoVisionPendingZMoveSpeedRpm = 0
+                root.autoVisionPendingZMoveDirection = 0
+                root.autoVisionActuatorPhase = ""
+                root.workflowState = "Z轴回升超时"
+                root.storageState = "未收到F4 ACTUATOR_MOVE_DONE，禁止启动机械臂抓取，请手动确认Z轴已离开零件"
+                root.autoVisionLastText = root.storageState
+                root.showStorageToast()
+            } else if (root.autoVisionActuatorPhase === "z-down-skip"
                     || root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
-                if (root.autoVisionActuatorPhase === "z-down") {
-                    root.autoVisionZFocusSettled = true
-                }
                 root.autoVisionRequestFineTuneLocate()
+            } else if (root.autoVisionActuatorPhase === "focus-settle") {
+                root.autoVisionZFocusSettled = true
+                root.autoVisionActuatorPhase = ""
+                root.autoVisionStartDetectDelay()
             }
         }
     }
@@ -5050,6 +5433,18 @@ Rectangle {
         }
     }
 
+    /* stepperStartupSyncTimer 在开机后自动把参数页三台电机配置同步到 F4，避免 F4 继续使用旧运行参数。 */
+    Timer {
+        id: stepperStartupSyncTimer
+        interval: 1600
+        repeat: false
+        running: false
+
+        onTriggered: {
+            root.syncStepperSettingsToF4("开机自动下发")
+        }
+    }
+
     /*
      * Component.onCompleted 在 QML 根对象加载完成后执行一次。
      * 这里二次隐藏 overlay 视频层，用于覆盖手动重启 Qt 但 overlay 仍在运行的场景。
@@ -5057,6 +5452,7 @@ Rectangle {
     Component.onCompleted: {
         root.setBootOverlayVisible(false)
         root.evaluateRuntimeAlarms()
+        stepperStartupSyncTimer.restart()
     }
 
     Connections {
@@ -5199,8 +5595,15 @@ Rectangle {
         onF4StepperSettingsFinished: {
             root.stepperSettingsSending = false
             if (ok) {
-                root.stepperMotorResultText = "F4已接收步进参数：" + root.stepperMotorRoleAddressSummary() + "；" + detail
-                root.settingsLastActionText = "步进电机参数已保存并下发 F4：" + root.stepperMotorRoleAddressSummary()
+                root.stepperMotorResultText = "F4已接收步进参数："
+                        + root.stepperMotorRoleAddressSummary()
+                        + "，上料=" + root.conveyorScanSpeedRpm() + "rpm"
+                        + "，对中=" + root.conveyorTrackSpeedRpm() + "rpm；"
+                        + detail
+                root.settingsLastActionText = "步进电机参数已保存并下发 F4："
+                        + root.stepperMotorRoleAddressSummary()
+                        + "，上料=" + root.conveyorScanSpeedRpm() + "rpm"
+                        + "，对中=" + root.conveyorTrackSpeedRpm() + "rpm"
             } else {
                 root.stepperMotorResultText = "F4步进参数下发失败：" + detail
                 root.settingsLastActionText = root.stepperMotorResultText
@@ -5337,13 +5740,13 @@ Rectangle {
 
         /*
          * onF4ActuatorCommandFinished 的作用：
-         *   接收 ACTUATOR_POS_MOVE/ACTUATOR_STOP 的 ACK/NACK，并按自动阶段或手动阶段分别推进。
+         *   接收 ACTUATOR_POS_MOVE 的真实到位结果或其它执行器命令 ACK/NACK，并按阶段推进。
          *
          * 参数：
-         *   ok 表示 F4 是否 ACK 本次执行器命令。
+         *   ok 对 ACTUATOR_POS_MOVE 表示已经收到 F4 ACTUATOR_MOVE_DONE；对其它命令表示 ACK 成功。
          *   action 是执行器命令名称。
          *   cycleId 是当前自动流程号，手动命令通常为 0。
-         *   detail 是 ACK/NACK 解析结果或串口失败原因。
+         *   detail 是 ACK、EVENT_REPORT、NACK 或串口失败原因。
          */
         onF4ActuatorCommandFinished: {
             root.autoVisionCommandBusy = false
@@ -5351,25 +5754,17 @@ Rectangle {
 
             if (root.autoVisionActuatorPhase !== "") {
                 if (ok) {
-                    root.autoVisionLastText = "执行器ACK：" + root.autoVisionActuatorPhase + " " + detail
+                    root.autoVisionLastText = "执行器完成：" + root.autoVisionActuatorPhase + " " + detail
                     if (root.autoVisionActuatorPhase === "z-down") {
                         root.autoVisionNeedsZUp = true
-                        root.workflowState = "对焦稳定"
-                        root.storageState = "上下电机下降完成，等待约3秒让摄像头对焦稳定"
-                        root.showStorageToast()
-                        autoVisionActuatorSettleTimer.interval = root.autoVisionZFocusSettleMs
-                        autoVisionActuatorSettleTimer.restart()
+                        root.autoVisionActuatorPhase = "z-motion-down-wait"
+                        root.autoVisionHandleActuatorMoveDone(detail)
                     } else if (root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                         autoVisionActuatorSettleTimer.interval = root.autoVisionShortSettleMs
                         autoVisionActuatorSettleTimer.restart()
                     } else if (root.autoVisionActuatorPhase === "z-up") {
-                        root.autoVisionNeedsZUp = false
-                        root.autoVisionZFocusSettled = false
-                        root.autoVisionDetectFromZFlow = false
-                        root.autoVisionActuatorPhase = ""
-                        root.workflowState = "高度已恢复"
-                        root.storageState = "上下电机已回升到识别高度：" + detail
-                        root.showStorageToast()
+                        root.autoVisionActuatorPhase = "z-motion-up-wait"
+                        root.autoVisionHandleActuatorMoveDone(detail)
                     }
                 } else {
                     root.autoVisionLastText = "执行器失败：" + root.autoVisionActuatorPhase + " " + detail
@@ -5427,6 +5822,62 @@ Rectangle {
             root.showStorageToast()
         }
 
+            root.evaluateRuntimeAlarms()
+        }
+
+        /*
+         * onF4ArmInspectionFlowFinished 的作用：
+         *   接收 F4 主动回传的称重和电感数据，收齐后启动一次性完整云端上传。
+         *
+         * 主要流程：
+         *   1. 成功时把 WEIGHT_RESULT/LDC_RESULT/F4流程上下文交给 storageController。
+         *   2. 失败时停止本轮自动流程并提示人工处理，避免缺少传感器数据仍上传完整记录。
+         *   3. 上传动作不在 F4 回调里直接拼 JSON，保证云端字段由 C++ 上传控制器统一生成。
+         */
+        onF4ArmInspectionFlowFinished: {
+            if (ok) {
+                root.workflowState = "完整上传"
+                root.storageState = "称重和电感数据已收齐，正在把图片、模型和传感器数据一次性上传"
+                root.showStorageToast()
+                storageController.uploadCompletedInspectionBundle(weightContextJson,
+                                                                  ldcContextJson,
+                                                                  f4FlowContextJson)
+            } else {
+                root.workflowState = "待人工处理"
+                root.storageState = "F4机械臂称重/电感流程失败：" + detail
+                root.raiseRuntimeAlarm("f4-link-failed",
+                                       "ALM-F4-001",
+                                       "告警",
+                                       "F4机械臂检测流程失败",
+                                       detail)
+                root.showStorageToast()
+            }
+        }
+
+        /*
+         * onF4FinalSortFinished 的作用：
+         *   接收 F4 最终分拣和 CYCLE_DONE 结果，本轮自动检测到这里才闭环完成。
+         *
+         * 说明：
+         *   如果前一步完整上传失败，C++ 会把 FINAL_SORT_RESULT 改为 upload_status=2/final_bin=3，
+         *   因此这里收到成功也可能表示“已放入待复核盘”，不是云端上传成功。
+         */
+        onF4FinalSortFinished: {
+            if (ok) {
+                root.workflowState = "本轮完成"
+                root.storageState = "F4已完成最终分拣：" + detail + " " + cycleDoneContextJson
+                root.markAlarmRecovered("f4-link-failed")
+                root.markAlarmRecovered("cloud-upload-failed")
+            } else {
+                root.workflowState = "分拣异常"
+                root.storageState = "F4最终分拣失败：" + detail
+                root.raiseRuntimeAlarm("f4-link-failed",
+                                       "ALM-F4-001",
+                                       "告警",
+                                       "F4最终分拣失败",
+                                       detail)
+            }
+            root.showStorageToast()
             root.evaluateRuntimeAlarms()
         }
 
@@ -5542,6 +5993,9 @@ Rectangle {
         onDetectCurrentFrameFinished: {
             detectImageBusy = false
             handleDetectResultText(resultText)
+            if (resultText.indexOf("RESULT ") === 0) {
+                root.latestModelResultText = resultText
+            }
             storageState = resultText
             if (resultText.indexOf("检测失败") === 0) {
                 root.raiseRuntimeAlarm("model-detect-failed",
@@ -5562,6 +6016,11 @@ Rectangle {
                 }
             }
             showStorageToast()
+
+            if (root.autoVisionDetectFromZFlow) {
+                root.autoVisionDetectFromZFlow = false
+                root.autoVisionRequestZUp()
+            }
         }
 
         /*
@@ -5592,6 +6051,41 @@ Rectangle {
                                        resultText)
             }
             showStorageToast()
+        }
+
+        /*
+         * onCompletedInspectionBundleUploaded 的作用：
+         *   自动流程完整上传结束后，把上传结果交给 F4 做最终分拣决策。
+         *
+         * 主要流程：
+         *   1. 成功上传时按云端 result 分拣到良品盘、不良品盘或待复核盘。
+         *   2. 上传失败时本地历史已经保留，仍然通知 F4，但 C++ 会强制 final_bin=3 待复核盘。
+         *   3. 只有 F4 后续返回 CYCLE_DONE，才认为这一件零件自动检测流程真正完成。
+         */
+        onCompletedInspectionBundleUploaded: {
+            root.latestCompletedUploadResultText = resultText
+            root.latestCompletedCloudResult = cloudResult && cloudResult.length > 0 ? cloudResult : "review"
+            root.storageState = resultText
+
+            if (ok) {
+                root.workflowState = "等待分拣"
+                root.markAlarmRecovered("cloud-upload-failed")
+            } else {
+                root.workflowState = "上传失败待复核"
+                root.raiseRuntimeAlarm("cloud-upload-failed",
+                                       "ALM-UPLOAD-001",
+                                       "预警",
+                                       "完整上传失败，零件将进入待复核盘",
+                                       resultText)
+            }
+
+            root.showStorageToast()
+
+            if (!deviceHealth.requestF4FinalSortResult(root.latestCompletedCloudResult,
+                                                       root.latestCompletedUploadResultText)) {
+                root.storageState = "F4最终分拣命令未启动：" + root.latestCompletedUploadResultText
+                root.showStorageToast()
+            }
         }
     }
 
@@ -9321,6 +9815,7 @@ Rectangle {
                             onClicked: {
                                 root.stepperMotorPageIndex = index
                                 root.stepperSpeedEditorVisible = false
+                                root.stepperSpeedEditKey = "normalSpeedRpm"
                                 root.stepperStepEditorVisible = false
                                 root.stepperStepEditKey = ""
                                 root.stepperSpeedInputText = "" + (modelData.normalSpeedRpm || 0)
@@ -9546,7 +10041,7 @@ Rectangle {
                     Text {
                         width: 92
                         anchors.verticalCenter: parent.verticalCenter
-                        text: "常规速度"
+                        text: (stepperMotorPopupPanel.motorConfig.role || "") === "conveyor" ? "对中速度" : "常规速度"
                         color: "#dce3e6"
                         font.pixelSize: 13
                         font.bold: true
@@ -9616,7 +10111,7 @@ Rectangle {
                             anchors.fill: parent
 
                             onClicked: {
-                                root.openStepperSpeedEditor()
+                                root.openStepperSpeedEditor("normalSpeedRpm")
                             }
                         }
                     }
@@ -9651,6 +10146,119 @@ Rectangle {
                 Row {
                     x: 14
                     y: 192
+                    width: parent.width - 28
+                    height: 34
+                    spacing: 8
+                    visible: (stepperMotorPopupPanel.motorConfig.role || "") === "conveyor"
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "上料速度"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: (stepperMotorPopupPanel.motorConfig.scanSpeedRpm || 0) + " rpm"
+                            color: "#eef3f4"
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
+                    }
+
+                    Rectangle {
+                        width: 72
+                        height: 34
+                        radius: 7
+                        color: stepperScanSpeedMinusMouse.pressed ? "#30363b" : "#22272b"
+                        border.color: "#5aa7ff"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "速度-"
+                            color: "#d9ecff"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperScanSpeedMinusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("scanSpeedRpm", -10)
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 72
+                        height: 34
+                        radius: 7
+                        color: stepperScanSpeedInputMouse.pressed ? "#3c3322" : "#33291b"
+                        border.color: root.accentAmber
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "输入"
+                            color: "#fff3d5"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperScanSpeedInputMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.openStepperSpeedEditor("scanSpeedRpm")
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 72
+                        height: 34
+                        radius: 7
+                        color: stepperScanSpeedPlusMouse.pressed ? "#30413a" : "#1f332b"
+                        border.color: root.accentGreen
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "速度+"
+                            color: "#eafff2"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperScanSpeedPlusMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeStepperMotorValue("scanSpeedRpm", 10)
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    x: 14
+                    y: (stepperMotorPopupPanel.motorConfig.role || "") === "conveyor" ? 232 : 192
                     width: parent.width - 28
                     height: 34
                     spacing: 8
@@ -9912,6 +10520,7 @@ Rectangle {
                         var count = motors && motors.length > 0 ? motors.length : 1
                         root.stepperMotorPageIndex = (root.stepperMotorPageIndex + 1) % count
                         root.stepperSpeedEditorVisible = false
+                        root.stepperSpeedEditKey = "normalSpeedRpm"
                         root.stepperStepEditorVisible = false
                         root.stepperStepEditKey = ""
                         root.stepperSpeedInputText = "" + (root.currentStepperMotorSetting().normalSpeedRpm || 0)
@@ -9977,15 +10586,6 @@ Rectangle {
 
                     onClicked: {
                         root.settingsApplyAction("save")
-                        root.stepperSettingsSending = true
-                        root.stepperMotorResultText = root.settingsLastActionText
-                                + "；下发ID：" + root.stepperMotorRoleAddressSummary()
-                                + "；正在通过二进制协议下发 F4"
-                        root.storageState = root.stepperMotorResultText
-                        root.showStorageToast()
-                        if (!deviceHealth.sendF4StepperSettings(detectSettings.stepperMotorSettings)) {
-                            root.stepperSettingsSending = false
-                        }
                     }
                 }
             }
@@ -10023,7 +10623,7 @@ Rectangle {
                         x: 16
                         y: 14
                         width: parent.width - 108
-                        text: "常规速度输入"
+                        text: root.stepperSpeedEditKey === "scanSpeedRpm" ? "上料速度输入" : "常规/对中速度输入"
                         color: "#f1f4f5"
                         font.pixelSize: 18
                         font.bold: true
@@ -10062,7 +10662,7 @@ Rectangle {
                         x: 16
                         y: 54
                         width: parent.width - 32
-                        text: "范围 0~5000 rpm；0 表示保存为常规停止速度。"
+                        text: "范围 0~5000 rpm；0 表示保存为停止速度，自动流程会用兜底速度避免误停。"
                         color: "#cfd7db"
                         font.pixelSize: 12
                         font.bold: true

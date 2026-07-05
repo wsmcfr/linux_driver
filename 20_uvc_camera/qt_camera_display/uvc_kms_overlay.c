@@ -95,6 +95,18 @@
 /* 自动视觉定位的最大外接框边长，首版零件必须小于中心 ROI 的大部分区域。 */
 #define AUTO_LOCATE_MAX_BBOX_SIDE 260U
 
+/* 自动视觉定位的最低实体密度百分比，过低通常是噪声边线，不是完整零件。 */
+#define AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT 8U
+
+/* 自动视觉定位的最高实体密度百分比，过高通常是黑色传送带或整片阴影，不是带孔垫圈。 */
+#define AUTO_LOCATE_MAX_SOLID_DENSITY_PERCENT 78U
+
+/* 自动视觉定位的中心孔采样分母，4 表示取 bbox 中央约 1/4 宽高区域判断垫圈中心孔。 */
+#define AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR 4U
+
+/* 自动视觉定位的中心孔背景占比阈值，中央采样区至少 35% 不是候选亮度才认为像垫圈孔。 */
+#define AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT 35U
+
 /*
  * 自动视觉定位的基础亮度差阈值。
  *
@@ -2022,6 +2034,75 @@ static int auto_locate_is_candidate_luma(unsigned int luma,
 }
 
 /*
+ * auto_locate_component_has_ring_hole 的作用：
+ *   判断候选连通域中心是否存在垫圈类零件常见的“孔/背景”区域。
+ *
+ * 主要流程：
+ *   1. 在候选 bbox 中央取一个小窗口，窗口尺寸约为 bbox 的 1/4。
+ *   2. 统计窗口内不属于候选亮度的像素占比。
+ *   3. 背景占比足够高时认为该连通域具有中心孔结构。
+ *
+ * 参数：
+ *   frame 是原始 YUYV 帧。
+ *   roi_x/roi_y 是搜索 ROI 在整帧中的起点。
+ *   min_x/max_x/min_y/max_y 是候选 bbox 在 ROI 内的范围。
+ *   bright_threshold/dark_threshold 是本帧自适应候选阈值。
+ *
+ * 返回值：
+ *   像垫圈中心孔返回 1；否则返回 0。
+ */
+static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
+                                               unsigned int roi_x,
+                                               unsigned int roi_y,
+                                               unsigned int min_x,
+                                               unsigned int max_x,
+                                               unsigned int min_y,
+                                               unsigned int max_y,
+                                               unsigned int bright_threshold,
+                                               unsigned int dark_threshold)
+{
+    unsigned int bbox_w = max_x - min_x + 1U;
+    unsigned int bbox_h = max_y - min_y + 1U;
+    unsigned int sample_w = bbox_w / AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR;
+    unsigned int sample_h = bbox_h / AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR;
+    unsigned int sample_x0;
+    unsigned int sample_y0;
+    unsigned int x;
+    unsigned int y;
+    unsigned int total = 0U;
+    unsigned int background = 0U;
+
+    if (sample_w < 1U) {
+        sample_w = 1U;
+    }
+    if (sample_h < 1U) {
+        sample_h = 1U;
+    }
+
+    sample_x0 = min_x + (bbox_w - sample_w) / 2U;
+    sample_y0 = min_y + (bbox_h - sample_h) / 2U;
+
+    for (y = 0; y < sample_h; y++) {
+        for (x = 0; x < sample_w; x++) {
+            unsigned int luma = yuyv_luma_at(frame,
+                                             roi_x + sample_x0 + x,
+                                             roi_y + sample_y0 + y);
+
+            total++;
+            if (!auto_locate_is_candidate_luma(luma, bright_threshold, dark_threshold)) {
+                background++;
+            }
+        }
+    }
+
+    if (total == 0U) {
+        return 0;
+    }
+
+    return (background * 100U / total) >= AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT ? 1 : 0;
+}
+
+/*
  * locate_part_in_yuyv_frame 的作用：
  *   在最新 YUYV 原始帧的中心 ROI 内定位传送带上的零件。
  *
@@ -2257,6 +2338,24 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
 
             contrast_avg = contrast_sum / area;
             density = bbox_area > 0U ? (area * 100U) / bbox_area : 0U;
+
+            if (density < AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT ||
+                density > AUTO_LOCATE_MAX_SOLID_DENSITY_PERCENT) {
+                continue;
+            }
+
+            if (!auto_locate_component_has_ring_hole(frame,
+                                                     roi_x,
+                                                     roi_y,
+                                                     min_x,
+                                                     max_x,
+                                                     min_y,
+                                                     max_y,
+                                                     bright_threshold,
+                                                     dark_threshold)) {
+                continue;
+            }
+
             score = area + bbox_area / 4U + contrast_avg * 8U;
 
             if (score <= best_score) {

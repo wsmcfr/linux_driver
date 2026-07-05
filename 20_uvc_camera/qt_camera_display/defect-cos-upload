@@ -36,6 +36,11 @@ CLOUD_HEALTH_URL_OVERRIDE="${CLOUD_HEALTH_URL:-}"
 CLOUD_TIME_TZ_OVERRIDE="${CLOUD_TIME_TZ:-}"
 CLOUD_TIME_OFFSET_OVERRIDE="${CLOUD_TIME_OFFSET:-}"
 CLOUD_TIME_NOW_CMD_OVERRIDE="${CLOUD_TIME_NOW_CMD:-}"
+CLOUD_WEIGHT_CONTEXT_OVERRIDE="${CLOUD_WEIGHT_CONTEXT:-}"
+CLOUD_LDC_CONTEXT_OVERRIDE="${CLOUD_LDC_CONTEXT:-}"
+CLOUD_F4_FLOW_CONTEXT_OVERRIDE="${CLOUD_F4_FLOW_CONTEXT:-}"
+CLOUD_DECISION_CONTEXT_OVERRIDE="${CLOUD_DECISION_CONTEXT:-}"
+CLOUD_VISION_CONTEXT_OVERRIDE="${CLOUD_VISION_CONTEXT:-}"
 SOURCE_HEADERS_OVERRIDE="${SOURCE_HEADERS:-}"
 ANNOTATED_HEADERS_OVERRIDE="${ANNOTATED_HEADERS:-}"
 
@@ -81,6 +86,26 @@ json_escape()
 {
     # 这个函数只处理本脚本生成的短字符串，主要转义反斜杠和双引号，避免 JSON 被路径或账号破坏。
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_context_or_empty_object()
+{
+    # json_context_or_empty_object 的作用：
+    #   把 Qt 通过环境变量传入的 JSON 上下文安全地插入检测记录请求体。
+    # 主要流程：
+    #   1. 空值直接输出 {}，保证云端字段始终是 JSON 对象。
+    #   2. 只有看起来以 { 开始并以 } 结束的文本才原样输出。
+    #   3. 其它内容降级为 {}，避免错误文本破坏 POST /records 的 JSON。
+    value="${1:-}"
+
+    case "$value" in
+        \{*\})
+            printf '%s' "$value"
+            ;;
+        *)
+            printf '{}'
+            ;;
+    esac
 }
 
 extract_json_string()
@@ -827,6 +852,11 @@ apply_runtime_overrides()
     [ -z "$CLOUD_TIME_TZ_OVERRIDE" ] || CLOUD_TIME_TZ="$CLOUD_TIME_TZ_OVERRIDE"
     [ -z "$CLOUD_TIME_OFFSET_OVERRIDE" ] || CLOUD_TIME_OFFSET="$CLOUD_TIME_OFFSET_OVERRIDE"
     [ -z "$CLOUD_TIME_NOW_CMD_OVERRIDE" ] || CLOUD_TIME_NOW_CMD="$CLOUD_TIME_NOW_CMD_OVERRIDE"
+    [ -z "$CLOUD_WEIGHT_CONTEXT_OVERRIDE" ] || CLOUD_WEIGHT_CONTEXT="$CLOUD_WEIGHT_CONTEXT_OVERRIDE"
+    [ -z "$CLOUD_LDC_CONTEXT_OVERRIDE" ] || CLOUD_LDC_CONTEXT="$CLOUD_LDC_CONTEXT_OVERRIDE"
+    [ -z "$CLOUD_F4_FLOW_CONTEXT_OVERRIDE" ] || CLOUD_F4_FLOW_CONTEXT="$CLOUD_F4_FLOW_CONTEXT_OVERRIDE"
+    [ -z "$CLOUD_DECISION_CONTEXT_OVERRIDE" ] || CLOUD_DECISION_CONTEXT="$CLOUD_DECISION_CONTEXT_OVERRIDE"
+    [ -z "$CLOUD_VISION_CONTEXT_OVERRIDE" ] || CLOUD_VISION_CONTEXT="$CLOUD_VISION_CONTEXT_OVERRIDE"
     [ -z "$SOURCE_HEADERS_OVERRIDE" ] || SOURCE_HEADERS="$SOURCE_HEADERS_OVERRIDE"
     [ -z "$ANNOTATED_HEADERS_OVERRIDE" ] || ANNOTATED_HEADERS="$ANNOTATED_HEADERS_OVERRIDE"
 }
@@ -879,6 +909,14 @@ export TZ="$CLOUD_TIME_ZONE"
 
 # CLOUD_TIME_NOW_CMD 只供自检注入固定时间命令，正式运行保持为空。
 CLOUD_TIME_NOW_CMD="${CLOUD_TIME_NOW_CMD:-}"
+
+# CLOUD_*_CONTEXT 由 MP157 Qt 自动流程传入，写入云端记录 JSON 上下文。
+# 为空时降级为 {}，历史重发也能继续沿用只上传图片和模型结果的旧路线。
+CLOUD_WEIGHT_CONTEXT="${CLOUD_WEIGHT_CONTEXT:-}"
+CLOUD_LDC_CONTEXT="${CLOUD_LDC_CONTEXT:-}"
+CLOUD_F4_FLOW_CONTEXT="${CLOUD_F4_FLOW_CONTEXT:-}"
+CLOUD_DECISION_CONTEXT="${CLOUD_DECISION_CONTEXT:-}"
+CLOUD_VISION_CONTEXT="${CLOUD_VISION_CONTEXT:-}"
 
 # 上传响应头保存位置，便于开发板 SSH 排查 COS 返回的 ETag 和 HTTP 状态。
 SOURCE_HEADERS="${SOURCE_HEADERS:-/tmp/source_upload_headers.txt}"
@@ -1005,12 +1043,20 @@ create_record()
     request_part_code_json="$(json_escape "$request_part_code")"
     request_class_label_json="$(json_escape "${CLOUD_CLASS_LABEL:-}")"
     record_part_fields="$(record_part_payload_fields)"
+    weight_context_json="$(json_context_or_empty_object "$CLOUD_WEIGHT_CONTEXT")"
+    ldc_context_json="$(json_context_or_empty_object "$CLOUD_LDC_CONTEXT")"
+    f4_flow_context_json="$(json_context_or_empty_object "$CLOUD_F4_FLOW_CONTEXT")"
+    decision_context_json="$(json_context_or_empty_object "$CLOUD_DECISION_CONTEXT")"
+    vision_context_json="$(json_context_or_empty_object "$CLOUD_VISION_CONTEXT")"
     record_body="{
 \"record_no\":\"$record_no\",
 $record_part_fields,
 \"device_id\":$CLOUD_DEVICE_ID,
 \"result\":\"$CLOUD_RESULT\",
-\"device_context\":{\"part_code\":\"$request_part_code_json\",\"class_label\":\"$request_class_label_json\"},
+\"vision_context\":$vision_context_json,
+\"sensor_context\":{\"weighing\":$weight_context_json,\"ldc1614_eddy_current\":$ldc_context_json,\"f4_flow\":$f4_flow_context_json},
+\"decision_context\":$decision_context_json,
+\"device_context\":{\"part_code\":\"$request_part_code_json\",\"class_label\":\"$request_class_label_json\",\"f4_flow\":$f4_flow_context_json},
 \"captured_at\":\"$captured_at\",
 \"detected_at\":\"$captured_at\"
 }"
