@@ -247,6 +247,9 @@ static const quint8 BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U;
 /* 二进制执行器位置运动命令：用于让 F4 以 Emm42 位置模式控制传送带、左右轴或上下轴移动固定步数。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE = 0x50U;
 
+/* 执行器位置运动命令负载长度：cycle_id2 + actuator1 + direction1 + mode1 + speed2 + steps4 + flags1。 */
+static const int BINARY_PROTOCOL_ACTUATOR_POS_MOVE_PAYLOAD_SIZE = 12;
+
 /* 二进制执行器停止命令：用于手动急停或停止指定执行器，actuator=0xFF 表示全部可停止执行器。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_STOP = 0x51U;
 
@@ -279,6 +282,21 @@ static const quint16 F4_ACTUATOR_MOVE_STATUS_REACHED_ACK = 0x0000U;
 
 /* 执行器位置运动完成状态：5 表示 F4 未等到主动回包，但按速度、步数和安全余量估算运动已经结束。 */
 static const quint16 F4_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE = 0x0005U;
+
+/* MP157 本地估算每圈步数：张大头 Emm42 默认细分折算为 200 step/rev，用于 F4 事件丢失时兜底。 */
+static const int MP157_ACTUATOR_FALLBACK_STEPS_PER_REV = 200;
+
+/* MP157 本地估算安全余量：覆盖 F4 转发、驱动器加减速和机构惯性，单位 ms。 */
+static const int MP157_ACTUATOR_FALLBACK_SAFETY_MS = 900;
+
+/* MP157 本地估算短稳定时间：运动结束后给画面和机构一个最小稳定窗口，单位 ms。 */
+static const int MP157_ACTUATOR_FALLBACK_SETTLE_MS = 450;
+
+/* MP157 本地估算最短等待：小步数也不能马上推进 ROI 复查，单位 ms。 */
+static const int MP157_ACTUATOR_FALLBACK_MIN_MS = 1200;
+
+/* MP157 本地估算最长等待：保留比 C++ 70 秒串口等待略短的上限，避免后台线程永久占用。 */
+static const int MP157_ACTUATOR_FALLBACK_MAX_MS = 65000;
 
 /* 二进制称重结果命令：F4 读取 HX711 稳定结果后主动上报给 MP157。 */
 static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U;
@@ -11360,6 +11378,83 @@ private:
     }
 
     /*
+     * estimateActuatorPositionMoveFallbackMs 的作用：
+     *   当 MP157 已收到 ACTUATOR_POS_MOVE 的 ACK、但没有等到 F4 EVENT_REPORT 时，
+     *   根据“本次实际发送的命令帧”估算一个兜底完成时间，避免自动流程无声卡在 Z 轴下降后。
+     *
+     * 主要流程：
+     *   1. 从完整二进制帧中校验 CMD 和 payload 长度，确保解析的是 ACTUATOR_POS_MOVE。
+     *   2. 直接读取帧内 actuator、direction、speed_rpm 和 steps，因此用户在参数页修改速度或步数后，
+     *      下一次命令会自动得到新的估算等待时间，不使用写死 sleep。
+     *   3. 用 steps / 每圈步数 / rpm 换算运动时间，再叠加安全余量和短稳定时间。
+     *   4. 对异常输入做限幅；如果帧格式不对则返回 -1，调用方继续只等 F4 事件。
+     *
+     * 参数：
+     *   frame 是已经写给 F4 的完整 ACTUATOR_POS_MOVE 二进制帧。
+     *   summary 用于返回本次估算使用的 actuator、direction、speed、steps 和 wait_ms，便于现场日志对账。
+     *
+     * 返回值：
+     *   返回正整数表示 MP157 本地兜底等待毫秒数；返回 -1 表示无法安全估算。
+     */
+    static int estimateActuatorPositionMoveFallbackMs(const QByteArray &frame, QString *summary)
+    {
+        const int payloadOffset = 7;       /* payloadOffset 指向完整帧中 PAYLOAD 的首字节。 */
+        const int payloadLengthOffset = 4; /* payloadLengthOffset 是 LEN 字段下标。 */
+        const int commandOffset = 3;       /* commandOffset 是 CMD 字段下标。 */
+
+        if (summary) {
+            summary->clear();
+        }
+
+        if (frame.size() < BINARY_PROTOCOL_MIN_FRAME_SIZE + BINARY_PROTOCOL_ACTUATOR_POS_MOVE_PAYLOAD_SIZE) {
+            return -1;
+        }
+
+        if (static_cast<quint8>(frame.at(commandOffset)) != BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE) {
+            return -1;
+        }
+
+        if (static_cast<quint8>(frame.at(payloadLengthOffset)) != BINARY_PROTOCOL_ACTUATOR_POS_MOVE_PAYLOAD_SIZE) {
+            return -1;
+        }
+
+        const quint8 actuator = static_cast<quint8>(frame.at(payloadOffset + 2));
+        const quint8 direction = static_cast<quint8>(frame.at(payloadOffset + 3));
+        const quint16 speedRpmRaw = readLe16(frame, payloadOffset + 5);
+        const quint32 steps = readLe32Unsigned(frame, payloadOffset + 7);
+        int fallbackSpeedRpm = 40;
+
+        if (actuator == 1U) {
+            fallbackSpeedRpm = 120;
+        } else if (actuator == 2U) {
+            fallbackSpeedRpm = 80;
+        }
+
+        const int speedRpm = speedRpmRaw > 0U
+                ? static_cast<int>(std::min<quint16>(speedRpmRaw, static_cast<quint16>(5000U)))
+                : fallbackSpeedRpm;
+        const double moveMsDouble = (static_cast<double>(steps) * 60000.0)
+                / (static_cast<double>(MP157_ACTUATOR_FALLBACK_STEPS_PER_REV) * static_cast<double>(speedRpm));
+        int waitMs = static_cast<int>(std::ceil(moveMsDouble))
+                + MP157_ACTUATOR_FALLBACK_SAFETY_MS
+                + MP157_ACTUATOR_FALLBACK_SETTLE_MS;
+
+        waitMs = std::max(MP157_ACTUATOR_FALLBACK_MIN_MS, waitMs);
+        waitMs = std::min(MP157_ACTUATOR_FALLBACK_MAX_MS, waitMs);
+
+        if (summary) {
+            *summary = QStringLiteral("mp157-local-estimate actuator=") + QString::number(actuator)
+                    + QStringLiteral(" direction=") + QString::number(direction)
+                    + QStringLiteral(" speed_rpm=") + QString::number(speedRpm)
+                    + QStringLiteral(" speed_source=") + (speedRpmRaw > 0U ? QStringLiteral("frame") : QStringLiteral("axis-default"))
+                    + QStringLiteral(" steps=") + QString::number(steps)
+                    + QStringLiteral(" wait_ms=") + QString::number(waitMs);
+        }
+
+        return waitMs;
+    }
+
+    /*
      * runF4ActuatorPositionMoveAndWaitDone 的作用：
      *   专门发送 ACTUATOR_POS_MOVE，并在同一个串口连接中等待“ACK + 完成事件”。
      *
@@ -11393,9 +11488,11 @@ private:
         struct termios tio;                  /* tio 保存 raw 串口配置，避免二进制协议被行规程改写。 */
         QString ackDetail;                   /* ackDetail 保存 F4 接收命令后的 ACK 文本。 */
         QString lastReadDetail;              /* lastReadDetail 保存等待过程中最近一次非目标帧或读失败原因。 */
+        QString fallbackEstimateDetail;       /* fallbackEstimateDetail 保存 MP157 用帧内速度和步数算出的兜底等待依据。 */
         bool ackMatched = false;             /* ackMatched 标记是否已经收到本命令对应的 ACK。 */
         QElapsedTimer ackTimer;              /* ackTimer 限制 ACK 阶段等待时间。 */
         QElapsedTimer moveTimer;             /* moveTimer 限制到位事件阶段等待时间。 */
+        const int fallbackMoveMs = estimateActuatorPositionMoveFallbackMs(frame, &fallbackEstimateDetail);
 
         if (frame.isEmpty()) {
             if (detail) {
@@ -11555,8 +11652,48 @@ private:
             F4BinaryReply reply;
             QString readErrorText;
 
+            if (fallbackMoveMs > 0 && moveTimer.elapsed() >= fallbackMoveMs) {
+                /*
+                 * F4 的 EVENT_REPORT 仍然是首选完成依据；走到这里说明 ACK 已收到，
+                 * 但同一 related_seq 的 DONE 没有及时回来。为了避免老 F4 固件、RX 接线或事件丢失
+                 * 让自动流程一直停在 Z 轴下降，MP157 使用本次帧内 speed_rpm/steps 的保守估算继续流程。
+                 */
+                if (detail) {
+                    *detail = ackDetail
+                            + QStringLiteral("；EVENT_REPORT actuator-move-done cycle=")
+                            + QString::number(expectedCycleId)
+                            + QStringLiteral(" status=5(estimated-done,mp157-local-estimated-done) related_seq=")
+                            + QString::number(expectedSequence)
+                            + QStringLiteral("；")
+                            + fallbackEstimateDetail
+                            + QStringLiteral("；last=")
+                            + lastReadDetail;
+                }
+                ::close(fd);
+                return true;
+            }
+
             if (!readF4BinaryReply(fd, &reply, &readErrorText)) {
                 lastReadDetail = readErrorText;
+                if (fallbackMoveMs > 0 && moveTimer.elapsed() >= fallbackMoveMs) {
+                    /*
+                     * readF4BinaryReply() 每次最多等待 700ms；如果这次短等待结束后已经超过估算时间，
+                     * 立即返回本地兜底完成，避免再多等一轮导致现场看起来没有反应。
+                     */
+                    if (detail) {
+                        *detail = ackDetail
+                                + QStringLiteral("；EVENT_REPORT actuator-move-done cycle=")
+                                + QString::number(expectedCycleId)
+                                + QStringLiteral(" status=5(estimated-done,mp157-local-estimated-done) related_seq=")
+                                + QString::number(expectedSequence)
+                                + QStringLiteral("；")
+                                + fallbackEstimateDetail
+                                + QStringLiteral("；last=")
+                                + lastReadDetail;
+                    }
+                    ::close(fd);
+                    return true;
+                }
                 continue;
             }
 

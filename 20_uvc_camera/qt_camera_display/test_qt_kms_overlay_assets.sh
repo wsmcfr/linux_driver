@@ -871,10 +871,22 @@ require_grep "actuator-move-done" "qml/Main.qml"
 require_grep "actuator-move-timeout" "qml/Main.qml"
 require_grep "estimated-done" "main.cpp"
 require_grep "estimated-done" "qml/Main.qml"
+require_grep "estimateActuatorPositionMoveFallbackMs" "main.cpp"
+require_grep "mp157-local-estimated-done" "main.cpp"
 require_grep "z-motion-down-wait" "qml/Main.qml"
 require_grep "z-motion-up-wait" "qml/Main.qml"
 require_grep "requestF4ArmInspectionFlow" "qml/Main.qml"
 require_grep "onF4ArmInspectionFlowFinished" "qml/Main.qml"
+mp157_fallback_block="$(sed -n '/estimateActuatorPositionMoveFallbackMs/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'readLe16(frame, payloadOffset + 5)'; then
+    fail "MP157 本地估算必须从 ACTUATOR_POS_MOVE 帧内 speed_rpm 读取速度，不能写死等待时间"
+fi
+if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'readLe32Unsigned(frame, payloadOffset + 7)'; then
+    fail "MP157 本地估算必须从 ACTUATOR_POS_MOVE 帧内 steps 读取步数，参数页改步数后下一次命令要实时生效"
+fi
+if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'wait_ms='; then
+    fail "MP157 本地估算日志必须输出 wait_ms，方便现场核对速度、步数和等待时间"
+fi
 z_down_ack_block="$(sed -n '/root.autoVisionActuatorPhase === "z-down"/,/root.autoVisionActuatorPhase.indexOf("fine-tune")/p' "$SCRIPT_DIR/qml/Main.qml")"
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionZFocusSettleMs'; then
     fail "Z 下降 ACK 后不能直接等待 3s 对焦；必须先短稳定并用传送带+左右轴复查 ROI 中心"
