@@ -421,6 +421,8 @@ require_grep "ACTUATOR_HOME" "qml/Main.qml"
 require_grep "ACTUATOR_STOP_NOW" "qml/Main.qml"
 require_grep "sendManualActuatorVelocityMove" "qml/Main.qml"
 require_grep "sendF4ActuatorStopNow" "qml/Main.qml"
+require_grep "manualActuatorStopRetryTimer" "qml/Main.qml"
+require_grep "manualStopRetryActuatorId" "qml/Main.qml"
 require_grep "sendStepperActuatorHome" "qml/Main.qml"
 require_grep "设当前位置为零点" "qml/Main.qml"
 require_grep "manualCameraZZeroKnown" "qml/Main.qml"
@@ -615,6 +617,7 @@ require_grep "z_motion_timeout_ms" "main.cpp"
 require_grep "zMotionTimeoutMs" "main.cpp"
 require_grep "f4_arm_result_timeout_ms" "main.cpp"
 require_grep "f4ArmResultTimeoutMs" "main.cpp"
+require_grep "F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS = 300000" "main.cpp"
 require_grep "conveyorTrackSpeedRpm" "qml/Main.qml"
 require_grep "conveyorScanSpeedRpm" "qml/Main.qml"
 require_grep "cameraZMotionTimeoutMs" "qml/Main.qml"
@@ -724,11 +727,11 @@ if printf '%s\n' "$final_sort_block" | grep -q 'F4_ARM_ACTIVE_FRAME_TIMEOUT_MS';
 fi
 stepper_min_step_minus_block="$(sed -n '/id: stepperMinStepMinusMouse/,/^                            }/p' "$SCRIPT_DIR/qml/Main.qml")"
 stepper_min_step_plus_block="$(sed -n '/id: stepperMinStepPlusMouse/,/^                            }/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$stepper_min_step_minus_block" | grep -q 'changeStepperMotorValue("minStep", -100)'; then
-    fail "步进电机最小步长减号按钮必须每次减少 100 step，不能继续只减少 1 step"
+if ! printf '%s\n' "$stepper_min_step_minus_block" | grep -q 'changeStepperMotorValue("minStep", -50)'; then
+    fail "步进电机最小步长减号按钮必须每次减少 50 step，不能继续只减少 1 step 或旧的 100 step"
 fi
-if ! printf '%s\n' "$stepper_min_step_plus_block" | grep -q 'changeStepperMotorValue("minStep", 100)'; then
-    fail "步进电机最小步长加号按钮必须每次增加 100 step，不能继续只增加 1 step"
+if ! printf '%s\n' "$stepper_min_step_plus_block" | grep -q 'changeStepperMotorValue("minStep", 50)'; then
+    fail "步进电机最小步长加号按钮必须每次增加 50 step，不能继续只增加 1 step 或旧的 100 step"
 fi
 stepper_step_open_block="$(sed -n '/function openStepperStepEditor/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$stepper_step_open_block" | grep -q 'stepperStepReplaceOnNextDigit = stepperStepEditorIsTimeout()'; then

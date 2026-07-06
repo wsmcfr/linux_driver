@@ -313,6 +313,12 @@ Rectangle {
     /* manualPendingZReturnHome 表示当前上下轴命令是否由“回原位”触发，成功后偏移直接归零。 */
     property bool manualPendingZReturnHome: false
 
+    /* manualStopRetryActuatorId 保存需要补发 STOP 的执行器编号，-1 表示当前没有补发任务。 */
+    property int manualStopRetryActuatorId: -1
+
+    /* manualStopRetryTargetText 保存补发 STOP 时写入日志的目标名称，便于现场对照本次停止的是哪一轴。 */
+    property string manualStopRetryTargetText: ""
+
     /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
     property var settingsSupportedPartTypes: ["波形垫圈", "平垫圈", "弹性垫圈"]
 
@@ -2659,6 +2665,15 @@ Rectangle {
             return false
         }
 
+        /*
+         * 手动方向键和停止键可能被快速连续点击：
+         * 第一轮 STOP 会立即写入串口，延迟补发一轮用于覆盖上一条运动帧刚启动、
+         * 普通串口线程仍在打开/写入阶段时，STOP 被运动帧时序覆盖的窗口。
+         */
+        manualStopRetryActuatorId = actuator
+        manualStopRetryTargetText = targetText
+        manualActuatorStopRetryTimer.restart()
+
         return true
     }
 
@@ -3931,7 +3946,7 @@ Rectangle {
             detectSettings.overlayAlpha = Math.max(0.0, Math.min(1.0, settingsOverlayAlpha + delta))
             settingsLastActionText = "真实检测配置：overlay透明度 " + settingsOverlayAlpha.toFixed(2)
         } else if (key === "f4-arm-timeout") {
-            detectSettings.f4ArmResultTimeoutMs = Math.max(10000, Math.min(180000, settingsF4ArmResultTimeoutMs + delta))
+            detectSettings.f4ArmResultTimeoutMs = Math.max(10000, Math.min(300000, settingsF4ArmResultTimeoutMs + delta))
             settingsLastActionText = "真实检测配置：机械臂等待超时 " + settingsF4ArmResultTimeoutText()
                     + "，只影响MP157等待F4主动结果帧"
         }
@@ -5907,6 +5922,37 @@ Rectangle {
 
         onTriggered: {
             storageToastVisible = false
+        }
+    }
+
+    /* manualActuatorStopRetryTimer 用于给手动停止键补发一次 STOP，避免快速连点时第一轮 STOP 被上一条运动帧时序覆盖。 */
+    Timer {
+        id: manualActuatorStopRetryTimer
+        interval: 260
+        repeat: false
+        running: false
+
+        onTriggered: {
+            if (root.manualStopRetryActuatorId < 0) {
+                return
+            }
+
+            var retryActuator = root.manualStopRetryActuatorId
+            var retryTarget = root.manualStopRetryTargetText.length > 0
+                    ? root.manualStopRetryTargetText
+                    : "三轴电机"
+            root.manualStopRetryActuatorId = -1
+            root.manualStopRetryTargetText = ""
+
+            if (deviceHealth.sendF4ActuatorStopNow(retryActuator, 0)) {
+                root.manualLastAckText = "已启动补发停止帧：" + retryTarget
+            } else {
+                root.manualLastAckText = "补发停止帧启动失败：" + retryTarget
+            }
+
+            root.storageState = root.formatF4ToastText(root.manualLastAckText)
+            root.appendManualCommandLog("停止补发", retryTarget, root.manualLastAckText)
+            root.showStorageToast()
         }
     }
 
@@ -10740,7 +10786,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: "步长-100"
+                            text: "步长-50"
                             color: "#d9ecff"
                             font.pixelSize: 12
                             font.bold: true
@@ -10752,7 +10798,7 @@ Rectangle {
                             preventStealing: true
 
                             onClicked: {
-                                root.changeStepperMotorValue("minStep", -100)
+                                root.changeStepperMotorValue("minStep", -50)
                             }
                         }
                     }
@@ -10767,7 +10813,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: "步长+100"
+                            text: "步长+50"
                             color: "#eafff2"
                             font.pixelSize: 12
                             font.bold: true
@@ -10779,7 +10825,7 @@ Rectangle {
                             preventStealing: true
 
                             onClicked: {
-                                root.changeStepperMotorValue("minStep", 100)
+                                root.changeStepperMotorValue("minStep", 50)
                             }
                         }
                     }

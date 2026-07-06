@@ -334,8 +334,8 @@ static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_DEFAULT_MS = 75000;
 /* F4 机械臂主动结果等待最小窗口，单位毫秒；低于 10 秒容易把正常抓取误判为超时。 */
 static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_MIN_MS = 10000;
 
-/* F4 机械臂主动结果等待最大窗口，单位毫秒；限制到 180 秒避免串口后台线程长时间占用。 */
-static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS = 180000;
+/* F4 机械臂主动结果等待最大窗口，单位毫秒；限制到 300 秒，给 ESP32S3 机械臂慢动作和传感器稳定留足余量。 */
+static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS = 300000;
 
 /* 板端缺陷分类推理程序默认路径，首页“检测”按钮会通过 QProcess 调用它。 */
 static const char *DEFAULT_DEFECT_CLASSIFY_BIN = "/root/qt_camera_display/defect-classify";
@@ -3914,7 +3914,7 @@ public:
      *   返回 MP157 等待 F4 主动上报 WEIGHT_RESULT、LDC_RESULT 和 CYCLE_DONE 的最大时间。
      *
      * 返回值：
-     *   返回毫秒数，合法范围由 normalizedSettings() 统一限制为 10000~180000。
+     *   返回毫秒数，合法范围由 normalizedSettings() 统一限制为 10000~300000。
      */
     int f4ArmResultTimeoutMs() const
     {
@@ -4069,7 +4069,7 @@ public:
      *
      * 主要流程：
      *   1. 接收 QML 参数页加减按钮传入的毫秒数。
-     *   2. 通过 applySettings() 统一限制到 10~180 秒，避免过短误判或过长占用串口线程。
+     *   2. 通过 applySettings() 统一限制到 10~300 秒，避免过短误判，同时允许现场机械臂最慢等待到 5 分钟。
      *   3. 只影响 MP157 等待 WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE，不会写进 F4 发给 ESP32S3 的动作 payload。
      *
      * 参数：
