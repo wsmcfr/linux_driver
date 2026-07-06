@@ -61,6 +61,25 @@ require_absent()
     fi
 }
 
+# 作用：从 qml/Main.qml 中指定 id 开始截取一小段代码，再检查这段代码是否包含指定模式。
+# 主要流程：
+#   1. 使用 awk 找到 `id: <qml_id>` 所在位置，并向后保留有限行，避免误扫到其它控件。
+#   2. 如果找不到该 id，直接失败，说明测试目标控件已经被改名或删除。
+#   3. 在局部代码块中执行正则检查，保证滑动体验参数确实落在对应控件上。
+# 关键参数：
+#   qml_id 是 QML 控件 id；pattern 是必须命中的正则；message 是失败时给操作员看的原因。
+# 返回值：
+#   命中时继续执行；未命中时通过 fail() 退出脚本并返回非 0。
+require_qml_id_near_grep()
+{
+    qml_id="$1"
+    pattern="$2"
+    message="$3"
+    block="$(awk -v id_text="id: $qml_id" 'index($0, id_text) { found = 1; n = 0 } found && n < 45 { print; n++ }' "$SCRIPT_DIR/qml/Main.qml")"
+    [ -n "$block" ] || fail "qml/Main.qml 找不到 id：$qml_id"
+    printf '%s\n' "$block" | grep -Eq -- "$pattern" || fail "$message"
+}
+
 require_file "uvc_kms_overlay.c"
 require_file "build_uvc_kms_overlay.sh"
 require_file "run_qt_kms_overlay_display.sh"
@@ -680,7 +699,7 @@ require_grep "stepperStepReplaceOnNextDigit" "qml/Main.qml"
 require_grep "id: stepperMotorSettingsFlickable" "qml/Main.qml"
 require_grep "contentHeight: stepperMotorSettingsContent.height" "qml/Main.qml"
 require_grep "flickableDirection: Flickable.VerticalFlick" "qml/Main.qml"
-require_grep "boundsBehavior: Flickable.StopAtBounds" "qml/Main.qml"
+require_grep "boundsBehavior: Flickable.DragOverBounds" "qml/Main.qml"
 require_grep "stepperMotorInputTouchGuard" "qml/Main.qml"
 require_grep "id: stepperSpeedEditor" "qml/Main.qml"
 require_grep "0~5000 rpm" "qml/Main.qml"
@@ -878,6 +897,27 @@ require_grep "selectedHistoryRecord" "qml/Main.qml"
 require_grep "imageCarousel" "qml/Main.qml"
 require_grep "flickDeceleration" "qml/Main.qml"
 require_grep "maximumFlickVelocity" "qml/Main.qml"
+require_grep "uiHorizontalFlickVelocity" "qml/Main.qml"
+require_grep "uiHorizontalFlickDeceleration" "qml/Main.qml"
+require_grep "uiVerticalFlickVelocity" "qml/Main.qml"
+require_grep "uiVerticalFlickDeceleration" "qml/Main.qml"
+require_grep "uiCarouselCachePages" "qml/Main.qml"
+require_grep "uiListCachePages" "qml/Main.qml"
+require_qml_id_near_grep "historyListView" "boundsBehavior:[[:space:]]*Flickable\\.DragOverBounds" "历史记录列表必须使用柔和边界，避免滑到头时硬停顿"
+require_qml_id_near_grep "historyListView" "maximumFlickVelocity:[[:space:]]*root\\.uiHorizontalFlickVelocity" "历史记录列表必须使用统一横向滑动速度上限"
+require_qml_id_near_grep "historyListView" "flickDeceleration:[[:space:]]*root\\.uiHorizontalFlickDeceleration" "历史记录列表必须使用统一横向滑动减速度"
+require_qml_id_near_grep "imageCarousel" "boundsBehavior:[[:space:]]*Flickable\\.DragOverBounds" "历史图片轮播必须使用柔和边界，避免图片滑动到头时顿挫"
+require_qml_id_near_grep "imageCarousel" "maximumFlickVelocity:[[:space:]]*root\\.uiHorizontalFlickVelocity" "历史图片轮播必须使用统一横向滑动速度上限"
+require_qml_id_near_grep "imageCarousel" "flickDeceleration:[[:space:]]*root\\.uiHorizontalFlickDeceleration" "历史图片轮播必须使用统一横向滑动减速度"
+require_qml_id_near_grep "imageCarousel" "cacheBuffer:[[:space:]]*width \\* root\\.uiCarouselCachePages" "历史图片轮播必须预缓存相邻图片，避免边滑边解码卡顿"
+require_qml_id_near_grep "imageCarousel" "sourceSize\\.width:[[:space:]]*imageCarousel\\.width" "历史图片轮播必须限制图片解码尺寸，避免大图按原尺寸进入纹理"
+require_qml_id_near_grep "imageCarousel" "smooth:[[:space:]]*!imageCarousel\\.moving" "历史图片轮播必须在滑动中关闭平滑缩放，降低 MP157 滑动时的纹理开销"
+for smooth_scroll_id in statsRecentListView manualSafetyFlickable manualCommandLogView settingsDetailFlickable stepperMotorSettingsFlickable calibrationResultFlickable alarmHistoryListView alarmAdviceDetailFlickable logListView logDetailFlickable analysisDetailFlickable
+do
+    require_qml_id_near_grep "$smooth_scroll_id" "boundsBehavior:[[:space:]]*Flickable\\.DragOverBounds" "$smooth_scroll_id 必须使用柔和边界，避免上下滑动到边界时硬停顿"
+    require_qml_id_near_grep "$smooth_scroll_id" "maximumFlickVelocity:[[:space:]]*root\\.uiVerticalFlickVelocity" "$smooth_scroll_id 必须使用统一垂直滑动速度上限"
+    require_qml_id_near_grep "$smooth_scroll_id" "flickDeceleration:[[:space:]]*root\\.uiVerticalFlickDeceleration" "$smooth_scroll_id 必须使用统一垂直滑动减速度"
+done
 require_grep "setOverlayVisible" "qml/Main.qml"
 require_grep "safeRemoveSdCard" "qml/Main.qml"
 require_grep "saveAlarmSnapshotToSdCard" "qml/Main.qml"

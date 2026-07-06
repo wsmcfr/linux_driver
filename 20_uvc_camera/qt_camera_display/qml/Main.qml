@@ -268,6 +268,24 @@ Rectangle {
     /* logPageVisible 给日志查看页面做显隐判断；日志页打开时隐藏首页视频层，避免 KMS plane 遮挡列表和弹窗。 */
     property bool logPageVisible: activePage === "logs"
 
+    /* uiHorizontalFlickVelocity 是历史卡片和图片轮播的横向最大滑动速度，数值偏高可以减少“拖不动”的滞涩感。 */
+    property int uiHorizontalFlickVelocity: 2400
+
+    /* uiHorizontalFlickDeceleration 是横向滑动松手后的减速度，数值比旧配置低，避免图片轮播刚甩动就突然停下。 */
+    property int uiHorizontalFlickDeceleration: 1050
+
+    /* uiVerticalFlickVelocity 是统计、参数、告警和日志等上下滚动区的最大滑动速度，统一后各页面触摸手感一致。 */
+    property int uiVerticalFlickVelocity: 2200
+
+    /* uiVerticalFlickDeceleration 是上下滚动区的减速度，降低硬刹车感，同时保持短列表不会滑得过远。 */
+    property int uiVerticalFlickDeceleration: 1250
+
+    /* uiCarouselCachePages 表示历史图片轮播额外预缓存的页面数，用来提前准备左右相邻图片，减少边滑边解码。 */
+    property int uiCarouselCachePages: 3
+
+    /* uiListCachePages 表示普通列表额外预缓存的屏数，让快速滑动时下一屏委托提前创建，降低短暂停顿。 */
+    property int uiListCachePages: 2
+
     /* manualMode 表示当前是否允许调试级手动动作；当前只保护已接入的传送带和检测辅助动作。 */
     property bool manualMode: false
 
@@ -7449,13 +7467,13 @@ Rectangle {
                 spacing: 14
                 clip: true
                 model: uploadHistory
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
                 highlightRangeMode: ListView.NoHighlightRange
                 interactive: uploadHistory.count > 0
-                cacheBuffer: width * 2
-                flickDeceleration: 1800
-                maximumFlickVelocity: 1100
-                highlightMoveDuration: 180
+                cacheBuffer: width * root.uiListCachePages
+                flickDeceleration: root.uiHorizontalFlickDeceleration
+                maximumFlickVelocity: root.uiHorizontalFlickVelocity
+                highlightMoveDuration: 120
 
                 delegate: Rectangle {
                     width: 226
@@ -7717,21 +7735,24 @@ Rectangle {
                     highlightRangeMode: ListView.StrictlyEnforceRange
                     preferredHighlightBegin: 0
                     preferredHighlightEnd: width
-                    boundsBehavior: Flickable.StopAtBounds
+                    boundsBehavior: Flickable.DragOverBounds
                     interactive: root.historyImages().length > 1
-                    cacheBuffer: width * 2
-                    flickDeceleration: 1500
-                    maximumFlickVelocity: 900
-                    highlightMoveDuration: 180
+                    cacheBuffer: width * root.uiCarouselCachePages
+                    flickDeceleration: root.uiHorizontalFlickDeceleration
+                    maximumFlickVelocity: root.uiHorizontalFlickVelocity
+                    highlightMoveDuration: 120
                     clip: true
 
                     delegate: Image {
                         width: imageCarousel.width
                         height: imageCarousel.height
                         source: "file://" + modelData.path
+                        sourceSize.width: imageCarousel.width
+                        sourceSize.height: imageCarousel.height
                         fillMode: Image.PreserveAspectFit
-                        smooth: true
+                        smooth: !imageCarousel.moving
                         asynchronous: true
+                        cache: true
                     }
 
                     onCurrentIndexChanged: {
@@ -8071,7 +8092,10 @@ Rectangle {
                 contentWidth: width
                 contentHeight: fullAnalysisText.height
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
+                flickDeceleration: root.uiVerticalFlickDeceleration
+                interactive: contentHeight > height
 
                 Text {
                     id: fullAnalysisText
@@ -8484,9 +8508,10 @@ Rectangle {
                     clip: true
                     model: root.statsRecentRows()
                     spacing: 4
-                    boundsBehavior: Flickable.StopAtBounds
-                    maximumFlickVelocity: 900
-                    flickDeceleration: 2200
+                    boundsBehavior: Flickable.DragOverBounds
+                    cacheBuffer: height * root.uiListCachePages
+                    maximumFlickVelocity: root.uiVerticalFlickVelocity
+                    flickDeceleration: root.uiVerticalFlickDeceleration
 
                     delegate: Rectangle {
                         width: statsRecentListView.width
@@ -8959,7 +8984,10 @@ Rectangle {
                 height: 138
                 clip: true
                 contentHeight: manualSafetyColumn.height
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
+                flickDeceleration: root.uiVerticalFlickDeceleration
+                interactive: contentHeight > height
 
                 Column {
                     id: manualSafetyColumn
@@ -9158,7 +9186,10 @@ Rectangle {
                 clip: true
                 model: manualCommandLog
                 spacing: 4
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
+                cacheBuffer: height * root.uiListCachePages
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
+                flickDeceleration: root.uiVerticalFlickDeceleration
 
                 delegate: Rectangle {
                     width: manualCommandLogView.width
@@ -10416,7 +10447,10 @@ Rectangle {
                 contentWidth: width
                 contentHeight: fullSettingsDetailText.height
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
+                flickDeceleration: root.uiVerticalFlickDeceleration
+                interactive: contentHeight > height
 
                 Text {
                     id: fullSettingsDetailText
@@ -10590,7 +10624,10 @@ Rectangle {
                     contentWidth: width
                     contentHeight: stepperMotorSettingsContent.height
                     flickableDirection: Flickable.VerticalFlick
-                    boundsBehavior: Flickable.StopAtBounds
+                    boundsBehavior: Flickable.DragOverBounds
+                    maximumFlickVelocity: root.uiVerticalFlickVelocity
+                    flickDeceleration: root.uiVerticalFlickDeceleration
+                    interactive: contentHeight > height
 
                     Item {
                         id: stepperMotorSettingsContent
@@ -12055,6 +12092,10 @@ Rectangle {
                     contentWidth: width
                     contentHeight: calibrationResultTextItem.height
                     flickableDirection: Flickable.VerticalFlick
+                    boundsBehavior: Flickable.DragOverBounds
+                    maximumFlickVelocity: root.uiVerticalFlickVelocity
+                    flickDeceleration: root.uiVerticalFlickDeceleration
+                    interactive: contentHeight > height
 
                     Text {
                         id: calibrationResultTextItem
@@ -12541,9 +12582,10 @@ Rectangle {
                 clip: true
                 model: alarmHistoryModel
                 spacing: 5
-                boundsBehavior: Flickable.StopAtBounds
-                maximumFlickVelocity: 900
-                flickDeceleration: 2200
+                boundsBehavior: Flickable.DragOverBounds
+                cacheBuffer: height * root.uiListCachePages
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
+                flickDeceleration: root.uiVerticalFlickDeceleration
 
                 delegate: Rectangle {
                     width: alarmHistoryListView.width
@@ -12798,7 +12840,10 @@ Rectangle {
                 contentWidth: width
                 contentHeight: fullAlarmAdviceText.height
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
+                flickDeceleration: root.uiVerticalFlickDeceleration
+                interactive: contentHeight > height
 
                 Text {
                     id: fullAlarmAdviceText
@@ -12966,11 +13011,11 @@ Rectangle {
                 model: logFileModel
                 spacing: 10
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragOverBounds
                 interactive: logFileModel.count > 0
-                cacheBuffer: height
-                flickDeceleration: 1800
-                maximumFlickVelocity: 1200
+                cacheBuffer: height * root.uiListCachePages
+                flickDeceleration: root.uiVerticalFlickDeceleration
+                maximumFlickVelocity: root.uiVerticalFlickVelocity
 
                 delegate: Rectangle {
                     width: logListView.width
@@ -13221,7 +13266,10 @@ Rectangle {
                     contentWidth: width
                     contentHeight: logDetailTextItem.height
                     clip: true
-                    boundsBehavior: Flickable.StopAtBounds
+                    boundsBehavior: Flickable.DragOverBounds
+                    maximumFlickVelocity: root.uiVerticalFlickVelocity
+                    flickDeceleration: root.uiVerticalFlickDeceleration
+                    interactive: contentHeight > height
 
                     Text {
                         id: logDetailTextItem

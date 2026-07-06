@@ -17,6 +17,25 @@
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
 
+## 2026-07-07 历史图片与长内容滑动体验优化记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | MP157 触摸屏上历史记录图片左右滑动、统计/手动/参数/告警/日志等页面上下滑动存在明显顿挫感；旧 QML 多处使用较低 `maximumFlickVelocity`、较高 `flickDeceleration` 和 `Flickable.StopAtBounds`，滑到边界时会硬停，历史图片轮播还会在滑动中持续做平滑缩放，容易增加 MP157 纹理采样压力。 |
+| 具体改动 | `Main.qml` 新增统一滑动参数 `uiHorizontalFlickVelocity`、`uiHorizontalFlickDeceleration`、`uiVerticalFlickVelocity`、`uiVerticalFlickDeceleration`、`uiCarouselCachePages` 和 `uiListCachePages`；`historyListView`、`imageCarousel`、`statsRecentListView`、`manualSafetyFlickable`、`manualCommandLogView`、`settingsDetailFlickable`、`stepperMotorSettingsFlickable`、`calibrationResultFlickable`、`alarmHistoryListView`、`alarmAdviceDetailFlickable`、`logListView`、`logDetailFlickable`、`analysisDetailFlickable` 统一改为更柔和的 `Flickable.DragOverBounds`、统一速度上限和减速度；历史图片 `Image` 增加 `sourceSize` 限制解码尺寸，滑动时 `smooth: !imageCarousel.moving`，静止后恢复平滑显示。 |
+| 使用方法 | QML 已编进 `qt_camera_display` 资源，不能只拷贝 `Main.qml` 到板端；必须同步源码到虚拟机 `/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display`，运行 `./build_qt_camera_display.sh` 重新交叉编译，再替换板端 `/root/qt_camera_display/qt_camera_display` 并重启 Qt。 |
+| 生效边界 | 这次只优化 MP157 Qt/QML 滑动体验，不修改 F4 协议、自动检测状态机、模型检测、云端上传或历史 JSON 格式；Windows 源码已改不等于板端已生效，板端必须部署新二进制后才能看到滑动变化。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `"C:/Program Files/Git/bin/bash.exe" -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查统一滑动参数、`Flickable.DragOverBounds`、历史图片 `sourceSize` 和 `smooth: !imageCarousel.moving` 等 marker。 | 若缺 marker，先看 `qml/Main.qml` 是否同步了本次改动；若缺某个控件 id，说明 QML 结构变动后测试脚本也要同步更新。 |
+| QML 资源进入二进制 | 虚拟机 `/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display` | `./build_qt_camera_display.sh && strings build-mp157/qt_camera_display | grep -E 'uiHorizontalFlickVelocity|uiCarouselCachePages|DragOverBounds'` | 交叉编译成功，`strings` 能看到本次滑动优化 marker，说明新 QML 已通过 Qt resource 链接进 ARM 程序。 | 若 `strings` 查不到，先确认同步到虚拟机的是新 `qml/Main.qml`，再清理旧 `build-mp157` 后重新构建。 |
+| 历史图片左右滑动 | 开发板触摸屏 + SSH | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart`，进入 `历史记录`，打开任意含多张图片的记录，在图片区域左右滑动。 | 图片切换过程中不再有明显硬停和拖拽滞涩；滑动中优先保证跟手，停下后图片恢复平滑显示。 | 若仍顿挫，先执行 `strings /root/qt_camera_display/qt_camera_display | grep -E 'uiHorizontalFlickVelocity|uiCarouselCachePages|DragOverBounds'` 确认板端不是旧二进制；再检查图片是否来自超大分辨率文件或 SD 卡读写异常。 |
+| 其它上下滑动页面 | 开发板触摸屏 | 依次打开 `统计分析` 最近记录、`手动控制` 安全状态/命令日志、`参数设置` 详情和步进参数、`告警维护` 告警历史/查看全部、`日志查看` 文件列表/日志详情，并上下滑动。 | 各页面边界变为柔和拖拽，滑动速度和减速手感一致，不再出现旧的明显硬刹车感。 | 若个别页面手感仍旧，先用 `grep -n 'id: <控件id>' qml/Main.qml` 确认该控件是否套用了统一参数；若板端旧，重新部署新二进制。 |
+
 ## 模块文档总览
 
 | 项目 | 内容 |
