@@ -547,9 +547,9 @@ F4 接收后的动作：
 | 场景 | 处理 |
 |---|---|
 | 首页自动流程 Z 轴下探 | `actuator=2`，`direction=0`，`steps=z_down_fixed_steps`，收到 ACK 后 MP157 继续等待 `EVENT_REPORT event=0x14 related_seq=<下降命令SEQ>`；收到 DONE 后才复查 ROI，并用传送带/左右轴微调到检测中心。 |
-| 首页自动流程前后/Y 方向微调 | `actuator=0`，按 ROI 的 `errorY` 选择 `direction=0/1`，`steps=min_step`，由传送带做短步前后补偿，每次动作后重新读取 `LOCATE`。 |
-| 首页自动流程左右/X 方向微调 | `actuator=1`，按 ROI 的 `errorX` 选择 `direction=0/1`，`steps=min_step`，由摄像头左右轴做短步补偿，每次动作后重新读取 `LOCATE`。 |
-| 首页模型检测后 Z 轴回升 | `actuator=2`，`direction=1`，`steps=z_up_fixed_steps`，由 MP157 在模型检测完成回调中自动发送；收到 ACK 后继续等待 `EVENT_REPORT event=0x14 related_seq=<回升命令SEQ>`，确认检测头离开零件后才下发 `MODEL_READY/ARM_JOB_START`。 |
+| 首页自动流程前后/Y 方向微调 | `actuator=0`，按 ROI 的 `errorY` 选择 `direction=0/1`，`steps=fine_tune_steps`，由传送带做短步前后补偿，每次动作后重新读取 `LOCATE`。`fine_tune_steps` 由 MP157 根据 `abs(errorY)` 超出死区的像素量计算，至少为参数页 `min_step`，每超出约 `4px` 加一档，连续无改善时加档，单次最大限制为 `min_step` 的 `12` 倍且不超过 `10000 step`。 |
+| 首页自动流程左右/X 方向微调 | `actuator=1`，按 ROI 的 `errorX` 选择 `direction=0/1`，`steps=fine_tune_steps`，由摄像头左右轴做短步补偿，每次动作后重新读取 `LOCATE`。`errorX>0` 表示零件在画面右侧，MP157 发送 `direction=1` 让相机右移、画面左移回中心；`fine_tune_steps` 由 MP157 根据 `abs(errorX)` 超出死区的像素量计算，至少为参数页 `min_step`，每超出约 `4px` 加一档，连续无改善时加档，单次最大限制为 `min_step` 的 `12` 倍且不超过 `10000 step`。 |
+| 首页模型检测后 Z 轴回升和左右回中 | `actuator=2`，`direction=1`，`steps=z_up_fixed_steps`，由 MP157 在模型检测完成回调中自动发送；收到 ACK 后继续等待 `EVENT_REPORT event=0x14 related_seq=<回升命令SEQ>`。如果本轮 `actuator=1` 左右轴微调收到过完成回执，MP157 会把成功微调的 `direction/steps` 累计为相机相对皮带基准偏移，并在 Z 轴回升完成后追加一条反向 `ACTUATOR_POS_MOVE actuator=1` 回中；没有动过左右轴时不发送回中动作。左右回中完成后才下发 `MODEL_READY/ARM_JOB_START`。 |
 | 手动上下轴弹窗 | `actuator=2`，下降按钮使用 `zDownFixedSteps`，上升按钮使用 `zUpFixedSteps`；每次点击只发一次高层位置命令，不在 MP157 直接拼 Emm42 帧。 |
 
 ### 9.16 ACTUATOR_STOP `0x51`

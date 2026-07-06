@@ -118,6 +118,33 @@ Rectangle {
     /* autoVisionFineTuneTolerancePx 是 Z 轴下降后 ROI 复查的中心死区，默认复用视觉居中死区。 */
     property int autoVisionFineTuneTolerancePx: 24
 
+    /* autoVisionFineTuneStepScalePx 是微调步数放大比例：误差每超出死区约 4px，就在 minStep 基础上多走一档。 */
+    property int autoVisionFineTuneStepScalePx: 4
+
+    /* autoVisionFineTuneMaxStepMultiplier 限制单次微调最多放大到 minStep 的 12 倍，兼顾现场可见动作和防止一次过冲。 */
+    property int autoVisionFineTuneMaxStepMultiplier: 12
+
+    /* autoVisionFineTuneProgressDeadbandPx 是判断“误差是否没有改善”的像素死区，避免 1~2px 抖动误触发加档。 */
+    property int autoVisionFineTuneProgressDeadbandPx: 2
+
+    /* autoVisionFineTuneLastAxis 记录上一次微调的轴名，conveyor 表示 Y/传送带，lateral 表示 X/左右轴。 */
+    property string autoVisionFineTuneLastAxis: ""
+
+    /* autoVisionFineTuneLastAbsError 记录上一次同轴微调后的绝对误差，用于判断当前位置有没有真的被拉回中心。 */
+    property int autoVisionFineTuneLastAbsError: 0
+
+    /* autoVisionFineTuneNoImproveCount 记录同一轴连续没有改善的次数，连续无变化时自动把下一次步数再放大。 */
+    property int autoVisionFineTuneNoImproveCount: 0
+
+    /* autoVisionLateralReturnOffsetSteps 记录本轮自动检测中左右轴相对皮带基准的累计偏移，正值表示相机向右动过。 */
+    property int autoVisionLateralReturnOffsetSteps: 0
+
+    /* autoVisionPendingLateralFineTuneSteps 暂存已经下发、但还没有收到完成回执的左右轴微调步数。 */
+    property int autoVisionPendingLateralFineTuneSteps: 0
+
+    /* autoVisionPendingLateralFineTuneDirection 暂存已经下发、但还没有收到完成回执的左右轴微调方向。 */
+    property int autoVisionPendingLateralFineTuneDirection: 0
+
     /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
     property int autoVisionZFocusSettleMs: 3000
 
@@ -893,6 +920,7 @@ Rectangle {
         autoVisionLocatePurpose = "center"
         autoVisionActuatorPhase = ""
         autoVisionFineTuneAttempts = 0
+        resetAutoVisionFineTuneProgress()
         autoVisionZFocusSettled = false
         autoVisionNeedsZUp = false
         autoVisionDetectFromZFlow = false
@@ -933,6 +961,8 @@ Rectangle {
         autoVisionLocatePurpose = "center"
         autoVisionActuatorPhase = ""
         autoVisionFineTuneAttempts = 0
+        resetAutoVisionFineTuneProgress()
+        resetAutoVisionLateralReturnState()
         autoVisionZFocusSettled = false
         autoVisionDetectFromZFlow = false
         autoVisionPendingZMoveSteps = 0
@@ -1282,6 +1312,8 @@ Rectangle {
         var timeoutMs = cameraZMotionTimeoutMs()
 
         autoVisionFineTuneAttempts = 0
+        resetAutoVisionFineTuneProgress()
+        resetAutoVisionLateralReturnState()
         autoVisionZFocusSettled = false
         autoVisionDetectFromZFlow = false
         autoVisionPendingZMoveSteps = 0
@@ -1350,6 +1382,176 @@ Rectangle {
         autoVisionStartDetectDelay()
         showStorageToast()
         return false
+    }
+
+    /*
+     * resetAutoVisionFineTuneProgress 的作用：
+     *   清空 ROI 微调的“上一轴误差”和“连续未改善次数”，保证新一轮零件从干净状态开始。
+     *
+     * 主要流程：
+     *   1. 清空上一次微调轴名，避免上一轮 X 轴或 Y 轴结果影响本轮。
+     *   2. 清零上一次绝对误差和连续未改善计数。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 QML 自动流程状态变量。
+     */
+    function resetAutoVisionFineTuneProgress() {
+        autoVisionFineTuneLastAxis = ""
+        autoVisionFineTuneLastAbsError = 0
+        autoVisionFineTuneNoImproveCount = 0
+    }
+
+    /*
+     * resetAutoVisionLateralReturnState 的作用：
+     *   清空本轮自动检测左右轴回中相关状态，保证每个零件只按本轮实际左右微调量回中。
+     *
+     * 主要流程：
+     *   1. 清零左右轴累计偏移，表示相机当前以本轮开始时的位置作为皮带基准。
+     *   2. 清空等待 F4 回执的左右轴微调步数和方向，避免上一轮残留被误累计。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 QML 自动流程状态变量。
+     */
+    function resetAutoVisionLateralReturnState() {
+        autoVisionLateralReturnOffsetSteps = 0
+        autoVisionPendingLateralFineTuneSteps = 0
+        autoVisionPendingLateralFineTuneDirection = 0
+    }
+
+    /*
+     * recordAutoVisionPendingLateralFineTune 的作用：
+     *   在左右轴微调命令写入 F4 前暂存本次 direction/steps，等待完成回执后再真正累计偏移。
+     *
+     * 主要流程：
+     *   1. 把 direction 规范成 0/1，和 ACTUATOR_POS_MOVE 协议一致。
+     *   2. 把 steps 规范成正整数，防止无效步数进入回中累计。
+     *
+     * 参数：
+     *   direction 是本次左右轴逻辑方向，0=相机左移，1=相机右移。
+     *   steps 是本次左右轴位置微调步数，单位 step。
+     *
+     * 返回值：
+     *   无返回值；函数只暂存待确认的左右轴微调动作。
+     */
+    function recordAutoVisionPendingLateralFineTune(direction, steps) {
+        autoVisionPendingLateralFineTuneDirection = Math.floor(Number(direction || 0)) === 1 ? 1 : 0
+        autoVisionPendingLateralFineTuneSteps = Math.max(0, Math.floor(Number(steps || 0)))
+    }
+
+    /*
+     * clearAutoVisionPendingLateralFineTune 的作用：
+     *   清空等待确认的左右轴微调动作，用于命令失败或已经成功累计后的收尾。
+     *
+     * 返回值：
+     *   无返回值；函数只清空 pending 状态。
+     */
+    function clearAutoVisionPendingLateralFineTune() {
+        autoVisionPendingLateralFineTuneSteps = 0
+        autoVisionPendingLateralFineTuneDirection = 0
+    }
+
+    /*
+     * commitAutoVisionLateralFineTuneOffset 的作用：
+     *   在 F4 确认左右轴 ACTUATOR_POS_MOVE 完成后，把本次实际微调量计入本轮相机偏移。
+     *
+     * 主要流程：
+     *   1. 读取 pending 中的 direction/steps；没有有效 pending 时直接返回。
+     *   2. direction=1 表示相机向右移动，累计偏移加 steps；direction=0 表示相机向左移动，累计偏移减 steps。
+     *   3. 累计后清空 pending，避免同一条 F4 回执被重复累计。
+     *
+     * 返回值：
+     *   返回累计后的有符号偏移，单位 step；正值表示相机偏右，负值表示相机偏左。
+     */
+    function commitAutoVisionLateralFineTuneOffset() {
+        var steps = Math.max(0, Math.floor(Number(autoVisionPendingLateralFineTuneSteps || 0)))
+        var direction = Math.floor(Number(autoVisionPendingLateralFineTuneDirection || 0)) === 1 ? 1 : 0
+        var signedSteps = direction === 1 ? steps : -steps
+
+        if (steps <= 0) {
+            clearAutoVisionPendingLateralFineTune()
+            return autoVisionLateralReturnOffsetSteps
+        }
+
+        autoVisionLateralReturnOffsetSteps = Math.max(-1000000,
+                                                       Math.min(1000000,
+                                                                Math.floor(Number(autoVisionLateralReturnOffsetSteps || 0)) + signedSteps))
+        clearAutoVisionPendingLateralFineTune()
+        return autoVisionLateralReturnOffsetSteps
+    }
+
+    /*
+     * autoVisionFineTuneNoImproveBoost 的作用：
+     *   判断同一根轴连续微调后误差是否没有明显变小；如果没有改善，则给下一次 steps 额外加档。
+     *
+     * 主要流程：
+     *   1. 同一轴连续微调时，比较当前绝对误差和上一次绝对误差。
+     *   2. 如果当前误差没有比上一次至少减少 autoVisionFineTuneProgressDeadbandPx，就认为本次无明显改善。
+     *   3. 无改善次数最多累加到 3 档，避免机构不动时无限增大步数。
+     *   4. 轴切换时重置无改善计数，因为 X/Y 对应不同执行器。
+     *
+     * 参数：
+     *   axisName 是当前微调轴名，conveyor 表示传送带/Y 方向，lateral 表示左右轴/X 方向。
+     *   absError 是当前 ROI 复查得到的绝对像素误差。
+     *
+     * 返回值：
+     *   返回本次因为连续无改善而追加的倍率档数，范围 0~3。
+     */
+    function autoVisionFineTuneNoImproveBoost(axisName, absError) {
+        var axis = String(axisName || "")
+        var currentError = Math.max(0, Math.floor(Number(absError || 0)))
+        var deadband = Math.max(0, Math.floor(Number(autoVisionFineTuneProgressDeadbandPx || 0)))
+
+        if (axis.length <= 0) {
+            resetAutoVisionFineTuneProgress()
+            return 0
+        }
+
+        if (autoVisionFineTuneLastAxis === axis) {
+            if (currentError >= Math.max(0, autoVisionFineTuneLastAbsError - deadband)) {
+                autoVisionFineTuneNoImproveCount = Math.min(3, autoVisionFineTuneNoImproveCount + 1)
+            } else {
+                autoVisionFineTuneNoImproveCount = 0
+            }
+        } else {
+            autoVisionFineTuneNoImproveCount = 0
+        }
+
+        autoVisionFineTuneLastAxis = axis
+        autoVisionFineTuneLastAbsError = currentError
+        return autoVisionFineTuneNoImproveCount
+    }
+
+    /*
+     * autoVisionFineTuneStepsForError 的作用：
+     *   把 ROI 像素误差转换成实际下发给 F4 的 ACTUATOR_POS_MOVE steps。
+     *
+     * 主要流程：
+     *   1. 先读取参数页的 minStep，作为单次微调的最小脉冲数。
+     *   2. 计算 abs(error) 超出中心死区的像素量；只有超出死区的部分才放大步数。
+     *   3. 每超出 autoVisionFineTuneStepScalePx 像素，就在 minStep 基础上多走一档。
+     *   4. 如果同一轴连续微调后误差没有明显改善，再追加 1~3 档，解决现场“每次都是 steps=15 但画面不变”的问题。
+     *   5. 最后把单次微调限制在 minStep 的 autoVisionFineTuneMaxStepMultiplier 倍以内，并限制到 10000 step。
+     *
+     * 参数：
+     *   errorPixels 是当前轴的带符号像素误差，errorY 对应传送带，errorX 对应左右轴。
+     *   motorMinStep 是参数页配置的最小步长，单位 step。
+     *   axisName 是当前微调轴名，用于判断连续无改善。
+     *
+     * 返回值：
+     *   返回本次应下发的相对移动步数，单位 step，范围 1~10000。
+     */
+    function autoVisionFineTuneStepsForError(errorPixels, motorMinStep, axisName) {
+        var minStep = Math.max(1, Math.min(10000, Math.floor(Number(motorMinStep || 1))))
+        var absError = Math.abs(Math.floor(Number(errorPixels || 0)))
+        var tolerance = Math.max(0, Math.floor(Number(autoVisionFineTuneTolerancePx || 0)))
+        var scalePx = Math.max(1, Math.floor(Number(autoVisionFineTuneStepScalePx || 1)))
+        var maxMultiplier = Math.max(1, Math.floor(Number(autoVisionFineTuneMaxStepMultiplier || 1)))
+        var excessPx = Math.max(0, absError - tolerance)
+        var noImproveBoost = autoVisionFineTuneNoImproveBoost(axisName, absError)
+        var multiplier = 1 + Math.ceil(excessPx / scalePx) + noImproveBoost
+
+        multiplier = Math.max(1, Math.min(maxMultiplier, multiplier))
+        return Math.max(1, Math.min(10000, minStep * multiplier))
     }
 
     /*
@@ -1478,7 +1680,8 @@ Rectangle {
      */
     function autoVisionFineTuneConveyor(errorY) {
         var motor = conveyorMotorSetting()
-        var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+        var minStep = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+        var steps = autoVisionFineTuneStepsForError(errorY, minStep, "conveyor")
         var speed = conveyorTrackSpeedRpm()
         var direction = errorY > 0 ? 0 : 1
 
@@ -1487,6 +1690,12 @@ Rectangle {
         workflowState = "传送带微调"
         autoVisionLastText = "自动视觉：传送带前后微调第 " + autoVisionFineTuneAttempts
                 + " 次，errorY=" + errorY + "，steps=" + steps
+                + "，minStep=" + minStep
+                + "，direction=" + direction
+                + (direction === 0 ? "(后退)" : "(前进)")
+                + (autoVisionFineTuneNoImproveCount > 0
+                   ? "，无改善加档=" + autoVisionFineTuneNoImproveCount
+                   : "")
         storageState = autoVisionLastText
         showStorageToast()
 
@@ -1510,21 +1719,80 @@ Rectangle {
      *
      * 参数：
      *   errorX 是零件中心 X 与 ROI 中心的像素差，正值表示零件在画面中心右侧。
+     *   左右轴移动的是摄像头本体，画面坐标会和相机运动方向相反；
+     *   因此零件在右侧时要让相机右移，画面里的零件才会向左回到 ROI 中心。
      *
      * 返回值：
      *   true 表示微调命令已启动；false 表示命令未能启动并改为进入模型检测。
      */
     function autoVisionFineTuneLateral(errorX) {
         var motor = cameraLateralMotorSetting()
-        var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+        var minStep = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+        var steps = autoVisionFineTuneStepsForError(errorX, minStep, "lateral")
         var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
-        var direction = errorX > 0 ? 0 : 1
+        var direction = errorX > 0 ? 1 : 0
 
         autoVisionFineTuneAttempts += 1
         autoVisionActuatorPhase = "fine-tune-lateral"
         workflowState = "左右微调"
         autoVisionLastText = "自动视觉：左右轴微调第 " + autoVisionFineTuneAttempts
                 + " 次，errorX=" + errorX + "，steps=" + steps
+                + "，minStep=" + minStep
+                + "，direction=" + direction
+                + (direction === 1 ? "(相机右移/画面左移)" : "(相机左移/画面右移)")
+                + (autoVisionFineTuneNoImproveCount > 0
+                   ? "，无改善加档=" + autoVisionFineTuneNoImproveCount
+                   : "")
+        storageState = autoVisionLastText
+        showStorageToast()
+
+        recordAutoVisionPendingLateralFineTune(direction, steps)
+        if (deviceHealth.sendF4ActuatorPositionMove(1, direction, 0, speed, steps, 0)) {
+            autoVisionCommandBusy = true
+            return true
+        }
+
+        clearAutoVisionPendingLateralFineTune()
+        autoVisionActuatorPhase = ""
+        workflowState = "模型检测"
+        autoVisionLastText = "左右轴微调命令未启动，进入模型检测"
+        storageState = autoVisionLastText
+        autoVisionStartDetectDelay()
+        showStorageToast()
+        return false
+    }
+
+    /*
+     * autoVisionRequestLateralReturnToBeltCenter 的作用：
+     *   本轮自动检测中如果左右轴为了让零件进入 ROI 中心而移动过相机，模型检测和 Z 轴回升后要把相机退回皮带基准位置。
+     *
+     * 主要流程：
+     *   1. 读取 autoVisionLateralReturnOffsetSteps；0 表示本轮没有左右轴净偏移，不发任何回中动作。
+     *   2. 正偏移表示相机曾向右移动，回中要发送 direction=0 左移；负偏移表示相机曾向左移动，回中要发送 direction=1 右移。
+     *   3. 使用摄像头左右轴参数页 normalSpeedRpm 作为回中速度，步数等于累计偏移绝对值。
+     *   4. 只启动命令，不在这里清零；必须等 F4 完成回执后再清零，防止命令失败却误认为已回中。
+     *
+     * 返回值：
+     *   true 表示已启动左右轴回中命令；false 表示无需回中或命令未能启动。
+     */
+    function autoVisionRequestLateralReturnToBeltCenter() {
+        var offsetSteps = Math.floor(Number(autoVisionLateralReturnOffsetSteps || 0))
+        var steps = Math.abs(offsetSteps)
+
+        if (steps <= 0) {
+            return false
+        }
+
+        var motor = cameraLateralMotorSetting()
+        var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+        var direction = offsetSteps > 0 ? 0 : 1
+
+        workflowState = "左右轴回中"
+        autoVisionActuatorPhase = "lateral-return"
+        autoVisionLastText = "本轮左右轴曾微调，相机回到皮带基准：offset="
+                + offsetSteps + " step，returnSteps=" + steps
+                + "，direction=" + direction
+                + (direction === 0 ? "(相机左移)" : "(相机右移)")
         storageState = autoVisionLastText
         showStorageToast()
 
@@ -1534,10 +1802,9 @@ Rectangle {
         }
 
         autoVisionActuatorPhase = ""
-        workflowState = "模型检测"
-        autoVisionLastText = "左右轴微调命令未启动，进入模型检测"
+        autoVisionLastText = "左右轴回中命令未启动，仍保留累计偏移 "
+                + offsetSteps + " step，请手动回中后再继续自动循环"
         storageState = autoVisionLastText
-        autoVisionStartDetectDelay()
         showStorageToast()
         return false
     }
@@ -1555,6 +1822,10 @@ Rectangle {
      *   true 表示 F4 长流程已启动；false 表示缺少模型结果或 F4 忙。
      */
     function autoVisionStartF4ArmInspectionAfterZUp() {
+        if (autoVisionLateralReturnOffsetSteps !== 0) {
+            return autoVisionRequestLateralReturnToBeltCenter()
+        }
+
         if (!latestModelResultText || latestModelResultText.indexOf("RESULT ") !== 0) {
             storageState = "模型结果未缓存，不能启动F4机械臂称重/电感流程"
             showStorageToast()
@@ -6067,18 +6338,44 @@ Rectangle {
                         root.autoVisionActuatorPhase = "z-motion-down-wait"
                         root.autoVisionHandleActuatorMoveDone(detail)
                     } else if (root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
+                        if (root.autoVisionActuatorPhase === "fine-tune-lateral") {
+                            var lateralOffset = root.commitAutoVisionLateralFineTuneOffset()
+                            root.autoVisionLastText = root.autoVisionLastText
+                                    + "；左右轴累计回中偏移=" + lateralOffset + " step"
+                            root.storageState = root.autoVisionLastText
+                            root.showStorageToast()
+                        }
                         autoVisionActuatorSettleTimer.interval = root.autoVisionShortSettleMs
                         autoVisionActuatorSettleTimer.restart()
                     } else if (root.autoVisionActuatorPhase === "z-up") {
                         root.autoVisionActuatorPhase = "z-motion-up-wait"
                         root.autoVisionHandleActuatorMoveDone(detail)
+                    } else if (root.autoVisionActuatorPhase === "lateral-return") {
+                        root.autoVisionLateralReturnOffsetSteps = 0
+                        root.clearAutoVisionPendingLateralFineTune()
+                        root.autoVisionActuatorPhase = ""
+                        root.workflowState = "左右轴已回中"
+                        root.storageState = "左右轴已按本轮累计偏移回到皮带基准：" + detail
+                        root.autoVisionLastText = root.storageState
+                        root.showStorageToast()
+                        root.autoVisionStartF4ArmInspectionAfterZUp()
                     }
                 } else {
                     root.autoVisionLastText = "执行器失败：" + root.autoVisionActuatorPhase + " " + detail
                     root.storageState = root.autoVisionLastText
                     root.showStorageToast()
+                    if (root.autoVisionActuatorPhase === "fine-tune-lateral") {
+                        root.clearAutoVisionPendingLateralFineTune()
+                    }
                     if (root.autoVisionActuatorPhase === "z-up") {
                         root.autoVisionNeedsZUp = true
+                    } else if (root.autoVisionActuatorPhase === "lateral-return") {
+                        root.workflowState = "左右轴回中失败"
+                        root.storageState = "左右轴回中失败，累计偏移仍为 "
+                                + root.autoVisionLateralReturnOffsetSteps
+                                + " step，请手动让绿色ROI重新对齐黑色传送带两边后再继续"
+                        root.autoVisionLastText = root.storageState
+                        root.showStorageToast()
                     }
                     root.autoVisionActuatorPhase = ""
                 }
@@ -10343,7 +10640,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: "步长-"
+                            text: "步长-100"
                             color: "#d9ecff"
                             font.pixelSize: 12
                             font.bold: true
@@ -10355,7 +10652,7 @@ Rectangle {
                             preventStealing: true
 
                             onClicked: {
-                                root.changeStepperMotorValue("minStep", -1)
+                                root.changeStepperMotorValue("minStep", -100)
                             }
                         }
                     }
@@ -10370,7 +10667,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: "步长+"
+                            text: "步长+100"
                             color: "#eafff2"
                             font.pixelSize: 12
                             font.bold: true
@@ -10382,7 +10679,7 @@ Rectangle {
                             preventStealing: true
 
                             onClicked: {
-                                root.changeStepperMotorValue("minStep", 1)
+                                root.changeStepperMotorValue("minStep", 100)
                             }
                         }
                     }

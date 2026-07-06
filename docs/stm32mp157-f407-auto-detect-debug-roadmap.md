@@ -203,8 +203,8 @@
 | 3 | 视觉坐标闭环 | 首页按 `开始`，MP157 识别目标后周期发 `VISION_POS`。 | F4 `latest_error_px = axis-target` 的绝对值变小；进入死区后 MP157 发 `BELT_STOP_CENTERED`。 |
 | 3.1 | 黑色波形零件漏检保持 | 首页按 `开始`，让黑色波形零件已经被识别一次后，遮挡/反光导致 `LOCATE` 偶发返回 `has_target=0`。 | Qt 显示 `目标短暂丢失` 或 `连续丢失但保持停机`，右侧偏差显示 `-- px`；F4 不应收到 `VISION_LOST reason=1` 后重新扫描，传送带应保持或超时停住等待重新识别。 |
 | 4 | Z 轴下探物理等待 | ROI 居中并收到 `BELT_STOP_CENTERED` ACK 后，Qt 发送 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN steps=zDownFixedSteps`。 | F4 返回 ACK 后，Qt 进入 `z-motion-down-wait`，按步数/速度等待上下轴物理下降完成，传送带保持停止。 |
-| 5 | ROI 复查和前后/左右微调 | Z 轴物理下降等待结束后继续读取 `LOCATE`；若 `errorY` 超出死区，Qt 发送 `ACTUATOR_POS_MOVE actuator=0 direction=0/1 steps=minStep`；若 `errorX` 超出死区，Qt 发送 `ACTUATOR_POS_MOVE actuator=1 direction=0/1 steps=minStep`。 | 微调次数受限，X/Y 偏差都回到 ±24px 内后进入 3 秒对焦稳定；超限时界面显示需要人工复核。 |
-| 6 | 自动模型触发和 Z 轴回升 | 3 秒对焦稳定结束后运行双模型；模型检测完成回调发送 `ACTUATOR_POS_MOVE actuator=2 direction=UP steps=zUpFixedSteps`。 | Qt 生成 source、annotated、模型结果缓存，并在 `z-motion-up-wait` 等待物理回升完成后通知 F4/ESP32S3。 |
+| 5 | ROI 复查和前后/左右微调 | Z 轴物理下降等待结束后继续读取 `LOCATE`；若 `errorY` 超出死区，Qt 发送 `ACTUATOR_POS_MOVE actuator=0 direction=0/1 steps=fine_tune_steps`；若 `errorX` 超出死区，Qt 发送 `ACTUATOR_POS_MOVE actuator=1 direction=0/1 steps=fine_tune_steps`。`fine_tune_steps` 至少等于对应电机 `minStep`，每超出约 `4px` 加一档，连续无改善时继续加档，单次最多 `12 * minStep` 且不超过 `10000 step`；`errorX>0` 时左右轴发送 `direction=1`，让相机右移、画面左移回中心。 | 微调次数受限，X/Y 偏差都回到 ±24px 内后进入 3 秒对焦稳定；若 `steps` 放大后误差仍不变，优先检查 F4 是否真的收到 `ACTUATOR_POS_MOVE`、电机地址、方向、使能、共地和张大头 Response。 |
+| 6 | 自动模型触发、Z 轴回升和左右轴回中 | 3 秒对焦稳定结束后运行双模型；模型检测完成回调发送 `ACTUATOR_POS_MOVE actuator=2 direction=UP steps=zUpFixedSteps`。如果本轮左右轴微调收到过完成回执，Qt 按累计 `direction/steps` 发送反向 `ACTUATOR_POS_MOVE actuator=1`，把相机退回黑色传送带两边大致对齐的基准位置；如果左右轴没动过，则不发送回中动作。 | Qt 生成 source、annotated、模型结果缓存；Z 轴回升完成且左右轴必要回中完成后，再通知 F4/ESP32S3 抓取称重和电感。 |
 | 7 | F4-ESP32S3 握手 | F4 发 `HELLO/HEARTBEAT/ARM_HOME`。 | ESP32S3 ACK，机械臂可回安全位。 |
 | 8 | 称重阶段 | F4 发 `ARM_MOVE_TO_WEIGHT`，ESP32S3 完成后 F4 采样 HX711。 | MP157 收到 `WEIGHT_RESULT`。 |
 | 9 | 电感阶段 | F4 发 `ARM_MOVE_TO_LDC`，ESP32S3 完成后 F4 采样 LDC1614。 | MP157 收到 `LDC_RESULT`。 |

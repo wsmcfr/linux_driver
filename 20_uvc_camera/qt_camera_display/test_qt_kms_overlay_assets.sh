@@ -696,6 +696,14 @@ fi
 if ! grep -q '本次自动检测Z轴下降/回升最多等待' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "应用 Z 轴超时后必须直接提示本次自动检测使用的等待毫秒数，方便现场确认不是固定 10 秒"
 fi
+stepper_min_step_minus_block="$(sed -n '/id: stepperMinStepMinusMouse/,/^                            }/p' "$SCRIPT_DIR/qml/Main.qml")"
+stepper_min_step_plus_block="$(sed -n '/id: stepperMinStepPlusMouse/,/^                            }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$stepper_min_step_minus_block" | grep -q 'changeStepperMotorValue("minStep", -100)'; then
+    fail "步进电机最小步长减号按钮必须每次减少 100 step，不能继续只减少 1 step"
+fi
+if ! printf '%s\n' "$stepper_min_step_plus_block" | grep -q 'changeStepperMotorValue("minStep", 100)'; then
+    fail "步进电机最小步长加号按钮必须每次增加 100 step，不能继续只增加 1 step"
+fi
 stepper_step_open_block="$(sed -n '/function openStepperStepEditor/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$stepper_step_open_block" | grep -q 'stepperStepReplaceOnNextDigit = stepperStepEditorIsTimeout()'; then
     fail "打开 Z 轴超时数字键盘后，第一次按数字必须替换当前 10 秒，不能追加成 105 秒再被范围拒绝"
@@ -985,6 +993,56 @@ fi
 fine_tune_block="$(sed -n '/function handleAutoVisionFineTuneLocateFinished/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionStartFocusSettleBeforeDetect'; then
     fail "ROI 二次对中通过后必须先调用 autoVisionStartFocusSettleBeforeDetect() 等 3s，再启动模型检测"
+fi
+require_grep "autoVisionFineTuneStepsForError" "qml/Main.qml"
+conveyor_fine_tune_block="$(sed -n '/function autoVisionFineTuneConveyor/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+lateral_fine_tune_block="$(sed -n '/function autoVisionFineTuneLateral/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! grep -q 'property int autoVisionFineTuneMaxStepMultiplier: 12' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "ROI 微调最大放大倍数必须为 12，避免 minStep=300 时 X/Y 偏差大但单次动作仍偏小"
+fi
+if ! grep -q 'property int autoVisionFineTuneStepScalePx: 4' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "ROI 微调像素放大比例必须为每 4px 加一档，避免 errorX/errorY 明显偏离但 steps 增长太慢"
+fi
+if printf '%s\n' "$conveyor_fine_tune_block" | grep -q 'var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))'; then
+    fail "传送带 ROI 微调不能只固定使用 minStep；必须按 errorY 超出死区的像素差放大步数"
+fi
+if printf '%s\n' "$lateral_fine_tune_block" | grep -q 'var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))'; then
+    fail "左右轴 ROI 微调不能只固定使用 minStep；必须按 errorX 超出死区的像素差放大步数"
+fi
+if printf '%s\n' "$lateral_fine_tune_block" | grep -q 'var direction = errorX > 0 ? 0 : 1'; then
+    fail "左右轴 ROI 微调方向不能把 errorX>0 映射到 direction=0；零件在 ROI 右侧时应发送 direction=1，让相机右移后画面向左回中心"
+fi
+if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'var direction = errorX > 0 ? 1 : 0'; then
+    fail "左右轴 ROI 微调必须把 errorX>0 映射到 ACTUATOR_POS_MOVE direction=1"
+fi
+if ! printf '%s\n' "$conveyor_fine_tune_block" | grep -q 'autoVisionFineTuneStepsForError(errorY'; then
+    fail "传送带 ROI 微调必须通过 autoVisionFineTuneStepsForError(errorY, ...) 计算实际 steps"
+fi
+if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'autoVisionFineTuneStepsForError(errorX'; then
+    fail "左右轴 ROI 微调必须通过 autoVisionFineTuneStepsForError(errorX, ...) 计算实际 steps"
+fi
+require_grep "autoVisionLateralReturnOffsetSteps" "qml/Main.qml"
+require_grep "autoVisionPendingLateralFineTuneSteps" "qml/Main.qml"
+require_grep "resetAutoVisionLateralReturnState" "qml/Main.qml"
+require_grep "recordAutoVisionPendingLateralFineTune" "qml/Main.qml"
+require_grep "commitAutoVisionLateralFineTuneOffset" "qml/Main.qml"
+require_grep "autoVisionRequestLateralReturnToBeltCenter" "qml/Main.qml"
+if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'recordAutoVisionPendingLateralFineTune(direction, steps)'; then
+    fail "左右轴 ROI 微调发命令前必须记录本次 direction/steps，成功回执后才能累计回中偏移"
+fi
+start_arm_after_z_block="$(sed -n '/function autoVisionStartF4ArmInspectionAfterZUp/,/function autoVisionRequestZUp/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$start_arm_after_z_block" | grep -q 'autoVisionLateralReturnOffsetSteps !== 0'; then
+    fail "Z 轴回升后只有左右轴本轮确实动过时才允许追加左右轴回中，不能无条件发回中动作"
+fi
+if ! printf '%s\n' "$start_arm_after_z_block" | grep -q 'autoVisionRequestLateralReturnToBeltCenter'; then
+    fail "Z 轴回升后启动机械臂前必须先按左右轴累计偏移反向回中"
+fi
+actuator_finished_block="$(sed -n '/onF4ActuatorCommandFinished:/,/if (root.stepperHomePendingCommand !== "")/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$actuator_finished_block" | grep -q 'commitAutoVisionLateralFineTuneOffset'; then
+    fail "左右轴微调必须等 F4 ACTUATOR_MOVE_DONE 成功后再累计偏移，不能只按发送成功累计"
+fi
+if ! printf '%s\n' "$actuator_finished_block" | grep -q 'root.autoVisionActuatorPhase === "lateral-return"'; then
+    fail "左右轴回中完成回执必须有独立阶段处理，回中完成后才能继续 F4/ESP32S3 机械臂流程"
 fi
 settle_timer_block="$(sed -n '/id: autoVisionActuatorSettleTimer/,/Connections {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$settle_timer_block" | grep -q 'autoVisionActuatorPhase === "focus-settle"'; then
