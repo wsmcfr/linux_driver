@@ -325,6 +325,18 @@ static const quint8 BINARY_PROTOCOL_CMD_CYCLE_DONE = 0x86U;
 /* 二进制故障上报命令：F4 用固定 16 字节负载返回 LDC、称重、电机等结构化错误。 */
 static const quint8 BINARY_PROTOCOL_CMD_FAULT_REPORT = 0x87U;
 
+/* F4 机械臂主动结果等待默认窗口，单位毫秒。
+ * 这个值只是参数页和 JSON 缺省值；真实等待时间必须从 DetectSettingsSnapshot 传入。
+ * 默认 75000ms 大于 F4 当前 60000ms 动作超时和 5000ms DONE 串口余量，避免 MP157 提前超时。
+ */
+static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_DEFAULT_MS = 75000;
+
+/* F4 机械臂主动结果等待最小窗口，单位毫秒；低于 10 秒容易把正常抓取误判为超时。 */
+static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_MIN_MS = 10000;
+
+/* F4 机械臂主动结果等待最大窗口，单位毫秒；限制到 180 秒避免串口后台线程长时间占用。 */
+static const int F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS = 180000;
+
 /* 板端缺陷分类推理程序默认路径，首页“检测”按钮会通过 QProcess 调用它。 */
 static const char *DEFAULT_DEFECT_CLASSIFY_BIN = "/root/qt_camera_display/defect-classify";
 
@@ -532,6 +544,7 @@ static QVariantList stepperMotorSettingsToVariantList(const QVector<StepperMotor
  *   segmentMinPixels 是 UNet 判 NG 的最小缺陷像素数，传给 defect-segment 的 --min-defect-pixels。
  *   overlayAlpha 是 UNet 叠加图透明度，传给 defect-segment 的 --alpha。
  *   autoUploadEnabled 为 false 时检测仍写本地历史，但跳过 COS 上传并返回 upload_status=SKIP。
+ *   f4ArmResultTimeoutMs 是 MP157 等待 F4 主动 WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE 的最大窗口，单位 ms。
  *   stepperMotors 保存三台步进电机的地址、最小步长、常规速度、方向和上下轴固定位置步数配置。
  */
 struct DetectSettingsSnapshot
@@ -543,6 +556,7 @@ struct DetectSettingsSnapshot
     int segmentMinPixels = 1;
     double overlayAlpha = 0.45;
     bool autoUploadEnabled = true;
+    int f4ArmResultTimeoutMs = F4_ARM_ACTIVE_FRAME_TIMEOUT_DEFAULT_MS;
     QVector<StepperMotorSettings> stepperMotors = defaultStepperMotorSettings();
 };
 
@@ -644,7 +658,7 @@ static quint32 clampedUInt32FromText(const QString &text, bool *ok)
  *   settings 是要转换的检测配置快照。
  *
  * 返回值：
- *   返回包含 partType/modelThreshold/reviewThreshold/roiSize/segmentMinPixels/overlayAlpha/autoUploadEnabled 的 map。
+ *   返回包含 partType/modelThreshold/reviewThreshold/roiSize/segmentMinPixels/overlayAlpha/autoUploadEnabled/f4ArmResultTimeoutMs 的 map。
  */
 static QVariantMap detectSettingsToVariantMap(const DetectSettingsSnapshot &settings)
 {
@@ -657,6 +671,7 @@ static QVariantMap detectSettingsToVariantMap(const DetectSettingsSnapshot &sett
     map.insert(QStringLiteral("segmentMinPixels"), settings.segmentMinPixels);
     map.insert(QStringLiteral("overlayAlpha"), settings.overlayAlpha);
     map.insert(QStringLiteral("autoUploadEnabled"), settings.autoUploadEnabled);
+    map.insert(QStringLiteral("f4ArmResultTimeoutMs"), settings.f4ArmResultTimeoutMs);
     map.insert(QStringLiteral("stepperMotors"), stepperMotorSettingsToVariantList(settings.stepperMotors));
     return map;
 }
@@ -3775,6 +3790,7 @@ class DetectSettingsController : public QObject
     Q_PROPERTY(int segmentMinPixels READ segmentMinPixels WRITE setSegmentMinPixels NOTIFY settingsChanged)
     Q_PROPERTY(double overlayAlpha READ overlayAlpha WRITE setOverlayAlpha NOTIFY settingsChanged)
     Q_PROPERTY(bool autoUploadEnabled READ autoUploadEnabled WRITE setAutoUploadEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(int f4ArmResultTimeoutMs READ f4ArmResultTimeoutMs WRITE setF4ArmResultTimeoutMs NOTIFY settingsChanged)
     Q_PROPERTY(QVariantList stepperMotorSettings READ stepperMotorSettings NOTIFY settingsChanged)
     Q_PROPERTY(QString lastStatusText READ lastStatusText NOTIFY lastStatusTextChanged)
 
@@ -3891,6 +3907,18 @@ public:
     bool autoUploadEnabled() const
     {
         return m_settings.autoUploadEnabled;
+    }
+
+    /*
+     * f4ArmResultTimeoutMs 的作用：
+     *   返回 MP157 等待 F4 主动上报 WEIGHT_RESULT、LDC_RESULT 和 CYCLE_DONE 的最大时间。
+     *
+     * 返回值：
+     *   返回毫秒数，合法范围由 normalizedSettings() 统一限制为 10000~180000。
+     */
+    int f4ArmResultTimeoutMs() const
+    {
+        return m_settings.f4ArmResultTimeoutMs;
     }
 
     /*
@@ -4033,6 +4061,26 @@ public:
             ? QStringLiteral("真实检测配置：已启用自动上传")
             : QStringLiteral("真实检测配置：已关闭自动上传"));
         emit settingsChanged();
+    }
+
+    /*
+     * setF4ArmResultTimeoutMs 的作用：
+     *   设置 MP157 等待 F4 机械臂主动结果帧的最大时间。
+     *
+     * 主要流程：
+     *   1. 接收 QML 参数页加减按钮传入的毫秒数。
+     *   2. 通过 applySettings() 统一限制到 10~180 秒，避免过短误判或过长占用串口线程。
+     *   3. 只影响 MP157 等待 WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE，不会写进 F4 发给 ESP32S3 的动作 payload。
+     *
+     * 参数：
+     *   value 是新的等待窗口，单位 ms。
+     */
+    void setF4ArmResultTimeoutMs(int value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.f4ArmResultTimeoutMs = value;
+        applySettings(next, QStringLiteral("真实检测配置：机械臂等待超时已调整"));
     }
 
     /*
@@ -4183,6 +4231,8 @@ public:
             object.value(QStringLiteral("overlayAlpha")).toDouble(next.overlayAlpha));
         next.autoUploadEnabled = object.value(QStringLiteral("auto_upload_enabled")).toBool(
             object.value(QStringLiteral("autoUploadEnabled")).toBool(next.autoUploadEnabled));
+        next.f4ArmResultTimeoutMs = object.value(QStringLiteral("f4_arm_result_timeout_ms")).toInt(
+            object.value(QStringLiteral("f4ArmResultTimeoutMs")).toInt(next.f4ArmResultTimeoutMs));
         /* stepperArray 保存配置文件中的三台电机参数数组；兼容旧 camelCase 键，便于调试期间手写 JSON。 */
         const QJsonArray stepperArray = object.value(QStringLiteral("stepper_motors")).toArray(
             object.value(QStringLiteral("stepperMotors")).toArray());
@@ -4252,6 +4302,7 @@ public:
         object.insert(QStringLiteral("segment_min_pixels"), m_settings.segmentMinPixels);
         object.insert(QStringLiteral("overlay_alpha"), m_settings.overlayAlpha);
         object.insert(QStringLiteral("auto_upload_enabled"), m_settings.autoUploadEnabled);
+        object.insert(QStringLiteral("f4_arm_result_timeout_ms"), m_settings.f4ArmResultTimeoutMs);
         /* stepperMotorsArray 保存三台步进电机参数，和界面三页顺序保持一致。 */
         QJsonArray stepperMotorsArray;
         for (const StepperMotorSettings &motor : m_settings.stepperMotors) {
@@ -4469,6 +4520,9 @@ private:
         next.roiSize = clampedInt(next.roiSize, 160, 640);
         next.segmentMinPixels = clampedInt(next.segmentMinPixels, 0, 50000);
         next.overlayAlpha = clampedDouble(next.overlayAlpha, 0.0, 1.0);
+        next.f4ArmResultTimeoutMs = clampedInt(next.f4ArmResultTimeoutMs,
+                                               F4_ARM_ACTIVE_FRAME_TIMEOUT_MIN_MS,
+                                               F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS);
         next.stepperMotors = normalizedStepperMotors(next.stepperMotors);
         return next;
     }
@@ -4487,6 +4541,7 @@ private:
             && left.segmentMinPixels == right.segmentMinPixels
             && qFuzzyCompare(left.overlayAlpha + 1.0, right.overlayAlpha + 1.0)
             && left.autoUploadEnabled == right.autoUploadEnabled
+            && left.f4ArmResultTimeoutMs == right.f4ArmResultTimeoutMs
             && stepperMotorSettingsEqual(left.stepperMotors, right.stepperMotors);
     }
 
@@ -8587,11 +8642,13 @@ public:
      *
      * 参数：
      *   modelResultText 是 storageController 检测完成返回的 RESULT 行。
+     *   activeFrameTimeoutMs 是参数页配置的 F4 主动结果帧等待窗口，单位 ms。
      *
      * 返回值：
      *   true 表示长流程后台线程已启动；false 表示当前 cycle、串口或模型结果不满足启动条件。
      */
-    Q_INVOKABLE bool requestF4ArmInspectionFlow(const QString &modelResultText)
+    Q_INVOKABLE bool requestF4ArmInspectionFlow(const QString &modelResultText,
+                                                int activeFrameTimeoutMs)
     {
         const quint16 cycleId = m_f4AutoCycleId;
         const quint8 modelResult = modelResultCodeFromText(modelResultText);
@@ -8604,6 +8661,9 @@ public:
         const quint16 modelSequence = m_f4BinarySequence++;
         const quint16 armSequence = m_f4BinarySequence++;
         const quint16 ackSequenceBase = m_f4BinarySequence;
+        const int armResultTimeoutMs = clampedInt(activeFrameTimeoutMs,
+                                                  F4_ARM_ACTIVE_FRAME_TIMEOUT_MIN_MS,
+                                                  F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS);
         QByteArray modelPayload;
         QByteArray armPayload;
 
@@ -8691,7 +8751,8 @@ public:
                                                  armSequence,
                                                  ackSequenceBase,
                                                  cycleId,
-                                                 jobId]() {
+                                                 jobId,
+                                                 armResultTimeoutMs]() {
             QString detail;
             QString weightContextJson;
             QString ldcContextJson;
@@ -8705,6 +8766,7 @@ public:
                                                    ackSequenceBase,
                                                    cycleId,
                                                    jobId,
+                                                   armResultTimeoutMs,
                                                    &detail,
                                                    &weightContextJson,
                                                    &ldcContextJson,
@@ -8752,12 +8814,14 @@ public:
      * 参数：
      *   cloudResult 是本次云端记录 result，取值 good/bad/review。
      *   uploadResultText 是上传脚本返回的一行状态，必须包含成功语义。
+     *   activeFrameTimeoutMs 是参数页配置的 CYCLE_DONE 等待窗口，单位 ms。
      *
      * 返回值：
      *   true 表示最终分拣线程已启动；false 表示上传未成功或 F4 当前状态不允许。
      */
     Q_INVOKABLE bool requestF4FinalSortResult(const QString &cloudResult,
-                                              const QString &uploadResultText)
+                                              const QString &uploadResultText,
+                                              int activeFrameTimeoutMs)
     {
         const quint16 cycleId = m_f4AutoCycleId;
         const quint16 jobId = m_f4LastArmJobId;
@@ -8767,6 +8831,9 @@ public:
         const quint8 finalBin = uploadSucceeded ? finalBinFromModelResult(finalResult) : 3U;
         const quint16 finalSequence = m_f4BinarySequence++;
         const quint16 ackSequenceBase = m_f4BinarySequence;
+        const int armResultTimeoutMs = clampedInt(activeFrameTimeoutMs,
+                                                  F4_ARM_ACTIVE_FRAME_TIMEOUT_MIN_MS,
+                                                  F4_ARM_ACTIVE_FRAME_TIMEOUT_MAX_MS);
         QByteArray payload;
 
         if (m_f4CommandRunning || m_f4ArmFlowRunning || m_f4FinalSortRunning) {
@@ -8811,7 +8878,8 @@ public:
                                                  finalSequence,
                                                  ackSequenceBase,
                                                  cycleId,
-                                                 jobId]() {
+                                                 jobId,
+                                                 armResultTimeoutMs]() {
             QString detail;
             QString cycleDoneContextJson;
             const bool ok = runF4FinalSortAndWaitCycleDone(dev,
@@ -8821,6 +8889,7 @@ public:
                                                            ackSequenceBase,
                                                            cycleId,
                                                            jobId,
+                                                           armResultTimeoutMs,
                                                            &detail,
                                                            &cycleDoneContextJson);
 
@@ -12155,6 +12224,8 @@ private:
         if (detail) {
             *detail += QStringLiteral(" timeout_wait=")
                     + f4BinaryCommandName(expectedCommand)
+                    + QStringLiteral(" timeout_ms=")
+                    + QString::number(timeoutMs)
                     + QStringLiteral(" last=")
                     + lastReadError;
         }
@@ -12176,6 +12247,7 @@ private:
                                        quint16 ackSequenceBase,
                                        quint16 cycleId,
                                        quint16 jobId,
+                                       int activeFrameTimeoutMs,
                                        QString *detail,
                                        QString *weightContextJson,
                                        QString *ldcContextJson,
@@ -12219,7 +12291,7 @@ private:
                                   baud,
                                   BINARY_PROTOCOL_CMD_WEIGHT_RESULT,
                                   cycleId,
-                                  45000,
+                                  activeFrameTimeoutMs,
                                   &waitDetail,
                                   &weightJson)) {
             if (detail) {
@@ -12232,7 +12304,7 @@ private:
                                   baud,
                                   BINARY_PROTOCOL_CMD_LDC_RESULT,
                                   cycleId,
-                                  45000,
+                                  activeFrameTimeoutMs,
                                   &waitDetail,
                                   &ldcJson)) {
             if (detail) {
@@ -12246,6 +12318,7 @@ private:
         flow.insert(QStringLiteral("job_id"), static_cast<int>(jobId));
         flow.insert(QStringLiteral("model_ready_ack"), modelAck);
         flow.insert(QStringLiteral("arm_job_start_ack"), armAck);
+        flow.insert(QStringLiteral("active_frame_timeout_ms"), activeFrameTimeoutMs);
         flow.insert(QStringLiteral("weight_result_received"), true);
         flow.insert(QStringLiteral("ldc_result_received"), true);
         flow.insert(QStringLiteral("next_step"), QStringLiteral("upload_then_final_sort"));
@@ -12276,6 +12349,7 @@ private:
                                                quint16 ackSequenceBase,
                                                quint16 cycleId,
                                                quint16 jobId,
+                                               int activeFrameTimeoutMs,
                                                QString *detail,
                                                QString *cycleDoneContextJson)
     {
@@ -12302,7 +12376,7 @@ private:
                                   baud,
                                   BINARY_PROTOCOL_CMD_CYCLE_DONE,
                                   cycleId,
-                                  45000,
+                                  activeFrameTimeoutMs,
                                   &waitDetail,
                                   &doneJson)) {
             if (detail) {
@@ -13191,6 +13265,7 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("segment_min_pixels=120\n")
         + QStringLiteral("overlay_alpha=0.45\n")
         + QStringLiteral("auto_upload_enabled=true\n")
+        + QStringLiteral("f4_arm_result_timeout_ms=75000\n")
         + QStringLiteral("stepper_motor[0].name=传送带电机\n")
         + QStringLiteral("stepper_motor[0].role=conveyor\n")
         + QStringLiteral("stepper_motor[0].serial=UART4 PC10/PC11\n")

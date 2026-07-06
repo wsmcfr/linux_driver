@@ -340,6 +340,9 @@ Rectangle {
     /* settingsUploadEnabled 表示检测完成后是否自动触发 COS 上传，真实值来自 detectSettings.autoUploadEnabled。 */
     property bool settingsUploadEnabled: detectSettings.autoUploadEnabled
 
+    /* settingsF4ArmResultTimeoutMs 保存 MP157 等待 F4 主动机械臂结果帧的最大时间，真实值来自 detectSettings.f4ArmResultTimeoutMs。 */
+    property int settingsF4ArmResultTimeoutMs: detectSettings.f4ArmResultTimeoutMs
+
     /* settingsLastActionText 保存参数页最近一次加载、保存或恢复默认的结果提示。 */
     property string settingsLastActionText: detectSettings.lastStatusText
 
@@ -1833,10 +1836,11 @@ Rectangle {
         }
 
         workflowState = "机械臂检测"
-        storageState = "Z轴已回升，通知F4/ESP32S3抓取零件并放到称重、电感模块"
+        storageState = "Z轴已回升，通知F4/ESP32S3抓取零件并放到称重、电感模块，机械臂等待 "
+                + settingsF4ArmResultTimeoutText()
         showStorageToast()
 
-        if (!deviceHealth.requestF4ArmInspectionFlow(latestModelResultText)) {
+        if (!deviceHealth.requestF4ArmInspectionFlow(latestModelResultText, root.settingsF4ArmResultTimeoutMs)) {
             storageState = "F4机械臂检测流程未启动"
             showStorageToast()
             return false
@@ -2812,6 +2816,17 @@ Rectangle {
     }
 
     /*
+     * settingsF4ArmResultTimeoutText 的作用：
+     *   把机械臂主动结果等待超时从毫秒转换成参数页显示的秒数。
+     *
+     * 返回值：
+     *   返回例如 75秒 的短文本，供摘要、按钮和日志复用。
+     */
+    function settingsF4ArmResultTimeoutText() {
+        return Math.floor(root.settingsF4ArmResultTimeoutMs / 1000) + "秒"
+    }
+
+    /*
      * settingsSummaryText 的作用：
      *   生成参数设置页右侧摘要，让操作员应用参数前能快速确认关键值。
      *
@@ -2826,6 +2841,7 @@ Rectangle {
                 + "  UNet>" + settingsSegmentMinPixels + "px"
                 + "  电机ID" + stepperMotorCompactSummary()
                 + "  带" + conveyorScanSpeedRpm() + "/" + conveyorTrackSpeedRpm() + "rpm"
+                + "  臂等" + settingsF4ArmResultTimeoutText()
                 + "  上传" + (settingsUploadEnabled ? "自动" : "手动")
     }
 
@@ -2859,6 +2875,7 @@ Rectangle {
             "segment_min_pixels=" + settingsSegmentMinPixels,
             "overlay_alpha=" + settingsOverlayAlpha.toFixed(2),
             "auto_upload_enabled=" + (settingsUploadEnabled ? "true" : "false"),
+            "f4_arm_result_timeout_ms=" + settingsF4ArmResultTimeoutMs,
             stepperMotorLogText(),
             "classify_args=--roi " + settingsRoiSize + " --bad-threshold " + (settingsDecisionThreshold / 1000.0).toFixed(3),
             "segment_args=--roi " + settingsRoiSize + " --alpha " + settingsOverlayAlpha.toFixed(2) + " --min-defect-pixels " + settingsSegmentMinPixels,
@@ -3703,8 +3720,9 @@ Rectangle {
             "2. F4 负责运动控制、光电触发、急停限位、传感器采集和执行器联锁。",
             "3. 传送带开放 BELT_MANUAL_CONTROL/QUERY_STATUS，摄像头轴开放 ACTUATOR_POS_MOVE、ACTUATOR_STOP、ACTUATOR_VEL_MOVE 和 ACTUATOR_HOME。",
             "4. 步进电机参数弹窗保存三台 Emm42 的地址、最小步长、常规/对中速度、传送带上料速度和方向，保存或开机都会发送 STEPPER_PARAM_SET 给 F407。",
-            "5. 当前 Qt 不直接拼 Emm42 帧，不绕过 F407 执行速度、位置、剔除动作、急停解除或联锁时序。",
-            "6. F4 ACK 表示命令被协议层接收，现场仍要用 CAMINFO、QUERY_STATUS 或实际动作确认运行时参数和电机地址。"
+            "5. 机械臂等待超时只控制 MP157 等待 WEIGHT_RESULT、LDC_RESULT 和 CYCLE_DONE 的窗口，当前为 " + settingsF4ArmResultTimeoutText() + "。",
+            "6. 当前 Qt 不直接拼 Emm42 帧，不绕过 F407 执行速度、位置、剔除动作、急停解除或联锁时序。",
+            "7. F4 ACK 表示命令被协议层接收，现场仍要用 CAMINFO、QUERY_STATUS 或实际动作确认运行时参数和电机地址。"
         ]
         return lines.join("\n")
     }
@@ -3912,6 +3930,10 @@ Rectangle {
         } else if (key === "alpha") {
             detectSettings.overlayAlpha = Math.max(0.0, Math.min(1.0, settingsOverlayAlpha + delta))
             settingsLastActionText = "真实检测配置：overlay透明度 " + settingsOverlayAlpha.toFixed(2)
+        } else if (key === "f4-arm-timeout") {
+            detectSettings.f4ArmResultTimeoutMs = Math.max(10000, Math.min(180000, settingsF4ArmResultTimeoutMs + delta))
+            settingsLastActionText = "真实检测配置：机械臂等待超时 " + settingsF4ArmResultTimeoutText()
+                    + "，只影响MP157等待F4主动结果帧"
         }
 
         storageState = settingsLastActionText
@@ -6701,7 +6723,8 @@ Rectangle {
             root.showStorageToast()
 
             if (!deviceHealth.requestF4FinalSortResult(root.latestCompletedCloudResult,
-                                                       root.latestCompletedUploadResultText)) {
+                                                       root.latestCompletedUploadResultText,
+                                                       root.settingsF4ArmResultTimeoutMs)) {
                 root.storageState = "F4最终分拣命令未启动：" + root.latestCompletedUploadResultText
                 root.showStorageToast()
             }
@@ -10151,8 +10174,85 @@ Rectangle {
             }
 
             Rectangle {
+                id: settingsArmTimeoutControl
                 x: 14
-                y: 82
+                y: 60
+                width: parent.width - 28
+                height: 30
+                radius: 6
+                color: "#15191c"
+                border.color: "#343d43"
+                border.width: 1
+
+                Text {
+                    x: 10
+                    width: 86
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "机械臂等待"
+                    color: "#dce3e6"
+                    font.pixelSize: 12
+                    font.bold: true
+                    elide: Text.ElideRight
+                }
+
+                Rectangle {
+                    x: 102
+                    width: 76
+                    height: 22
+                    radius: 5
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: "#20262a"
+                    border.color: root.accentAmber
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: root.settingsF4ArmResultTimeoutText()
+                        color: "#fff3d5"
+                        font.pixelSize: 12
+                        font.bold: true
+                    }
+                }
+
+                Repeater {
+                    model: [
+                        {"text": "-10秒", "delta": -10000, "color": "#9aa6ad"},
+                        {"text": "+10秒", "delta": 10000, "color": root.accentGreen}
+                    ]
+
+                    Rectangle {
+                        x: 190 + index * 78
+                        width: 70
+                        height: 22
+                        radius: 5
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: settingsArmTimeoutMouse.pressed ? "#2d3338" : "#22272b"
+                        border.color: modelData.color
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.text
+                            color: "#ffffff"
+                            font.pixelSize: 11
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: settingsArmTimeoutMouse
+                            anchors.fill: parent
+
+                            onClicked: {
+                                root.changeSettingValue("f4-arm-timeout", modelData.delta)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 14
+                y: 96
                 width: parent.width - 28
                 height: 34
                 radius: 6
@@ -10176,7 +10276,7 @@ Rectangle {
 
             Grid {
                 x: 14
-                y: 134
+                y: 138
                 width: parent.width - 28
                 columns: 2
                 rowSpacing: 8

@@ -613,9 +613,13 @@ require_grep "scan_speed_rpm" "main.cpp"
 require_grep "scanSpeedRpm" "main.cpp"
 require_grep "z_motion_timeout_ms" "main.cpp"
 require_grep "zMotionTimeoutMs" "main.cpp"
+require_grep "f4_arm_result_timeout_ms" "main.cpp"
+require_grep "f4ArmResultTimeoutMs" "main.cpp"
 require_grep "conveyorTrackSpeedRpm" "qml/Main.qml"
 require_grep "conveyorScanSpeedRpm" "qml/Main.qml"
 require_grep "cameraZMotionTimeoutMs" "qml/Main.qml"
+require_grep "settingsF4ArmResultTimeoutMs" "qml/Main.qml"
+require_grep "机械臂等待" "qml/Main.qml"
 require_grep "direction" "main.cpp"
 require_fixed_grep "BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U" "main.cpp"
 require_grep "buildStepperSettingsPayload" "main.cpp"
@@ -671,6 +675,8 @@ require_grep "摄像头左右" "README.md"
 require_grep "stepper_motors" "README.md"
 require_grep "scan_speed_rpm" "README.md"
 require_grep "z_motion_timeout_ms" "README.md"
+require_grep "f4_arm_result_timeout_ms" "README.md"
+require_grep "机械臂等待超时" "README.md"
 require_grep "0~5000 rpm" "README.md"
 require_grep "STEPPER_PARAM_SET 0x42" "README.md"
 require_grep "31 字节" "README.md"
@@ -695,6 +701,26 @@ if ! grep -q 'property var motorConfig: root.stepperMotorSettingsRevision' "$SCR
 fi
 if ! grep -q '本次自动检测Z轴下降/回升最多等待' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "应用 Z 轴超时后必须直接提示本次自动检测使用的等待毫秒数，方便现场确认不是固定 10 秒"
+fi
+if ! grep -q 'requestF4ArmInspectionFlow(latestModelResultText, root.settingsF4ArmResultTimeoutMs)' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "Z 轴回升后启动机械臂检测流程时，必须把参数页机械臂等待超时传给 C++，不能继续使用写死等待窗口"
+fi
+if ! grep -q 'root.settingsF4ArmResultTimeoutMs)' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "最终分拣等待 CYCLE_DONE 时也必须使用参数页机械臂等待超时"
+fi
+arm_flow_block="$(sed -n '/static bool runF4ArmInspectionFlow/,/static bool runF4FinalSortAndWaitCycleDone/p' "$SCRIPT_DIR/main.cpp")"
+final_sort_block="$(sed -n '/static bool runF4FinalSortAndWaitCycleDone/,/static bool sendF4BinaryHeartbeat/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$arm_flow_block" | grep -q 'activeFrameTimeoutMs'; then
+    fail "runF4ArmInspectionFlow() 必须接收 activeFrameTimeoutMs 参数，用参数页数值等待 WEIGHT_RESULT/LDC_RESULT"
+fi
+if printf '%s\n' "$arm_flow_block" | grep -q 'F4_ARM_ACTIVE_FRAME_TIMEOUT_MS'; then
+    fail "runF4ArmInspectionFlow() 不能继续直接使用固定 F4_ARM_ACTIVE_FRAME_TIMEOUT_MS"
+fi
+if ! printf '%s\n' "$final_sort_block" | grep -q 'activeFrameTimeoutMs'; then
+    fail "runF4FinalSortAndWaitCycleDone() 必须接收 activeFrameTimeoutMs 参数，用参数页数值等待 CYCLE_DONE"
+fi
+if printf '%s\n' "$final_sort_block" | grep -q 'F4_ARM_ACTIVE_FRAME_TIMEOUT_MS'; then
+    fail "runF4FinalSortAndWaitCycleDone() 不能继续直接使用固定 F4_ARM_ACTIVE_FRAME_TIMEOUT_MS"
 fi
 stepper_min_step_minus_block="$(sed -n '/id: stepperMinStepMinusMouse/,/^                            }/p' "$SCRIPT_DIR/qml/Main.qml")"
 stepper_min_step_plus_block="$(sed -n '/id: stepperMinStepPlusMouse/,/^                            }/p' "$SCRIPT_DIR/qml/Main.qml")"
