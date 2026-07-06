@@ -295,8 +295,8 @@ static const int MP157_ACTUATOR_FALLBACK_SETTLE_MS = 450;
 /* MP157 本地估算最短等待：小步数也不能马上推进 ROI 复查，单位 ms。 */
 static const int MP157_ACTUATOR_FALLBACK_MIN_MS = 1200;
 
-/* MP157 本地估算最长等待：保留比 C++ 70 秒串口等待略短的上限，避免后台线程永久占用。 */
-static const int MP157_ACTUATOR_FALLBACK_MAX_MS = 65000;
+/* MP157 本地估算最长等待：现场把 Z 轴速度/步数调到 10 秒内完成，后台线程也必须在 10 秒兜底返回，避免串口 busy 卡住 ROI 微调。 */
+static const int MP157_ACTUATOR_FALLBACK_MAX_MS = 10000;
 
 /* 二进制称重结果命令：F4 读取 HX711 稳定结果后主动上报给 MP157。 */
 static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U;

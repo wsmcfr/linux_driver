@@ -70,8 +70,11 @@ Rectangle {
     /* autoVisionLocateBusy 表示当前 overlay LOCATE 请求尚未返回，避免 100ms 定时器重复创建线程。 */
     property bool autoVisionLocateBusy: false
 
-    /* autoVisionCommandBusy 表示当前 VISION_POS/VISION_LOST/BELT_STOP_CENTERED 仍在等待 F4 ACK。 */
+    /* autoVisionCommandBusy 表示当前 VISION_POS/VISION_LOST/BELT_STOP_CENTERED 或执行器命令仍在等待 F4/C++ 后台线程回调。 */
     property bool autoVisionCommandBusy: false
+
+    /* autoVisionIgnoreNextZMotionDone 表示 Z 轴已经由 MP157 10s 兜底推进，下一条迟到的 Z 轴回调只记录不再重复推进流程。 */
+    property bool autoVisionIgnoreNextZMotionDone: false
 
     /* autoVisionStableFrames 保存连续进入中心死区的帧数，达到 3 帧才发送居中停止。 */
     property int autoVisionStableFrames: 0
@@ -121,17 +124,17 @@ Rectangle {
     /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
     property int autoVisionZFocusSettleMs: 3000
 
-    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护超时的每圈步数；正常完成以 F4 ACTUATOR_MOVE_DONE 事件为准。 */
+    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护等待的每圈步数，参数页速度和步数变化后下一次等待会实时变化。 */
     property int autoVisionZMoveStepsPerRev: 200
 
     /* autoVisionZMotionSafetyMs 是 Z 轴估算运动时间之外的安全余量，用于覆盖 F4 转发、驱动器加减速和机构惯性。 */
     property int autoVisionZMotionSafetyMs: 900
 
-    /* autoVisionZMotionMinimumWaitMs 是 Z 轴 ACK 后最短物理等待时间，避免小步数或配置异常时立刻进入 ROI 复查。 */
+    /* autoVisionZMotionMinimumWaitMs 是 Z 轴命令发出后的最短物理等待时间，避免小步数或配置异常时立刻进入 ROI 复查。 */
     property int autoVisionZMotionMinimumWaitMs: 1200
 
-    /* autoVisionZMotionMaximumWaitMs 是 Z 轴 ACK 后最长物理等待时间，避免错误步数把自动流程长时间卡住。 */
-    property int autoVisionZMotionMaximumWaitMs: 30000
+    /* autoVisionZMotionMaximumWaitMs 是 Z 轴命令发出后的最长物理等待时间，现场把速度/步数调到 10s 内完成后，MP157 不再等 F4 DONE 卡住。 */
+    property int autoVisionZMotionMaximumWaitMs: 10000
 
     /* autoVisionPostFocusDetectDelayMs 是已经完成 Z 轴对焦等待后的短检测延时，给 overlay 刷新一帧。 */
     property int autoVisionPostFocusDetectDelayMs: 300
@@ -859,6 +862,7 @@ Rectangle {
         autoVisionRunning = true
         autoVisionLocateBusy = false
         autoVisionCommandBusy = false
+        autoVisionIgnoreNextZMotionDone = false
         autoVisionStableFrames = 0
         autoVisionCenteredSent = false
         autoVisionHasSeenTarget = false
@@ -902,6 +906,7 @@ Rectangle {
         autoVisionRunning = false
         autoVisionLocateBusy = false
         autoVisionCommandBusy = false
+        autoVisionIgnoreNextZMotionDone = false
         autoVisionStableFrames = 0
         autoVisionCenteredSent = false
         autoVisionHasSeenTarget = false
@@ -1137,12 +1142,13 @@ Rectangle {
 
     /*
      * autoVisionStartZMotionWait 的作用：
-     *   在 Z 轴位置命令发出后启动本地超时保护，避免 F4 到位事件丢失时自动流程永久卡住。
+     *   在 Z 轴位置命令写入线程启动后，立即启动 MP157 本地运动等待，不再把流程推进绑定到 F4 DONE。
      *
      * 主要流程：
      *   1. 按 direction 选择 z-motion-down-wait 或 z-motion-up-wait 阶段。
-     *   2. 用 autoVisionEstimateZMoveMs() 估算保护超时时间，并重启 autoVisionActuatorSettleTimer。
-     *   3. 正常路径不靠该定时器推进，必须由 autoVisionHandleActuatorMoveDone() 收到 F4 完成事件后推进。
+     *   2. 用 autoVisionEstimateZMoveMs() 按本次 speed/steps 估算等待时间，并受 autoVisionZMotionMaximumWaitMs=10s 限制。
+     *   3. 如果 F4 DONE 或 C++ 本地估算回调先回来，则 autoVisionHandleActuatorMoveDone() 会提前推进。
+     *   4. 如果 F4 没有可靠回调，则定时器到期后按 z-motion-10s-fallback 兜底继续 ROI 复查或机械臂流程。
      *
      * 参数：
      *   direction 为 0 时表示下降，为 1 时表示回升。
@@ -1150,19 +1156,20 @@ Rectangle {
      *   speedRpm 是本次 Z 轴移动速度。
      *
      * 返回值：
-     *   无返回值；函数只设置阶段和本地保护定时器。
+     *   无返回值；函数只设置阶段和 MP157 本地等待定时器。
      */
     function autoVisionStartZMotionWait(direction, stepsValue, speedRpm) {
         var movingDown = Math.floor(Number(direction || 0)) === 0
         var waitMs = autoVisionEstimateZMoveMs(stepsValue, speedRpm)
         var waitSeconds = (waitMs / 1000.0).toFixed(1)
 
+        autoVisionIgnoreNextZMotionDone = false
         autoVisionActuatorPhase = movingDown ? "z-motion-down-wait" : "z-motion-up-wait"
-        workflowState = movingDown ? "Z轴下降到位等待" : "Z轴回升到位等待"
-        autoVisionLastText = "等待 F4 ACTUATOR_MOVE_DONE 确认上下电机"
+        workflowState = movingDown ? "Z轴下降等待" : "Z轴回升等待"
+        autoVisionLastText = "MP157按本次速度/步数等待上下电机"
                 + (movingDown ? "下降" : "回升")
-                + "动作完成，本地保护 " + waitSeconds + " 秒，steps=" + stepsValue
-                + "，speed=" + speedRpm + "rpm"
+                + "，最大10秒兜底，当前估算 " + waitSeconds + " 秒，steps=" + stepsValue
+                + "，speed=" + speedRpm + "rpm；F4 DONE回来则提前进入下一步"
         storageState = autoVisionLastText
         showStorageToast()
         autoVisionActuatorSettleTimer.interval = waitMs
@@ -1170,11 +1177,78 @@ Rectangle {
     }
 
     /*
-     * autoVisionHandleActuatorMoveDone 的作用：
-     *   在 MP157 C++ 已确认收到 F4 ACTUATOR_MOVE_DONE 后推进自动流程。
+     * autoVisionHandleZMotionFallbackDone 的作用：
+     *   在 Z 轴本地等待到期后兜底推进自动流程，避免现场因为 F4 DONE/ACK 丢失而一直停在“Z轴下降”。
      *
      * 主要流程：
-     *   1. 停止 Z 轴本地保护定时器，说明正常完成来自 F4 完成事件而不是固定 sleep。
+     *   1. 判断当前等待阶段是下降还是回升；非 Z 轴等待阶段直接返回 false，防止误处理其它执行器。
+     *   2. 记录本次 speed/steps/direction，清空 pending 字段，保证下一轮 Z 命令不会复用旧参数。
+     *   3. 下降兜底后设置 autoVisionNeedsZUp=true，并进入 ROI 复查，让摄像头判断下降后零件是否偏离中心。
+     *   4. 回升兜底后清理 Z 轴检测标志，并继续启动 F4/ESP32S3 机械臂称重、电感流程。
+     *   5. 如果 C++ 后台位置运动线程仍未回调，则设置 autoVisionIgnoreNextZMotionDone，防止迟到回调重复推进。
+     *
+     * 参数：
+     *   reason 是写入日志的兜底原因，必须包含 z-motion-10s-fallback，方便板端 grep。
+     *
+     * 返回值：
+     *   true 表示已经处理当前 Z 轴等待阶段；false 表示当前不是 Z 轴等待。
+     */
+    function autoVisionHandleZMotionFallbackDone(reason) {
+        var phase = autoVisionActuatorPhase
+        var movingDown = phase === "z-motion-down-wait"
+        var movingUp = phase === "z-motion-up-wait"
+        var steps = autoVisionPendingZMoveSteps
+        var speed = autoVisionPendingZMoveSpeedRpm
+        var direction = autoVisionPendingZMoveDirection
+        var fallbackReason = String(reason || "z-motion-10s-fallback")
+        var lateCallbackMayArrive = autoVisionCommandBusy
+
+        if (!movingDown && !movingUp) {
+            return false
+        }
+
+        if (fallbackReason.indexOf("z-motion-10s-fallback") < 0) {
+            fallbackReason = "z-motion-10s-fallback " + fallbackReason
+        }
+
+        autoVisionActuatorSettleTimer.stop()
+        autoVisionPendingZMoveSteps = 0
+        autoVisionPendingZMoveSpeedRpm = 0
+        autoVisionPendingZMoveDirection = 0
+        autoVisionActuatorPhase = ""
+        autoVisionIgnoreNextZMotionDone = lateCallbackMayArrive
+
+        if (movingDown) {
+            autoVisionNeedsZUp = true
+            workflowState = "ROI复查"
+            autoVisionLastText = fallbackReason
+                    + " vision-stable-after-z-down：MP157已等待Z轴下降估算/最大10秒，开始ROI复查；direction="
+                    + direction + " steps=" + steps + " speed=" + speed + "rpm"
+            storageState = autoVisionLastText
+            showStorageToast()
+            autoVisionRequestFineTuneLocate()
+            return true
+        }
+
+        autoVisionNeedsZUp = false
+        autoVisionZFocusSettled = false
+        autoVisionDetectFromZFlow = false
+        workflowState = "机械臂检测"
+        autoVisionLastText = fallbackReason
+                + "：MP157已等待Z轴回升估算/最大10秒，继续启动F4/ESP32S3机械臂流程；direction="
+                + direction + " steps=" + steps + " speed=" + speed + "rpm"
+        storageState = autoVisionLastText
+        showStorageToast()
+        autoVisionStartF4ArmInspectionAfterZUp()
+        return true
+    }
+
+    /*
+     * autoVisionHandleActuatorMoveDone 的作用：
+     *   在 F4 DONE 或 C++ 本地估算完成先于 10s 定时器返回时，提前推进 Z 轴自动流程。
+     *
+     * 主要流程：
+     *   1. 停止 Z 轴本地等待定时器，避免后续 10s 兜底重复触发。
      *   2. Z 下降完成后，先用传送带和左右轴继续复查/微调 ROI 中心。
      *   3. Z 回升完成后，才允许通知 F4/ESP32S3 机械臂抓取零件并进入称重、电感流程。
      *
@@ -1205,13 +1279,14 @@ Rectangle {
 
         if (autoVisionActuatorPhase === "z-motion-down-wait") {
             autoVisionActuatorSettleTimer.stop()
+            autoVisionIgnoreNextZMotionDone = false
             autoVisionNeedsZUp = true
             autoVisionPendingZMoveSteps = 0
             autoVisionPendingZMoveSpeedRpm = 0
             autoVisionPendingZMoveDirection = 0
             autoVisionLastText = (estimatedDone
-                    ? "F4估算Z轴下降完成，开始ROI复查并用传送带/左右轴微调："
-                    : "F4收到Z轴下降主动到位回包，开始ROI复查并用传送带/左右轴微调：") + eventText
+                    ? "vision-stable-after-z-down：F4/MP157估算Z轴下降完成，开始ROI复查并用传送带/左右轴微调："
+                    : "vision-stable-after-z-down：F4收到Z轴下降主动到位回包，开始ROI复查并用传送带/左右轴微调：") + eventText
             storageState = autoVisionLastText
             showStorageToast()
             autoVisionRequestFineTuneLocate()
@@ -1220,6 +1295,7 @@ Rectangle {
 
         if (autoVisionActuatorPhase === "z-motion-up-wait") {
             autoVisionActuatorSettleTimer.stop()
+            autoVisionIgnoreNextZMotionDone = false
             autoVisionNeedsZUp = false
             autoVisionZFocusSettled = false
             autoVisionDetectFromZFlow = false
@@ -1278,12 +1354,13 @@ Rectangle {
         autoVisionPendingZMoveSteps = steps
         autoVisionPendingZMoveSpeedRpm = speed
         autoVisionPendingZMoveDirection = 0
-        autoVisionLastText = "自动视觉：上下电机下降 " + steps + " step，等待 F4 到位事件"
+        autoVisionLastText = "自动视觉：上下电机下降 " + steps + " step，MP157本地等待最大10秒后进入ROI复查"
         storageState = autoVisionLastText
         showStorageToast()
 
         if (deviceHealth.sendF4ActuatorPositionMove(2, 0, 0, speed, steps, 0)) {
             autoVisionCommandBusy = true
+            autoVisionStartZMotionWait(0, steps, speed)
             return true
         }
 
@@ -1587,12 +1664,13 @@ Rectangle {
         autoVisionPendingZMoveSteps = steps
         autoVisionPendingZMoveSpeedRpm = speed
         autoVisionPendingZMoveDirection = 1
-        autoVisionLastText = "模型检测完成，上下电机回升 " + steps + " step，等待 F4 到位事件"
+        autoVisionLastText = "模型检测完成，上下电机回升 " + steps + " step，MP157本地等待最大10秒后继续机械臂流程"
         storageState = autoVisionLastText
         showStorageToast()
 
         if (deviceHealth.sendF4ActuatorPositionMove(2, 1, 0, speed, steps, 0)) {
             autoVisionCommandBusy = true
+            autoVisionStartZMotionWait(1, steps, speed)
             return true
         }
 
@@ -5365,26 +5443,9 @@ Rectangle {
 
         onTriggered: {
             if (root.autoVisionActuatorPhase === "z-motion-down-wait") {
-                root.autoVisionPendingZMoveSteps = 0
-                root.autoVisionPendingZMoveSpeedRpm = 0
-                root.autoVisionPendingZMoveDirection = 0
-                root.autoVisionActuatorPhase = ""
-                root.workflowState = "Z轴下降超时"
-                root.storageState = "未收到F4 ACTUATOR_MOVE_DONE，禁止进入ROI复查和模型检测，请检查Emm42 Response/RX/地址"
-                root.autoVisionLastText = root.storageState
-                root.showStorageToast()
+                root.autoVisionHandleZMotionFallbackDone("z-motion-10s-fallback：Z轴下降未等到可靠F4 DONE，按MP157本地最大等待继续")
             } else if (root.autoVisionActuatorPhase === "z-motion-up-wait") {
-                root.autoVisionNeedsZUp = true
-                root.autoVisionZFocusSettled = false
-                root.autoVisionDetectFromZFlow = false
-                root.autoVisionPendingZMoveSteps = 0
-                root.autoVisionPendingZMoveSpeedRpm = 0
-                root.autoVisionPendingZMoveDirection = 0
-                root.autoVisionActuatorPhase = ""
-                root.workflowState = "Z轴回升超时"
-                root.storageState = "未收到F4 ACTUATOR_MOVE_DONE，禁止启动机械臂抓取，请手动确认Z轴已离开零件"
-                root.autoVisionLastText = root.storageState
-                root.showStorageToast()
+                root.autoVisionHandleZMotionFallbackDone("z-motion-10s-fallback：Z轴回升未等到可靠F4 DONE，按MP157本地最大等待继续")
             } else if (root.autoVisionActuatorPhase === "z-down-skip"
                     || root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                 root.autoVisionRequestFineTuneLocate()
@@ -5746,10 +5807,10 @@ Rectangle {
 
         /*
          * onF4ActuatorCommandFinished 的作用：
-         *   接收 ACTUATOR_POS_MOVE 的完成事件结果或其它执行器命令 ACK/NACK，并按阶段推进。
+         *   接收 ACTUATOR_POS_MOVE 的完成事件、MP157 估算完成或其它执行器 ACK/NACK，并按阶段推进。
          *
          * 参数：
-         *   ok 对 ACTUATOR_POS_MOVE 表示已经收到 F4 ACTUATOR_MOVE_DONE；对其它命令表示 ACK 成功。
+         *   ok 对 ACTUATOR_POS_MOVE 表示收到 F4 DONE 或 MP157 本地估算完成；对其它命令表示 ACK 成功。
          *   action 是执行器命令名称。
          *   cycleId 是当前自动流程号，手动命令通常为 0。
          *   detail 是 ACK、EVENT_REPORT、NACK 或串口失败原因。
@@ -5758,12 +5819,24 @@ Rectangle {
             root.autoVisionCommandBusy = false
             root.autoCycleId = cycleId
 
+            if (root.autoVisionIgnoreNextZMotionDone && action === "ACTUATOR_POS_MOVE") {
+                root.autoVisionIgnoreNextZMotionDone = false
+                root.autoVisionLastText = "忽略已由z-motion-10s-fallback推进的Z轴迟到回调：" + detail
+                root.storageState = root.autoVisionLastText
+                root.showStorageToast()
+                root.evaluateRuntimeAlarms()
+                return
+            }
+
             if (root.autoVisionActuatorPhase !== "") {
                 if (ok) {
                     root.autoVisionLastText = "执行器完成：" + root.autoVisionActuatorPhase + " " + detail
                     if (root.autoVisionActuatorPhase === "z-down") {
                         root.autoVisionNeedsZUp = true
                         root.autoVisionActuatorPhase = "z-motion-down-wait"
+                        root.autoVisionHandleActuatorMoveDone(detail)
+                    } else if (root.autoVisionActuatorPhase === "z-motion-down-wait"
+                            || root.autoVisionActuatorPhase === "z-motion-up-wait") {
                         root.autoVisionHandleActuatorMoveDone(detail)
                     } else if (root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                         autoVisionActuatorSettleTimer.interval = root.autoVisionShortSettleMs
@@ -5776,10 +5849,17 @@ Rectangle {
                     root.autoVisionLastText = "执行器失败：" + root.autoVisionActuatorPhase + " " + detail
                     root.storageState = root.autoVisionLastText
                     root.showStorageToast()
-                    if (root.autoVisionActuatorPhase === "z-up") {
+                    if (root.autoVisionActuatorPhase === "z-motion-down-wait"
+                            || root.autoVisionActuatorPhase === "z-motion-up-wait") {
+                        root.autoVisionLastText += "；继续等待MP157本地10s兜底"
+                        root.storageState = root.autoVisionLastText
+                        root.showStorageToast()
+                    } else if (root.autoVisionActuatorPhase === "z-up") {
                         root.autoVisionNeedsZUp = true
+                        root.autoVisionActuatorPhase = ""
+                    } else {
+                        root.autoVisionActuatorPhase = ""
                     }
-                    root.autoVisionActuatorPhase = ""
                 }
 
                 root.evaluateRuntimeAlarms()

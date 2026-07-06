@@ -867,12 +867,17 @@ require_grep "focus-settle" "qml/Main.qml"
 require_grep "autoVisionStartZMotionWait" "qml/Main.qml"
 require_grep "autoVisionEstimateZMoveMs" "qml/Main.qml"
 require_grep "autoVisionHandleActuatorMoveDone" "qml/Main.qml"
+require_grep "autoVisionHandleZMotionFallbackDone" "qml/Main.qml"
+require_grep "autoVisionZMotionMaximumWaitMs: 10000" "qml/Main.qml"
+require_grep "z-motion-10s-fallback" "qml/Main.qml"
+require_grep "vision-stable-after-z-down" "qml/Main.qml"
 require_grep "actuator-move-done" "qml/Main.qml"
 require_grep "actuator-move-timeout" "qml/Main.qml"
 require_grep "estimated-done" "main.cpp"
 require_grep "estimated-done" "qml/Main.qml"
 require_grep "estimateActuatorPositionMoveFallbackMs" "main.cpp"
 require_grep "mp157-local-estimated-done" "main.cpp"
+require_grep "MP157_ACTUATOR_FALLBACK_MAX_MS = 10000" "main.cpp"
 require_grep "z-motion-down-wait" "qml/Main.qml"
 require_grep "z-motion-up-wait" "qml/Main.qml"
 require_grep "requestF4ArmInspectionFlow" "qml/Main.qml"
@@ -887,18 +892,23 @@ fi
 if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'wait_ms='; then
     fail "MP157 本地估算日志必须输出 wait_ms，方便现场核对速度、步数和等待时间"
 fi
+if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'MP157_ACTUATOR_FALLBACK_MAX_MS'; then
+    fail "MP157 本地估算必须受 10s 最大兜底限制，避免 ACTUATOR_POS_MOVE 后台线程长时间占用串口"
+fi
+z_down_request_block="$(sed -n '/function autoVisionRequestZDown/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_down_request_block" | grep -q 'autoVisionStartZMotionWait(0, steps, speed)'; then
+    fail "Z 下降命令一旦写入线程启动，QML 必须立即启动本地运动等待，不能等 F4 DONE 回调后才计时"
+fi
+z_up_request_block="$(sed -n '/function autoVisionRequestZUp/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_up_request_block" | grep -q 'autoVisionStartZMotionWait(1, steps, speed)'; then
+    fail "Z 回升命令一旦写入线程启动，QML 必须立即启动本地运动等待，不能等 F4 DONE 回调后才计时"
+fi
 z_down_ack_block="$(sed -n '/root.autoVisionActuatorPhase === "z-down"/,/root.autoVisionActuatorPhase.indexOf("fine-tune")/p' "$SCRIPT_DIR/qml/Main.qml")"
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionZFocusSettleMs'; then
     fail "Z 下降 ACK 后不能直接等待 3s 对焦；必须先短稳定并用传送带+左右轴复查 ROI 中心"
 fi
-if ! printf '%s\n' "$z_down_ack_block" | grep -q 'root.autoVisionActuatorPhase = "z-motion-down-wait"'; then
-    fail "Z 下降完成回调必须切到 z-motion-down-wait，再由统一 DONE 处理函数推进"
-fi
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionStartZMotionWait'; then
     fail "Z 下降回调中的 ok 已经表示 C++ 等到 F4 DONE，不能再叠加本地估算等待"
-fi
-if ! printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionHandleActuatorMoveDone'; then
-    fail "Z 下降必须等待 F4 ACTUATOR_MOVE_DONE 事件确认电机真实到位，不能只靠本地估算等待推进"
 fi
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionShortSettleMs'; then
     fail "Z 下降 ACK 后不能直接用短稳定替代物理运动完成等待"
@@ -915,17 +925,21 @@ if ! printf '%s\n' "$settle_timer_block" | grep -q 'autoVisionStartDetectDelay';
     fail "focus-settle 结束后必须再进入检测延时，而不是继续 ROI 复查"
 fi
 z_up_ack_block="$(sed -n '/root.autoVisionActuatorPhase === "z-up"/,/root.autoVisionActuatorPhase = ""/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$z_up_ack_block" | grep -q 'root.autoVisionActuatorPhase = "z-motion-up-wait"'; then
-    fail "Z 回升完成回调必须切到 z-motion-up-wait，再由统一 DONE 处理函数推进机械臂流程"
-fi
 if printf '%s\n' "$z_up_ack_block" | grep -q 'autoVisionStartZMotionWait'; then
     fail "Z 回升回调中的 ok 已经表示 C++ 等到 F4 DONE，不能再叠加本地估算等待"
 fi
-if ! printf '%s\n' "$z_up_ack_block" | grep -q 'autoVisionHandleActuatorMoveDone'; then
-    fail "Z 回升必须等待 F4 ACTUATOR_MOVE_DONE 事件确认电机真实到位，不能只靠本地估算等待启动机械臂"
-fi
 if printf '%s\n' "$z_up_ack_block" | grep -q 'requestF4ArmInspectionFlow'; then
     fail "Z 回升 ACK 后不能直接启动 F4 机械臂流程，避免检测头未离开零件就抓取"
+fi
+z_motion_done_callback_block="$(sed -n '/onF4ActuatorCommandFinished:/,/onF4ArmInspectionFlowFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_motion_done_callback_block" | grep -q 'z-motion-down-wait'; then
+    fail "Z 下降阶段的 F4 DONE 或 MP157 估算完成回调必须能提前结束 10s 等待"
+fi
+if ! printf '%s\n' "$z_motion_done_callback_block" | grep -q 'z-motion-up-wait'; then
+    fail "Z 回升阶段的 F4 DONE 或 MP157 估算完成回调必须能提前结束 10s 等待"
+fi
+if ! printf '%s\n' "$z_motion_done_callback_block" | grep -q 'autoVisionHandleActuatorMoveDone'; then
+    fail "执行器完成回调仍要复用 autoVisionHandleActuatorMoveDone()，避免 DONE 路径和 10s 兜底路径分叉"
 fi
 z_motion_timer_block="$(sed -n '/id: autoVisionActuatorSettleTimer/,/Connections {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$z_motion_timer_block" | grep -q 'z-motion-down-wait'; then
@@ -936,17 +950,24 @@ if ! printf '%s\n' "$z_motion_timer_block" | grep -q 'z-motion-up-wait'; then
 fi
 z_motion_down_timer_block="$(sed -n '/root.autoVisionActuatorPhase === "z-motion-down-wait"/,/} else if (root.autoVisionActuatorPhase === "z-motion-up-wait")/p' "$SCRIPT_DIR/qml/Main.qml")"
 z_motion_up_timer_block="$(sed -n '/root.autoVisionActuatorPhase === "z-motion-up-wait"/,/} else if (root.autoVisionActuatorPhase === "z-down-skip"/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$z_motion_down_timer_block" | grep -q '未收到F4 ACTUATOR_MOVE_DONE'; then
-    fail "Z 下降本地保护超时必须提示未收到 F4 ACTUATOR_MOVE_DONE，不能冒充正常到位"
+z_motion_fallback_handler_block="$(sed -n '/function autoVisionHandleZMotionFallbackDone/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_motion_down_timer_block" | grep -q 'autoVisionHandleZMotionFallbackDone'; then
+    fail "Z 下降 10s 兜底到期必须进入统一兜底完成函数，不能停在 Z轴下降"
 fi
-if printf '%s\n' "$z_motion_down_timer_block" | grep -q 'autoVisionRequestFineTuneLocate'; then
-    fail "Z 下降本地保护超时不能进入 ROI 复查；正常推进必须来自 F4 ACTUATOR_MOVE_DONE"
+if ! printf '%s\n' "$z_motion_down_timer_block" | grep -q 'z-motion-10s-fallback'; then
+    fail "Z 下降 10s 兜底日志必须带 z-motion-10s-fallback marker，方便现场 grep"
 fi
-if ! printf '%s\n' "$z_motion_up_timer_block" | grep -q '未收到F4 ACTUATOR_MOVE_DONE'; then
-    fail "Z 回升本地保护超时必须提示未收到 F4 ACTUATOR_MOVE_DONE，不能冒充正常到位"
+if ! printf '%s\n' "$z_motion_fallback_handler_block" | grep -q 'autoVisionRequestFineTuneLocate'; then
+    fail "Z 下降 10s 兜底后必须进入 ROI 复查，让摄像头判断下降后零件是否偏离中心"
 fi
-if printf '%s\n' "$z_motion_up_timer_block" | grep -q 'autoVisionStartF4ArmInspectionAfterZUp'; then
-    fail "Z 回升本地保护超时不能启动机械臂；正常推进必须来自 F4 ACTUATOR_MOVE_DONE"
+if ! printf '%s\n' "$z_motion_up_timer_block" | grep -q 'autoVisionHandleZMotionFallbackDone'; then
+    fail "Z 回升 10s 兜底到期必须进入统一兜底完成函数，不能停在 Z轴回升"
+fi
+if ! printf '%s\n' "$z_motion_up_timer_block" | grep -q 'z-motion-10s-fallback'; then
+    fail "Z 回升 10s 兜底日志必须带 z-motion-10s-fallback marker，方便现场 grep"
+fi
+if ! printf '%s\n' "$z_motion_fallback_handler_block" | grep -q 'autoVisionStartF4ArmInspectionAfterZUp'; then
+    fail "Z 回升 10s 兜底后必须继续启动机械臂流程，不能继续等待 F4 DONE"
 fi
 require_grep "AUTO_LOCATE_MIN_LUMA_DELTA 12U" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT" "uvc_kms_overlay.c"
