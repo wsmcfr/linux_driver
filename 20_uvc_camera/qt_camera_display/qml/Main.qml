@@ -313,12 +313,6 @@ Rectangle {
     /* manualPendingZReturnHome 表示当前上下轴命令是否由“回原位”触发，成功后偏移直接归零。 */
     property bool manualPendingZReturnHome: false
 
-    /* manualStopRetryActuatorId 保存需要补发 STOP 的执行器编号，-1 表示当前没有补发任务。 */
-    property int manualStopRetryActuatorId: -1
-
-    /* manualStopRetryTargetText 保存补发 STOP 时写入日志的目标名称，便于现场对照本次停止的是哪一轴。 */
-    property string manualStopRetryTargetText: ""
-
     /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
     property var settingsSupportedPartTypes: ["波形垫圈", "平垫圈", "弹性垫圈"]
 
@@ -2589,17 +2583,14 @@ Rectangle {
      *
      * 主要流程：
      *   1. 如果当前还没有成功设零，则拒绝回原位，避免继续盲目上升。
-     *   2. 如果本地偏移已经是 0，则只提示当前位置就是零点，不再发送电机命令。
-     *   3. 如果偏移为正，说明相对零点下降过，回原位要上升；偏移为负则反向下降。
+     *   2. 如果上一条上下轴动作还没有完成回执，则拒绝回原位，避免用尚未更新的旧偏移误判已经在零点。
+     *   3. 如果本地偏移已经是 0，则只提示当前位置就是零点，不再发送电机命令。
+     *   4. 如果偏移为正，说明相对零点下降过，回原位要上升；偏移为负则反向下降。
      *
      * 返回值：
      *   true 表示回原位位置命令已启动；false 表示无需移动、缺少零点或串口层拒绝。
      */
     function sendManualActuatorZReturnHome(label) {
-        var offsetSteps = Math.floor(Number(manualCameraZOffsetSteps || 0))
-        var direction = offsetSteps > 0 ? 1 : 0
-        var steps = Math.abs(offsetSteps)
-
         if (!manualCameraZZeroKnown) {
             manualLastAckText = "请先在参数设置中对上下电机点击设当前位置为零点，再使用回原位"
             storageState = formatF4ToastText(manualLastAckText)
@@ -2607,6 +2598,24 @@ Rectangle {
             showStorageToast()
             return false
         }
+
+        if (manualPendingF4Command !== "") {
+            /*
+             * 上下轴偏移只在 ACTUATOR_POS_MOVE 成功完成后更新。
+             * 如果上一条上升/下降还在等待 ACK、DONE 或 MP157 本地估算完成，
+             * 此时 manualCameraZOffsetSteps 仍是旧值，不能据此判断“已经在零点”。
+             */
+            manualLastAckText = "F4命令发送中：" + manualPendingF4Command
+                    + "，等待上下轴上一条动作完成后再回原位；若现场需要立即中断，请先点停止并重新设零"
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "上下电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        var offsetSteps = Math.floor(Number(manualCameraZOffsetSteps || 0))
+        var direction = offsetSteps > 0 ? 1 : 0
+        var steps = Math.abs(offsetSteps)
 
         if (steps <= 0) {
             manualLastAckText = "上下电机当前位置已经是零点，不再发送回原位命令"
@@ -2664,15 +2673,6 @@ Rectangle {
             showStorageToast()
             return false
         }
-
-        /*
-         * 手动方向键和停止键可能被快速连续点击：
-         * 第一轮 STOP 会立即写入串口，延迟补发一轮用于覆盖上一条运动帧刚启动、
-         * 普通串口线程仍在打开/写入阶段时，STOP 被运动帧时序覆盖的窗口。
-         */
-        manualStopRetryActuatorId = actuator
-        manualStopRetryTargetText = targetText
-        manualActuatorStopRetryTimer.restart()
 
         return true
     }
@@ -5922,37 +5922,6 @@ Rectangle {
 
         onTriggered: {
             storageToastVisible = false
-        }
-    }
-
-    /* manualActuatorStopRetryTimer 用于给手动停止键补发一次 STOP，避免快速连点时第一轮 STOP 被上一条运动帧时序覆盖。 */
-    Timer {
-        id: manualActuatorStopRetryTimer
-        interval: 260
-        repeat: false
-        running: false
-
-        onTriggered: {
-            if (root.manualStopRetryActuatorId < 0) {
-                return
-            }
-
-            var retryActuator = root.manualStopRetryActuatorId
-            var retryTarget = root.manualStopRetryTargetText.length > 0
-                    ? root.manualStopRetryTargetText
-                    : "三轴电机"
-            root.manualStopRetryActuatorId = -1
-            root.manualStopRetryTargetText = ""
-
-            if (deviceHealth.sendF4ActuatorStopNow(retryActuator, 0)) {
-                root.manualLastAckText = "已启动补发停止帧：" + retryTarget
-            } else {
-                root.manualLastAckText = "补发停止帧启动失败：" + retryTarget
-            }
-
-            root.storageState = root.formatF4ToastText(root.manualLastAckText)
-            root.appendManualCommandLog("停止补发", retryTarget, root.manualLastAckText)
-            root.showStorageToast()
         }
     }
 
@@ -9395,9 +9364,13 @@ Rectangle {
                     text: root.manualMotorPageIndex === 2
                           ? ("上下轴：下降 "
                              + Math.floor(Number(manualMotorPopupPanel.motorConfig.zDownFixedSteps || 0))
-                             + " step，上升/回原位 "
+                             + " step，上升 "
                              + Math.floor(Number(manualMotorPopupPanel.motorConfig.zUpFixedSteps || 0))
-                             + " step。")
+                             + " step；回原位按偏移 "
+                             + (root.manualCameraZZeroKnown
+                                ? (Math.floor(Number(root.manualCameraZOffsetSteps || 0)) + " step")
+                                : "未设零")
+                             + "。")
                           : ("速度 "
                              + (manualMotorPopupPanel.motorConfig.normalSpeedRpm || 0)
                              + " rpm；点击方向键后持续运动，按停止键结束。")

@@ -63,6 +63,7 @@
 #include <QSaveFile>            /* QSaveFile 用于原子写入检测参数 JSON，避免断电留下半截配置。 */
 #include <QSet>                 /* QSet 用于检测多天历史 JSON 中的重复记录，避免旧文件兼容读取时重复显示。 */
 #include <QMetaObject>          /* QMetaObject 用于把后台线程的检测阶段进度安全投递回 Qt 主线程。 */
+#include <QMutex>               /* QMutex 用于约束 F4 普通运动帧和强制停止帧的串口写入顺序。 */
 #include <QPointer>             /* QPointer 用于后台线程投递进度前判断控制器对象是否仍然存在。 */
 #include <QQmlEngine>           /* qmlRegisterType 需要 Qt QML 类型系统声明。 */
 #include <QQmlContext>          /* QQmlContext 用于把 C++ 变量暴露给 QML。 */
@@ -82,6 +83,7 @@
 #include <QVariantMap>          /* QVariantMap 用于向 QML 返回当前选中历史记录详情。 */
 #include <QVector>              /* QVector 用于保存内存中的上传历史记录列表。 */
 #include <algorithm>            /* std::stable_sort 用于把跨日期历史记录按上传时间重新排成时间顺序。 */
+#include <atomic>               /* std::atomic 用于跨后台线程记录强制 STOP 代际，取消未写出的旧运动命令。 */
 #include <cmath>                /* std::isfinite 用于校验 QML/JSON 传入的 32 位位置步数是否为有效数字。 */
 #include <cstdlib>              /* EXIT_SUCCESS/EXIT_FAILURE 是 main 返回值语义。 */
 #include <ctime>                /* tzset 用于让运行时立刻重新读取 TZ 时区变量。 */
@@ -7522,6 +7524,8 @@ public:
           m_sdcardMount(QString::fromLatin1(DEFAULT_SDCARD_MOUNT_POINT)),
           m_f4Device(QString::fromLatin1(DEFAULT_F4_SERIAL_DEVICE)),
           m_f4Baud(DEFAULT_F4_SERIAL_BAUD),
+          m_f4ActuatorStopGeneration(new std::atomic<quint64>(0U)),
+          m_f4SerialWriteMutex(new QMutex),
           m_networkStatusText(QStringLiteral("检测中")),
           m_networkStatusColor(QStringLiteral("#f4b942")),
           m_cameraStatusText(QStringLiteral("检测中")),
@@ -10774,10 +10778,26 @@ private:
         const QByteArray frame = buildF4BinaryFrame(command, sequence, payload);
         const QString dev = m_f4Device;
         const int baud = m_f4Baud;
+        const QSharedPointer<QMutex> serialWriteMutex = m_f4SerialWriteMutex;
+        const QSharedPointer<std::atomic<quint64>> stopGeneration = m_f4ActuatorStopGeneration;
+        const quint64 stopGenerationAtStart = stopGeneration.isNull()
+                ? 0U
+                : stopGeneration->load(std::memory_order_acquire);
         m_f4CommandRunning = true;
 
         QPointer<DeviceHealthController> self(this);
-        QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId, positionFallbackMaxWaitMs]() {
+        QThread *workerThread = QThread::create([self,
+                                                  dev,
+                                                  baud,
+                                                  frame,
+                                                  action,
+                                                  command,
+                                                  sequence,
+                                                  cycleId,
+                                                  positionFallbackMaxWaitMs,
+                                                  serialWriteMutex,
+                                                  stopGeneration,
+                                                  stopGenerationAtStart]() {
             QString detail;
             const bool ok = (command == BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE)
                     ? runF4ActuatorPositionMoveAndWaitDone(dev,
@@ -10786,8 +10806,22 @@ private:
                                                            sequence,
                                                            cycleId,
                                                            positionFallbackMaxWaitMs,
-                                                           &detail)
-                    : sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
+                                                           &detail,
+                                                           serialWriteMutex,
+                                                           stopGeneration,
+                                                           stopGenerationAtStart,
+                                                           action)
+                    : sendF4BinaryCommand(dev,
+                                          baud,
+                                          frame,
+                                          command,
+                                          sequence,
+                                          cycleId,
+                                          &detail,
+                                          serialWriteMutex,
+                                          stopGeneration,
+                                          stopGenerationAtStart,
+                                          action);
 
             if (!self) {
                 return;
@@ -10837,20 +10871,31 @@ private:
                                        quint16 cycleId,
                                        const QByteArray &payload)
     {
+        /*
+         * STOP 是安全抢占动作。先递增代际，再启动写线程：
+         * - 如果旧运动线程还没写帧，它进入写锁后会发现代际变化并取消；
+         * - 如果旧运动线程已经在写帧，STOP 会在同一写锁后排队写出，覆盖刚启动的运动。
+         */
+        if (!m_f4ActuatorStopGeneration.isNull()) {
+            m_f4ActuatorStopGeneration->fetch_add(1U, std::memory_order_acq_rel);
+        }
+
         const quint16 sequence = m_f4BinarySequence++;
         const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_ACTUATOR_STOP, sequence, payload);
         const QString dev = m_f4Device;
         const int baud = m_f4Baud;
+        const QSharedPointer<QMutex> serialWriteMutex = m_f4SerialWriteMutex;
 
         QPointer<DeviceHealthController> self(this);
-        QThread *workerThread = QThread::create([self, dev, baud, frame, action, cycleId, sequence]() {
+        QThread *workerThread = QThread::create([self, dev, baud, frame, action, cycleId, sequence, serialWriteMutex]() {
             QString detail;        /* detail 保存写入线程生成的结果说明，回到主线程后显示到 QML。 */
             const bool ok = writeF4BinaryFrameWithoutReply(dev,
                                                            baud,
                                                            frame,
                                                            &detail,
                                                            F4_ACTUATOR_STOP_NOW_REPEAT_COUNT,
-                                                           F4_ACTUATOR_STOP_NOW_REPEAT_DELAY_US);
+                                                           F4_ACTUATOR_STOP_NOW_REPEAT_DELAY_US,
+                                                           serialWriteMutex);
 
             if (!detail.isEmpty()) {
                 detail += QStringLiteral(" seq=") + QString::number(sequence);
@@ -11109,6 +11154,48 @@ private:
     }
 
     /*
+     * f4ActuatorStopGenerationChanged 的作用：
+     *   判断当前强制 STOP 代际是否已经不同于普通运动命令启动时捕获的代际。
+     *
+     * 主要流程：
+     *   1. 如果没有传入代际对象，说明调用方不需要取消保护，直接返回 false。
+     *   2. 用 acquire 读取原子值，保证后台线程能看到 STOP 线程已经发布的代际递增。
+     *   3. 只比较代际值，不读取 QObject 成员，避免后台线程在对象销毁时访问悬空指针。
+     *
+     * 参数：
+     *   stopGeneration 是共享的 STOP 代际原子对象。
+     *   generationAtStart 是普通运动命令启动时捕获的代际。
+     *
+     * 返回值：
+     *   true 表示 STOP 已经抢占，旧运动命令不能再写入串口或继续等待完成事件。
+     */
+    static bool f4ActuatorStopGenerationChanged(const QSharedPointer<std::atomic<quint64>> &stopGeneration,
+                                                quint64 generationAtStart)
+    {
+        if (stopGeneration.isNull()) {
+            return false;
+        }
+
+        return stopGeneration->load(std::memory_order_acquire) != generationAtStart;
+    }
+
+    /*
+     * f4ActuatorStopCanceledDetail 的作用：
+     *   生成普通执行器命令被强制 STOP 抢占后的统一诊断文本。
+     *
+     * 参数：
+     *   action 是被取消的命令名称，例如 ACTUATOR_VEL_MOVE 或 ACTUATOR_POS_MOVE。
+     *
+     * 返回值：
+     *   返回给 QML/F4 日志显示的中文取消原因。
+     */
+    static QString f4ActuatorStopCanceledDetail(const QString &action)
+    {
+        return QStringLiteral("ACTUATOR_STOP 抢占：取消尚未写入或仍在等待完成的 ")
+                + action;
+    }
+
+    /*
      * readF4BinaryReply 的作用：
      *   从 F4 串口读取一帧完整二进制协议回复，并完成帧头、长度、帧尾和 CRC 校验。
      *
@@ -11224,7 +11311,11 @@ private:
                                       int baud,
                                       const QByteArray &frame,
                                       F4BinaryReply *reply,
-                                      QString *detail)
+                                      QString *detail,
+                                      const QSharedPointer<QMutex> &serialWriteMutex = QSharedPointer<QMutex>(),
+                                      const QSharedPointer<std::atomic<quint64>> &stopGeneration = QSharedPointer<std::atomic<quint64>>(),
+                                      quint64 stopGenerationAtStart = 0U,
+                                      const QString &cancelAction = QString())
     {
         const QByteArray devBytes = device.toLocal8Bit();
         int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -11278,15 +11369,39 @@ private:
             return false;
         }
 
-        tcflush(fd, TCIOFLUSH);
-        if (!writeAllToFd(fd, frame)) {
-            if (detail) {
-                *detail = QStringLiteral("写入 F4 二进制命令失败：") + hexByteString(frame);
+        {
+            /*
+             * 普通运动帧和强制 STOP 帧共用 `/dev/ttySTM2`。
+             * 这里只把配置后的 flush/write/drain 短窗口纳入互斥，读取 ACK 阶段不持锁，
+             * 否则 STOP 会被普通命令的 ACK 等待卡住。
+             */
+            QMutexLocker writeLocker(serialWriteMutex.data());
+
+            if (f4ActuatorStopGenerationChanged(stopGeneration, stopGenerationAtStart)) {
+                if (detail) {
+                    *detail = f4ActuatorStopCanceledDetail(cancelAction);
+                }
+                ::close(fd);
+                return false;
             }
-            ::close(fd);
-            return false;
+
+            tcflush(fd, TCIOFLUSH);
+            if (!writeAllToFd(fd, frame)) {
+                if (detail) {
+                    *detail = QStringLiteral("写入 F4 二进制命令失败：") + hexByteString(frame);
+                }
+                ::close(fd);
+                return false;
+            }
+
+            if (tcdrain(fd) != 0) {
+                if (detail) {
+                    *detail = QStringLiteral("等待 F4 二进制命令发送完成失败");
+                }
+                ::close(fd);
+                return false;
+            }
         }
-        tcdrain(fd);
 
         if (!readF4BinaryReply(fd, reply, &readErrorText)) {
             if (detail) {
@@ -11326,7 +11441,8 @@ private:
                                                const QByteArray &frame,
                                                QString *detail,
                                                int repeatCount = 1,
-                                               int repeatDelayUs = 0)
+                                               int repeatDelayUs = 0,
+                                               const QSharedPointer<QMutex> &serialWriteMutex = QSharedPointer<QMutex>())
     {
         const QByteArray devBytes = device.toLocal8Bit();
         int fd = -1;              /* fd 保存本次强制 STOP 独立打开的串口文件描述符。 */
@@ -11374,38 +11490,46 @@ private:
             return false;
         }
 
-        /*
-         * 只清理本 fd 的待发送输出队列，不使用 TCIOFLUSH。
-         * TCIOFLUSH 会丢弃输入数据，可能影响上一条普通命令线程正在等待的 ACK。
-         */
-        tcflush(fd, TCOFLUSH);
-        for (int attempt = 0; attempt < safeRepeatCount; ++attempt) {
+        {
             /*
-             * 每一轮都完整写入并等待发送队列排空。
-             * 如果 F4 正在处理上一条位置/速度命令，重复 STOP 可以确保下一次 USART1 取帧仍能看到停止请求。
+             * STOP 与普通运动命令共用同一条 MP157-F4 TTY。
+             * 这里持有短写锁，避免 STOP 写入时被普通命令线程的 tcflush/write 交叉覆盖。
              */
-            if (!writeAllToFd(fd, frame)) {
-                if (detail) {
-                    *detail = QStringLiteral("写入 F4 强制停止帧失败：")
-                            + hexByteString(frame)
-                            + QStringLiteral(" attempt=")
-                            + QString::number(attempt + 1);
-                }
-                ::close(fd);
-                return false;
-            }
+            QMutexLocker writeLocker(serialWriteMutex.data());
 
-            if (tcdrain(fd) != 0) {
-                if (detail) {
-                    *detail = QStringLiteral("等待 F4 强制停止帧发送完成失败 attempt=")
-                            + QString::number(attempt + 1);
+            /*
+             * 只清理本 fd 的待发送输出队列，不使用 TCIOFLUSH。
+             * TCIOFLUSH 会丢弃输入数据，可能影响上一条普通命令线程正在等待的 ACK。
+             */
+            tcflush(fd, TCOFLUSH);
+            for (int attempt = 0; attempt < safeRepeatCount; ++attempt) {
+                /*
+                 * 每一轮都完整写入并等待发送队列排空。
+                 * 如果 F4 正在处理上一条位置/速度命令，重复 STOP 可以确保下一次 USART1 取帧仍能看到停止请求。
+                 */
+                if (!writeAllToFd(fd, frame)) {
+                    if (detail) {
+                        *detail = QStringLiteral("写入 F4 强制停止帧失败：")
+                                + hexByteString(frame)
+                                + QStringLiteral(" attempt=")
+                                + QString::number(attempt + 1);
+                    }
+                    ::close(fd);
+                    return false;
                 }
-                ::close(fd);
-                return false;
-            }
 
-            if ((attempt + 1 < safeRepeatCount) && (repeatDelayUs > 0)) {
-                usleep(static_cast<useconds_t>(repeatDelayUs));
+                if (tcdrain(fd) != 0) {
+                    if (detail) {
+                        *detail = QStringLiteral("等待 F4 强制停止帧发送完成失败 attempt=")
+                                + QString::number(attempt + 1);
+                    }
+                    ::close(fd);
+                    return false;
+                }
+
+                if ((attempt + 1 < safeRepeatCount) && (repeatDelayUs > 0)) {
+                    usleep(static_cast<useconds_t>(repeatDelayUs));
+                }
             }
         }
 
@@ -11448,11 +11572,23 @@ private:
                                     quint8 expectedCommand,
                                     quint16 expectedSequence,
                                     quint16 expectedCycleId,
-                                    QString *detail)
+                                    QString *detail,
+                                    const QSharedPointer<QMutex> &serialWriteMutex = QSharedPointer<QMutex>(),
+                                    const QSharedPointer<std::atomic<quint64>> &stopGeneration = QSharedPointer<std::atomic<quint64>>(),
+                                    quint64 stopGenerationAtStart = 0U,
+                                    const QString &cancelAction = QString())
     {
         F4BinaryReply reply;
 
-        if (!exchangeF4BinaryFrame(device, baud, frame, &reply, detail)) {
+        if (!exchangeF4BinaryFrame(device,
+                                   baud,
+                                   frame,
+                                   &reply,
+                                   detail,
+                                   serialWriteMutex,
+                                   stopGeneration,
+                                   stopGenerationAtStart,
+                                   cancelAction)) {
             return false;
         }
 
@@ -11667,7 +11803,11 @@ private:
                                                      quint16 expectedSequence,
                                                      quint16 expectedCycleId,
                                                      int fallbackMaxWaitMs,
-                                                     QString *detail)
+                                                     QString *detail,
+                                                     const QSharedPointer<QMutex> &serialWriteMutex = QSharedPointer<QMutex>(),
+                                                     const QSharedPointer<std::atomic<quint64>> &stopGeneration = QSharedPointer<std::atomic<quint64>>(),
+                                                     quint64 stopGenerationAtStart = 0U,
+                                                     const QString &cancelAction = QString())
     {
         const QByteArray devBytes = device.toLocal8Bit();
         int fd = -1;                         /* fd 保存本次位置运动专用串口连接，ACK 和 DONE 都从这里读取。 */
@@ -11723,20 +11863,52 @@ private:
             return false;
         }
 
-        tcflush(fd, TCIOFLUSH);
-        if (!writeAllToFd(fd, frame)) {
-            if (detail) {
-                *detail = QStringLiteral("写入 ACTUATOR_POS_MOVE 失败：") + hexByteString(frame);
+        {
+            /*
+             * 写 ACTUATOR_POS_MOVE 前必须和强制 STOP 互斥。
+             * 如果 STOP 已经递增代际，就不能再 flush/write 旧的位置运动帧，
+             * 否则会把停止意图覆盖成新的运动。
+             */
+            QMutexLocker writeLocker(serialWriteMutex.data());
+
+            if (f4ActuatorStopGenerationChanged(stopGeneration, stopGenerationAtStart)) {
+                if (detail) {
+                    *detail = f4ActuatorStopCanceledDetail(cancelAction);
+                }
+                ::close(fd);
+                return false;
             }
-            ::close(fd);
-            return false;
+
+            tcflush(fd, TCIOFLUSH);
+            if (!writeAllToFd(fd, frame)) {
+                if (detail) {
+                    *detail = QStringLiteral("写入 ACTUATOR_POS_MOVE 失败：") + hexByteString(frame);
+                }
+                ::close(fd);
+                return false;
+            }
+
+            if (tcdrain(fd) != 0) {
+                if (detail) {
+                    *detail = QStringLiteral("等待 ACTUATOR_POS_MOVE 发送完成失败");
+                }
+                ::close(fd);
+                return false;
+            }
         }
-        tcdrain(fd);
 
         ackTimer.start();
         while (ackTimer.elapsed() < 2500) {
             F4BinaryReply reply;
             QString readErrorText;
+
+            if (f4ActuatorStopGenerationChanged(stopGeneration, stopGenerationAtStart)) {
+                if (detail) {
+                    *detail = f4ActuatorStopCanceledDetail(cancelAction);
+                }
+                ::close(fd);
+                return false;
+            }
 
             if (!readF4BinaryReply(fd, &reply, &readErrorText)) {
                 lastReadDetail = readErrorText;
@@ -11839,6 +12011,16 @@ private:
         while (moveTimer.elapsed() < 70000) {
             F4BinaryReply reply;
             QString readErrorText;
+
+            if (f4ActuatorStopGenerationChanged(stopGeneration, stopGenerationAtStart)) {
+                if (detail) {
+                    *detail = ackDetail
+                            + QStringLiteral("；")
+                            + f4ActuatorStopCanceledDetail(cancelAction);
+                }
+                ::close(fd);
+                return false;
+            }
 
             if (fallbackMoveMs > 0 && moveTimer.elapsed() >= fallbackMoveMs) {
                 /*
@@ -12751,6 +12933,8 @@ private:
     QString m_f4Device;                 /* m_f4Device 保存 F4 串口设备节点。 */
     int m_f4Baud;                       /* m_f4Baud 保存 F4 串口波特率。 */
     QElapsedTimer m_f4HeartbeatElapsed;  /* m_f4HeartbeatElapsed 记录上一次二进制心跳发送时间，用于把周期心跳限制为 2 分钟一次。 */
+    QSharedPointer<std::atomic<quint64>> m_f4ActuatorStopGeneration; /* m_f4ActuatorStopGeneration 是强制 STOP 代际；STOP 点击会递增它，旧运动线程写帧前发现代际变化就取消，避免停止后又被晚到运动帧重新启动。 */
+    QSharedPointer<QMutex> m_f4SerialWriteMutex; /* m_f4SerialWriteMutex 只保护 F4 串口 open/config/flush/write/drain 这一小段，保证普通运动帧和强制 STOP 帧不会同时对同一个 TTY 做 flush/write。 */
     QString m_networkStatusText;        /* m_networkStatusText 保存网络状态文本。 */
     QString m_networkStatusColor;       /* m_networkStatusColor 保存网络状态颜色。 */
     QString m_cameraStatusText;         /* m_cameraStatusText 保存摄像头状态文本。 */

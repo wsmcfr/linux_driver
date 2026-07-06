@@ -421,14 +421,18 @@ require_grep "ACTUATOR_HOME" "qml/Main.qml"
 require_grep "ACTUATOR_STOP_NOW" "qml/Main.qml"
 require_grep "sendManualActuatorVelocityMove" "qml/Main.qml"
 require_grep "sendF4ActuatorStopNow" "qml/Main.qml"
-require_grep "manualActuatorStopRetryTimer" "qml/Main.qml"
-require_grep "manualStopRetryActuatorId" "qml/Main.qml"
+require_grep "m_f4ActuatorStopGeneration" "main.cpp"
+require_grep "f4ActuatorStopGenerationChanged" "main.cpp"
+require_grep "ACTUATOR_STOP 抢占" "main.cpp"
+require_absent "manualActuatorStopRetryTimer" "qml/Main.qml"
+require_absent "manualStopRetryActuatorId" "qml/Main.qml"
 require_grep "sendStepperActuatorHome" "qml/Main.qml"
 require_grep "设当前位置为零点" "qml/Main.qml"
 require_grep "manualCameraZZeroKnown" "qml/Main.qml"
 require_grep "manualCameraZOffsetSteps" "qml/Main.qml"
 require_grep "updateManualCameraZOffsetAfterMove" "qml/Main.qml"
 require_grep "sendManualActuatorZReturnHome" "qml/Main.qml"
+require_grep "回原位按偏移" "qml/Main.qml"
 require_grep "上下电机当前位置已经是零点，不再发送回原位命令" "qml/Main.qml"
 require_grep "请先在参数设置中对上下电机点击设当前位置为零点" "qml/Main.qml"
 require_grep "manualPendingF4Command = \"\"" "qml/Main.qml"
@@ -436,9 +440,31 @@ require_grep "F4_ACTUATOR_STOP_NOW_REPEAT_COUNT" "main.cpp"
 require_grep "repeat=" "main.cpp"
 require_absent "停止已排队" "qml/Main.qml"
 require_absent "每次点击只发送一次位置模式点动命令" "qml/Main.qml"
+actuator_start_block="$(sed -n '/bool startF4ActuatorCommand/,/bool startF4ActuatorStopNowCommand/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$actuator_start_block" | grep -q 'stopGenerationAtStart'; then
+    fail "普通执行器命令必须捕获 STOP 代际，防止 STOP 已按下后旧运动线程才写入运动帧"
+fi
+exchange_block="$(sed -n '/static bool exchangeF4BinaryFrame/,/static bool writeF4BinaryFrameWithoutReply/p' "$SCRIPT_DIR/main.cpp")"
+position_wait_block="$(sed -n '/static bool runF4ActuatorPositionMoveAndWaitDone/,/static quint32 readLe32Unsigned/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n%s\n' "$exchange_block" "$position_wait_block" | grep -q 'f4ActuatorStopGenerationChanged'; then
+    fail "普通执行器命令写帧前必须检查 STOP 代际，不能让 STOP 之前的旧运动帧晚到覆盖停止"
+fi
+if ! printf '%s\n%s\n' "$exchange_block" "$position_wait_block" | grep -q 'QMutexLocker writeLocker'; then
+    fail "普通运动写帧窗口必须和强制 STOP 使用同一短写锁，避免两个线程同时 flush/write 同一 TTY"
+fi
+stop_now_block="$(sed -n '/bool startF4ActuatorStopNowCommand/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$stop_now_block" | grep -q 'fetch_add'; then
+    fail "强制 STOP 必须先递增 STOP 代际，让未写出的普通运动命令取消"
+fi
 z_return_home_block="$(sed -n '/function sendManualActuatorZReturnHome/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
 if printf '%s\n' "$z_return_home_block" | grep -q 'return sendManualActuatorZFixedMove(1, label)'; then
     fail "回原位不能再直接复用固定上升步数；设当前位置为零点后必须按本地零点偏移决定是否移动"
+fi
+if ! printf '%s\n' "$z_return_home_block" | grep -q 'manualPendingF4Command !== ""'; then
+    fail "回原位判断本地偏移为 0 之前必须先检查手动执行器命令是否仍在途，避免上升/下降未完成时误报已经在零点"
+fi
+if ! printf '%s\n' "$z_return_home_block" | grep -q '等待上下轴上一条动作完成后再回原位'; then
+    fail "回原位被在途上下轴命令阻止时必须给出明确提示，不能继续显示已经在零点"
 fi
 require_grep "zDownFixedSteps" "main.cpp"
 require_grep "zUpFixedSteps" "main.cpp"
