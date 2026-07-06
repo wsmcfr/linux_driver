@@ -423,8 +423,21 @@ require_grep "sendManualActuatorVelocityMove" "qml/Main.qml"
 require_grep "sendF4ActuatorStopNow" "qml/Main.qml"
 require_grep "sendStepperActuatorHome" "qml/Main.qml"
 require_grep "设当前位置为零点" "qml/Main.qml"
+require_grep "manualCameraZZeroKnown" "qml/Main.qml"
+require_grep "manualCameraZOffsetSteps" "qml/Main.qml"
+require_grep "updateManualCameraZOffsetAfterMove" "qml/Main.qml"
+require_grep "sendManualActuatorZReturnHome" "qml/Main.qml"
+require_grep "上下电机当前位置已经是零点，不再发送回原位命令" "qml/Main.qml"
+require_grep "请先在参数设置中对上下电机点击设当前位置为零点" "qml/Main.qml"
+require_grep "manualPendingF4Command = \"\"" "qml/Main.qml"
+require_grep "F4_ACTUATOR_STOP_NOW_REPEAT_COUNT" "main.cpp"
+require_grep "repeat=" "main.cpp"
 require_absent "停止已排队" "qml/Main.qml"
 require_absent "每次点击只发送一次位置模式点动命令" "qml/Main.qml"
+z_return_home_block="$(sed -n '/function sendManualActuatorZReturnHome/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$z_return_home_block" | grep -q 'return sendManualActuatorZFixedMove(1, label)'; then
+    fail "回原位不能再直接复用固定上升步数；设当前位置为零点后必须按本地零点偏移决定是否移动"
+fi
 require_grep "zDownFixedSteps" "main.cpp"
 require_grep "zUpFixedSteps" "main.cpp"
 require_grep "f4ActuatorCommandFinished" "main.cpp"
@@ -598,8 +611,11 @@ require_grep "min_step" "main.cpp"
 require_grep "normal_speed_rpm" "main.cpp"
 require_grep "scan_speed_rpm" "main.cpp"
 require_grep "scanSpeedRpm" "main.cpp"
+require_grep "z_motion_timeout_ms" "main.cpp"
+require_grep "zMotionTimeoutMs" "main.cpp"
 require_grep "conveyorTrackSpeedRpm" "qml/Main.qml"
 require_grep "conveyorScanSpeedRpm" "qml/Main.qml"
+require_grep "cameraZMotionTimeoutMs" "qml/Main.qml"
 require_grep "direction" "main.cpp"
 require_fixed_grep "BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U" "main.cpp"
 require_grep "buildStepperSettingsPayload" "main.cpp"
@@ -626,6 +642,13 @@ require_grep "sendF4StepperSettings" "qml/Main.qml"
 require_grep "onF4StepperSettingsFinished" "qml/Main.qml"
 require_grep "保存并下发" "qml/Main.qml"
 require_grep "id: stepperMotorPopup" "qml/Main.qml"
+require_grep "stepperMotorSettingsRevision" "qml/Main.qml"
+require_grep "stepperStepReplaceOnNextDigit" "qml/Main.qml"
+require_grep "id: stepperMotorSettingsFlickable" "qml/Main.qml"
+require_grep "contentHeight: stepperMotorSettingsContent.height" "qml/Main.qml"
+require_grep "flickableDirection: Flickable.VerticalFlick" "qml/Main.qml"
+require_grep "boundsBehavior: Flickable.StopAtBounds" "qml/Main.qml"
+require_grep "stepperMotorInputTouchGuard" "qml/Main.qml"
 require_grep "id: stepperSpeedEditor" "qml/Main.qml"
 require_grep "0~5000 rpm" "qml/Main.qml"
 require_grep "id: stepperMotorPageTabs" "qml/Main.qml"
@@ -637,6 +660,7 @@ require_grep "最小步长" "qml/Main.qml"
 require_grep "常规速度" "qml/Main.qml"
 require_grep "上料速度" "qml/Main.qml"
 require_grep "对中速度" "qml/Main.qml"
+require_grep "Z轴超时" "qml/Main.qml"
 require_grep "应用速度" "qml/Main.qml"
 require_grep "方向" "qml/Main.qml"
 require_grep "地址" "qml/Main.qml"
@@ -646,6 +670,7 @@ require_grep "步进电机参数弹窗" "README.md"
 require_grep "摄像头左右" "README.md"
 require_grep "stepper_motors" "README.md"
 require_grep "scan_speed_rpm" "README.md"
+require_grep "z_motion_timeout_ms" "README.md"
 require_grep "0~5000 rpm" "README.md"
 require_grep "STEPPER_PARAM_SET 0x42" "README.md"
 require_grep "31 字节" "README.md"
@@ -662,6 +687,41 @@ require_grep "参数日志查看验证" "README.md"
 require_grep "settings-log-self-test" "README.md"
 require_grep "action=保存配置" "README.md"
 require_grep "action=导出摘要" "README.md"
+if ! grep -q 'root.stepperMotorSettingsRevision += 1' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "DetectSettingsController 发出 settingsChanged 后，QML 必须递增 stepperMotorSettingsRevision，让步进弹窗重新读取最新 zMotionTimeoutMs"
+fi
+if ! grep -q 'property var motorConfig: root.stepperMotorSettingsRevision' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "步进电机弹窗 motorConfig 必须依赖 stepperMotorSettingsRevision，避免输入 Z 轴超时后仍显示旧的 10 秒"
+fi
+if ! grep -q '本次自动检测Z轴下降/回升最多等待' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "应用 Z 轴超时后必须直接提示本次自动检测使用的等待毫秒数，方便现场确认不是固定 10 秒"
+fi
+stepper_step_open_block="$(sed -n '/function openStepperStepEditor/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$stepper_step_open_block" | grep -q 'stepperStepReplaceOnNextDigit = stepperStepEditorIsTimeout()'; then
+    fail "打开 Z 轴超时数字键盘后，第一次按数字必须替换当前 10 秒，不能追加成 105 秒再被范围拒绝"
+fi
+stepper_step_append_block="$(sed -n '/function appendStepperStepDigit/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$stepper_step_append_block" | grep -q 'stepperStepReplaceOnNextDigit ? "" : stepperStepInputText'; then
+    fail "Z 轴超时数字键第一次输入必须从空文本开始，避免当前 10 秒阻塞输入 1~9 秒"
+fi
+stepper_step_clear_block="$(sed -n '/function clearStepperStepInput/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$stepper_step_clear_block" | grep -q 'stepperStepEditorIsTimeout() ? "10" : "0"'; then
+    fail "Z 轴超时的清空键不能继续写回 10 秒"
+fi
+if ! printf '%s\n' "$stepper_step_clear_block" | grep -q 'stepperStepInputText = ""'; then
+    fail "Z 轴超时的清空键必须真正清空输入框，方便重新输入任意 1~60 秒"
+fi
+stepper_input_mouse_block="$(sed -n '/id: stepperMotorSettingsFlickable/,/id: stepperSpeedEditor/p' "$SCRIPT_DIR/qml/Main.qml")"
+for mouse_id in \
+    stepperSpeedInputMouse \
+    stepperScanSpeedInputMouse \
+    stepperZDownInputMouse \
+    stepperZUpInputMouse \
+    stepperZTimeoutInputMouse; do
+    if ! printf '%s\n' "$stepper_input_mouse_block" | sed -n "/id: ${mouse_id}/,/onClicked:/p" | grep -q 'preventStealing: true'; then
+        fail "步进电机参数弹窗放入 Flickable 后，${mouse_id} 必须设置 preventStealing: true，避免触摸滑动层抢走输入按钮点击"
+    fi
+done
 require_grep "classify_args" "README.md"
 require_grep "segment_args" "README.md"
 require_grep "--bad-threshold" "defect_classify.cpp"
@@ -867,17 +927,14 @@ require_grep "focus-settle" "qml/Main.qml"
 require_grep "autoVisionStartZMotionWait" "qml/Main.qml"
 require_grep "autoVisionEstimateZMoveMs" "qml/Main.qml"
 require_grep "autoVisionHandleActuatorMoveDone" "qml/Main.qml"
-require_grep "autoVisionHandleZMotionFallbackDone" "qml/Main.qml"
-require_grep "autoVisionZMotionMaximumWaitMs: 10000" "qml/Main.qml"
-require_grep "z-motion-10s-fallback" "qml/Main.qml"
-require_grep "vision-stable-after-z-down" "qml/Main.qml"
 require_grep "actuator-move-done" "qml/Main.qml"
 require_grep "actuator-move-timeout" "qml/Main.qml"
 require_grep "estimated-done" "main.cpp"
 require_grep "estimated-done" "qml/Main.qml"
 require_grep "estimateActuatorPositionMoveFallbackMs" "main.cpp"
+require_grep "sendF4ActuatorPositionMoveWithTimeout" "main.cpp"
+require_grep "sendF4ActuatorPositionMoveWithTimeout" "qml/Main.qml"
 require_grep "mp157-local-estimated-done" "main.cpp"
-require_grep "MP157_ACTUATOR_FALLBACK_MAX_MS = 10000" "main.cpp"
 require_grep "z-motion-down-wait" "qml/Main.qml"
 require_grep "z-motion-up-wait" "qml/Main.qml"
 require_grep "requestF4ArmInspectionFlow" "qml/Main.qml"
@@ -892,23 +949,35 @@ fi
 if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'wait_ms='; then
     fail "MP157 本地估算日志必须输出 wait_ms，方便现场核对速度、步数和等待时间"
 fi
-if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'MP157_ACTUATOR_FALLBACK_MAX_MS'; then
-    fail "MP157 本地估算必须受 10s 最大兜底限制，避免 ACTUATOR_POS_MOVE 后台线程长时间占用串口"
+if ! printf '%s\n' "$mp157_fallback_block" | grep -q 'fallbackMaxWaitMs'; then
+    fail "MP157 本地估算必须接收参数页 Z 轴超时时间作为最大等待上限，不能写死 10s 或 65s"
 fi
-z_down_request_block="$(sed -n '/function autoVisionRequestZDown/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$z_down_request_block" | grep -q 'autoVisionStartZMotionWait(0, steps, speed)'; then
-    fail "Z 下降命令一旦写入线程启动，QML 必须立即启动本地运动等待，不能等 F4 DONE 回调后才计时"
+z_down_send_block="$(sed -n '/function autoVisionRequestZDown/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_down_send_block" | grep -q 'cameraZMotionTimeoutMs'; then
+    fail "Z 下降命令必须从摄像头上下电机参数读取 zMotionTimeoutMs"
 fi
-z_up_request_block="$(sed -n '/function autoVisionRequestZUp/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$z_up_request_block" | grep -q 'autoVisionStartZMotionWait(1, steps, speed)'; then
-    fail "Z 回升命令一旦写入线程启动，QML 必须立即启动本地运动等待，不能等 F4 DONE 回调后才计时"
+if ! printf '%s\n' "$z_down_send_block" | grep -q 'sendF4ActuatorPositionMoveWithTimeout'; then
+    fail "Z 下降命令必须使用带参数页超时的发送入口，不能继续走默认固定等待"
+fi
+z_up_send_block="$(sed -n '/function autoVisionRequestZUp/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_up_send_block" | grep -q 'cameraZMotionTimeoutMs'; then
+    fail "Z 回升命令必须复用摄像头上下电机参数里的 zMotionTimeoutMs"
+fi
+if ! printf '%s\n' "$z_up_send_block" | grep -q 'sendF4ActuatorPositionMoveWithTimeout'; then
+    fail "Z 回升命令必须使用带参数页超时的发送入口，避免默认等待时间和参数页不一致"
 fi
 z_down_ack_block="$(sed -n '/root.autoVisionActuatorPhase === "z-down"/,/root.autoVisionActuatorPhase.indexOf("fine-tune")/p' "$SCRIPT_DIR/qml/Main.qml")"
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionZFocusSettleMs'; then
     fail "Z 下降 ACK 后不能直接等待 3s 对焦；必须先短稳定并用传送带+左右轴复查 ROI 中心"
 fi
+if ! printf '%s\n' "$z_down_ack_block" | grep -q 'root.autoVisionActuatorPhase = "z-motion-down-wait"'; then
+    fail "Z 下降完成回调必须切到 z-motion-down-wait，再由统一 DONE 处理函数推进"
+fi
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionStartZMotionWait'; then
     fail "Z 下降回调中的 ok 已经表示 C++ 等到 F4 DONE，不能再叠加本地估算等待"
+fi
+if ! printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionHandleActuatorMoveDone'; then
+    fail "Z 下降必须等待 F4 ACTUATOR_MOVE_DONE 事件确认电机真实到位，不能只靠本地估算等待推进"
 fi
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionShortSettleMs'; then
     fail "Z 下降 ACK 后不能直接用短稳定替代物理运动完成等待"
@@ -925,21 +994,17 @@ if ! printf '%s\n' "$settle_timer_block" | grep -q 'autoVisionStartDetectDelay';
     fail "focus-settle 结束后必须再进入检测延时，而不是继续 ROI 复查"
 fi
 z_up_ack_block="$(sed -n '/root.autoVisionActuatorPhase === "z-up"/,/root.autoVisionActuatorPhase = ""/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$z_up_ack_block" | grep -q 'root.autoVisionActuatorPhase = "z-motion-up-wait"'; then
+    fail "Z 回升完成回调必须切到 z-motion-up-wait，再由统一 DONE 处理函数推进机械臂流程"
+fi
 if printf '%s\n' "$z_up_ack_block" | grep -q 'autoVisionStartZMotionWait'; then
     fail "Z 回升回调中的 ok 已经表示 C++ 等到 F4 DONE，不能再叠加本地估算等待"
 fi
+if ! printf '%s\n' "$z_up_ack_block" | grep -q 'autoVisionHandleActuatorMoveDone'; then
+    fail "Z 回升必须等待 F4 ACTUATOR_MOVE_DONE 事件确认电机真实到位，不能只靠本地估算等待启动机械臂"
+fi
 if printf '%s\n' "$z_up_ack_block" | grep -q 'requestF4ArmInspectionFlow'; then
     fail "Z 回升 ACK 后不能直接启动 F4 机械臂流程，避免检测头未离开零件就抓取"
-fi
-z_motion_done_callback_block="$(sed -n '/onF4ActuatorCommandFinished:/,/onF4ArmInspectionFlowFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$z_motion_done_callback_block" | grep -q 'z-motion-down-wait'; then
-    fail "Z 下降阶段的 F4 DONE 或 MP157 估算完成回调必须能提前结束 10s 等待"
-fi
-if ! printf '%s\n' "$z_motion_done_callback_block" | grep -q 'z-motion-up-wait'; then
-    fail "Z 回升阶段的 F4 DONE 或 MP157 估算完成回调必须能提前结束 10s 等待"
-fi
-if ! printf '%s\n' "$z_motion_done_callback_block" | grep -q 'autoVisionHandleActuatorMoveDone'; then
-    fail "执行器完成回调仍要复用 autoVisionHandleActuatorMoveDone()，避免 DONE 路径和 10s 兜底路径分叉"
 fi
 z_motion_timer_block="$(sed -n '/id: autoVisionActuatorSettleTimer/,/Connections {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$z_motion_timer_block" | grep -q 'z-motion-down-wait'; then
@@ -950,24 +1015,17 @@ if ! printf '%s\n' "$z_motion_timer_block" | grep -q 'z-motion-up-wait'; then
 fi
 z_motion_down_timer_block="$(sed -n '/root.autoVisionActuatorPhase === "z-motion-down-wait"/,/} else if (root.autoVisionActuatorPhase === "z-motion-up-wait")/p' "$SCRIPT_DIR/qml/Main.qml")"
 z_motion_up_timer_block="$(sed -n '/root.autoVisionActuatorPhase === "z-motion-up-wait"/,/} else if (root.autoVisionActuatorPhase === "z-down-skip"/p' "$SCRIPT_DIR/qml/Main.qml")"
-z_motion_fallback_handler_block="$(sed -n '/function autoVisionHandleZMotionFallbackDone/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$z_motion_down_timer_block" | grep -q 'autoVisionHandleZMotionFallbackDone'; then
-    fail "Z 下降 10s 兜底到期必须进入统一兜底完成函数，不能停在 Z轴下降"
+if ! printf '%s\n' "$z_motion_down_timer_block" | grep -q 'autoVisionRequestFineTuneLocate'; then
+    fail "Z 下降参数页超时到时必须继续 ROI 复查，不能再次卡在等待 F4 DONE"
 fi
-if ! printf '%s\n' "$z_motion_down_timer_block" | grep -q 'z-motion-10s-fallback'; then
-    fail "Z 下降 10s 兜底日志必须带 z-motion-10s-fallback marker，方便现场 grep"
+if printf '%s\n' "$z_motion_down_timer_block" | grep -q '禁止进入ROI复查'; then
+    fail "Z 下降参数页超时不能再提示禁止进入 ROI 复查"
 fi
-if ! printf '%s\n' "$z_motion_fallback_handler_block" | grep -q 'autoVisionRequestFineTuneLocate'; then
-    fail "Z 下降 10s 兜底后必须进入 ROI 复查，让摄像头判断下降后零件是否偏离中心"
+if ! printf '%s\n' "$z_motion_up_timer_block" | grep -q '未收到F4 ACTUATOR_MOVE_DONE'; then
+    fail "Z 回升本地保护超时必须提示未收到 F4 ACTUATOR_MOVE_DONE，不能冒充正常到位"
 fi
-if ! printf '%s\n' "$z_motion_up_timer_block" | grep -q 'autoVisionHandleZMotionFallbackDone'; then
-    fail "Z 回升 10s 兜底到期必须进入统一兜底完成函数，不能停在 Z轴回升"
-fi
-if ! printf '%s\n' "$z_motion_up_timer_block" | grep -q 'z-motion-10s-fallback'; then
-    fail "Z 回升 10s 兜底日志必须带 z-motion-10s-fallback marker，方便现场 grep"
-fi
-if ! printf '%s\n' "$z_motion_fallback_handler_block" | grep -q 'autoVisionStartF4ArmInspectionAfterZUp'; then
-    fail "Z 回升 10s 兜底后必须继续启动机械臂流程，不能继续等待 F4 DONE"
+if printf '%s\n' "$z_motion_up_timer_block" | grep -q 'autoVisionStartF4ArmInspectionAfterZUp'; then
+    fail "Z 回升本地保护超时不能启动机械臂；正常推进必须来自 F4 ACTUATOR_MOVE_DONE"
 fi
 require_grep "AUTO_LOCATE_MIN_LUMA_DELTA 12U" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT" "uvc_kms_overlay.c"

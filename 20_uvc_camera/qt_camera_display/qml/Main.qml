@@ -70,11 +70,8 @@ Rectangle {
     /* autoVisionLocateBusy 表示当前 overlay LOCATE 请求尚未返回，避免 100ms 定时器重复创建线程。 */
     property bool autoVisionLocateBusy: false
 
-    /* autoVisionCommandBusy 表示当前 VISION_POS/VISION_LOST/BELT_STOP_CENTERED 或执行器命令仍在等待 F4/C++ 后台线程回调。 */
+    /* autoVisionCommandBusy 表示当前 VISION_POS/VISION_LOST/BELT_STOP_CENTERED 仍在等待 F4 ACK。 */
     property bool autoVisionCommandBusy: false
-
-    /* autoVisionIgnoreNextZMotionDone 表示 Z 轴已经由 MP157 10s 兜底推进，下一条迟到的 Z 轴回调只记录不再重复推进流程。 */
-    property bool autoVisionIgnoreNextZMotionDone: false
 
     /* autoVisionStableFrames 保存连续进入中心死区的帧数，达到 3 帧才发送居中停止。 */
     property int autoVisionStableFrames: 0
@@ -124,16 +121,16 @@ Rectangle {
     /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
     property int autoVisionZFocusSettleMs: 3000
 
-    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护等待的每圈步数，参数页速度和步数变化后下一次等待会实时变化。 */
+    /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护超时的每圈步数；正常完成以 F4 ACTUATOR_MOVE_DONE 事件为准。 */
     property int autoVisionZMoveStepsPerRev: 200
 
     /* autoVisionZMotionSafetyMs 是 Z 轴估算运动时间之外的安全余量，用于覆盖 F4 转发、驱动器加减速和机构惯性。 */
     property int autoVisionZMotionSafetyMs: 900
 
-    /* autoVisionZMotionMinimumWaitMs 是 Z 轴命令发出后的最短物理等待时间，避免小步数或配置异常时立刻进入 ROI 复查。 */
+    /* autoVisionZMotionMinimumWaitMs 是 Z 轴 ACK 后最短物理等待时间，避免小步数或配置异常时立刻进入 ROI 复查。 */
     property int autoVisionZMotionMinimumWaitMs: 1200
 
-    /* autoVisionZMotionMaximumWaitMs 是 Z 轴命令发出后的最长物理等待时间，现场把速度/步数调到 10s 内完成后，MP157 不再等 F4 DONE 卡住。 */
+    /* autoVisionZMotionMaximumWaitMs 是 Z 轴缺省最长等待时间；实际自动流程优先读取参数页 zMotionTimeoutMs。 */
     property int autoVisionZMotionMaximumWaitMs: 10000
 
     /* autoVisionPostFocusDetectDelayMs 是已经完成 Z 轴对焦等待后的短检测延时，给 overlay 刷新一帧。 */
@@ -271,6 +268,24 @@ Rectangle {
     /* manualMotorPageIndex 保存三轴手动弹窗当前页，0=传送带，1=摄像头左右，2=摄像头上下。 */
     property int manualMotorPageIndex: 0
 
+    /* manualCameraZZeroKnown 表示 MP157 是否知道上下轴当前零点；只有 ACTUATOR_HOME 成功后才置 true。 */
+    property bool manualCameraZZeroKnown: false
+
+    /* manualCameraZOffsetSteps 保存上下轴相对最近一次设零点的本地估算偏移；下降为正，上升为负，单位 step。 */
+    property real manualCameraZOffsetSteps: 0
+
+    /* manualPendingActuatorId 保存正在等待回执的手动执行器编号；停止键会清掉它，避免旧 ACK 覆盖停止结果。 */
+    property int manualPendingActuatorId: -1
+
+    /* manualPendingZDirection 保存正在等待回执的上下轴方向，0=下降，1=上升；非上下轴命令时为 -1。 */
+    property int manualPendingZDirection: -1
+
+    /* manualPendingZSteps 保存正在等待回执的上下轴步数；成功回执后才用于更新本地零点偏移。 */
+    property real manualPendingZSteps: 0
+
+    /* manualPendingZReturnHome 表示当前上下轴命令是否由“回原位”触发，成功后偏移直接归零。 */
+    property bool manualPendingZReturnHome: false
+
     /* settingsSupportedPartTypes 保存参数页允许切换的真实零件名称；当前检测链路只按这三类垫圈展示。 */
     property var settingsSupportedPartTypes: ["波形垫圈", "平垫圈", "弹性垫圈"]
 
@@ -313,6 +328,9 @@ Rectangle {
     /* stepperMotorSettings 保存 C++ DetectSettingsController 暴露的三台步进电机参数，用于三页弹窗显示。 */
     property var stepperMotorSettings: detectSettings.stepperMotorSettings
 
+    /* stepperMotorSettingsRevision 在 C++ 参数变化后递增，强制步进弹窗刷新 QVariantMap 副本。 */
+    property int stepperMotorSettingsRevision: 0
+
     /* stepperMotorPageNames 保存三页固定名称，也作为 QML 资源 marker，便于部署后用 strings 验证。 */
     property var stepperMotorPageNames: ["传送带电机", "摄像头左右电机", "摄像头上下电机"]
 
@@ -343,13 +361,16 @@ Rectangle {
     /* stepperSpeedEditKey 保存当前速度键盘正在编辑的字段：normalSpeedRpm 或 scanSpeedRpm。 */
     property string stepperSpeedEditKey: "normalSpeedRpm"
 
-    /* stepperStepEditorVisible 表示上下电机固定位置步数数字键盘是否打开。 */
+    /* stepperStepEditorVisible 表示上下电机固定位置步数或 Z 轴超时数字键盘是否打开。 */
     property bool stepperStepEditorVisible: false
 
-    /* stepperStepInputText 保存固定下探/回升步数数字键盘当前输入文本，范围为 0~4294967295 step。 */
+    /* stepperStepInputText 保存固定下探/回升步数或 Z 轴超时数字键盘当前输入文本。 */
     property string stepperStepInputText: "0"
 
-    /* stepperStepEditKey 保存当前正在编辑的 32 位 step 字段：zDownFixedSteps 或 zUpFixedSteps。 */
+    /* stepperStepReplaceOnNextDigit 表示下一次数字键是否替换当前文本，解决超时默认 10 秒无法直接输入 1~9 秒的问题。 */
+    property bool stepperStepReplaceOnNextDigit: false
+
+    /* stepperStepEditKey 保存当前正在编辑的字段：zDownFixedSteps、zUpFixedSteps 或 zMotionTimeoutMs。 */
     property string stepperStepEditKey: ""
 
     /* calibrationPopupVisible 表示称重标定弹窗是否打开，用于指导用户放置砝码并发起二进制称重标定命令。 */
@@ -862,7 +883,6 @@ Rectangle {
         autoVisionRunning = true
         autoVisionLocateBusy = false
         autoVisionCommandBusy = false
-        autoVisionIgnoreNextZMotionDone = false
         autoVisionStableFrames = 0
         autoVisionCenteredSent = false
         autoVisionHasSeenTarget = false
@@ -906,7 +926,6 @@ Rectangle {
         autoVisionRunning = false
         autoVisionLocateBusy = false
         autoVisionCommandBusy = false
-        autoVisionIgnoreNextZMotionDone = false
         autoVisionStableFrames = 0
         autoVisionCenteredSent = false
         autoVisionHasSeenTarget = false
@@ -1136,19 +1155,18 @@ Rectangle {
         var waitMs = moveMs + autoVisionZMotionSafetyMs + autoVisionShortSettleMs
 
         waitMs = Math.max(autoVisionZMotionMinimumWaitMs, waitMs)
-        waitMs = Math.min(autoVisionZMotionMaximumWaitMs, waitMs)
+        waitMs = Math.min(cameraZMotionTimeoutMs(), waitMs)
         return waitMs
     }
 
     /*
      * autoVisionStartZMotionWait 的作用：
-     *   在 Z 轴位置命令写入线程启动后，立即启动 MP157 本地运动等待，不再把流程推进绑定到 F4 DONE。
+     *   在 Z 轴位置命令发出后启动本地超时保护，避免 F4 到位事件丢失时自动流程永久卡住。
      *
      * 主要流程：
      *   1. 按 direction 选择 z-motion-down-wait 或 z-motion-up-wait 阶段。
-     *   2. 用 autoVisionEstimateZMoveMs() 按本次 speed/steps 估算等待时间，并受 autoVisionZMotionMaximumWaitMs=10s 限制。
-     *   3. 如果 F4 DONE 或 C++ 本地估算回调先回来，则 autoVisionHandleActuatorMoveDone() 会提前推进。
-     *   4. 如果 F4 没有可靠回调，则定时器到期后按 z-motion-10s-fallback 兜底继续 ROI 复查或机械臂流程。
+     *   2. 用 autoVisionEstimateZMoveMs() 估算保护超时时间，并重启 autoVisionActuatorSettleTimer。
+     *   3. 正常路径不靠该定时器推进，必须由 autoVisionHandleActuatorMoveDone() 收到 F4 完成事件后推进。
      *
      * 参数：
      *   direction 为 0 时表示下降，为 1 时表示回升。
@@ -1156,20 +1174,19 @@ Rectangle {
      *   speedRpm 是本次 Z 轴移动速度。
      *
      * 返回值：
-     *   无返回值；函数只设置阶段和 MP157 本地等待定时器。
+     *   无返回值；函数只设置阶段和本地保护定时器。
      */
     function autoVisionStartZMotionWait(direction, stepsValue, speedRpm) {
         var movingDown = Math.floor(Number(direction || 0)) === 0
         var waitMs = autoVisionEstimateZMoveMs(stepsValue, speedRpm)
         var waitSeconds = (waitMs / 1000.0).toFixed(1)
 
-        autoVisionIgnoreNextZMotionDone = false
         autoVisionActuatorPhase = movingDown ? "z-motion-down-wait" : "z-motion-up-wait"
-        workflowState = movingDown ? "Z轴下降等待" : "Z轴回升等待"
-        autoVisionLastText = "MP157按本次速度/步数等待上下电机"
+        workflowState = movingDown ? "Z轴下降到位等待" : "Z轴回升到位等待"
+        autoVisionLastText = "等待 F4 ACTUATOR_MOVE_DONE 确认上下电机"
                 + (movingDown ? "下降" : "回升")
-                + "，最大10秒兜底，当前估算 " + waitSeconds + " 秒，steps=" + stepsValue
-                + "，speed=" + speedRpm + "rpm；F4 DONE回来则提前进入下一步"
+                + "动作完成，本地保护 " + waitSeconds + " 秒，steps=" + stepsValue
+                + "，speed=" + speedRpm + "rpm"
         storageState = autoVisionLastText
         showStorageToast()
         autoVisionActuatorSettleTimer.interval = waitMs
@@ -1177,78 +1194,11 @@ Rectangle {
     }
 
     /*
-     * autoVisionHandleZMotionFallbackDone 的作用：
-     *   在 Z 轴本地等待到期后兜底推进自动流程，避免现场因为 F4 DONE/ACK 丢失而一直停在“Z轴下降”。
-     *
-     * 主要流程：
-     *   1. 判断当前等待阶段是下降还是回升；非 Z 轴等待阶段直接返回 false，防止误处理其它执行器。
-     *   2. 记录本次 speed/steps/direction，清空 pending 字段，保证下一轮 Z 命令不会复用旧参数。
-     *   3. 下降兜底后设置 autoVisionNeedsZUp=true，并进入 ROI 复查，让摄像头判断下降后零件是否偏离中心。
-     *   4. 回升兜底后清理 Z 轴检测标志，并继续启动 F4/ESP32S3 机械臂称重、电感流程。
-     *   5. 如果 C++ 后台位置运动线程仍未回调，则设置 autoVisionIgnoreNextZMotionDone，防止迟到回调重复推进。
-     *
-     * 参数：
-     *   reason 是写入日志的兜底原因，必须包含 z-motion-10s-fallback，方便板端 grep。
-     *
-     * 返回值：
-     *   true 表示已经处理当前 Z 轴等待阶段；false 表示当前不是 Z 轴等待。
-     */
-    function autoVisionHandleZMotionFallbackDone(reason) {
-        var phase = autoVisionActuatorPhase
-        var movingDown = phase === "z-motion-down-wait"
-        var movingUp = phase === "z-motion-up-wait"
-        var steps = autoVisionPendingZMoveSteps
-        var speed = autoVisionPendingZMoveSpeedRpm
-        var direction = autoVisionPendingZMoveDirection
-        var fallbackReason = String(reason || "z-motion-10s-fallback")
-        var lateCallbackMayArrive = autoVisionCommandBusy
-
-        if (!movingDown && !movingUp) {
-            return false
-        }
-
-        if (fallbackReason.indexOf("z-motion-10s-fallback") < 0) {
-            fallbackReason = "z-motion-10s-fallback " + fallbackReason
-        }
-
-        autoVisionActuatorSettleTimer.stop()
-        autoVisionPendingZMoveSteps = 0
-        autoVisionPendingZMoveSpeedRpm = 0
-        autoVisionPendingZMoveDirection = 0
-        autoVisionActuatorPhase = ""
-        autoVisionIgnoreNextZMotionDone = lateCallbackMayArrive
-
-        if (movingDown) {
-            autoVisionNeedsZUp = true
-            workflowState = "ROI复查"
-            autoVisionLastText = fallbackReason
-                    + " vision-stable-after-z-down：MP157已等待Z轴下降估算/最大10秒，开始ROI复查；direction="
-                    + direction + " steps=" + steps + " speed=" + speed + "rpm"
-            storageState = autoVisionLastText
-            showStorageToast()
-            autoVisionRequestFineTuneLocate()
-            return true
-        }
-
-        autoVisionNeedsZUp = false
-        autoVisionZFocusSettled = false
-        autoVisionDetectFromZFlow = false
-        workflowState = "机械臂检测"
-        autoVisionLastText = fallbackReason
-                + "：MP157已等待Z轴回升估算/最大10秒，继续启动F4/ESP32S3机械臂流程；direction="
-                + direction + " steps=" + steps + " speed=" + speed + "rpm"
-        storageState = autoVisionLastText
-        showStorageToast()
-        autoVisionStartF4ArmInspectionAfterZUp()
-        return true
-    }
-
-    /*
      * autoVisionHandleActuatorMoveDone 的作用：
-     *   在 F4 DONE 或 C++ 本地估算完成先于 10s 定时器返回时，提前推进 Z 轴自动流程。
+     *   在 MP157 C++ 已确认收到 F4 ACTUATOR_MOVE_DONE 后推进自动流程。
      *
      * 主要流程：
-     *   1. 停止 Z 轴本地等待定时器，避免后续 10s 兜底重复触发。
+     *   1. 停止 Z 轴本地保护定时器，说明正常完成来自 F4 完成事件而不是固定 sleep。
      *   2. Z 下降完成后，先用传送带和左右轴继续复查/微调 ROI 中心。
      *   3. Z 回升完成后，才允许通知 F4/ESP32S3 机械臂抓取零件并进入称重、电感流程。
      *
@@ -1279,14 +1229,13 @@ Rectangle {
 
         if (autoVisionActuatorPhase === "z-motion-down-wait") {
             autoVisionActuatorSettleTimer.stop()
-            autoVisionIgnoreNextZMotionDone = false
             autoVisionNeedsZUp = true
             autoVisionPendingZMoveSteps = 0
             autoVisionPendingZMoveSpeedRpm = 0
             autoVisionPendingZMoveDirection = 0
             autoVisionLastText = (estimatedDone
-                    ? "vision-stable-after-z-down：F4/MP157估算Z轴下降完成，开始ROI复查并用传送带/左右轴微调："
-                    : "vision-stable-after-z-down：F4收到Z轴下降主动到位回包，开始ROI复查并用传送带/左右轴微调：") + eventText
+                    ? "F4估算Z轴下降完成，开始ROI复查并用传送带/左右轴微调："
+                    : "F4收到Z轴下降主动到位回包，开始ROI复查并用传送带/左右轴微调：") + eventText
             storageState = autoVisionLastText
             showStorageToast()
             autoVisionRequestFineTuneLocate()
@@ -1295,7 +1244,6 @@ Rectangle {
 
         if (autoVisionActuatorPhase === "z-motion-up-wait") {
             autoVisionActuatorSettleTimer.stop()
-            autoVisionIgnoreNextZMotionDone = false
             autoVisionNeedsZUp = false
             autoVisionZFocusSettled = false
             autoVisionDetectFromZFlow = false
@@ -1331,6 +1279,7 @@ Rectangle {
         var motor = cameraZMotorSetting()
         var steps = Math.floor(Number(motor.zDownFixedSteps || 0))
         var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+        var timeoutMs = cameraZMotionTimeoutMs()
 
         autoVisionFineTuneAttempts = 0
         autoVisionZFocusSettled = false
@@ -1354,13 +1303,14 @@ Rectangle {
         autoVisionPendingZMoveSteps = steps
         autoVisionPendingZMoveSpeedRpm = speed
         autoVisionPendingZMoveDirection = 0
-        autoVisionLastText = "自动视觉：上下电机下降 " + steps + " step，MP157本地等待最大10秒后进入ROI复查"
+        autoVisionLastText = "自动视觉：上下电机下降 " + steps
+                + " step，最多等待 " + (timeoutMs / 1000.0).toFixed(1)
+                + " 秒后按 MP157 本地估算继续"
         storageState = autoVisionLastText
         showStorageToast()
 
-        if (deviceHealth.sendF4ActuatorPositionMove(2, 0, 0, speed, steps, 0)) {
+        if (deviceHealth.sendF4ActuatorPositionMoveWithTimeout(2, 0, 0, speed, steps, 0, timeoutMs)) {
             autoVisionCommandBusy = true
-            autoVisionStartZMotionWait(0, steps, speed)
             return true
         }
 
@@ -1645,6 +1595,7 @@ Rectangle {
         var motor = cameraZMotorSetting()
         var steps = Math.floor(Number(motor.zUpFixedSteps || 0))
         var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+        var timeoutMs = cameraZMotionTimeoutMs()
 
         if (steps <= 0) {
             autoVisionNeedsZUp = false
@@ -1664,13 +1615,14 @@ Rectangle {
         autoVisionPendingZMoveSteps = steps
         autoVisionPendingZMoveSpeedRpm = speed
         autoVisionPendingZMoveDirection = 1
-        autoVisionLastText = "模型检测完成，上下电机回升 " + steps + " step，MP157本地等待最大10秒后继续机械臂流程"
+        autoVisionLastText = "模型检测完成，上下电机回升 " + steps
+                + " step，最多等待 " + (timeoutMs / 1000.0).toFixed(1)
+                + " 秒后按 MP157 本地估算继续"
         storageState = autoVisionLastText
         showStorageToast()
 
-        if (deviceHealth.sendF4ActuatorPositionMove(2, 1, 0, speed, steps, 0)) {
+        if (deviceHealth.sendF4ActuatorPositionMoveWithTimeout(2, 1, 0, speed, steps, 0, timeoutMs)) {
             autoVisionCommandBusy = true
-            autoVisionStartZMotionWait(1, steps, speed)
             return true
         }
 
@@ -2206,28 +2158,93 @@ Rectangle {
     }
 
     /*
+     * clearManualPendingMotionContext 的作用：
+     *   清空手动执行器命令附带的本地运动上下文。
+     *
+     * 主要流程：
+     *   1. 在命令失败、命令完成或 STOP 抢占时调用。
+     *   2. 只清 QML 本地等待信息，不修改 F4 串口层 busy 标志，避免伪造串口空闲状态。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 QML 本地属性。
+     */
+    function clearManualPendingMotionContext() {
+        manualPendingActuatorId = -1
+        manualPendingZDirection = -1
+        manualPendingZSteps = 0
+        manualPendingZReturnHome = false
+    }
+
+    /*
+     * updateManualCameraZOffsetAfterMove 的作用：
+     *   在上下轴位置命令真正成功后，更新 MP157 对“当前点距离设零点”的本地估算。
+     *
+     * 主要流程：
+     *   1. 如果还没有成功设零，说明 MP157 没有可信基准，不更新偏移。
+     *   2. 如果本次命令是“回原位”，成功后直接把偏移归零，避免重复点击继续上升。
+     *   3. 普通下降让偏移增加，普通上升让偏移减少，后续“回原位”按偏移反向移动。
+     *
+     * 参数：
+     *   direction 是上下轴逻辑方向，0=下降，1=上升。
+     *   steps 是本次实际下发的相对移动步数，单位 step。
+     *   returnHome 表示本次命令是否由“回原位”触发。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 manualCameraZOffsetSteps。
+     */
+    function updateManualCameraZOffsetAfterMove(direction, steps, returnHome) {
+        var safeSteps = Math.max(0, Math.floor(Number(steps || 0)))
+
+        if (!manualCameraZZeroKnown) {
+            return
+        }
+
+        if (returnHome) {
+            manualCameraZOffsetSteps = 0
+            return
+        }
+
+        if (direction === 0) {
+            manualCameraZOffsetSteps = Math.floor(Number(manualCameraZOffsetSteps || 0)) + safeSteps
+        } else {
+            manualCameraZOffsetSteps = Math.floor(Number(manualCameraZOffsetSteps || 0)) - safeSteps
+        }
+
+        if (Math.abs(manualCameraZOffsetSteps) < 1) {
+            manualCameraZOffsetSteps = 0
+        }
+    }
+
+    /*
      * sendManualActuatorZFixedMove 的作用：
      *   把上下电机手动“下降/上升”按钮转换为固定步数 ACTUATOR_POS_MOVE。
      *
      * 主要流程：
      *   1. direction=0 时读取 zDownFixedSteps，direction=1 时读取 zUpFixedSteps。
-     *   2. 步数为 0 时拒绝下发，让现场先到参数页配置固定下降/上升值。
-     *   3. 调用 C++ sendF4ActuatorPositionMove()，F4 只执行一次固定步数位置运动。
+     *   2. 如果调用方传入 overrideSteps，则用于“回原位”按本地零点偏移移动，而不是固定上升。
+     *   3. 步数为 0 时拒绝下发，让现场先到参数页配置固定下降/上升值。
+     *   4. 调用 C++ sendF4ActuatorPositionMove()，F4 只执行一次固定步数位置运动。
      *
      * 参数：
      *   direction 是上下轴方向，0=下降，1=上升。
      *   label 是按钮文本，用于命令日志显示。
+     *   overrideSteps 是可选步数覆盖值；未传时使用参数页固定步数。
+     *   returnHome 是可选标志，true 表示本次命令用于回到最近一次设零点。
      *
      * 返回值：
      *   true 表示命令线程已启动；false 表示命令未能进入 C++ 串口层。
      */
-    function sendManualActuatorZFixedMove(direction, label) {
+    function sendManualActuatorZFixedMove(direction, label, overrideSteps, returnHome) {
         var motor = manualMotorSetting()
         var speed = Math.floor(Number(motor.normalSpeedRpm || 0))
-        var steps = direction === 0
+        var hasOverrideSteps = overrideSteps !== undefined && overrideSteps !== null
+        var steps = hasOverrideSteps
+                ? Math.floor(Number(overrideSteps || 0))
+                : (direction === 0
                 ? Math.floor(Number(motor.zDownFixedSteps || 0))
-                : Math.floor(Number(motor.zUpFixedSteps || 0))
-        var commandText = "ACTUATOR_POS_MOVE_Z_" + direction
+                : Math.floor(Number(motor.zUpFixedSteps || 0)))
+        var returnHomeCommand = returnHome === true
+        var commandText = returnHomeCommand ? "ACTUATOR_POS_MOVE_Z_HOME" : ("ACTUATOR_POS_MOVE_Z_" + direction)
 
         if (manualPendingF4Command !== "") {
             manualLastAckText = "F4命令发送中：" + manualPendingF4Command
@@ -2247,6 +2264,10 @@ Rectangle {
         }
 
         manualPendingF4Command = commandText
+        manualPendingActuatorId = 2
+        manualPendingZDirection = direction
+        manualPendingZSteps = steps
+        manualPendingZReturnHome = returnHomeCommand
         manualLastAckText = "正在下发上下电机" + label + "：steps=" + steps + " speed=" + speed + "rpm"
         storageState = formatF4ToastText(manualLastAckText)
         appendManualCommandLog(label, "上下电机", manualLastAckText)
@@ -2254,6 +2275,7 @@ Rectangle {
 
         if (!deviceHealth.sendF4ActuatorPositionMove(2, direction, 0, speed, steps, 0)) {
             manualPendingF4Command = ""
+            clearManualPendingMotionContext()
             manualLastAckText = "F4拒绝启动上下电机固定步数命令：" + commandText
             storageState = formatF4ToastText(manualLastAckText)
             appendManualCommandLog(label, "上下电机", manualLastAckText)
@@ -2282,17 +2304,38 @@ Rectangle {
 
     /*
      * sendManualActuatorZReturnHome 的作用：
-     *   手动上下轴下降后，使用参数页配置的 zUpFixedSteps 固定步数回到识别高度。
+     *   手动上下轴下降或上升后，按最近一次“设当前位置为零点”记录的本地偏移回到零点。
      *
      * 主要流程：
-     *   1. 直接复用 sendManualActuatorZFixedMove(direction=1)，保证和“上升”按钮走同一条协议。
-     *   2. 日志保留“回原位”文案，便于现场区分普通上升和复位高度操作。
+     *   1. 如果当前还没有成功设零，则拒绝回原位，避免继续盲目上升。
+     *   2. 如果本地偏移已经是 0，则只提示当前位置就是零点，不再发送电机命令。
+     *   3. 如果偏移为正，说明相对零点下降过，回原位要上升；偏移为负则反向下降。
      *
      * 返回值：
-     *   true 表示上升固定步数命令已启动；false 表示参数非法或串口层拒绝。
+     *   true 表示回原位位置命令已启动；false 表示无需移动、缺少零点或串口层拒绝。
      */
     function sendManualActuatorZReturnHome(label) {
-        return sendManualActuatorZFixedMove(1, label)
+        var offsetSteps = Math.floor(Number(manualCameraZOffsetSteps || 0))
+        var direction = offsetSteps > 0 ? 1 : 0
+        var steps = Math.abs(offsetSteps)
+
+        if (!manualCameraZZeroKnown) {
+            manualLastAckText = "请先在参数设置中对上下电机点击设当前位置为零点，再使用回原位"
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "上下电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        if (steps <= 0) {
+            manualLastAckText = "上下电机当前位置已经是零点，不再发送回原位命令"
+            storageState = formatF4ToastText(manualLastAckText)
+            appendManualCommandLog(label, "上下电机", manualLastAckText)
+            showStorageToast()
+            return false
+        }
+
+        return sendManualActuatorZFixedMove(direction, label, steps, true)
     }
 
     /*
@@ -2310,11 +2353,28 @@ Rectangle {
     function sendManualActuatorStop(actuator, label) {
         var commandText = actuator === 255 ? "ACTUATOR_STOP_ALL" : ("ACTUATOR_STOP_" + actuator)
         var targetText = actuator === 255 ? "全部执行器" : stepperMotorPageNames[Math.max(0, Math.min(2, actuator))]
+        var stopTouchesCameraZ = actuator === 2 || actuator === 255
 
         manualLastAckText = "正在立即写入 " + commandText + " 到 F407，不等待上一条运动ACK"
         storageState = formatF4ToastText(manualLastAckText)
         appendManualCommandLog(label, targetText, manualLastAckText)
         showStorageToast()
+
+        /*
+         * STOP 是安全动作，点击后立即取消 QML 本地等待中的手动命令。
+         * 这样旧的 ACTUATOR_VEL_MOVE/ACTUATOR_POS_MOVE ACK 即使稍后回来，也不会覆盖“已停止”的现场提示。
+         */
+        manualPendingF4Command = ""
+        clearManualPendingMotionContext()
+
+        if (stopTouchesCameraZ) {
+            /*
+             * 上下轴在位置运动中被 STOP 打断后，MP157 无法只靠相对步数知道最终停在哪。
+             * 因此清掉本地零点可信标志，要求操作者在当前位置重新设零后再使用“回原位”。
+             */
+            manualCameraZZeroKnown = false
+            manualCameraZOffsetSteps = 0
+        }
 
         if (!deviceHealth.sendF4ActuatorStopNow(actuator, 0)) {
             manualLastAckText = "F4拒绝启动停止命令：" + commandText
@@ -2563,6 +2623,12 @@ Rectangle {
      *   返回包含 name、address、minStep、normalSpeedRpm 和 direction 的对象。
      */
     function currentStepperMotorSetting() {
+        /*
+         * stepperMotorSettingsRevision 参与依赖跟踪：
+         *   C++ settingsChanged 后 QVariantList 会重新生成，QML 旧 map 副本不一定自动刷新。
+         *   这里显式读取版本号，让所有调用 currentStepperMotorSetting() 的绑定都能重新取最新对象。
+         */
+        var revision = stepperMotorSettingsRevision
         var motors = detectSettings.stepperMotorSettings
         if (!motors || stepperMotorPageIndex < 0 || stepperMotorPageIndex >= motors.length) {
             return {}
@@ -2613,6 +2679,25 @@ Rectangle {
             return {}
         }
         return motors[2]
+    }
+
+    /*
+     * cameraZMotionTimeoutMs 的作用：
+     *   从参数页“摄像头上下电机”的 zMotionTimeoutMs 读取自动 Z 轴下降/回升最大等待时间。
+     *
+     * 主要流程：
+     *   1. 优先读取 DetectSettingsController 暴露的第三台电机参数。
+     *   2. 配置缺失时使用 autoVisionZMotionMaximumWaitMs 作为兼容默认值。
+     *   3. 最终限制在 1~60 秒，避免误输入导致流程立刻推进或长时间卡住串口线程。
+     *
+     * 返回值：
+     *   返回毫秒数，用于 C++ 等待 F4 ACTUATOR_MOVE_DONE 或 MP157 本地估算完成的最大上限。
+     */
+    function cameraZMotionTimeoutMs() {
+        var motor = cameraZMotorSetting()
+        var timeoutMs = Math.floor(Number(motor.zMotionTimeoutMs || autoVisionZMotionMaximumWaitMs))
+
+        return Math.max(1000, Math.min(60000, timeoutMs))
     }
 
     /*
@@ -2762,6 +2847,7 @@ Rectangle {
             lines.push(prefix + ".direction=" + motor.direction + " (" + root.stepperMotorDirectionText(motor.direction) + ")")
             lines.push(prefix + ".z_down_fixed_steps=" + (motor.zDownFixedSteps || 0))
             lines.push(prefix + ".z_up_fixed_steps=" + (motor.zUpFixedSteps || 0))
+            lines.push(prefix + ".z_motion_timeout_ms=" + (motor.zMotionTimeoutMs || 10000))
         }
         return lines.join("\n")
     }
@@ -2817,30 +2903,124 @@ Rectangle {
     }
 
     /*
+     * stepperStepEditorIsTimeout 的作用：
+     *   判断当前复用数字键盘是否正在编辑 Z 轴最大等待超时。
+     *
+     * 返回值：
+     *   true 表示当前字段为 zMotionTimeoutMs；false 表示当前字段为下探/回升步数。
+     */
+    function stepperStepEditorIsTimeout() {
+        return stepperStepEditKey === "zMotionTimeoutMs"
+    }
+
+    /*
+     * stepperStepEditorUnitText 的作用：
+     *   返回当前数字键盘应该显示的单位文本。
+     *
+     * 返回值：
+     *   Z 轴超时返回“秒”；固定步数返回“step”。
+     */
+    function stepperStepEditorUnitText() {
+        return stepperStepEditorIsTimeout() ? "秒" : "step"
+    }
+
+    /*
+     * stepperStepEditorMaxValue 的作用：
+     *   返回当前数字键盘允许输入的最大整数。
+     *
+     * 返回值：
+     *   Z 轴超时最大 60 秒；固定步数最大 4294967295 step。
+     */
+    function stepperStepEditorMaxValue() {
+        return stepperStepEditorIsTimeout() ? 60 : 4294967295
+    }
+
+    /*
+     * stepperStepEditorMinValue 的作用：
+     *   返回当前数字键盘允许应用的最小整数。
+     *
+     * 返回值：
+     *   Z 轴超时最小 1 秒；固定步数允许 0 step，用于跳过下探或回升。
+     */
+    function stepperStepEditorMinValue() {
+        return stepperStepEditorIsTimeout() ? 1 : 0
+    }
+
+    /*
+     * stepperStepEditorTitleText 的作用：
+     *   根据当前字段生成数字键盘标题。
+     *
+     * 返回值：
+     *   返回可直接显示在弹窗顶部的中文标题。
+     */
+    function stepperStepEditorTitleText() {
+        if (stepperStepEditKey === "zDownFixedSteps") {
+            return "下探固定步数"
+        }
+        if (stepperStepEditKey === "zUpFixedSteps") {
+            return "回升固定步数"
+        }
+        return "Z轴超时等待"
+    }
+
+    /*
+     * stepperStepEditorRangeText 的作用：
+     *   根据当前字段生成范围说明，避免操作者把秒和 step 混淆。
+     *
+     * 返回值：
+     *   返回可换行显示的范围说明。
+     */
+    function stepperStepEditorRangeText() {
+        if (stepperStepEditorIsTimeout()) {
+            return "范围 1~60 秒；自动 Z 轴下降或回升未收到 F4 DONE 时，最多等待到该时间后按 MP157 本地估算继续。"
+        }
+        return "范围 0~4294967295 step，对应张大头42步进电机位置模式 4 字节脉冲数。"
+    }
+
+    /*
+     * stepperStepEditorPendingText 的作用：
+     *   生成当前数字键盘输入待应用提示。
+     *
+     * 返回值：
+     *   返回包含数值和单位的中文提示。
+     */
+    function stepperStepEditorPendingText() {
+        return (stepperStepEditorIsTimeout() ? "Z轴超时待应用：" : "位置步数待应用：")
+                + stepperStepInputText + " " + stepperStepEditorUnitText()
+    }
+
+    /*
      * openStepperStepEditor 的作用：
-     *   打开上下电机固定下探/回升步数数字键盘，并载入当前字段值。
+     *   打开上下电机固定下探/回升步数或 Z 轴超时数字键盘，并载入当前字段值。
      *
      * 参数：
-     *   key 是 zDownFixedSteps 或 zUpFixedSteps。
+     *   key 是 zDownFixedSteps、zUpFixedSteps 或 zMotionTimeoutMs。
      *
      * 返回值：
      *   无返回值；字段非法时只更新提示，不打开数字键盘。
      */
     function openStepperStepEditor(key) {
         var motor = currentStepperMotorSetting()
-        if (key !== "zDownFixedSteps" && key !== "zUpFixedSteps") {
-            stepperMotorResultText = "位置步数字段无效：" + key
+        if (key !== "zDownFixedSteps" && key !== "zUpFixedSteps" && key !== "zMotionTimeoutMs") {
+            stepperMotorResultText = "上下电机数字字段无效：" + key
             storageState = stepperMotorResultText
             showStorageToast()
             return
         }
 
         stepperStepEditKey = key
-        stepperStepInputText = "" + Math.floor(Number(motor[key] || 0))
+        if (stepperStepEditorIsTimeout()) {
+            stepperStepInputText = "" + Math.max(1, Math.min(60, Math.floor(Number(motor.zMotionTimeoutMs || 10000) / 1000)))
+        } else {
+            stepperStepInputText = "" + Math.floor(Number(motor[key] || 0))
+        }
+        stepperStepReplaceOnNextDigit = stepperStepEditorIsTimeout()
         stepperSpeedEditorVisible = false
         stepperStepEditorVisible = true
-        stepperMotorResultText = "请输入 " + (key === "zDownFixedSteps" ? "下探" : "回升")
-                + " 固定步数：0~4294967295 step"
+        stepperMotorResultText = "请输入 " + stepperStepEditorTitleText()
+                + "：" + stepperStepEditorMinValue()
+                + "~" + stepperStepEditorMaxValue()
+                + " " + stepperStepEditorUnitText()
     }
 
     /*
@@ -2942,79 +3122,108 @@ Rectangle {
 
     /*
      * appendStepperStepDigit 的作用：
-     *   向 32 位位置步数输入框追加一个数字，让触摸屏可以输入完整 Emm42 位置模式范围。
+     *   向复用数字键盘追加一个数字，让触摸屏可以输入完整 Emm42 步数或 Z 轴超时秒数。
      *
      * 参数：
      *   digit 是被点击的数字字符。
      *
      * 返回值：
-     *   无返回值；超过 4294967295 时拒绝追加。
+     *   无返回值；超过当前字段最大值时拒绝追加。
      */
     function appendStepperStepDigit(digit) {
-        var nextText = (stepperStepInputText + digit).replace(/^0+/, "")
+        var baseText = stepperStepReplaceOnNextDigit ? "" : stepperStepInputText
+        var nextText = (baseText + digit).replace(/^0+/, "")
         if (nextText.length === 0) {
             nextText = "0"
         }
 
-        if (!/^[0-9]+$/.test(nextText) || Number(nextText) > 4294967295) {
-            stepperMotorResultText = "固定步数范围是 0~4294967295 step"
+        if (!/^[0-9]+$/.test(nextText) || Number(nextText) > stepperStepEditorMaxValue()) {
+            stepperMotorResultText = stepperStepEditorTitleText()
+                    + "范围是 " + stepperStepEditorMinValue()
+                    + "~" + stepperStepEditorMaxValue()
+                    + " " + stepperStepEditorUnitText()
             return
         }
 
+        stepperStepReplaceOnNextDigit = false
         stepperStepInputText = nextText
-        stepperMotorResultText = "位置步数待应用：" + stepperStepInputText + " step"
+        stepperMotorResultText = stepperStepEditorPendingText()
     }
 
     /*
      * backspaceStepperStepDigit 的作用：
-     *   删除位置步数输入框最后一位，便于触摸屏纠正输入。
+     *   删除复用数字键盘最后一位，便于触摸屏纠正输入。
      *
      * 返回值：
      *   无返回值；输入为空时回到 0。
      */
     function backspaceStepperStepDigit() {
+        stepperStepReplaceOnNextDigit = false
         stepperStepInputText = stepperStepInputText.substring(0, Math.max(0, stepperStepInputText.length - 1))
         if (stepperStepInputText.length === 0) {
             stepperStepInputText = "0"
         }
-        stepperMotorResultText = "位置步数待应用：" + stepperStepInputText + " step"
+        stepperMotorResultText = stepperStepEditorPendingText()
     }
 
     /*
      * clearStepperStepInput 的作用：
-     *   清空并重置固定位置步数输入为 0。
+     *   清空并重置固定位置步数或 Z 轴超时输入。
      *
      * 返回值：
      *   无返回值；函数只更新输入文本和提示。
      */
     function clearStepperStepInput() {
+        stepperStepReplaceOnNextDigit = false
+        if (stepperStepEditorIsTimeout()) {
+            stepperStepInputText = ""
+            stepperMotorResultText = "Z轴超时已清空，请输入1~60秒"
+            return
+        }
+
         stepperStepInputText = "0"
-        stepperMotorResultText = "位置步数待应用：0 step"
+        stepperMotorResultText = stepperStepEditorPendingText()
     }
 
     /*
      * applyStepperStepInput 的作用：
-     *   校验 32 位位置步数输入框，并写入当前页上下电机参数。
+     *   校验复用数字键盘，并写入当前页上下电机步数或 Z 轴超时参数。
      *
      * 主要流程：
-     *   1. 只接受 0~4294967295 十进制整数。
-     *   2. 调用 C++ setStepperMotorStepValue()，避免 32 位 step 经过 int 截断。
-     *   3. 成功后关闭数字键盘，提示用户保存并下发配置。
+     *   1. 步数接受 0~4294967295 十进制整数，超时接受 1~60 秒。
+     *   2. 步数调用 C++ setStepperMotorStepValue()，避免 32 位 step 经过 int 截断。
+     *   3. 超时调用 C++ setStepperMotorValue("zMotionTimeoutMs")，内部保存为毫秒。
+     *   4. 成功后关闭数字键盘，提示用户保存并下发配置。
      *
      * 返回值：
      *   无返回值；成功后关闭位置步数数字键盘。
      */
     function applyStepperStepInput() {
         var trimmedText = stepperStepInputText.replace(/^\s+|\s+$/g, "")
+        var parsedValue = Number(trimmedText)
+        var editingTimeout = stepperStepEditorIsTimeout()
+        var appliedTimeoutMs = editingTimeout ? Math.floor(parsedValue * 1000) : -1
 
-        if (!/^[0-9]+$/.test(trimmedText) || Number(trimmedText) > 4294967295) {
-            stepperMotorResultText = "固定步数必须是 0~4294967295 step 的整数"
+        if (!/^[0-9]+$/.test(trimmedText)
+                || parsedValue < stepperStepEditorMinValue()
+                || parsedValue > stepperStepEditorMaxValue()) {
+            stepperMotorResultText = stepperStepEditorTitleText()
+                    + "必须是 " + stepperStepEditorMinValue()
+                    + "~" + stepperStepEditorMaxValue()
+                    + " " + stepperStepEditorUnitText() + " 的整数"
             storageState = stepperMotorResultText
             showStorageToast()
             return
         }
 
-        if (!detectSettings.setStepperMotorStepValue(stepperMotorPageIndex, stepperStepEditKey, trimmedText)) {
+        if (editingTimeout) {
+            if (!detectSettings.setStepperMotorValue(stepperMotorPageIndex, "zMotionTimeoutMs", appliedTimeoutMs)) {
+                stepperMotorResultText = detectSettings.lastStatusText
+                storageState = stepperMotorResultText
+                showStorageToast()
+                return
+            }
+        } else if (!detectSettings.setStepperMotorStepValue(stepperMotorPageIndex, stepperStepEditKey, trimmedText)) {
             stepperMotorResultText = detectSettings.lastStatusText
             storageState = stepperMotorResultText
             showStorageToast()
@@ -3023,10 +3232,18 @@ Rectangle {
 
         stepperStepEditorVisible = false
         var motor = currentStepperMotorSetting()
+        var visibleTimeoutMs = editingTimeout
+                ? appliedTimeoutMs
+                : Math.floor(Number(motor.zMotionTimeoutMs || autoVisionZMotionMaximumWaitMs))
         stepperMotorResultText = motor.name + "：下探 " + (motor.zDownFixedSteps || 0)
                 + " step，回升 " + (motor.zUpFixedSteps || 0)
-                + " step，点击保存并下发写入JSON并通知F4"
-        settingsLastActionText = "上下电机固定位置步数已更新"
+                + " step，Z轴超时 " + (visibleTimeoutMs / 1000.0).toFixed(1)
+                + " 秒，本次自动检测Z轴下降/回升最多等待 " + visibleTimeoutMs
+                + " ms；点击保存并下发写入JSON并通知F4"
+        settingsLastActionText = editingTimeout
+                ? "上下电机Z轴超时已更新为 " + (visibleTimeoutMs / 1000.0).toFixed(1)
+                    + " 秒，本次自动检测立即使用；保存后重启仍生效"
+                : "上下电机固定位置步数已更新"
         storageState = settingsLastActionText
         showStorageToast()
     }
@@ -3110,6 +3327,8 @@ Rectangle {
             nextValue = (motor.scanSpeedRpm || 0) + delta
         } else if (key === "direction") {
             nextValue = delta >= 0 ? 1 : -1
+        } else if (key === "zMotionTimeoutMs") {
+            nextValue = Math.floor(Number(motor.zMotionTimeoutMs || 10000)) + delta
         } else {
             stepperMotorResultText = "步进电机参数异常：未知字段 " + key
             storageState = stepperMotorResultText
@@ -3127,12 +3346,15 @@ Rectangle {
         motor = currentStepperMotorSetting()
         if (key === "normalSpeedRpm" || key === "scanSpeedRpm") {
             stepperSpeedInputText = "" + Math.floor(Number(motor[key] || 0))
+        } else if (key === "zMotionTimeoutMs") {
+            stepperStepInputText = "" + Math.max(1, Math.min(60, Math.floor(Number(motor.zMotionTimeoutMs || 10000) / 1000)))
         }
         stepperMotorResultText = motor.name + "：地址 " + motor.addressHex
                 + "，最小步长 " + motor.minStep + " step"
                 + "，常规速度 " + motor.normalSpeedRpm + " rpm"
                 + "，上料速度 " + (motor.scanSpeedRpm || 0) + " rpm"
                 + "，方向 " + root.stepperMotorDirectionText(motor.direction)
+                + "，Z轴超时 " + (Math.floor(Number(motor.zMotionTimeoutMs || 10000)) / 1000.0).toFixed(1) + " 秒"
         settingsLastActionText = "步进电机参数已更新，点击保存配置写入JSON"
         storageState = settingsLastActionText
         showStorageToast()
@@ -5443,9 +5665,27 @@ Rectangle {
 
         onTriggered: {
             if (root.autoVisionActuatorPhase === "z-motion-down-wait") {
-                root.autoVisionHandleZMotionFallbackDone("z-motion-10s-fallback：Z轴下降未等到可靠F4 DONE，按MP157本地最大等待继续")
+                root.autoVisionNeedsZUp = true
+                root.autoVisionPendingZMoveSteps = 0
+                root.autoVisionPendingZMoveSpeedRpm = 0
+                root.autoVisionPendingZMoveDirection = 0
+                root.workflowState = "Z轴下降本地超时"
+                root.storageState = "Z轴下降达到参数页超时，未收到F4 ACTUATOR_MOVE_DONE，按MP157本地等待策略继续ROI复查"
+                root.autoVisionLastText = root.storageState
+                root.showStorageToast()
+                root.autoVisionRequestFineTuneLocate()
             } else if (root.autoVisionActuatorPhase === "z-motion-up-wait") {
-                root.autoVisionHandleZMotionFallbackDone("z-motion-10s-fallback：Z轴回升未等到可靠F4 DONE，按MP157本地最大等待继续")
+                root.autoVisionNeedsZUp = true
+                root.autoVisionZFocusSettled = false
+                root.autoVisionDetectFromZFlow = false
+                root.autoVisionPendingZMoveSteps = 0
+                root.autoVisionPendingZMoveSpeedRpm = 0
+                root.autoVisionPendingZMoveDirection = 0
+                root.autoVisionActuatorPhase = ""
+                root.workflowState = "Z轴回升超时"
+                root.storageState = "未收到F4 ACTUATOR_MOVE_DONE，禁止启动机械臂抓取，请手动确认Z轴已离开零件"
+                root.autoVisionLastText = root.storageState
+                root.showStorageToast()
             } else if (root.autoVisionActuatorPhase === "z-down-skip"
                     || root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                 root.autoVisionRequestFineTuneLocate()
@@ -5807,10 +6047,10 @@ Rectangle {
 
         /*
          * onF4ActuatorCommandFinished 的作用：
-         *   接收 ACTUATOR_POS_MOVE 的完成事件、MP157 估算完成或其它执行器 ACK/NACK，并按阶段推进。
+         *   接收 ACTUATOR_POS_MOVE 的完成事件结果或其它执行器命令 ACK/NACK，并按阶段推进。
          *
          * 参数：
-         *   ok 对 ACTUATOR_POS_MOVE 表示收到 F4 DONE 或 MP157 本地估算完成；对其它命令表示 ACK 成功。
+         *   ok 对 ACTUATOR_POS_MOVE 表示已经收到 F4 ACTUATOR_MOVE_DONE；对其它命令表示 ACK 成功。
          *   action 是执行器命令名称。
          *   cycleId 是当前自动流程号，手动命令通常为 0。
          *   detail 是 ACK、EVENT_REPORT、NACK 或串口失败原因。
@@ -5819,24 +6059,12 @@ Rectangle {
             root.autoVisionCommandBusy = false
             root.autoCycleId = cycleId
 
-            if (root.autoVisionIgnoreNextZMotionDone && action === "ACTUATOR_POS_MOVE") {
-                root.autoVisionIgnoreNextZMotionDone = false
-                root.autoVisionLastText = "忽略已由z-motion-10s-fallback推进的Z轴迟到回调：" + detail
-                root.storageState = root.autoVisionLastText
-                root.showStorageToast()
-                root.evaluateRuntimeAlarms()
-                return
-            }
-
             if (root.autoVisionActuatorPhase !== "") {
                 if (ok) {
                     root.autoVisionLastText = "执行器完成：" + root.autoVisionActuatorPhase + " " + detail
                     if (root.autoVisionActuatorPhase === "z-down") {
                         root.autoVisionNeedsZUp = true
                         root.autoVisionActuatorPhase = "z-motion-down-wait"
-                        root.autoVisionHandleActuatorMoveDone(detail)
-                    } else if (root.autoVisionActuatorPhase === "z-motion-down-wait"
-                            || root.autoVisionActuatorPhase === "z-motion-up-wait") {
                         root.autoVisionHandleActuatorMoveDone(detail)
                     } else if (root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                         autoVisionActuatorSettleTimer.interval = root.autoVisionShortSettleMs
@@ -5849,17 +6077,10 @@ Rectangle {
                     root.autoVisionLastText = "执行器失败：" + root.autoVisionActuatorPhase + " " + detail
                     root.storageState = root.autoVisionLastText
                     root.showStorageToast()
-                    if (root.autoVisionActuatorPhase === "z-motion-down-wait"
-                            || root.autoVisionActuatorPhase === "z-motion-up-wait") {
-                        root.autoVisionLastText += "；继续等待MP157本地10s兜底"
-                        root.storageState = root.autoVisionLastText
-                        root.showStorageToast()
-                    } else if (root.autoVisionActuatorPhase === "z-up") {
+                    if (root.autoVisionActuatorPhase === "z-up") {
                         root.autoVisionNeedsZUp = true
-                        root.autoVisionActuatorPhase = ""
-                    } else {
-                        root.autoVisionActuatorPhase = ""
                     }
+                    root.autoVisionActuatorPhase = ""
                 }
 
                 root.evaluateRuntimeAlarms()
@@ -5871,15 +6092,20 @@ Rectangle {
                 var homeResult = ok
                         ? ("F4已将当前位置设为零点：" + detail)
                         : ("F4当前位置设零失败：" + detail)
+                if (ok && finishedHomeCommand === "ACTUATOR_HOME_2") {
+                    root.manualCameraZZeroKnown = true
+                    root.manualCameraZOffsetSteps = 0
+                    homeResult = homeResult + "；上下轴本地回原位偏移已清零"
+                }
                 root.stepperHomeSending = false
-            root.stepperHomePendingCommand = ""
-            root.stepperMotorResultText = homeResult
-            root.settingsLastActionText = homeResult
-            root.storageState = root.formatF4ToastText(homeResult + " [" + finishedHomeCommand + "]")
-            root.showStorageToast()
-            root.evaluateRuntimeAlarms()
-            return
-        }
+                root.stepperHomePendingCommand = ""
+                root.stepperMotorResultText = homeResult
+                root.settingsLastActionText = homeResult
+                root.storageState = root.formatF4ToastText(homeResult + " [" + finishedHomeCommand + "]")
+                root.showStorageToast()
+                root.evaluateRuntimeAlarms()
+                return
+            }
 
         if (action === "ACTUATOR_STOP_NOW") {
             var stopNowResult = ok
@@ -5898,11 +6124,21 @@ Rectangle {
             var manualResult = ok ? ("F4执行器回执：" + detail) : ("F4执行器失败：" + detail)
             if (ok && finishedManualCommand.indexOf("ACTUATOR_VEL_MOVE") === 0) {
                 manualResult = "F4执行器回执：" + detail + "；持续运动中，按停止结束"
-                } else if (ok && finishedManualCommand.indexOf("ACTUATOR_POS_MOVE_Z") === 0) {
-                    manualResult = "F4执行器回执：" + detail + "；上下轴固定步数已下发"
+            } else if (ok && finishedManualCommand.indexOf("ACTUATOR_POS_MOVE_Z") === 0) {
+                root.updateManualCameraZOffsetAfterMove(root.manualPendingZDirection,
+                                                        root.manualPendingZSteps,
+                                                        root.manualPendingZReturnHome)
+                manualResult = "F4执行器回执：" + detail + "；上下轴固定步数已完成"
+                if (root.manualCameraZZeroKnown) {
+                    manualResult = manualResult
+                            + "；本地零点偏移="
+                            + Math.floor(Number(root.manualCameraZOffsetSteps || 0))
+                            + " step"
                 }
-                root.manualLastAckText = manualResult
-                root.manualPendingF4Command = ""
+            }
+            root.manualLastAckText = manualResult
+            root.manualPendingF4Command = ""
+            root.clearManualPendingMotionContext()
             root.storageState = root.formatF4ToastText(manualResult)
             root.appendManualCommandLog(action, "三轴电机", manualResult)
             root.showStorageToast()
@@ -9807,7 +10043,9 @@ Rectangle {
             clip: true
 
             /* motorConfig 保存当前页电机参数对象，所有字段显示都从 C++ 配置控制器读取。 */
-            property var motorConfig: root.currentStepperMotorSetting()
+            property var motorConfig: root.stepperMotorSettingsRevision >= 0
+                                      ? root.currentStepperMotorSetting()
+                                      : ({})
 
             MouseArea {
                 anchors.fill: parent
@@ -9922,7 +10160,33 @@ Rectangle {
                 border.color: "#344149"
                 border.width: 1
 
+                /*
+                 * stepperMotorSettingsFlickable 的作用：
+                 *   1. 只负责中间参数区域的垂直滑动，标题、页签、结果栏和底部按钮保持固定。
+                 *   2. 摄像头上下电机比其它电机多了下探、回升和超时时间三行，1024x600 屏幕上会超出固定卡片高度。
+                 *   3. 通过 contentHeight 让触摸屏可以把被遮住的 Z 轴超时行滑出来，而不是继续依赖 clip 裁剪。
+                 *   4. stepperMotorInputTouchGuard 标记下面按钮会禁止 Flickable 抢走点击，避免能滑动但输入按钮打不开。
+                 */
+                Flickable {
+                    id: stepperMotorSettingsFlickable
+                    anchors.fill: parent
+                    clip: true
+                    contentWidth: width
+                    contentHeight: stepperMotorSettingsContent.height
+                    flickableDirection: Flickable.VerticalFlick
+                    boundsBehavior: Flickable.StopAtBounds
+
+                    Item {
+                        id: stepperMotorSettingsContent
+                        width: stepperMotorSettingsFlickable.width
+                        height: (stepperMotorPopupPanel.motorConfig.role || "") === "camera_z"
+                                ? 360
+                                : ((stepperMotorPopupPanel.motorConfig.role || "") === "conveyor" ? 280 : 240)
+                    }
+                }
+
                 Text {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 12
                     width: parent.width - 28
@@ -9935,6 +10199,7 @@ Rectangle {
                 }
 
                 Text {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 38
                     width: parent.width - 28
@@ -9946,6 +10211,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 72
                     width: parent.width - 28
@@ -9997,6 +10263,7 @@ Rectangle {
                         MouseArea {
                             id: stepperAddressMinusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("address", -1)
@@ -10023,6 +10290,7 @@ Rectangle {
                         MouseArea {
                             id: stepperAddressPlusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("address", 1)
@@ -10032,6 +10300,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 112
                     width: parent.width - 28
@@ -10083,6 +10352,7 @@ Rectangle {
                         MouseArea {
                             id: stepperMinStepMinusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("minStep", -1)
@@ -10109,6 +10379,7 @@ Rectangle {
                         MouseArea {
                             id: stepperMinStepPlusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("minStep", 1)
@@ -10118,6 +10389,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 152
                     width: parent.width - 28
@@ -10169,6 +10441,7 @@ Rectangle {
                         MouseArea {
                             id: stepperSpeedMinusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("normalSpeedRpm", -10)
@@ -10195,6 +10468,7 @@ Rectangle {
                         MouseArea {
                             id: stepperSpeedInputMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.openStepperSpeedEditor("normalSpeedRpm")
@@ -10221,6 +10495,7 @@ Rectangle {
                         MouseArea {
                             id: stepperSpeedPlusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("normalSpeedRpm", 10)
@@ -10230,6 +10505,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 192
                     width: parent.width - 28
@@ -10282,6 +10558,7 @@ Rectangle {
                         MouseArea {
                             id: stepperScanSpeedMinusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("scanSpeedRpm", -10)
@@ -10308,6 +10585,7 @@ Rectangle {
                         MouseArea {
                             id: stepperScanSpeedInputMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.openStepperSpeedEditor("scanSpeedRpm")
@@ -10334,6 +10612,7 @@ Rectangle {
                         MouseArea {
                             id: stepperScanSpeedPlusMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("scanSpeedRpm", 10)
@@ -10343,6 +10622,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: (stepperMotorPopupPanel.motorConfig.role || "") === "conveyor" ? 232 : 192
                     width: parent.width - 28
@@ -10395,6 +10675,7 @@ Rectangle {
                         MouseArea {
                             id: stepperReverseMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("direction", -1)
@@ -10422,6 +10703,7 @@ Rectangle {
                         MouseArea {
                             id: stepperForwardMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.changeStepperMotorValue("direction", 1)
@@ -10431,6 +10713,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 232
                     width: parent.width - 28
@@ -10484,6 +10767,7 @@ Rectangle {
                         MouseArea {
                             id: stepperZDownInputMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.openStepperStepEditor("zDownFixedSteps")
@@ -10493,6 +10777,7 @@ Rectangle {
                 }
 
                 Row {
+                    parent: stepperMotorSettingsContent
                     x: 14
                     y: 272
                     width: parent.width - 28
@@ -10546,9 +10831,74 @@ Rectangle {
                         MouseArea {
                             id: stepperZUpInputMouse
                             anchors.fill: parent
+                            preventStealing: true
 
                             onClicked: {
                                 root.openStepperStepEditor("zUpFixedSteps")
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    parent: stepperMotorSettingsContent
+                    x: 14
+                    y: 312
+                    width: parent.width - 28
+                    height: 34
+                    spacing: 8
+                    visible: (stepperMotorPopupPanel.motorConfig.role || "") === "camera_z"
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Z轴超时"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: (Math.floor(Number(stepperMotorPopupPanel.motorConfig.zMotionTimeoutMs || 10000)) / 1000.0).toFixed(1) + " 秒"
+                            color: "#eef3f4"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: stepperZTimeoutInputMouse.pressed ? "#3c3322" : "#33291b"
+                        border.color: root.accentAmber
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "输入1~60秒"
+                            color: "#fff3d5"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperZTimeoutInputMouse
+                            anchors.fill: parent
+                            preventStealing: true
+
+                            onClicked: {
+                                root.openStepperStepEditor("zMotionTimeoutMs")
                             }
                         }
                     }
@@ -10911,7 +11261,7 @@ Rectangle {
                         x: 16
                         y: 14
                         width: parent.width - 108
-                        text: stepperStepEditKey === "zDownFixedSteps" ? "下探固定步数" : "回升固定步数"
+                        text: root.stepperStepEditorTitleText()
                         color: "#f1f4f5"
                         font.pixelSize: 18
                         font.bold: true
@@ -10950,7 +11300,7 @@ Rectangle {
                         x: 16
                         y: 54
                         width: parent.width - 32
-                        text: "范围 0~4294967295 step，对应张大头42步进电机位置模式 4 字节脉冲数。"
+                        text: root.stepperStepEditorRangeText()
                         color: "#cfd7db"
                         font.pixelSize: 12
                         font.bold: true
@@ -10969,7 +11319,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: root.stepperStepInputText + " step"
+                            text: root.stepperStepInputText + " " + root.stepperStepEditorUnitText()
                             color: "#ffffff"
                             font.pixelSize: 22
                             font.bold: true
@@ -11035,7 +11385,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: "重置为0"
+                            text: root.stepperStepEditorIsTimeout() ? "重置为10秒" : "重置为0"
                             color: "#d9ecff"
                             font.pixelSize: 13
                             font.bold: true
@@ -11063,7 +11413,7 @@ Rectangle {
 
                         Text {
                             anchors.centerIn: parent
-                            text: "应用步数"
+                            text: root.stepperStepEditorIsTimeout() ? "应用超时" : "应用步数"
                             color: "#eafff2"
                             font.pixelSize: 13
                             font.bold: true
@@ -12336,6 +12686,7 @@ Rectangle {
          *   这里同步最近操作提示，保证底部状态栏能显示真实配置变化。
          */
         onSettingsChanged: {
+            root.stepperMotorSettingsRevision += 1
             root.settingsLastActionText = detectSettings.lastStatusText
             root.storageState = root.settingsLastActionText
         }

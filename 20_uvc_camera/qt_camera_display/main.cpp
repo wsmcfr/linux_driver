@@ -259,6 +259,12 @@ static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE = 0x52U;
 /* 二进制执行器设零命令：用于参数设置页把当前电机位置设为新的零点，不主动运动。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACTUATOR_HOME = 0x53U;
 
+/* F4_ACTUATOR_STOP_NOW_REPEAT_COUNT 是手动停止键重复写入 STOP 帧的次数；STOP 幂等，重复写入能覆盖串口竞争窗口。 */
+static const int F4_ACTUATOR_STOP_NOW_REPEAT_COUNT = 3;
+
+/* F4_ACTUATOR_STOP_NOW_REPEAT_DELAY_US 是重复 STOP 帧之间的短间隔，单位 us，给 F4 USART1 任务留出取帧时间。 */
+static const int F4_ACTUATOR_STOP_NOW_REPEAT_DELAY_US = 20000;
+
 /* 二进制协议 ACK 命令：F4 用它确认关键命令已被接收并接受。 */
 static const quint8 BINARY_PROTOCOL_CMD_ACK = 0x80U;
 
@@ -295,8 +301,17 @@ static const int MP157_ACTUATOR_FALLBACK_SETTLE_MS = 450;
 /* MP157 本地估算最短等待：小步数也不能马上推进 ROI 复查，单位 ms。 */
 static const int MP157_ACTUATOR_FALLBACK_MIN_MS = 1200;
 
-/* MP157 本地估算最长等待：现场把 Z 轴速度/步数调到 10 秒内完成，后台线程也必须在 10 秒兜底返回，避免串口 busy 卡住 ROI 微调。 */
-static const int MP157_ACTUATOR_FALLBACK_MAX_MS = 10000;
+/* MP157 本地估算默认最长等待：保留比 C++ 70 秒串口等待略短的上限，避免后台线程永久占用。 */
+static const int MP157_ACTUATOR_FALLBACK_MAX_MS = 65000;
+
+/* MP157 Z 轴参数页可配置超时默认值：旧现场流程使用 10 秒，缺少 JSON 字段时继续沿用这个安全值。 */
+static const int MP157_CAMERA_Z_TIMEOUT_DEFAULT_MS = 10000;
+
+/* MP157 Z 轴参数页可配置超时下限：小于 1 秒的等待容易让相机还没稳定就进入检测。 */
+static const int MP157_CAMERA_Z_TIMEOUT_MIN_MS = 1000;
+
+/* MP157 Z 轴参数页可配置超时上限：保持低于 C++ ACTUATOR_POS_MOVE 硬等待窗口，避免串口线程长时间占用。 */
+static const int MP157_CAMERA_Z_TIMEOUT_MAX_MS = 60000;
 
 /* 二进制称重结果命令：F4 读取 HX711 稳定结果后主动上报给 MP157。 */
 static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U;
@@ -364,6 +379,7 @@ static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
  *   direction 是方向映射，1 表示正向，-1 表示反向，用于现场坐标越调越远时快速反转。
  *   zDownFixedSteps 是上下电机自动检测前下探的固定相对位置步数，单位为 step。
  *   zUpFixedSteps 是上下电机模型检测后回升的固定相对位置步数，单位为 step。
+ *   zMotionTimeoutMs 是 MP157 等待上下电机下降/回升 DONE 或本地估算完成的最大时间，单位 ms。
  */
 struct StepperMotorSettings
 {
@@ -377,6 +393,7 @@ struct StepperMotorSettings
     int direction = 1;
     quint32 zDownFixedSteps = 0U;
     quint32 zUpFixedSteps = 0U;
+    int zMotionTimeoutMs = MP157_CAMERA_Z_TIMEOUT_DEFAULT_MS;
 };
 
 /*
@@ -428,6 +445,7 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraZMotor.direction = 1;
     cameraZMotor.zDownFixedSteps = 800U;
     cameraZMotor.zUpFixedSteps = 800U;
+    cameraZMotor.zMotionTimeoutMs = MP157_CAMERA_Z_TIMEOUT_DEFAULT_MS;
     motors.append(cameraZMotor);
 
     return motors;
@@ -477,6 +495,7 @@ static QVariantMap stepperMotorToVariantMap(const StepperMotorSettings &motor, i
     map.insert(QStringLiteral("directionText"), stepperDirectionText(motor.direction));
     map.insert(QStringLiteral("zDownFixedSteps"), static_cast<double>(motor.zDownFixedSteps));
     map.insert(QStringLiteral("zUpFixedSteps"), static_cast<double>(motor.zUpFixedSteps));
+    map.insert(QStringLiteral("zMotionTimeoutMs"), motor.zMotionTimeoutMs);
     return map;
 }
 
@@ -4027,7 +4046,7 @@ public:
      *
      * 参数：
      *   index 是弹窗页序号，0=传送带，1=摄像头左右，2=摄像头上下。
-     *   key 是字段名，支持 address/minStep/normalSpeedRpm/scanSpeedRpm/direction。
+     *   key 是字段名，支持 address/minStep/normalSpeedRpm/scanSpeedRpm/direction/zMotionTimeoutMs。
      *   value 是字段新值，函数内部会再次限幅。
      *
      * 返回值：
@@ -4053,6 +4072,8 @@ public:
             motor.scanSpeedRpm = value;
         } else if (key == QStringLiteral("direction")) {
             motor.direction = value >= 0 ? 1 : -1;
+        } else if (key == QStringLiteral("zMotionTimeoutMs")) {
+            motor.zMotionTimeoutMs = value;
         } else {
             setLastStatusText(QStringLiteral("步进电机参数：字段无效 ") + key);
             return false;
@@ -4188,6 +4209,8 @@ public:
                 motorObject.value(QStringLiteral("z_up_fixed_steps")).toDouble(
                     motorObject.value(QStringLiteral("zUpFixedSteps")).toDouble(
                         static_cast<double>(motor.zUpFixedSteps))));
+            motor.zMotionTimeoutMs = motorObject.value(QStringLiteral("z_motion_timeout_ms")).toInt(
+                motorObject.value(QStringLiteral("zMotionTimeoutMs")).toInt(motor.zMotionTimeoutMs));
             next.stepperMotors[index] = motor;
         }
 
@@ -4245,6 +4268,7 @@ public:
             motorObject.insert(QStringLiteral("direction"), motor.direction);
             motorObject.insert(QStringLiteral("z_down_fixed_steps"), static_cast<double>(motor.zDownFixedSteps));
             motorObject.insert(QStringLiteral("z_up_fixed_steps"), static_cast<double>(motor.zUpFixedSteps));
+            motorObject.insert(QStringLiteral("z_motion_timeout_ms"), motor.zMotionTimeoutMs);
             stepperMotorsArray.append(motorObject);
         }
         object.insert(QStringLiteral("stepper_motors"), stepperMotorsArray);
@@ -4351,7 +4375,7 @@ private:
      *
      * 主要流程：
      *   1. 以 defaultStepperMotorSettings() 为基准，确保始终只有三台已知电机。
-     *   2. 只继承用户可调的 address/minStep/normalSpeedRpm/scanSpeedRpm/direction，不允许 JSON 改写 name/role/serialName。
+     *   2. 只继承用户可调的 address/minStep/normalSpeedRpm/scanSpeedRpm/direction/zMotionTimeoutMs，不允许 JSON 改写 name/role/serialName。
      *   3. 对地址、步长、速度和方向做统一限幅；速度允许 0~5000，0 表示配置为常规停止速度。
      *
      * 参数：
@@ -4376,6 +4400,9 @@ private:
             motor.direction = source.direction >= 0 ? 1 : -1;
             motor.zDownFixedSteps = source.zDownFixedSteps;
             motor.zUpFixedSteps = source.zUpFixedSteps;
+            motor.zMotionTimeoutMs = clampedInt(source.zMotionTimeoutMs,
+                                                MP157_CAMERA_Z_TIMEOUT_MIN_MS,
+                                                MP157_CAMERA_Z_TIMEOUT_MAX_MS);
             normalized[index] = motor;
         }
 
@@ -4409,7 +4436,8 @@ private:
                     || leftMotor.scanSpeedRpm != rightMotor.scanSpeedRpm
                     || leftMotor.direction != rightMotor.direction
                     || leftMotor.zDownFixedSteps != rightMotor.zDownFixedSteps
-                    || leftMotor.zUpFixedSteps != rightMotor.zUpFixedSteps) {
+                    || leftMotor.zUpFixedSteps != rightMotor.zUpFixedSteps
+                    || leftMotor.zMotionTimeoutMs != rightMotor.zMotionTimeoutMs) {
                 return false;
             }
         }
@@ -7931,8 +7959,43 @@ public:
                                                 double stepsValue,
                                                 int flags)
     {
+        return sendF4ActuatorPositionMoveWithTimeout(actuator,
+                                                     direction,
+                                                     mode,
+                                                     speedRpm,
+                                                     stepsValue,
+                                                     flags,
+                                                     MP157_ACTUATOR_FALLBACK_MAX_MS);
+    }
+
+    /*
+     * sendF4ActuatorPositionMoveWithTimeout 的作用：
+     *   发送 ACTUATOR_POS_MOVE，并允许 QML 为本次位置运动指定 MP157 本地最大等待时间。
+     *
+     * 主要流程：
+     *   1. 和 sendF4ActuatorPositionMove() 使用同一套参数校验和负载编码。
+     *   2. timeoutMs 只影响 MP157 等待 F4 DONE 或本地估算完成的最大时长，不写入 F4 协议负载。
+     *   3. 摄像头上下轴自动下降/回升用参数页 zMotionTimeoutMs 调用这里，避免把 10 秒写死在代码里。
+     *
+     * 参数：
+     *   timeoutMs 是本次 MP157 本地等待上限，单位 ms，会被限制在 1~60 秒。
+     *
+     * 返回值：
+     *   true 表示后台串口任务已启动；false 表示参数非法、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4ActuatorPositionMoveWithTimeout(int actuator,
+                                                           int direction,
+                                                           int mode,
+                                                           int speedRpm,
+                                                           double stepsValue,
+                                                           int flags,
+                                                           int timeoutMs)
+    {
         const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
         const quint32 steps = clampedUInt32FromDouble(stepsValue);
+        const int fallbackMaxWaitMs = clampedInt(timeoutMs,
+                                                 MP157_CAMERA_Z_TIMEOUT_MIN_MS,
+                                                 MP157_CAMERA_Z_TIMEOUT_MAX_MS);
         QByteArray payload;        /* payload 保存 ACTUATOR_POS_MOVE 的固定 12 字节负载。 */
         QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
 
@@ -7969,7 +8032,8 @@ public:
         return startF4ActuatorCommand(QStringLiteral("ACTUATOR_POS_MOVE"),
                                       BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE,
                                       cycleId,
-                                      payload);
+                                      payload,
+                                      fallbackMaxWaitMs);
     }
 
     /*
@@ -10559,7 +10623,13 @@ private:
         QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId]() {
             QString detail;
             const bool ok = (command == BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE)
-                    ? runF4ActuatorPositionMoveAndWaitDone(dev, baud, frame, sequence, cycleId, &detail)
+                    ? runF4ActuatorPositionMoveAndWaitDone(dev,
+                                                           baud,
+                                                           frame,
+                                                           sequence,
+                                                           cycleId,
+                                                           MP157_ACTUATOR_FALLBACK_MAX_MS,
+                                                           &detail)
                     : sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
 
             if (!self) {
@@ -10604,6 +10674,7 @@ private:
      *   command 是要写入协议 CMD 字段的命令字。
      *   cycleId 是本次命令归属的流程号，手动命令允许为 0。
      *   payload 是已经编码好的协议负载。
+     *   positionFallbackMaxWaitMs 是 ACTUATOR_POS_MOVE 等待 F4 DONE 的 MP157 本地最大兜底时长。
      *
      * 返回值：
      *   true 表示后台任务已启动；false 表示串口忙或线程创建失败。
@@ -10611,7 +10682,8 @@ private:
     bool startF4ActuatorCommand(const QString &action,
                                 quint8 command,
                                 quint16 cycleId,
-                                const QByteArray &payload)
+                                const QByteArray &payload,
+                                int positionFallbackMaxWaitMs = MP157_ACTUATOR_FALLBACK_MAX_MS)
     {
         if (m_f4CommandRunning) {
             emit f4ActuatorCommandFinished(false,
@@ -10636,9 +10708,17 @@ private:
         m_f4CommandRunning = true;
 
         QPointer<DeviceHealthController> self(this);
-        QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId]() {
+        QThread *workerThread = QThread::create([self, dev, baud, frame, action, command, sequence, cycleId, positionFallbackMaxWaitMs]() {
             QString detail;
-            const bool ok = sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
+            const bool ok = (command == BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE)
+                    ? runF4ActuatorPositionMoveAndWaitDone(dev,
+                                                           baud,
+                                                           frame,
+                                                           sequence,
+                                                           cycleId,
+                                                           positionFallbackMaxWaitMs,
+                                                           &detail)
+                    : sendF4BinaryCommand(dev, baud, frame, command, sequence, cycleId, &detail);
 
             if (!self) {
                 return;
@@ -10696,7 +10776,12 @@ private:
         QPointer<DeviceHealthController> self(this);
         QThread *workerThread = QThread::create([self, dev, baud, frame, action, cycleId, sequence]() {
             QString detail;        /* detail 保存写入线程生成的结果说明，回到主线程后显示到 QML。 */
-            const bool ok = writeF4BinaryFrameWithoutReply(dev, baud, frame, &detail);
+            const bool ok = writeF4BinaryFrameWithoutReply(dev,
+                                                           baud,
+                                                           frame,
+                                                           &detail,
+                                                           F4_ACTUATOR_STOP_NOW_REPEAT_COUNT,
+                                                           F4_ACTUATOR_STOP_NOW_REPEAT_DELAY_US);
 
             if (!detail.isEmpty()) {
                 detail += QStringLiteral(" seq=") + QString::number(sequence);
@@ -11153,13 +11238,16 @@ private:
      * 主要流程：
      *   1. 打开 `/dev/ttySTM2` 并配置为 115200 8N1 raw 模式。
      *   2. 写入完整二进制帧，并调用 tcdrain() 等待内核发送队列排空。
-     *   3. 不调用 readF4BinaryReply()，避免强制 STOP 和上一条普通命令线程同时抢读回包。
+     *   3. STOP 是幂等安全动作，允许按 repeatCount 重复写入，覆盖手动停止和普通 ACK 等待重叠的窗口。
+     *   4. 不调用 readF4BinaryReply()，避免强制 STOP 和上一条普通命令线程同时抢读回包。
      *
      * 参数：
      *   device 是 Linux 串口节点。
      *   baud 是串口波特率。
      *   frame 是要写入的完整二进制帧。
      *   detail 返回写入结果或失败原因，可为 NULL。
+     *   repeatCount 是同一 STOP 帧重复写入次数，小于 1 时按 1 次处理。
+     *   repeatDelayUs 是重复写入之间的短间隔，单位 us。
      *
      * 返回值：
      *   完整写入并排空发送队列返回 true；打开、配置、写入或 tcdrain 失败返回 false。
@@ -11167,11 +11255,14 @@ private:
     static bool writeF4BinaryFrameWithoutReply(const QString &device,
                                                int baud,
                                                const QByteArray &frame,
-                                               QString *detail)
+                                               QString *detail,
+                                               int repeatCount = 1,
+                                               int repeatDelayUs = 0)
     {
         const QByteArray devBytes = device.toLocal8Bit();
         int fd = -1;              /* fd 保存本次强制 STOP 独立打开的串口文件描述符。 */
         struct termios tio;       /* tio 保存串口 raw 配置，保证二进制帧不会被行规程改写。 */
+        const int safeRepeatCount = std::max(1, repeatCount);
 
         if (frame.isEmpty()) {
             if (detail) {
@@ -11219,26 +11310,42 @@ private:
          * TCIOFLUSH 会丢弃输入数据，可能影响上一条普通命令线程正在等待的 ACK。
          */
         tcflush(fd, TCOFLUSH);
-        if (!writeAllToFd(fd, frame)) {
-            if (detail) {
-                *detail = QStringLiteral("写入 F4 强制停止帧失败：") + hexByteString(frame);
+        for (int attempt = 0; attempt < safeRepeatCount; ++attempt) {
+            /*
+             * 每一轮都完整写入并等待发送队列排空。
+             * 如果 F4 正在处理上一条位置/速度命令，重复 STOP 可以确保下一次 USART1 取帧仍能看到停止请求。
+             */
+            if (!writeAllToFd(fd, frame)) {
+                if (detail) {
+                    *detail = QStringLiteral("写入 F4 强制停止帧失败：")
+                            + hexByteString(frame)
+                            + QStringLiteral(" attempt=")
+                            + QString::number(attempt + 1);
+                }
+                ::close(fd);
+                return false;
             }
-            ::close(fd);
-            return false;
-        }
 
-        if (tcdrain(fd) != 0) {
-            if (detail) {
-                *detail = QStringLiteral("等待 F4 强制停止帧发送完成失败");
+            if (tcdrain(fd) != 0) {
+                if (detail) {
+                    *detail = QStringLiteral("等待 F4 强制停止帧发送完成失败 attempt=")
+                            + QString::number(attempt + 1);
+                }
+                ::close(fd);
+                return false;
             }
-            ::close(fd);
-            return false;
+
+            if ((attempt + 1 < safeRepeatCount) && (repeatDelayUs > 0)) {
+                usleep(static_cast<useconds_t>(repeatDelayUs));
+            }
         }
 
         ::close(fd);
         if (detail) {
             *detail = QStringLiteral("ACTUATOR_STOP 已写入串口，bytes=")
                     + QString::number(frame.size())
+                    + QStringLiteral("，repeat=")
+                    + QString::number(safeRepeatCount)
                     + QStringLiteral("，不等待ACK");
         }
         return true;
@@ -11387,16 +11494,20 @@ private:
      *   2. 直接读取帧内 actuator、direction、speed_rpm 和 steps，因此用户在参数页修改速度或步数后，
      *      下一次命令会自动得到新的估算等待时间，不使用写死 sleep。
      *   3. 用 steps / 每圈步数 / rpm 换算运动时间，再叠加安全余量和短稳定时间。
-     *   4. 对异常输入做限幅；如果帧格式不对则返回 -1，调用方继续只等 F4 事件。
+     *   4. 用 fallbackMaxWaitMs 作为参数页或默认策略传入的最大等待上限，避免固定等待时间。
+     *   5. 对异常输入做限幅；如果帧格式不对则返回 -1，调用方继续只等 F4 事件。
      *
      * 参数：
      *   frame 是已经写给 F4 的完整 ACTUATOR_POS_MOVE 二进制帧。
+     *   fallbackMaxWaitMs 是本次位置运动允许 MP157 本地兜底等待的最大时间，单位 ms。
      *   summary 用于返回本次估算使用的 actuator、direction、speed、steps 和 wait_ms，便于现场日志对账。
      *
      * 返回值：
      *   返回正整数表示 MP157 本地兜底等待毫秒数；返回 -1 表示无法安全估算。
      */
-    static int estimateActuatorPositionMoveFallbackMs(const QByteArray &frame, QString *summary)
+    static int estimateActuatorPositionMoveFallbackMs(const QByteArray &frame,
+                                                      int fallbackMaxWaitMs,
+                                                      QString *summary)
     {
         const int payloadOffset = 7;       /* payloadOffset 指向完整帧中 PAYLOAD 的首字节。 */
         const int payloadLengthOffset = 4; /* payloadLengthOffset 是 LEN 字段下标。 */
@@ -11435,12 +11546,15 @@ private:
                 : fallbackSpeedRpm;
         const double moveMsDouble = (static_cast<double>(steps) * 60000.0)
                 / (static_cast<double>(MP157_ACTUATOR_FALLBACK_STEPS_PER_REV) * static_cast<double>(speedRpm));
+        const int safeFallbackMaxWaitMs = clampedInt(fallbackMaxWaitMs,
+                                                     MP157_CAMERA_Z_TIMEOUT_MIN_MS,
+                                                     MP157_ACTUATOR_FALLBACK_MAX_MS);
         int waitMs = static_cast<int>(std::ceil(moveMsDouble))
                 + MP157_ACTUATOR_FALLBACK_SAFETY_MS
                 + MP157_ACTUATOR_FALLBACK_SETTLE_MS;
 
         waitMs = std::max(MP157_ACTUATOR_FALLBACK_MIN_MS, waitMs);
-        waitMs = std::min(MP157_ACTUATOR_FALLBACK_MAX_MS, waitMs);
+        waitMs = std::min(safeFallbackMaxWaitMs, waitMs);
 
         if (summary) {
             *summary = QStringLiteral("mp157-local-estimate actuator=") + QString::number(actuator)
@@ -11448,6 +11562,7 @@ private:
                     + QStringLiteral(" speed_rpm=") + QString::number(speedRpm)
                     + QStringLiteral(" speed_source=") + (speedRpmRaw > 0U ? QStringLiteral("frame") : QStringLiteral("axis-default"))
                     + QStringLiteral(" steps=") + QString::number(steps)
+                    + QStringLiteral(" fallbackMaxWaitMs=") + QString::number(safeFallbackMaxWaitMs)
                     + QStringLiteral(" wait_ms=") + QString::number(waitMs);
         }
 
@@ -11470,6 +11585,7 @@ private:
      *   frame 是已经组好的 ACTUATOR_POS_MOVE 完整帧。
      *   expectedSequence 是本次位置运动命令序号。
      *   expectedCycleId 是自动流程 ID，手动命令允许为 0。
+     *   fallbackMaxWaitMs 是 MP157 本地估算完成的最大等待时间，自动 Z 轴来自参数页 zMotionTimeoutMs。
      *   detail 返回 ACK 和 DONE/TIMEOUT 的完整诊断文本。
      *
      * 返回值：
@@ -11481,6 +11597,7 @@ private:
                                                      const QByteArray &frame,
                                                      quint16 expectedSequence,
                                                      quint16 expectedCycleId,
+                                                     int fallbackMaxWaitMs,
                                                      QString *detail)
     {
         const QByteArray devBytes = device.toLocal8Bit();
@@ -11492,7 +11609,9 @@ private:
         bool ackMatched = false;             /* ackMatched 标记是否已经收到本命令对应的 ACK。 */
         QElapsedTimer ackTimer;              /* ackTimer 限制 ACK 阶段等待时间。 */
         QElapsedTimer moveTimer;             /* moveTimer 限制到位事件阶段等待时间。 */
-        const int fallbackMoveMs = estimateActuatorPositionMoveFallbackMs(frame, &fallbackEstimateDetail);
+        const int fallbackMoveMs = estimateActuatorPositionMoveFallbackMs(frame,
+                                                                          fallbackMaxWaitMs,
+                                                                          &fallbackEstimateDetail);
 
         if (frame.isEmpty()) {
             if (detail) {
@@ -13096,6 +13215,7 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("stepper_motor[2].normal_speed_rpm=5000\n")
         + QStringLiteral("stepper_motor[2].scan_speed_rpm=0\n")
         + QStringLiteral("stepper_motor[2].direction=1 (正向)\n")
+        + QStringLiteral("stepper_motor[2].z_motion_timeout_ms=10000\n")
         + QStringLiteral("classify_args=--roi 352 --bad-threshold 0.650\n")
         + QStringLiteral("segment_args=--roi 352 --alpha 0.45 --min-defect-pixels 120\n");
 
