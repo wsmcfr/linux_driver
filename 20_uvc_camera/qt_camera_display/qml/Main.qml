@@ -55,11 +55,17 @@ Rectangle {
     /* autoCycleId 保存 MP157 当前自动检测流程号，由 C++ 在 F4 ACK/NACK 回调中返回。 */
     property int autoCycleId: 0
 
-    /* autoWorkflowRunning 表示 MP157 本地认为 F4 自动检测流程正在运行，用于 UI 状态和后续按钮语义。 */
+    /* autoWorkflowRunning 表示整个自动循环会话仍处于启用状态；只要它为 true，单件完成后就应继续进入下一轮。 */
     property bool autoWorkflowRunning: false
+
+    /* autoCycleRunning 表示当前这一个零件对应的 F4 cycle 仍在运行中；收到 CYCLE_DONE 后必须清零。 */
+    property bool autoCycleRunning: false
 
     /* autoWorkflowPaused 表示当前自动流程处于暂停状态，停止后不能继续，只能重新开始。 */
     property bool autoWorkflowPaused: false
+
+    /* autoRestartQueued 表示当前已经排队准备自动启动下一轮，防止本轮完成回调中重复触发 START_CYCLE。 */
+    property bool autoRestartQueued: false
 
     /* autoLastAckText 保存最近一次 F4 二进制自动流程 ACK/NACK 文本，便于现场串口调试核对。 */
     property string autoLastAckText: "自动流程待开始"
@@ -828,6 +834,23 @@ Rectangle {
             return
         }
 
+        /*
+         * 停止整个自动循环会话的本地兜底：
+         *   1. 如果当前 cycle 已经结束，但自动循环会话还处于“准备下一轮”的状态，
+         *      这时不应该再拿旧 cycle 发 STOP_CYCLE。
+         *   2. 直接在 MP157 本地结束会话，并取消已经排队的下一轮自动启动。
+         */
+        if (action === "stop"
+                && autoWorkflowRunning
+                && !autoCycleRunning
+                && !autoWorkflowPaused) {
+            root.stopAutoWorkflowSessionLocally("自动循环已停止：当前轮次已完成，不再启动下一轮", "停止")
+            root.autoLastAckText = "自动循环已停止：当前轮次已完成，未再发送旧 cycle 停止命令"
+            root.storageState = root.formatF4ToastText(root.autoLastAckText)
+            root.showStorageToast()
+            return
+        }
+
         autoPendingAction = action
         autoPendingStateText = stateText
         autoControlBusy = true
@@ -994,6 +1017,87 @@ Rectangle {
         if (reason && reason.length > 0) {
             autoVisionLastText = reason
         }
+    }
+
+    /*
+     * stopAutoWorkflowSessionLocally 的作用：
+     *   统一结束 MP157 本地自动循环会话，用于“本轮已结束后用户按停止”或故障退出场景。
+     *
+     * 主要流程：
+     *   1. 关闭自动续跑排队标志，避免 Qt.callLater 中的下一轮 start 误启动。
+     *   2. 清空“会话启用/当前 cycle 运行/暂停”三类本地状态。
+     *   3. 停止自动视觉定时器，并把 workflowState/storageState 切到明确的终态文本。
+     *
+     * 参数：
+     *   reason 是写入底部提示和自动视觉最后状态的中文原因。
+     *   stateText 是界面显示的流程状态，如“停止”或“待人工处理”。
+     *
+     * 返回值：
+     *   无返回值；该函数只修改 MP157 本地状态，不直接下发 F4 二进制命令。
+     */
+    function stopAutoWorkflowSessionLocally(reason, stateText) {
+        autoRestartQueued = false
+        autoWorkflowRunning = false
+        autoCycleRunning = false
+        autoWorkflowPaused = false
+        stopAutoVisionLoop(reason)
+        workflowState = stateText
+        storageState = reason
+    }
+
+    /*
+     * markAutoWorkflowAbnormalStopRequired 的作用：
+     *   处理“MP157 本地已经判定本轮异常，但 F4 侧大概率仍保留旧 cycle 运行态”的场景。
+     *
+     * 主要流程：
+     *   1. 关闭自动续跑排队，避免异常后继续偷偷启动下一轮。
+     *   2. 保留“会话仍在运行/当前 cycle 仍在运行”的本地状态，让首页停止键保持可点击。
+     *   3. 停掉自动视觉闭环，把界面状态切到“待人工停止/异常待停止”这类明确终态，
+     *      防止用户只能点开始，结果 C++ 又提示“当前流程未停止”。
+     *
+     * 参数：
+     *   reason 是写入底部提示的详细异常原因。
+     *   stateText 是首页流程状态文案，例如“待人工停止”或“分拣异常待停止”。
+     *
+     * 返回值：
+     *   无返回值；该函数只调整 MP157 本地状态，不会自动给 F4 发 STOP_CYCLE，
+     *   停止动作仍由用户点击首页“停止”按钮显式触发。
+     */
+    function markAutoWorkflowAbnormalStopRequired(reason, stateText) {
+        autoRestartQueued = false
+        autoWorkflowRunning = true
+        autoCycleRunning = true
+        autoWorkflowPaused = false
+        stopAutoVisionLoop(reason)
+        workflowState = stateText
+        storageState = reason
+    }
+
+    /*
+     * queueNextAutoCycleStart 的作用：
+     *   在上一件零件收到 CYCLE_DONE 后，如果自动循环会话还启用，则异步启动下一轮 START_CYCLE。
+     *
+     * 主要流程：
+     *   1. 用 autoRestartQueued 防止同一轮完成回调重复排队。
+     *   2. 通过 Qt.callLater 把下一轮 start 放到当前回调之后，避免和当前 FINAL_SORT_RESULT 结束逻辑交织。
+     *   3. 启动前再次检查会话是否仍启用、当前 cycle 是否已结束，以及是否没有新的自动流程命令在途。
+     *
+     * 返回值：
+     *   无返回值；真正的状态推进仍以 F4 START_CYCLE ACK 为准。
+     */
+    function queueNextAutoCycleStart() {
+        if (autoRestartQueued) {
+            return
+        }
+
+        autoRestartQueued = true
+        Qt.callLater(function() {
+            autoRestartQueued = false
+            if (!autoWorkflowRunning || autoWorkflowPaused || autoCycleRunning || autoControlBusy) {
+                return
+            }
+            handleControlAction("start", "定位预览")
+        })
     }
 
     /*
@@ -3993,10 +4097,20 @@ Rectangle {
             settingsLastActionText = "真实检测配置：下一次检测将使用当前内存参数"
         } else if (action === "save") {
             var saveResult = detectSettings.saveSettingsToDisk()
+            var reloadResult = ""
+            if (saveResult.indexOf("保存成功：") === 0) {
+                if (detectSettings.loadSettingsFromDisk()) {
+                    reloadResult = "已从JSON重新加载"
+                } else {
+                    reloadResult = "JSON回读失败：" + detectSettings.lastStatusText
+                }
+            }
             var saveLogResult = storageController.recordSettingsSummaryToSdCard(
                         "settings-save",
                         settingsLogText("保存配置", saveResult))
-            settingsLastActionText = saveResult + "；" + saveLogResult
+            settingsLastActionText = saveResult
+                    + (reloadResult.length > 0 ? "；" + reloadResult : "")
+                    + "；" + saveLogResult
             refreshLogFileList()
             syncStepperSettingsToF4("保存配置同步F4")
         } else if (action === "reset") {
@@ -6265,24 +6379,24 @@ Rectangle {
             if (ok) {
                 if (action === "start") {
                     root.autoWorkflowRunning = true
+                    root.autoCycleRunning = true
                     root.autoWorkflowPaused = false
                     root.workflowState = "定位预览"
                     root.startAutoVisionLoop()
                 } else if (action === "pause") {
                     root.autoWorkflowRunning = true
+                    root.autoCycleRunning = true
                     root.autoWorkflowPaused = true
                     root.workflowState = "暂停"
                     root.stopAutoVisionLoop("自动视觉已暂停")
                 } else if (action === "resume") {
                     root.autoWorkflowRunning = true
+                    root.autoCycleRunning = true
                     root.autoWorkflowPaused = false
                     root.workflowState = "继续检测"
                     root.startAutoVisionLoop()
                 } else if (action === "stop") {
-                    root.autoWorkflowRunning = false
-                    root.autoWorkflowPaused = false
-                    root.workflowState = "停止"
-                    root.stopAutoVisionLoop("自动视觉已停止")
+                    root.stopAutoWorkflowSessionLocally("自动视觉已停止", "停止")
                 }
 
                 if (!root.usingKmsOverlay && !root.usingGstVideo) {
@@ -6296,12 +6410,16 @@ Rectangle {
                 root.autoLastAckText = "自动流程ACK：cycle=" + cycleId + "，" + detail
             } else {
                 root.autoLastAckText = "自动流程失败：" + detail
+                if (action === "start"
+                        && detail.indexOf("当前流程未停止，请先按停止后再开始新检测") >= 0) {
+                    root.markAutoWorkflowAbnormalStopRequired("F4仍认为旧自动流程在运行，请先按停止清理旧流程", "待人工停止")
+                }
                 if (action === "start" || action === "resume") {
                     root.stopAutoVisionLoop("自动视觉未启动：" + detail)
                 }
                 if (root.autoWorkflowPaused) {
                     root.workflowState = "暂停"
-                } else if (root.autoWorkflowRunning) {
+                } else if (root.autoWorkflowRunning || root.autoCycleRunning) {
                     root.workflowState = "自动检测运行中"
                 } else {
                     root.workflowState = "定位预览"
@@ -6517,8 +6635,8 @@ Rectangle {
                                                                   ldcContextJson,
                                                                   f4FlowContextJson)
             } else {
-                root.workflowState = "待人工处理"
-                root.storageState = "F4机械臂称重/电感流程失败：" + detail
+                root.markAutoWorkflowAbnormalStopRequired("F4机械臂称重/电感流程失败：" + detail,
+                                                          "待人工停止")
                 root.raiseRuntimeAlarm("f4-link-failed",
                                        "ALM-F4-001",
                                        "告警",
@@ -6538,13 +6656,19 @@ Rectangle {
          */
         onF4FinalSortFinished: {
             if (ok) {
+                root.autoCycleRunning = false
+                root.autoWorkflowPaused = false
                 root.workflowState = "本轮完成"
                 root.storageState = "F4已完成最终分拣：" + detail + " " + cycleDoneContextJson
                 root.markAlarmRecovered("f4-link-failed")
                 root.markAlarmRecovered("cloud-upload-failed")
+                if (root.autoWorkflowRunning) {
+                    root.storageState = root.storageState + "；准备启动下一轮自动检测"
+                    root.queueNextAutoCycleStart()
+                }
             } else {
-                root.workflowState = "分拣异常"
-                root.storageState = "F4最终分拣失败：" + detail
+                root.markAutoWorkflowAbnormalStopRequired("F4最终分拣失败：" + detail,
+                                                          "分拣异常待停止")
                 root.raiseRuntimeAlarm("f4-link-failed",
                                        "ALM-F4-001",
                                        "告警",
@@ -6758,7 +6882,8 @@ Rectangle {
             if (!deviceHealth.requestF4FinalSortResult(root.latestCompletedCloudResult,
                                                        root.latestCompletedUploadResultText,
                                                        root.settingsF4ArmResultTimeoutMs)) {
-                root.storageState = "F4最终分拣命令未启动：" + root.latestCompletedUploadResultText
+                root.markAutoWorkflowAbnormalStopRequired("F4最终分拣命令未启动：" + root.latestCompletedUploadResultText,
+                                                          "待人工停止")
                 root.showStorageToast()
             }
         }
@@ -6832,13 +6957,22 @@ Rectangle {
         }
     }
 
-    /* 左侧导航栏：当前只做视觉占位，不切换页面，后续可接 StackView。 */
+    /*
+     * 左侧导航栏：
+     *   负责在首页、历史、统计、手动、参数、告警和日志页面之间切换。
+     *
+     * 这里显式抬高 z 的原因：
+     *   1. 首页右侧结果区、历史页、统计页等普通内容都在导航栏之后声明，后续如果某个面板误扩到左侧，
+     *      没有显式层级时就可能把导航点击区域遮住。
+     *   2. 导航栏应始终高于普通业务页面，但仍低于详情弹层、参数弹窗和启动 splash。
+     */
     Rectangle {
         id: navPanel
         x: 0
         y: topBar.height
         width: 160
         height: root.height - topBar.height
+        z: 20
         color: "#17191b"
         border.color: root.borderColor
         border.width: 1
@@ -6878,6 +7012,7 @@ Rectangle {
 
                     MouseArea {
                         anchors.fill: parent
+                        preventStealing: true
 
                         onClicked: {
                             root.switchPage(modelData.page)
@@ -7297,9 +7432,9 @@ Rectangle {
                     radius: 6
                     property bool actionEnabled: !root.autoControlBusy && !root.autoVisionCommandBusy
                                                  && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
-                                                     || (modelData.action === "pause" && root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                                                     || (modelData.action === "pause" && root.autoCycleRunning && !root.autoWorkflowPaused)
                                                      || (modelData.action === "resume" && root.autoWorkflowPaused)
-                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoWorkflowPaused)))
+                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoCycleRunning || root.autoWorkflowPaused)))
                     color: !actionEnabled ? "#171b1e" : (overlayButtonMouse.pressed ? "#2d3338" : "#22272b")
                     border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1
@@ -13378,9 +13513,9 @@ Rectangle {
                     radius: 8
                     property bool actionEnabled: !root.autoControlBusy && !root.autoVisionCommandBusy
                                                  && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
-                                                     || (modelData.action === "pause" && root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                                                     || (modelData.action === "pause" && root.autoCycleRunning && !root.autoWorkflowPaused)
                                                      || (modelData.action === "resume" && root.autoWorkflowPaused)
-                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoWorkflowPaused)))
+                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoCycleRunning || root.autoWorkflowPaused)))
                     color: !actionEnabled ? "#171b1e" : (mouseArea.pressed ? "#2d3338" : "#22272b")
                     border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1

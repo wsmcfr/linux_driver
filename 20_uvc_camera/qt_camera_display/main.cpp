@@ -9387,6 +9387,15 @@ private slots:
         m_f4CommandRunning = false;
         m_f4FinalSortRunning = false;
 
+        /*
+         * CYCLE_DONE 表示这一件零件对应的自动流程已经真正闭环完成：
+         *   1. 当前旧 cycle 后续不能再接受 pause/resume/stop。
+         *   2. 如果 QML 侧要继续跑下一件，必须重新发送 START_CYCLE 生成新 cycle_id。
+         *   3. 因此这里无论成功还是失败，都先释放本地 running/paused 状态，避免后续误把旧 cycle 当成仍在运行。
+         */
+        m_f4AutoRunning = false;
+        m_f4AutoPaused = false;
+
         if (ok) {
             setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
             setDetailText(QStringLiteral("F4 最终分拣完成：") + detail);

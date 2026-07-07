@@ -200,6 +200,11 @@ require_grep "storageToastVisible" "qml/Main.qml"
 require_grep "showStorageToast" "qml/Main.qml"
 require_grep "formatF4ToastText" "qml/Main.qml"
 require_grep "F4:" "qml/Main.qml"
+require_grep "autoCycleRunning" "qml/Main.qml"
+require_grep "autoRestartQueued" "qml/Main.qml"
+require_grep "stopAutoWorkflowSessionLocally" "qml/Main.qml"
+require_grep "markAutoWorkflowAbnormalStopRequired" "qml/Main.qml"
+require_grep "queueNextAutoCycleStart" "qml/Main.qml"
 require_grep "manualMotorActionButtons" "qml/Main.qml"
 require_grep "回原位" "qml/Main.qml"
 require_grep "stepperMotorRoleAddressSummary" "qml/Main.qml"
@@ -217,9 +222,30 @@ f4_auto_finished_block="$(sed -n '/onF4AutoControlFinished:/,/onCloudStatusChang
 if ! printf '%s\n' "$f4_auto_finished_block" | grep -q 'formatF4ToastText'; then
     fail "首页自动流程 F4 回包底部提示必须通过 formatF4ToastText 加 F4: 前缀"
 fi
+if ! printf '%s\n' "$f4_auto_finished_block" | grep -q 'autoCycleRunning = true'; then
+    fail "首页自动流程 ACK 成功后必须标记当前 cycle 已运行，避免自动循环会话和单件状态混淆"
+fi
 f4_detail_changed_block="$(sed -n '/onDetailTextChanged:/,/onCloudStatusChanged:/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$f4_detail_changed_block" | grep -q 'formatF4ToastText'; then
     fail "F4 心跳/故障详情变化必须通过 formatF4ToastText 显示到底部提示"
+fi
+f4_final_sort_block="$(sed -n '/onF4FinalSortFinished:/,/onDetailTextChanged:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$f4_final_sort_block" | grep -q 'queueNextAutoCycleStart'; then
+    fail "收到 CYCLE_DONE 后，如果自动循环会话仍启用，QML 必须自动排队启动下一轮 START_CYCLE"
+fi
+if ! printf '%s\n' "$f4_final_sort_block" | grep -q 'markAutoWorkflowAbnormalStopRequired'; then
+    fail "最终分拣失败时必须保留停止入口，避免 F4 仍持有旧 cycle 时首页停止键变灰"
+fi
+settings_save_block="$(sed -n '/function settingsApplyAction(action)/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$settings_save_block" | grep -q 'detectSettings.loadSettingsFromDisk()'; then
+    fail "参数保存成功后必须立即从 defect_ui_config.json 回读，确保界面显示和重启后读取同源"
+fi
+arm_flow_finished_block="$(sed -n '/onF4ArmInspectionFlowFinished:/,/onF4FinalSortFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$arm_flow_finished_block" | grep -q 'markAutoWorkflowAbnormalStopRequired'; then
+    fail "称重/电感流程异常时必须保留停止入口，避免首页只能点开始却又被 F4 拒绝"
+fi
+if ! printf '%s\n' "$f4_auto_finished_block" | grep -q '当前流程未停止，请先按停止后再开始新检测'; then
+    fail "首页自动流程回包分支必须识别 F4 仍在运行的拒绝原因，并把界面切回可停止状态"
 fi
 require_grep "LogFileModel" "main.cpp"
 require_grep "logFileModel" "main.cpp"
@@ -300,6 +326,19 @@ if ! printf '%s\n' "$focus_latest_block" | grep -q 'historyDetailVisible = false
 fi
 if ! grep -q 'positionHistoryListAtSelected' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "进入历史页选中最新记录后必须滚动 historyListView，让最新卡片立即可见"
+fi
+nav_panel_block="$(awk '
+    /id: navPanel/ { found = 1; n = 0 }
+    found && n < 80 { print; n++ }
+' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$nav_panel_block" | grep -q 'z: 20'; then
+    fail "左侧导航栏必须显式高于普通页面内容，避免后续面板遮住导航点击区域"
+fi
+if ! printf '%s\n' "$nav_panel_block" | grep -q 'preventStealing: true'; then
+    fail "左侧导航栏触摸区域必须禁止手势抢占，避免页面滚动或覆盖层吞掉导航点击"
+fi
+if ! printf '%s\n' "$nav_panel_block" | grep -q 'root.switchPage(modelData.page)'; then
+    fail "左侧导航栏点击后必须真正调用 switchPage() 切换页面"
 fi
 history_analysis_block="$(awk '
     /id: historyAnalysisPanel/ { in_panel = 1 }
@@ -1238,6 +1277,23 @@ if [ -f "$F4_BINARY_PROTOCOL_SOURCE" ]; then
         fail "F407 二进制协议处理路径不能再输出 [OK][BIN]/[ERROR][BIN] 文本回包，正确/错误必须用 ACK/NACK/STATUS_REPORT"
     fi
 fi
+F4_ROBOT_ARM_SOURCE="/e/hal/bisai_f407_project/User/App/robot_arm_service.c"
+if [ -f "$F4_ROBOT_ARM_SOURCE" ]; then
+    grep -q '#define ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS[[:space:]]*(100000U)' "$F4_ROBOT_ARM_SOURCE" || fail "F407 机械臂动作超时当前必须保留 100000ms，用于覆盖真实长动作"
+    grep -q '#define ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN[[:space:]]*(14U)' "$F4_ROBOT_ARM_SOURCE" || fail "F407 机械臂动作 payload 必须扩展到 14 字节，让 timeout_ms 按 u32 发送"
+    grep -q 'uint32_t timeout_ms;' "$F4_ROBOT_ARM_SOURCE" || fail "F407 机械臂发送上下文 timeout_ms 必须是 uint32_t，不能再用 uint16_t"
+    grep -q 'RobotArmService_WriteU32Le.*payload\[6\].*timeout_ms' "$F4_ROBOT_ARM_SOURCE" || fail "F407 发给 ESP32S3 的 timeout_ms 必须从 payload[6] 开始按 u32 小端写入"
+    grep -q '#define ROBOT_ARM_SERVICE_DONE_EXTRA_TIMEOUT_MS[[:space:]]*(10000U)' "$F4_ROBOT_ARM_SOURCE" || fail "F407 DONE 额外等待余量必须和协议文档保持一致"
+fi
+require_repo_grep "ESP32S3 回包总原则" "docs/f4_esp32s3_arm_protocol/esp32s3_send_sequence.md"
+require_repo_grep "cycle_id.*原样带回" "docs/f4_esp32s3_arm_protocol/esp32s3_send_sequence.md"
+require_repo_grep "job_id.*首版.*cycle_id" "docs/f4_esp32s3_arm_protocol/esp32s3_send_sequence.md"
+require_repo_grep "part_type.*1.*波形垫圈" "docs/f4_esp32s3_arm_protocol/esp32s3_send_sequence.md"
+require_repo_grep "stage_id.*1.*称重" "docs/f4_esp32s3_arm_protocol/esp32s3_send_sequence.md"
+require_repo_grep "timeout_ms.*u32.*100000" "docs/f4_esp32s3_arm_protocol/esp32s3_send_sequence.md"
+require_repo_grep "#define ARM_LINK_STAGE_COMMAND_PAYLOAD_LENGTH[[:space:]]*\\(14U\\)" "docs/f4_esp32s3_arm_protocol/arm_link_protocol.h"
+require_repo_grep "uint32_t timeout_ms" "docs/f4_esp32s3_arm_protocol/arm_link_protocol.h"
+require_repo_grep "ArmLinkProtocol_WriteU32Le.*out_payload\\[6\\].*payload->timeout_ms" "docs/f4_esp32s3_arm_protocol/arm_link_protocol.c"
 F4_UART_COMMAND_SOURCE="/e/hal/bisai_f407_project/User/App/uart_command.c"
 if [ -f "$F4_UART_COMMAND_SOURCE" ]; then
     grep -q 'UART_COMMAND_USART1_TEXT_ENABLE' "$F4_UART_COMMAND_SOURCE" || fail "F407 USART1 必须提供文本输出静默开关，MP157 主链路不能再收到 [OK]/[ERROR] 文本日志"
@@ -1312,6 +1368,13 @@ require_grep "run_alarm_snapshot_self_test" "main.cpp"
 require_grep "fsync" "main.cpp"
 if grep -Eq "DEFAULT_ALARM_SNAPSHOT_FILE|qt_alarm_snapshot\\.txt" "$SCRIPT_DIR/main.cpp"; then
     fail "main.cpp 不应继续使用固定 qt_alarm_snapshot.txt，必须生成每日 qt_alarm_snapshot_YYYYMMDD.txt"
+fi
+final_sort_handler_block="$(sed -n '/void handleF4FinalSortFinished(bool ok,/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$final_sort_handler_block" | grep -q 'm_f4AutoRunning = false'; then
+    fail "main.cpp 收到 CYCLE_DONE 后必须清空 m_f4AutoRunning，下一轮 START_CYCLE 才不会复用旧 cycle 状态"
+fi
+if ! printf '%s\n' "$final_sort_handler_block" | grep -q 'm_f4AutoPaused = false'; then
+    fail "main.cpp 收到 CYCLE_DONE 后必须清空 m_f4AutoPaused，避免停止/继续仍绑定到旧 cycle"
 fi
 require_grep "UploadHistoryModel" "main.cpp"
 require_grep "appendUploadHistoryRecord" "main.cpp"

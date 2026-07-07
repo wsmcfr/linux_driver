@@ -36,6 +36,28 @@
 | 历史图片左右滑动 | 开发板触摸屏 + SSH | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart`，进入 `历史记录`，打开任意含多张图片的记录，在图片区域左右滑动。 | 图片切换过程中不再有明显硬停和拖拽滞涩；滑动中优先保证跟手，停下后图片恢复平滑显示。 | 若仍顿挫，先执行 `strings /root/qt_camera_display/qt_camera_display | grep -E 'uiHorizontalFlickVelocity|uiCarouselCachePages|DragOverBounds'` 确认板端不是旧二进制；再检查图片是否来自超大分辨率文件或 SD 卡读写异常。 |
 | 其它上下滑动页面 | 开发板触摸屏 | 依次打开 `统计分析` 最近记录、`手动控制` 安全状态/命令日志、`参数设置` 详情和步进参数、`告警维护` 告警历史/查看全部、`日志查看` 文件列表/日志详情，并上下滑动。 | 各页面边界变为柔和拖拽，滑动速度和减速手感一致，不再出现旧的明显硬刹车感。 | 若个别页面手感仍旧，先用 `grep -n 'id: <控件id>' qml/Main.qml` 确认该控件是否套用了统一参数；若板端旧，重新部署新二进制。 |
 
+## 2026-07-07 自动循环停止与参数持久化修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场反馈两类问题：一是单件流程完成后，首页 `停止` 仍可能拿旧 cycle 继续发停止命令，且自动循环没有稳定进入下一轮；二是参数页保存后重启开发板，界面又显示默认值，说明保存结果、JSON 回读和界面显示之间闭环不够明确。 |
+| 自动循环修复 | QML 现在把“自动循环会话仍启用”和“当前单件 cycle 仍在运行”拆成两套状态；收到 `CYCLE_DONE` 后，C++ 会先清空旧 cycle 的 `m_f4AutoRunning/m_f4AutoPaused`，QML 再在会话仍启用时自动排队发送下一轮 `START_CYCLE`；如果用户在本轮完成后按 `停止`，MP157 只会本地结束整个自动循环会话，不再拿旧 cycle 发送 `STOP_CYCLE`。 |
+| 停止键语义 | 首页 `停止` 现在固定表示“终止整个自动循环”；只要按下后成功生效，后续就不会继续扫描下一件，必须重新点 `开始` 才会创建新的自动检测流程。 |
+| 异常待停止修复 | 如果流程中途卡在称重、电感、最终分拣命令未启动或最终分拣失败这类“F4 大概率仍保留旧 cycle”场景，QML 不再直接把本地自动流程状态清零，而是进入 `待人工停止/分拣异常待停止` 状态：页面会停掉自动视觉和自动续跑，但仍保持 `停止` 按钮可点、`开始` 按钮不可点，直到操作者手动点 `停止` 把旧流程明确终止，避免出现“开始可点但 F4 提示仍在运行，停止却是灰色”的互相矛盾状态。 |
+| 参数持久化修复 | 参数页继续以 `DetectSettingsController` 为唯一真值源；点击 `保存配置` 后，先原子写入 `/mnt/sdcard/config/defect_ui_config.json`，再立即调用 `loadSettingsFromDisk()` 从 JSON 回读，确保“当前界面显示值”和“重启后重新加载值”来自同一份文件；如果回读失败，界面会明确提示 `JSON回读失败`，不再默认认为已经永久保存。 |
+| 生效边界 | 这次修改的是 MP157 Qt/QML 与本地配置读写链路，不修改 F4 固件协议字段；Windows 源码已改不等于板端已生效，仍需在虚拟机重新编译 `qt_camera_display` 并替换开发板 `/root/qt_camera_display/qt_camera_display`。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `"C:/Program Files/Git/bin/bash.exe" -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `autoCycleRunning`、`queueNextAutoCycleStart`、`stopAutoWorkflowSessionLocally`、保存后 `loadSettingsFromDisk()` 回读等 marker。 | 若缺 marker，先看 `qml/Main.qml` 和 `main.cpp` 是否同步了本次修复；若脚本报旧 cycle 状态问题，检查 `handleF4FinalSortFinished()` 是否已经清空 `m_f4AutoRunning/m_f4AutoPaused`。 |
+| 单件完成后自动进入下一轮 | 开发板触摸屏 + F4 串口日志 | 首页点 `开始`，让一件零件完整跑完，观察收到 `CYCLE_DONE` 后的界面和串口 | 底部提示先显示本轮完成，再自动进入下一轮 `START_CYCLE`，传送带继续等待下一件，不需要人工再点 `开始`。 | 若停在本轮完成不再继续，先确认板端二进制包含 `queueNextAutoCycleStart` marker；再查 F4 `CYCLE_DONE` 后 MP157 是否真的发出了新的 `START_CYCLE`。 |
+| 本轮完成后按停止 | 开发板触摸屏 | 让一件零件完整跑完，在准备下一轮期间点 `停止` | 自动循环会话直接结束，界面状态变为 `停止`，后续不再自动启动下一轮，也不应再提示旧 cycle 停止异常。 | 若仍提示旧 cycle 停止异常，先查 `Main.qml` 的 `handleControlAction("stop")` 是否走到 `stopAutoWorkflowSessionLocally()` 本地停止分支。 |
+| 中途异常后停止入口保留 | 开发板触摸屏 | 让流程在称重、电感、上传后最终分拣命令未启动、或最终分拣失败等中途异常处结束，然后观察首页四按钮；此时不要重启程序，直接尝试点击 `停止` | 首页状态应显示 `待人工停止` 或 `分拣异常待停止`；`停止` 按钮保持可点击，`开始` 按钮不可再直接重新开新流程；点 `停止` 后才真正回到可重新开始的新空闲状态。 | 若异常后又出现“只有开始可点、点开始却提示当前流程未停止”，先查 `Main.qml` 是否仍保留 `markAutoWorkflowAbnormalStopRequired()`，再查 `onF4ArmInspectionFlowFinished`、`onF4FinalSortFinished` 和 `requestF4FinalSortResult()` 失败分支是否被回退成直接清空本地状态。 |
+| 参数保存后重启回显 | 开发板触摸屏 + SSH | 参数页修改阈值/ROI/上传策略/步进参数后点 `保存配置`；然后重启 Qt 或开发板，再回到参数页 | 页面显示上次保存值，不再回到默认值；`/mnt/sdcard/config/defect_ui_config.json` 内容与界面一致。 | 若重启后仍是默认值，先看保存提示是否包含 `保存成功` 和 `已从JSON重新加载`；再 SSH 执行 `cat /mnt/sdcard/config/defect_ui_config.json`，确认 SD 卡是否真实挂载、JSON 是否已写入。 |
+
 ## 模块文档总览
 
 | 项目 | 内容 |
@@ -436,6 +458,7 @@
 | 检测历史文件检查 | 开发板 SSH | `day=$(date +%Y%m%d); hist=/mnt/sdcard/images/upload_history_${day}.json; test -s "$hist"; tail -n 120 "$hist"` | 当天 JSON 最新记录包含 `source_path`、3 项 `annotated_images`、`classification_result`、`segmentation_result`、`upload_status`、`record_id` 和 `record_no`。 | 若文件不存在，先确认点击 `检测` 或 `--detect-self-test` 是否走到 Qt 主进程；再查 `/tmp/qt-kms-overlay-shell.log`、`upload history save failed` 和 SD 卡日期是否正确。 |
 | 上传成功状态回归 | 开发板屏幕、SSH 和云端页面 | 屏幕点击 `检测`；SSH 执行 `day=$(date +%Y%m%d); tail -n 160 /mnt/sdcard/images/upload_history_${day}.json; grep -n 'verify_status\\|upload_status=OK\\|record_id' /tmp/qt-kms-overlay-shell.log /tmp/defect-cos-record-detail.json 2>/dev/null || true`；云端打开最新检测记录 | 如果云端已经出现本次记录和图片，本地历史详情应显示 `上传成功`，JSON 中 `upload_status` 不应是 `上传失败`；脚本允许 stdout 出现 `verify_status=warning`，但仍必须带 `upload_status=OK`、`record_id` 和 `record_no`。 | 若云端有记录但本地仍显示失败，确认板端二进制和 `/root/qt_camera_display/defect-cos-upload` 是否都是新版；再查 `isUploadStatusSuccess()`、`cloudStatusSummary()` 和脚本 stdout 是否被旧启动包覆盖。 |
 | 历史页触摸验证 | 开发板屏幕 | 点击左侧 `历史记录`，确认停留在检测历史列表且最新卡片可见并高亮；横向滑动检测时间卡片，点击某条记录空白区域选中，再点击 `查看`，再在左侧图片区域左右滑动 | 进入历史页默认显示列表层，最新记录卡片可见；点击 `查看` 后进入详情页；详情页左侧能在原始图片、UNet raw、UNet overlay、UNet mask 之间切换，右侧只显示上传时间、记录ID、图片数量、云端编号、云端状态，以及“检测结论/可信度/缺陷提示/图片留档”四条普通中文说明，不单独显示本地路径。 | 若历史页空白，先查 `/mnt/sdcard/images/upload_history_*.json` 和旧 `/mnt/sdcard/images/upload_history.json`；若点选后列表自动滚动，检查 `Main.qml` 是否又出现 `currentIndex: root.selectedHistoryIndex` 或 `highlightRangeMode: ListView.ApplyRange`；若图片不显示，确认文件路径存在且图片头正确；若无法触摸，查 Goodix 输入配置。 |
+| 左侧导航切页验证 | 开发板屏幕 | 依次点击左侧 `历史记录`、`统计分析`、`手动控制`、`参数设置`、`告警维护`、`日志查看`，最后再点 `首页` | 每次点击后左侧当前页高亮立即切换，右侧主内容同步切到对应页面；返回 `首页` 后实时视频与右侧 `检测/开始/暂停/继续/停止` 控件恢复显示。 | 若点击无反应，先查 `Main.qml` 的 `navPanel` 是否保留 `z: 20`、导航 `MouseArea` 是否仍有 `preventStealing: true` 和 `root.switchPage(modelData.page)`；再确认板端运行的是重新编译后的新二进制，而不是旧 QML 资源。 |
 | 全局底部提示层 | 开发板屏幕 | 依次进入 `历史记录`、`统计分析`、`参数设置`、`告警维护`、`日志查看`，分别触发检测完成、`保存配置`、`导出摘要`、`保存诊断` 或刷新动作 | 底部绿色或红色提示条显示在当前页面最上层，不被页面底部按钮、表格、卡片或日志弹窗外层内容遮挡；启动动画显示时提示层仍在 `splashOverlay` 下方。 | 若提示完全不显示，先查 `globalStorageToastLayer` 是否是 `visible: true` 常驻，而不是 `visible: storageToast.visible`；若只有首页能看到提示，其它页面看不到，再查它是否在 `Main.qml` 末尾且 `z: 900`，并确认运行的是新 QML 资源编译出的二进制。 |
 | 历史失败完整重发验证 | 开发板屏幕和 SSH | 准备一条 `upload_status` 含 `上传失败` 且带 `weight_context_json/ldc_context_json/f4_flow_context_json/decision_context_json/vision_context_json` 的历史记录，屏幕进入该记录详情点击 `重新发送`，再执行 `day=$(date +%Y%m%d); tail -n 160 /mnt/sdcard/images/upload_history_${day}.json` | 点击后按钮短暂显示 `发送中`；成功时同一条 JSON 记录移动到数组最后，`upload_time` 变为本次重发完成时间，并写入本次重发日期文件，出现新的 `record_id`、`record_no` 和 `上传成功` 状态，界面详情同步刷新到这条最新记录；重发请求继续携带历史中保存的重量、电感、F4 流程、判定和视觉上下文；失败时该条记录保留原时间、原位置、失败状态和完整上下文并允许再次重发。 | 若按钮不显示，确认每日 JSON 中 `upload_status` 含 `失败`；若上下文字段为空，说明第一次自动检测未在上传前完成 `updateRecordInspectionContexts()` 写回；若成功但界面不刷新，查 `retryUploadFinished` 和 `updateRecordUploadResult`；若时间仍是旧值，查 `refreshedUploadTime` 和 `m_entries.move(row, lastRow)`；若上传失败，查 4G、云端 health、账号配置、`/tmp/defect-cos-record*.json` 和脚本 stderr。 |
 | 统计页触摸验证 | 开发板屏幕 | 点击左侧 `统计分析`，观察 KPI、最近检测趋势、分布概览、云端与文件状态、最近记录表；在最近记录卡片内上下滑动，再点击任一记录行 | 统计页打开后实时视频 plane 隐藏；总记录应等于所有 `upload_history_*.json` 汇总记录数；良品/待复核、上传成功率、图片数量和文件大小有值；`分布概览` 左列显示良品/坏品/待复核，右列显示上传成功/上传失败，五条都在面板边框内；最近记录表能在卡片内竖向滑动查看更多记录；点击最近记录行进入对应历史详情页。 | 若统计页无数据，先查 `/mnt/sdcard/images/upload_history_*.json` 是否存在且非空；若分布概览仍越界，检查 `statsDistributionLeftColumn`、`statsDistributionRightColumn` 和 `statsDistributionBarDelegate`；若不能滑动，检查 `statsRecentListView` 是否仍是 `ListView`；若点击无反应，检查 `openHistoryDetailFromStats` 和 `showHistoryDetail`；若视频仍覆盖统计页，查 `setOverlayVisible(pageName === "home")` 和 overlay `VISIBLE` 命令。 |
