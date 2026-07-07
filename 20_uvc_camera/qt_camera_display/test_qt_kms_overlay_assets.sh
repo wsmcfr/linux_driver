@@ -1125,8 +1125,38 @@ if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionShortSettleMs'; then
     fail "Z 下降 ACK 后不能直接用短稳定替代物理运动完成等待"
 fi
 fine_tune_block="$(sed -n '/function handleAutoVisionFineTuneLocateFinished/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionStartFocusSettleBeforeDetect'; then
-    fail "ROI 二次对中通过后必须先调用 autoVisionStartFocusSettleBeforeDetect() 等 3s，再启动模型检测"
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionStopRealtimeFineTune'; then
+    fail "ROI 复查阶段必须进入实时闭环 STOP 收口逻辑，不能继续沿用单次位置微调后直接推进"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'deviceHealth.sendF4ActuatorVelocityMove'; then
+    fail "ROI 复查阶段必须改成 ACTUATOR_VEL_MOVE 实时闭环点动"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeSelectAxis'; then
+    fail "ROI 实时闭环必须按 errorX/errorY 选择主误差轴，不能固定只先调一根轴"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeSpeedForAxis'; then
+    fail "ROI 实时闭环必须按误差档位和无改善次数动态调速"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeTuneTimeoutMs'; then
+    fail "ROI 实时闭环必须限制总微调时长，避免流程拖太久"
+fi
+require_grep "已硬停电机，等待 F4" "qml/Main.qml"
+require_grep "requestImmediateAutoControlInterruption" "qml/Main.qml"
+require_fixed_grep "sendF4ActuatorStopNow(255, 0)" "qml/Main.qml"
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeFineTuneLostFrames'; then
+    fail "ROI 实时闭环必须区分连续丢目标场景并触发停机收口"
+fi
+if ! grep -q 'property int autoVisionRealtimeTuneTimeoutMs: 3000' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "实时闭环微调总超时必须默认限制为 3000ms"
+fi
+if ! grep -q 'property int autoVisionLateralReturnTimeoutMs: 3000' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "左右轴快速回位超时必须默认限制为 3000ms"
+fi
+if ! grep -q 'property int autoVisionRealtimeTunePollMs: 90' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "实时闭环 LOCATE 轮询周期必须收紧到 90ms，避免微调反馈仍然过慢"
+fi
+if ! grep -q 'property int autoVisionRealtimeFineTuneSwitchDeadbandPx: 8' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "实时闭环切轴/反向必须保留 8px 防抖门槛，避免误差边缘来回抽动"
 fi
 require_grep "autoVisionFineTuneStepsForError" "qml/Main.qml"
 conveyor_fine_tune_block="$(sed -n '/function autoVisionFineTuneConveyor/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
@@ -1156,13 +1186,11 @@ if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'autoVisionFineTuneSteps
     fail "左右轴 ROI 微调必须通过 autoVisionFineTuneStepsForError(errorX, ...) 计算实际 steps"
 fi
 require_grep "autoVisionLateralReturnOffsetSteps" "qml/Main.qml"
-require_grep "autoVisionPendingLateralFineTuneSteps" "qml/Main.qml"
 require_grep "resetAutoVisionLateralReturnState" "qml/Main.qml"
-require_grep "recordAutoVisionPendingLateralFineTune" "qml/Main.qml"
-require_grep "commitAutoVisionLateralFineTuneOffset" "qml/Main.qml"
+require_grep "autoVisionUpdateRealtimeLateralEstimate" "qml/Main.qml"
 require_grep "autoVisionRequestLateralReturnToBeltCenter" "qml/Main.qml"
-if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'recordAutoVisionPendingLateralFineTune(direction, steps)'; then
-    fail "左右轴 ROI 微调发命令前必须记录本次 direction/steps，成功回执后才能累计回中偏移"
+if ! grep -q 'property real autoVisionLateralReturnSpeedMultiplier: 1.8' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "左右轴快速回位必须有独立的速度倍率，不能继续复用普通微调速度"
 fi
 start_arm_after_z_block="$(sed -n '/function autoVisionStartF4ArmInspectionAfterZUp/,/function autoVisionRequestZUp/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$start_arm_after_z_block" | grep -q 'autoVisionLateralReturnOffsetSteps !== 0'; then
@@ -1172,11 +1200,14 @@ if ! printf '%s\n' "$start_arm_after_z_block" | grep -q 'autoVisionRequestLatera
     fail "Z 轴回升后启动机械臂前必须先按左右轴累计偏移反向回中"
 fi
 actuator_finished_block="$(sed -n '/onF4ActuatorCommandFinished:/,/if (root.stepperHomePendingCommand !== "")/p' "$SCRIPT_DIR/qml/Main.qml")"
-if ! printf '%s\n' "$actuator_finished_block" | grep -q 'commitAutoVisionLateralFineTuneOffset'; then
-    fail "左右轴微调必须等 F4 ACTUATOR_MOVE_DONE 成功后再累计偏移，不能只按发送成功累计"
+if ! printf '%s\n' "$actuator_finished_block" | grep -q 'ACTUATOR_VEL_MOVE'; then
+    fail "执行器完成回调必须单独处理实时闭环 ACTUATOR_VEL_MOVE"
 fi
-if ! printf '%s\n' "$actuator_finished_block" | grep -q 'root.autoVisionActuatorPhase === "lateral-return"'; then
-    fail "左右轴回中完成回执必须有独立阶段处理，回中完成后才能继续 F4/ESP32S3 机械臂流程"
+if ! printf '%s\n' "$actuator_finished_block" | grep -q 'ACTUATOR_STOP_NOW'; then
+    fail "执行器完成回调必须单独处理实时闭环 STOP_NOW 收口"
+fi
+if ! printf '%s\n' "$actuator_finished_block" | grep -q 'root.autoVisionActuatorPhase === "lateral-return-fast"'; then
+    fail "左右轴快速回中完成回执必须有独立阶段处理，回中完成后才能继续 F4/ESP32S3 机械臂流程"
 fi
 settle_timer_block="$(sed -n '/id: autoVisionActuatorSettleTimer/,/Connections {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$settle_timer_block" | grep -q 'autoVisionActuatorPhase === "focus-settle"'; then

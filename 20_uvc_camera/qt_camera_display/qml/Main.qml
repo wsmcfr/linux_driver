@@ -52,6 +52,21 @@ Rectangle {
     /* autoPendingStateText 保存正在等待 ACK 的界面目标状态，ACK 成功后再正式写入 workflowState。 */
     property string autoPendingStateText: ""
 
+    /* autoForcedControlAction 保存用户已经按下、但还在等待 F4 抢占接收的最高优先级动作：pause 或 stop。 */
+    property string autoForcedControlAction: ""
+
+    /* autoForcedControlStateText 保存强制暂停/停止对应的界面状态文本。 */
+    property string autoForcedControlStateText: ""
+
+    /* autoForcedControlRetryCount 保存强制暂停/停止已经重试下发 F4 自动流程命令的次数。 */
+    property int autoForcedControlRetryCount: 0
+
+    /* autoForcedControlMaxRetries 限制强制暂停/停止最多重试次数，避免异常串口环境下无限刷屏。 */
+    property int autoForcedControlMaxRetries: 20
+
+    /* autoForcedControlRetryIntervalMs 是强制暂停/停止自动重试 F4 抢占命令的时间间隔。 */
+    property int autoForcedControlRetryIntervalMs: 120
+
     /* autoCycleId 保存 MP157 当前自动检测流程号，由 C++ 在 F4 ACK/NACK 回调中返回。 */
     property int autoCycleId: 0
 
@@ -142,6 +157,60 @@ Rectangle {
     /* autoVisionFineTuneNoImproveCount 记录同一轴连续没有改善的次数，连续无变化时自动把下一次步数再放大。 */
     property int autoVisionFineTuneNoImproveCount: 0
 
+    /* autoVisionRealtimeFineTuneActive 表示当前是否处于 ROI 复查后的实时闭环微调会话。 */
+    property bool autoVisionRealtimeFineTuneActive: false
+
+    /* autoVisionRealtimeFineTuneStartMs 记录实时闭环微调开始时间戳，用于总时长超时保护。 */
+    property real autoVisionRealtimeFineTuneStartMs: 0
+
+    /* autoVisionRealtimeFineTuneElapsedMs 保存最近一次状态刷新时的实时微调累计耗时。 */
+    property int autoVisionRealtimeFineTuneElapsedMs: 0
+
+    /* autoVisionRealtimeFineTuneAxis 记录当前闭环正在驱动的主误差轴：conveyor 或 lateral。 */
+    property string autoVisionRealtimeFineTuneAxis: ""
+
+    /* autoVisionRealtimeFineTuneDirection 记录当前闭环正在运行的逻辑方向；-1 表示当前没有持续运动。 */
+    property int autoVisionRealtimeFineTuneDirection: -1
+
+    /* autoVisionRealtimeFineTuneSpeedRpm 记录当前闭环持续运动速度，单位 rpm；0 表示当前未持续运动。 */
+    property int autoVisionRealtimeFineTuneSpeedRpm: 0
+
+    /* autoVisionRealtimeFineTuneSegmentStartMs 记录当前连续运动片段开始时间；切轴、切向、STOP 前要先结算这一段位移。 */
+    property real autoVisionRealtimeFineTuneSegmentStartMs: 0
+
+    /* autoVisionRealtimeFineTuneStopReason 记录最近一次实时闭环 STOP 的原因，便于日志与回调收口。 */
+    property string autoVisionRealtimeFineTuneStopReason: ""
+
+    /* autoVisionRealtimeFineTunePendingNextStage 记录 STOP 写入完成后的下一步：resume/focus/detect/none。 */
+    property string autoVisionRealtimeFineTunePendingNextStage: "none"
+
+    /* autoVisionRealtimeFineTuneLostFrames 记录实时闭环阶段连续丢目标的帧数。 */
+    property int autoVisionRealtimeFineTuneLostFrames: 0
+
+    /* autoVisionRealtimeFineTuneSwitchDeadbandPx 是实时闭环切轴/反向的防抖门槛，避免误差刚到边缘就来回抽动。 */
+    property int autoVisionRealtimeFineTuneSwitchDeadbandPx: 8
+
+    /* autoVisionRealtimeFineTuneLostStopFrames 是实时闭环连续丢目标后触发 STOP 的帧数上限。 */
+    property int autoVisionRealtimeFineTuneLostStopFrames: 4
+
+    /* autoVisionRealtimeTuneTimeoutMs 是实时闭环微调总时长上限，单位 ms；超过后直接 STOP 并退出。 */
+    property int autoVisionRealtimeTuneTimeoutMs: 3000
+
+    /* autoVisionRealtimeTunePollMs 是实时闭环 LOCATE 轮询周期，单位 ms。 */
+    property int autoVisionRealtimeTunePollMs: 90
+
+    /* autoVisionRealtimeFineTuneSpeedStepPercent 是误差每升一档时的速度倍率步长百分比。 */
+    property int autoVisionRealtimeFineTuneSpeedStepPercent: 30
+
+    /* autoVisionRealtimeFineTuneNoImproveSpeedPercent 是每档“无改善升速”叠加到基准速度的百分比。 */
+    property int autoVisionRealtimeFineTuneNoImproveSpeedPercent: 18
+
+    /* autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent 限制实时闭环速度最高放大倍率，避免高误差时速度过冲。 */
+    property int autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent: 220
+
+    /* autoVisionActuatorStepsPerRevEstimate 是 MP157 对执行器步数/转数换算的工程估算值，用于闭环位移与回位速度估算。 */
+    property int autoVisionActuatorStepsPerRevEstimate: 200
+
     /* autoVisionLateralReturnOffsetSteps 记录本轮自动检测中左右轴相对皮带基准的累计偏移，正值表示相机向右动过。 */
     property int autoVisionLateralReturnOffsetSteps: 0
 
@@ -177,6 +246,12 @@ Rectangle {
 
     /* autoVisionShortSettleMs 是跳过下探或短步微调后的短机械稳定等待时间，单位 ms。 */
     property int autoVisionShortSettleMs: 450
+
+    /* autoVisionLateralReturnTimeoutMs 是左右轴快速回位的单独等待上限，单位 ms。 */
+    property int autoVisionLateralReturnTimeoutMs: 3000
+
+    /* autoVisionLateralReturnSpeedMultiplier 是左右轴快速回位时相对常规速度的放大倍率。 */
+    property real autoVisionLateralReturnSpeedMultiplier: 1.8
 
     /* autoVisionZFocusSettled 表示本轮已经完成 Z 轴下降后的 3 秒对焦等待。 */
     property bool autoVisionZFocusSettled: false
@@ -828,6 +903,13 @@ Rectangle {
      *   无返回值；函数会更新 workflowState/storageState，并等待 onF4AutoControlFinished 确认结果。
      */
     function handleControlAction(action, stateText) {
+        var forceRetry = arguments.length >= 3 && arguments[2] === true
+
+        if ((action === "pause" || action === "stop") && !forceRetry) {
+            root.requestImmediateAutoControlInterruption(action, stateText)
+            return
+        }
+
         if (autoControlBusy) {
             storageState = formatF4ToastText("自动流程命令下发中，请等待F4回执")
             showStorageToast()
@@ -965,6 +1047,8 @@ Rectangle {
         autoVisionActuatorPhase = ""
         autoVisionFineTuneAttempts = 0
         resetAutoVisionFineTuneProgress()
+        resetAutoVisionRealtimeFineTuneState()
+        resetAutoVisionLateralReturnState()
         autoVisionZFocusSettled = false
         autoVisionNeedsZUp = false
         autoVisionDetectFromZFlow = false
@@ -978,8 +1062,76 @@ Rectangle {
         storageState = autoVisionLastText
         autoVisionDetectDelayTimer.stop()
         autoVisionActuatorSettleTimer.stop()
+        autoVisionTimer.interval = 100
         autoVisionTimer.restart()
         showStorageToast()
+    }
+
+    /*
+     * clearForcedAutoControlRequest 的作用：
+     *   清空首页“暂停/停止最高优先级抢占”请求及其重试状态，避免旧请求影响后续自动流程按钮。
+     */
+    function clearForcedAutoControlRequest() {
+        autoForcedControlAction = ""
+        autoForcedControlStateText = ""
+        autoForcedControlRetryCount = 0
+        autoForcedControlRetryTimer.stop()
+    }
+
+    /*
+     * requestImmediateAutoControlInterruption 的作用：
+     *   把首页暂停/停止提升为最高优先级：按钮一按下，先立即强制停全部执行器和本地自动流程阶段，
+     *   再异步重试向 F4 发送 PAUSE_CYCLE/STOP_CYCLE，让 F4 状态最终与 MP157 本地状态一致。
+     *
+     * 参数：
+     *   action 只允许 pause 或 stop。
+     *   stateText 是界面显示状态文本。
+     */
+    function requestImmediateAutoControlInterruption(action, stateText) {
+        var actionName = action === "pause" ? "暂停" : "停止"
+        var localReason = "用户按下首页" + actionName + "，立即强制停全部执行器"
+
+        autoRestartQueued = false
+        clearForcedAutoControlRequest()
+        autoForcedControlAction = action
+        autoForcedControlStateText = stateText
+
+        /*
+         * 先本地打断所有自动流程异步阶段，不等待 F4 当前指令自然完成。
+         * 这样就算 F4 还在执行 Z 轴、实时微调、回位或机械臂前置阶段，MP157 也不会继续推进后续链路。
+         */
+        stopAutoVisionLoop(localReason)
+        autoVisionRealtimeFineTunePendingNextStage = "none"
+        autoVisionRealtimeFineTuneStopReason = localReason
+        autoVisionDetectDelayTimer.stop()
+        autoVisionActuatorSettleTimer.stop()
+        detectImageBusy = false
+
+        if (action === "pause") {
+            autoWorkflowRunning = true
+            autoCycleRunning = true
+            autoWorkflowPaused = true
+            workflowState = "暂停中"
+            storageState = formatF4ToastText(localReason + "，已硬停电机，等待 F4 暂停当前自动流程")
+        } else {
+            autoWorkflowRunning = false
+            autoCycleRunning = false
+            autoWorkflowPaused = false
+            workflowState = "停止中"
+            storageState = formatF4ToastText(localReason + "，已硬停电机，等待 F4 结束当前自动流程")
+        }
+
+        showStorageToast()
+
+        if (!deviceHealth.sendF4ActuatorStopNow(255, 0)) {
+            autoLastAckText = localReason + "；ACTUATOR_STOP_NOW 未启动，但 MP157 已本地进入" + stateText + "，请立即检查 F4 串口与电机状态"
+            storageState = formatF4ToastText(autoLastAckText)
+            showStorageToast()
+        }
+
+        autoForcedControlRetryCount = 0
+        autoForcedControlRetryTimer.interval = autoForcedControlRetryIntervalMs
+        autoForcedControlRetryTimer.restart()
     }
 
     /*
@@ -1006,6 +1158,7 @@ Rectangle {
         autoVisionActuatorPhase = ""
         autoVisionFineTuneAttempts = 0
         resetAutoVisionFineTuneProgress()
+        resetAutoVisionRealtimeFineTuneState()
         resetAutoVisionLateralReturnState()
         autoVisionZFocusSettled = false
         autoVisionDetectFromZFlow = false
@@ -1123,7 +1276,6 @@ Rectangle {
         autoVisionLocateBusy = false
 
         if (autoVisionLocatePurpose === "fine-tune") {
-            autoVisionLocatePurpose = "center"
             handleAutoVisionFineTuneLocateFinished(ok, result, detail)
             return
         }
@@ -1489,24 +1641,28 @@ Rectangle {
      *   true 表示 LOCATE 请求已启动；false 表示 overlay 请求被拒绝。
      */
     function autoVisionRequestFineTuneLocate() {
+        var nowMs = new Date().getTime()
+
         autoVisionLocatePurpose = "fine-tune"
-        autoVisionLocateBusy = true
-        workflowState = "ROI复查"
-        autoVisionLastText = "自动视觉：Z轴下降或短步微调后复查ROI中心"
-        storageState = autoVisionLastText
-        showStorageToast()
-
-        if (deviceHealth.requestAutoVisionLocate()) {
-            return true
-        }
-
+        autoVisionRealtimeFineTuneActive = true
+        autoVisionRealtimeFineTuneStartMs = nowMs
+        autoVisionRealtimeFineTuneElapsedMs = 0
+        autoVisionRealtimeFineTuneLostFrames = 0
+        autoVisionRealtimeFineTuneStopReason = ""
+        autoVisionRealtimeFineTunePendingNextStage = "none"
+        autoVisionRealtimeFineTuneAxis = ""
+        autoVisionRealtimeFineTuneDirection = -1
+        autoVisionRealtimeFineTuneSpeedRpm = 0
+        autoVisionRealtimeFineTuneSegmentStartMs = 0
         autoVisionLocateBusy = false
-        autoVisionLocatePurpose = "center"
-        autoVisionLastText = "ROI复查 LOCATE 请求未启动，进入模型检测"
+        autoVisionCommandBusy = false
+        autoVisionTimer.interval = autoVisionRealtimeTunePollMs
+        workflowState = "ROI实时微调"
+        autoVisionLastText = "自动视觉：Z轴下降后进入 ROI 实时闭环微调"
         storageState = autoVisionLastText
-        autoVisionStartDetectDelay()
         showStorageToast()
-        return false
+        autoVisionTimer.restart()
+        return true
     }
 
     /*
@@ -1527,6 +1683,31 @@ Rectangle {
     }
 
     /*
+     * resetAutoVisionRealtimeFineTuneState 的作用：
+     *   清空实时闭环微调会话的所有运行态，保证新一轮 ROI 复查从干净状态开始。
+     *
+     * 主要流程：
+     *   1. 关闭实时闭环 active 标志，防止旧会话残留继续驱动 autoVisionTimer。
+     *   2. 清空当前主轴、方向、速度、片段起点和 STOP 收口阶段。
+     *   3. 同步清空连续丢目标计数与最近耗时统计。
+     *
+     * 返回值：
+     *   无返回值；函数只重置 QML 本地状态。
+     */
+    function resetAutoVisionRealtimeFineTuneState() {
+        autoVisionRealtimeFineTuneActive = false
+        autoVisionRealtimeFineTuneStartMs = 0
+        autoVisionRealtimeFineTuneElapsedMs = 0
+        autoVisionRealtimeFineTuneAxis = ""
+        autoVisionRealtimeFineTuneDirection = -1
+        autoVisionRealtimeFineTuneSpeedRpm = 0
+        autoVisionRealtimeFineTuneSegmentStartMs = 0
+        autoVisionRealtimeFineTuneStopReason = ""
+        autoVisionRealtimeFineTunePendingNextStage = "none"
+        autoVisionRealtimeFineTuneLostFrames = 0
+    }
+
+    /*
      * resetAutoVisionLateralReturnState 的作用：
      *   清空本轮自动检测左右轴回中相关状态，保证每个零件只按本轮实际左右微调量回中。
      *
@@ -1541,6 +1722,288 @@ Rectangle {
         autoVisionLateralReturnOffsetSteps = 0
         autoVisionPendingLateralFineTuneSteps = 0
         autoVisionPendingLateralFineTuneDirection = 0
+    }
+
+    /*
+     * autoVisionRealtimeFineTuneElapsed 的作用：
+     *   返回实时闭环微调会话已经运行的累计时长，统一给超时保护和状态文本复用。
+     *
+     * 返回值：
+     *   返回非负整数毫秒数；会话未激活时返回 0。
+     */
+    function autoVisionRealtimeFineTuneElapsed() {
+        if (!autoVisionRealtimeFineTuneActive || autoVisionRealtimeFineTuneStartMs <= 0) {
+            autoVisionRealtimeFineTuneElapsedMs = 0
+            return 0
+        }
+
+        autoVisionRealtimeFineTuneElapsedMs = Math.max(0,
+                                                       Math.floor(new Date().getTime() - Number(autoVisionRealtimeFineTuneStartMs || 0)))
+        return autoVisionRealtimeFineTuneElapsedMs
+    }
+
+    /*
+     * autoVisionEstimateMotionSteps 的作用：
+     *   按工程估算把“速度 + 运行时长”换算成相对位移步数，用于实时闭环左右轴净偏移累计。
+     *
+     * 参数：
+     *   speedRpm 是当前执行器运行速度，单位 rpm。
+     *   elapsedMs 是当前运动片段持续时长，单位 ms。
+     *
+     * 返回值：
+     *   返回估算步数，最小为 0。
+     */
+    function autoVisionEstimateMotionSteps(speedRpm, elapsedMs) {
+        var rpm = Math.max(0, Math.floor(Number(speedRpm || 0)))
+        var durationMs = Math.max(0, Math.floor(Number(elapsedMs || 0)))
+        var stepsPerRev = Math.max(1, Math.floor(Number(autoVisionActuatorStepsPerRevEstimate || 200)))
+        var estimated = Math.round((rpm * stepsPerRev * durationMs) / 60000.0)
+
+        return Math.max(0, estimated)
+    }
+
+    /*
+     * autoVisionUpdateRealtimeLateralEstimate 的作用：
+     *   在实时闭环左右轴持续运动结束、切轴或切向前，把当前运行片段估算成净偏移并累计到回位基准。
+     *
+     * 参数：
+     *   nowMs 是结算时刻时间戳；不传时使用当前系统时间。
+     *
+     * 返回值：
+     *   返回累计后的有符号左右轴偏移，单位 step。
+     */
+    function autoVisionUpdateRealtimeLateralEstimate(nowMs) {
+        var currentMs = nowMs !== undefined && nowMs !== null
+                ? Math.floor(Number(nowMs || 0))
+                : new Date().getTime()
+
+        if (autoVisionRealtimeFineTuneAxis !== "lateral"
+                || autoVisionRealtimeFineTuneSpeedRpm <= 0
+                || autoVisionRealtimeFineTuneSegmentStartMs <= 0
+                || autoVisionRealtimeFineTuneDirection < 0) {
+            autoVisionRealtimeFineTuneSegmentStartMs = currentMs
+            return autoVisionLateralReturnOffsetSteps
+        }
+
+        var elapsedMs = Math.max(0, Math.floor(currentMs - Number(autoVisionRealtimeFineTuneSegmentStartMs || currentMs)))
+        var steps = autoVisionEstimateMotionSteps(autoVisionRealtimeFineTuneSpeedRpm, elapsedMs)
+        var signedSteps = autoVisionRealtimeFineTuneDirection === 1 ? steps : -steps
+
+        if (steps > 0) {
+            autoVisionLateralReturnOffsetSteps = Math.max(-1000000,
+                                                           Math.min(1000000,
+                                                                    Math.floor(Number(autoVisionLateralReturnOffsetSteps || 0)) + signedSteps))
+        }
+
+        autoVisionRealtimeFineTuneSegmentStartMs = currentMs
+        return autoVisionLateralReturnOffsetSteps
+    }
+
+    /*
+     * autoVisionRealtimeSelectAxis 的作用：
+     *   根据实时 ROI 误差选出当前应该优先收敛的主轴，并尽量减少 X/Y 之间频繁来回切换。
+     *
+     * 参数：
+     *   errorX 是左右方向像素误差。
+     *   errorY 是传送带前后方向像素误差。
+     *
+     * 返回值：
+     *   返回 "lateral"、"conveyor" 或空字符串。
+     */
+    function autoVisionRealtimeSelectAxis(errorX, errorY) {
+        var absX = Math.abs(Math.floor(Number(errorX || 0)))
+        var absY = Math.abs(Math.floor(Number(errorY || 0)))
+        var tolerance = Math.max(0, Math.floor(Number(autoVisionFineTuneTolerancePx || 0)))
+        var switchDeadband = Math.max(0, Math.floor(Number(autoVisionRealtimeFineTuneSwitchDeadbandPx || 0)))
+        var xActive = absX > tolerance
+        var yActive = absY > tolerance
+
+        if (!xActive && !yActive) {
+            return ""
+        }
+
+        if (xActive && !yActive) {
+            return "lateral"
+        }
+
+        if (!xActive && yActive) {
+            return "conveyor"
+        }
+
+        if ((autoVisionRealtimeFineTuneAxis === "lateral" && absX + switchDeadband >= absY)
+                || (autoVisionRealtimeFineTuneAxis === "conveyor" && absY + switchDeadband >= absX)) {
+            return autoVisionRealtimeFineTuneAxis
+        }
+
+        return absX >= absY ? "lateral" : "conveyor"
+    }
+
+    /*
+     * autoVisionRealtimeDirectionForAxis 的作用：
+     *   把实时闭环当前主轴误差转换成 ACTUATOR_VEL_MOVE 的逻辑方向编号。
+     *
+     * 返回值：
+     *   conveyor：0=后退/1=前进；lateral：0=左移/1=右移。
+     */
+    function autoVisionRealtimeDirectionForAxis(axisName, errorX, errorY) {
+        if (axisName === "lateral") {
+            return Number(errorX) > 0 ? 1 : 0
+        }
+
+        return Number(errorY) > 0 ? 0 : 1
+    }
+
+    /*
+     * autoVisionRealtimeSpeedForAxis 的作用：
+     *   按主轴、误差档位和连续无改善次数，计算实时闭环下一次应使用的持续运动速度。
+     *
+     * 参数：
+     *   axisName 是主轴名，conveyor 或 lateral。
+     *   absError 是当前主轴绝对误差，单位像素。
+     *
+     * 返回值：
+     *   返回 1~5000 rpm 的闭环速度。
+     */
+    function autoVisionRealtimeSpeedForAxis(axisName, absError) {
+        var axis = String(axisName || "")
+        var errorPx = Math.max(0, Math.floor(Number(absError || 0)))
+        var tolerance = Math.max(0, Math.floor(Number(autoVisionFineTuneTolerancePx || 0)))
+        var scalePx = Math.max(1, Math.floor(Number(autoVisionFineTuneStepScalePx || 1)))
+        var excessPx = Math.max(0, errorPx - tolerance)
+        var level = Math.max(0, Math.ceil(excessPx / scalePx))
+        var speedStepPercent = Math.max(1, Math.floor(Number(autoVisionRealtimeFineTuneSpeedStepPercent || 30)))
+        var noImprovePercent = Math.max(0, Math.floor(Number(autoVisionRealtimeFineTuneNoImproveSpeedPercent || 18)))
+        var maxPercent = Math.max(100, Math.floor(Number(autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent || 220)))
+        var baseSpeed = axis === "lateral"
+                ? autoVisionNormalizeSpeedRpm(cameraLateralMotorSetting().normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+                : conveyorTrackSpeedRpm()
+        var multiplierPercent = 100 + level * speedStepPercent + Math.max(0, autoVisionFineTuneNoImproveCount) * noImprovePercent
+
+        multiplierPercent = Math.max(100, Math.min(maxPercent, multiplierPercent))
+        return Math.max(1, Math.min(5000, Math.floor(baseSpeed * multiplierPercent / 100.0)))
+    }
+
+    /*
+     * autoVisionCanReverseRealtimeDirection 的作用：
+     *   给实时闭环方向切换加一道防抖门槛，避免误差刚擦过中心就立即反向抽动。
+     *
+     * 参数：
+     *   absError 是当前主轴绝对误差，单位像素。
+     *
+     * 返回值：
+     *   true 表示允许反向；false 表示暂时保持现方向等待下一帧再看。
+     */
+    function autoVisionCanReverseRealtimeDirection(absError) {
+        var threshold = Math.max(0, Math.floor(Number(autoVisionFineTuneTolerancePx || 0)))
+                + Math.max(0, Math.floor(Number(autoVisionRealtimeFineTuneSwitchDeadbandPx || 0)))
+        return Math.max(0, Math.floor(Number(absError || 0))) >= threshold
+    }
+
+    /*
+     * autoVisionFinalizeRealtimeFineTuneStop 的作用：
+     *   在实时闭环 STOP 写入完成或本地无需 STOP 时，按预定下一阶段继续推进自动流程。
+     *
+     * 参数：
+     *   reasonText 是写入状态栏的停机原因。
+     *   nextStage 是 stop 后的下一阶段：focus/detect/resume/none。
+     *
+     * 返回值：
+     *   无返回值；函数只推进 QML 自动流程。
+     */
+    function autoVisionFinalizeRealtimeFineTuneStop(reasonText, nextStage) {
+        var reason = String(reasonText || "")
+        var stage = String(nextStage || "none")
+
+        autoVisionRealtimeFineTuneAxis = ""
+        autoVisionRealtimeFineTuneDirection = -1
+        autoVisionRealtimeFineTuneSpeedRpm = 0
+        autoVisionRealtimeFineTuneSegmentStartMs = 0
+        autoVisionRealtimeFineTuneStopReason = reason
+        autoVisionRealtimeFineTunePendingNextStage = "none"
+
+        if (stage === "resume") {
+            workflowState = "ROI实时微调"
+            storageState = reason
+            autoVisionLastText = reason
+            showStorageToast()
+            return
+        }
+
+        autoVisionRealtimeFineTuneActive = false
+        autoVisionLocatePurpose = "center"
+        autoVisionTimer.stop()
+        autoVisionLocateBusy = false
+
+        if (stage === "focus") {
+            autoVisionLastText = reason
+            storageState = reason
+            workflowState = "对焦稳定"
+            showStorageToast()
+            autoVisionStartFocusSettleBeforeDetect()
+            return
+        }
+
+        if (stage === "detect") {
+            autoVisionLastText = reason
+            storageState = reason
+            workflowState = "模型检测"
+            showStorageToast()
+            autoVisionStartDetectDelay()
+            return
+        }
+
+        autoVisionLastText = reason
+        storageState = reason
+        showStorageToast()
+    }
+
+    /*
+     * autoVisionStopRealtimeFineTune 的作用：
+     *   统一结束实时闭环当前连续运动，并按退出原因决定后续进入继续微调、对焦或检测。
+     *
+     * 参数：
+     *   reasonText 是 STOP 原因，会写到底部状态和日志。
+     *   nextStage 是 stop 后的下一阶段：focus/detect/resume/none。
+     *
+     * 返回值：
+     *   true 表示已经发出 STOP 或已完成本地收口；false 表示当前没有实时闭环会话。
+     */
+    function autoVisionStopRealtimeFineTune(reasonText, nextStage) {
+        var reason = String(reasonText || "实时闭环停止")
+        var stage = String(nextStage || "none")
+        var nowMs = new Date().getTime()
+        var movingActuator = autoVisionRealtimeFineTuneAxis === "lateral" ? 1
+                : (autoVisionRealtimeFineTuneAxis === "conveyor" ? 0 : -1)
+        var hasActiveMotion = movingActuator >= 0 && autoVisionRealtimeFineTuneSpeedRpm > 0
+
+        if (!autoVisionRealtimeFineTuneActive && !hasActiveMotion) {
+            autoVisionFinalizeRealtimeFineTuneStop(reason, stage)
+            return false
+        }
+
+        autoVisionUpdateRealtimeLateralEstimate(nowMs)
+        autoVisionRealtimeFineTuneElapsed()
+        autoVisionRealtimeFineTuneStopReason = reason
+        autoVisionRealtimeFineTunePendingNextStage = stage
+
+        if (!hasActiveMotion) {
+            autoVisionFinalizeRealtimeFineTuneStop(reason, stage)
+            return true
+        }
+
+        workflowState = stage === "resume" ? "实时微调切换" : "实时微调停止"
+        autoVisionLastText = reason
+        storageState = reason
+        showStorageToast()
+        autoVisionCommandBusy = true
+
+        if (!deviceHealth.sendF4ActuatorStopNow(movingActuator, 0)) {
+            autoVisionCommandBusy = false
+            autoVisionFinalizeRealtimeFineTuneStop(reason + "；STOP 写入未启动，按本地状态收口", stage)
+            return false
+        }
+
+        return true
     }
 
     /*
@@ -1739,16 +2202,28 @@ Rectangle {
      */
     function handleAutoVisionFineTuneLocateFinished(ok, result, detail) {
         autoVisionLocateBusy = false
+        autoVisionRealtimeFineTuneElapsed()
 
-        if (!ok || !result || Number(result.has_target) !== 1 || Number(result.width) <= 0 || Number(result.height) <= 0) {
-            workflowState = "模型检测"
-            autoVisionLastText = "ROI复查未稳定返回目标，先进入模型检测：" + detail
-            storageState = autoVisionLastText
-            autoVisionStartDetectDelay()
-            showStorageToast()
+        if (!autoVisionRealtimeFineTuneActive) {
             return
         }
 
+        if (!ok || !result || Number(result.has_target) !== 1 || Number(result.width) <= 0 || Number(result.height) <= 0) {
+            autoVisionRealtimeFineTuneLostFrames += 1
+            workflowState = "ROI实时微调"
+            autoVisionLastText = "ROI 实时闭环暂未稳定返回目标，第 "
+                    + autoVisionRealtimeFineTuneLostFrames + " 帧丢失：" + detail
+            storageState = autoVisionLastText
+            if (autoVisionRealtimeFineTuneLostFrames >= autoVisionRealtimeFineTuneLostStopFrames) {
+                autoVisionStopRealtimeFineTune("ROI 实时闭环连续丢目标 "
+                                               + autoVisionRealtimeFineTuneLostFrames
+                                               + " 帧，停止微调并进入模型检测；请检查光照、零件位置和电机动作",
+                                               "detect")
+            }
+            return
+        }
+
+        autoVisionRealtimeFineTuneLostFrames = 0
         var centerX = Number(result.center_x)
         var centerY = Number(result.center_y)
         var width = Number(result.width)
@@ -1761,36 +2236,107 @@ Rectangle {
         var absErrorY = Math.abs(errorY)
         var xCentered = absErrorX <= autoVisionFineTuneTolerancePx
         var yCentered = absErrorY <= autoVisionFineTuneTolerancePx
+        var elapsedMs = autoVisionRealtimeFineTuneElapsedMs
+        var selectedAxis = ""
+        var selectedError = 0
+        var selectedAbsError = 0
+        var desiredDirection = -1
+        var speed = 0
+        var directionChanged = false
+        var axisChanged = false
 
-        dxPixels = yCentered ? errorX : errorY
+        dxPixels = absErrorY >= absErrorX ? errorY : errorX
         dxPixelsValid = true
 
         if (xCentered && yCentered) {
-            autoVisionLastText = "ROI复查通过：errorY=" + errorY
-                    + "，errorX=" + errorX + "，进入3秒聚焦稳定"
-            storageState = autoVisionLastText
-            autoVisionStartFocusSettleBeforeDetect()
-            showStorageToast()
+            resetAutoVisionFineTuneProgress()
+            autoVisionStopRealtimeFineTune("ROI 实时闭环通过：errorY=" + errorY
+                                           + "，errorX=" + errorX
+                                           + "，停止微调并进入 3 秒对焦稳定",
+                                           "focus")
             return
         }
 
-        if (autoVisionFineTuneAttempts >= autoVisionFineTuneMaxAttempts) {
-            workflowState = "模型检测"
-            autoVisionLastText = "ROI复查仍偏移 errorY=" + errorY
+        if (elapsedMs >= autoVisionRealtimeTuneTimeoutMs) {
+            autoVisionStopRealtimeFineTune("ROI 实时闭环超时 "
+                                           + (elapsedMs / 1000.0).toFixed(2)
+                                           + " 秒，当前 errorY=" + errorY
+                                           + "，errorX=" + errorX
+                                           + "，停止微调并进入模型检测/人工复核",
+                                           "detect")
+            return
+        }
+
+        selectedAxis = autoVisionRealtimeSelectAxis(errorX, errorY)
+        selectedError = selectedAxis === "lateral" ? errorX : errorY
+        selectedAbsError = Math.abs(selectedError)
+        desiredDirection = autoVisionRealtimeDirectionForAxis(selectedAxis, errorX, errorY)
+        autoVisionFineTuneNoImproveBoost(selectedAxis, selectedAbsError)
+        speed = autoVisionRealtimeSpeedForAxis(selectedAxis, selectedAbsError)
+        axisChanged = autoVisionRealtimeFineTuneAxis !== ""
+                && autoVisionRealtimeFineTuneAxis !== selectedAxis
+        directionChanged = autoVisionRealtimeFineTuneDirection >= 0
+                && autoVisionRealtimeFineTuneDirection !== desiredDirection
+
+        if (directionChanged && !autoVisionCanReverseRealtimeDirection(selectedAbsError)) {
+            workflowState = "ROI实时微调"
+            autoVisionLastText = "实时微调防抖：errorY=" + errorY
                     + "，errorX=" + errorX
-                    + "，已达到微调上限 " + autoVisionFineTuneMaxAttempts + " 次，进入模型检测"
+                    + "，主轴=" + selectedAxis
+                    + "，误差仍在死区边缘，暂不反向"
             storageState = autoVisionLastText
-            autoVisionStartDetectDelay()
-            showStorageToast()
             return
         }
 
-        if (!yCentered) {
-            autoVisionFineTuneConveyor(errorY)
+        if (axisChanged || directionChanged) {
+            autoVisionStopRealtimeFineTune("实时微调切换：errorY=" + errorY
+                                           + "，errorX=" + errorX
+                                           + "，切到主轴=" + selectedAxis
+                                           + "，direction=" + desiredDirection,
+                                           "resume")
             return
         }
 
-        autoVisionFineTuneLateral(errorX)
+        workflowState = selectedAxis === "lateral" ? "左右实时微调" : "传送带实时微调"
+        autoVisionLastText = "实时微调：axis=" + selectedAxis
+                + "，errorY=" + errorY
+                + "，errorX=" + errorX
+                + "，direction=" + desiredDirection
+                + "，speed=" + speed + "rpm"
+                + "，elapsed=" + elapsedMs + "ms"
+                + (autoVisionFineTuneNoImproveCount > 0
+                   ? "，无改善升档=" + autoVisionFineTuneNoImproveCount
+                   : "")
+        storageState = autoVisionLastText
+
+        if (autoVisionRealtimeFineTuneAxis === selectedAxis
+                && autoVisionRealtimeFineTuneDirection === desiredDirection
+                && autoVisionRealtimeFineTuneSpeedRpm === speed) {
+            return
+        }
+
+        if (autoVisionRealtimeFineTuneAxis === "lateral"
+                && autoVisionRealtimeFineTuneDirection >= 0
+                && autoVisionRealtimeFineTuneSpeedRpm > 0) {
+            autoVisionUpdateRealtimeLateralEstimate(new Date().getTime())
+        }
+
+        if (deviceHealth.sendF4ActuatorVelocityMove(selectedAxis === "lateral" ? 1 : 0,
+                                                    desiredDirection,
+                                                    speed,
+                                                    0)) {
+            autoVisionCommandBusy = true
+            autoVisionRealtimeFineTuneAxis = selectedAxis
+            autoVisionRealtimeFineTuneDirection = desiredDirection
+            autoVisionRealtimeFineTuneSpeedRpm = speed
+            autoVisionRealtimeFineTuneSegmentStartMs = new Date().getTime()
+            return
+        }
+
+        autoVisionStopRealtimeFineTune("实时微调速度命令未启动：axis=" + selectedAxis
+                                       + "，direction=" + desiredDirection
+                                       + "，speed=" + speed + "rpm，改为直接进入模型检测",
+                                       "detect")
     }
 
     /*
@@ -1909,19 +2455,27 @@ Rectangle {
         }
 
         var motor = cameraLateralMotorSetting()
-        var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+        var timeoutMs = Math.max(500, Math.min(3000, Math.floor(Number(autoVisionLateralReturnTimeoutMs || 3000))))
+        var baseSpeed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
+        var requiredRpm = Math.ceil((steps * 60000.0) / (Math.max(1, Number(autoVisionActuatorStepsPerRevEstimate || 200)) * timeoutMs))
+        var boostedSpeed = Math.ceil(baseSpeed * Math.max(1.0, Number(autoVisionLateralReturnSpeedMultiplier || 1.8)))
+        var speed = Math.max(baseSpeed, Math.max(requiredRpm, boostedSpeed))
         var direction = offsetSteps > 0 ? 0 : 1
 
+        speed = Math.max(1, Math.min(5000, Math.floor(speed)))
+
         workflowState = "左右轴回中"
-        autoVisionActuatorPhase = "lateral-return"
+        autoVisionActuatorPhase = "lateral-return-fast"
         autoVisionLastText = "本轮左右轴曾微调，相机回到皮带基准：offset="
                 + offsetSteps + " step，returnSteps=" + steps
+                + "，returnSpeed=" + speed + "rpm"
+                + "，timeout=" + timeoutMs + "ms"
                 + "，direction=" + direction
                 + (direction === 0 ? "(相机左移)" : "(相机右移)")
         storageState = autoVisionLastText
         showStorageToast()
 
-        if (deviceHealth.sendF4ActuatorPositionMove(1, direction, 0, speed, steps, 0)) {
+        if (deviceHealth.sendF4ActuatorPositionMoveWithTimeout(1, direction, 0, speed, steps, 0, timeoutMs)) {
             autoVisionCommandBusy = true
             return true
         }
@@ -6065,9 +6619,11 @@ Rectangle {
         running: false
 
         onTriggered: {
-            if (!root.autoVisionRunning
+            var locateLoopActive = root.autoVisionRunning || root.autoVisionRealtimeFineTuneActive
+
+            if (!locateLoopActive
                     || root.autoWorkflowPaused
-                    || root.autoVisionCenteredSent
+                    || (root.autoVisionCenteredSent && !root.autoVisionRealtimeFineTuneActive)
                     || root.autoVisionLocateBusy
                     || root.autoVisionCommandBusy) {
                 return
@@ -6134,6 +6690,36 @@ Rectangle {
                 root.autoVisionActuatorPhase = ""
                 root.autoVisionStartDetectDelay()
             }
+        }
+    }
+
+    /* autoForcedControlRetryTimer 用于在首页暂停/停止抢占后，循环重试向 F4 下发 PAUSE_CYCLE/STOP_CYCLE。 */
+    Timer {
+        id: autoForcedControlRetryTimer
+        interval: root.autoForcedControlRetryIntervalMs
+        repeat: false
+        running: false
+
+        onTriggered: {
+            if (!root.autoForcedControlAction) {
+                return
+            }
+
+            if (root.autoControlBusy) {
+                autoForcedControlRetryTimer.restart()
+                return
+            }
+
+            if (root.autoForcedControlRetryCount >= root.autoForcedControlMaxRetries) {
+                root.autoLastAckText = "首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止")
+                        + " 已本地生效，但 F4 抢占同步超过重试上限，请检查 F4 串口状态后再操作"
+                root.storageState = root.formatF4ToastText(root.autoLastAckText)
+                root.showStorageToast()
+                return
+            }
+
+            root.autoForcedControlRetryCount += 1
+            root.handleControlAction(root.autoForcedControlAction, root.autoForcedControlStateText, true)
         }
     }
 
@@ -6371,10 +6957,43 @@ Rectangle {
          *   detail 是 ACK/NACK 解析文本或串口失败原因。
          */
         onF4AutoControlFinished: {
+            var forcedAction = root.autoForcedControlAction
+            var forcedStateText = root.autoForcedControlStateText
+            var thisIsForcedDispatch = forcedAction !== "" && action === forcedAction
+            var busyRetryFailure = detail.indexOf("上一条F4串口命令仍在发送中") >= 0
+                    || detail.indexOf("F4状态刷新仍在进行") >= 0
+
             root.autoControlBusy = false
             root.autoPendingAction = ""
             root.autoPendingStateText = ""
             root.autoCycleId = cycleId
+
+            /*
+             * 如果用户已经按下暂停/停止，旧的 start/resume/pause ACK 不能再恢复自动流程。
+             * 这里优先让最高优先级动作继续抢占，而不是按旧 ACK 重新 startAutoVisionLoop()。
+             */
+            if (forcedAction !== "" && action !== forcedAction) {
+                root.autoLastAckText = "自动流程ACK：cycle=" + cycleId + "，" + detail
+                        + "；但用户已按下首页" + (forcedAction === "pause" ? "暂停" : "停止")
+                        + "，继续抢占同步 F4"
+                root.storageState = root.formatF4ToastText(root.autoLastAckText)
+                root.showStorageToast()
+                root.autoForcedControlRetryTimer.restart()
+                root.evaluateRuntimeAlarms()
+                return
+            }
+
+            if (thisIsForcedDispatch && !ok && busyRetryFailure) {
+                root.autoLastAckText = "首页" + (forcedAction === "pause" ? "暂停" : "停止")
+                        + " 抢占同步等待重试：" + detail
+                root.storageState = root.formatF4ToastText(root.autoLastAckText)
+                root.showStorageToast()
+                if (root.autoForcedControlRetryCount < root.autoForcedControlMaxRetries) {
+                    root.autoForcedControlRetryTimer.restart()
+                }
+                root.evaluateRuntimeAlarms()
+                return
+            }
 
             if (ok) {
                 if (action === "start") {
@@ -6424,6 +7043,10 @@ Rectangle {
                 } else {
                     root.workflowState = "定位预览"
                 }
+            }
+
+            if (thisIsForcedDispatch && ok) {
+                root.clearForcedAutoControlRequest()
             }
 
             root.storageState = root.formatF4ToastText(root.autoLastAckText)
@@ -6523,7 +7146,7 @@ Rectangle {
                     } else if (root.autoVisionActuatorPhase === "z-up") {
                         root.autoVisionActuatorPhase = "z-motion-up-wait"
                         root.autoVisionHandleActuatorMoveDone(detail)
-                    } else if (root.autoVisionActuatorPhase === "lateral-return") {
+                    } else if (root.autoVisionActuatorPhase === "lateral-return-fast") {
                         root.autoVisionLateralReturnOffsetSteps = 0
                         root.clearAutoVisionPendingLateralFineTune()
                         root.autoVisionActuatorPhase = ""
@@ -6542,7 +7165,7 @@ Rectangle {
                     }
                     if (root.autoVisionActuatorPhase === "z-up") {
                         root.autoVisionNeedsZUp = true
-                    } else if (root.autoVisionActuatorPhase === "lateral-return") {
+                    } else if (root.autoVisionActuatorPhase === "lateral-return-fast") {
                         root.workflowState = "左右轴回中失败"
                         root.storageState = "左右轴回中失败，累计偏移仍为 "
                                 + root.autoVisionLateralReturnOffsetSteps
@@ -6553,6 +7176,51 @@ Rectangle {
                     root.autoVisionActuatorPhase = ""
                 }
 
+                root.evaluateRuntimeAlarms()
+                return
+            }
+
+            if (root.autoVisionRealtimeFineTuneActive || root.autoVisionRealtimeFineTunePendingNextStage !== "none") {
+                if (action === "ACTUATOR_VEL_MOVE") {
+                    if (ok) {
+                        root.workflowState = root.autoVisionRealtimeFineTuneAxis === "lateral"
+                                ? "左右实时微调"
+                                : "传送带实时微调"
+                        root.storageState = "实时微调速度命令已生效：" + detail
+                        root.autoVisionLastText = root.storageState
+                    } else {
+                        root.autoVisionFinalizeRealtimeFineTuneStop("实时微调速度命令失败：" + detail
+                                                                    + "；停止闭环并进入模型检测",
+                                                                    "detect")
+                    }
+                    root.showStorageToast()
+                    root.evaluateRuntimeAlarms()
+                    return
+                }
+
+                if (action === "ACTUATOR_STOP_NOW") {
+                    var stopReason = root.autoVisionRealtimeFineTuneStopReason
+                    var nextStage = root.autoVisionRealtimeFineTunePendingNextStage
+                    var finalReason = ok
+                            ? (stopReason + "；STOP 已写入 F407")
+                            : (stopReason + "；STOP 写入失败：" + detail + "，按 MP157 本地状态继续收口")
+
+                    root.autoVisionFinalizeRealtimeFineTuneStop(finalReason, nextStage)
+                    root.evaluateRuntimeAlarms()
+                    return
+                }
+            }
+
+            if (root.autoForcedControlAction !== "" && action === "ACTUATOR_STOP_NOW") {
+                var forcedStopResult = ok
+                        ? ("首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止") + " 已硬停电机，等待 F4 流程状态同步：" + detail)
+                        : ("首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止") + " 的强制 STOP 写入失败：" + detail + "；请立即检查 F4 串口与电机状态")
+                root.autoLastAckText = forcedStopResult
+                root.storageState = root.formatF4ToastText(forcedStopResult)
+                root.showStorageToast()
+                if (!root.autoControlBusy) {
+                    root.autoForcedControlRetryTimer.restart()
+                }
                 root.evaluateRuntimeAlarms()
                 return
             }
