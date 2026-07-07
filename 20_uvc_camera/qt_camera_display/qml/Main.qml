@@ -127,6 +127,30 @@ Rectangle {
     /* autoVisionLocatePurpose 标记当前 LOCATE 用途：center 用于传送带前后居中，fine-tune 用于 Z 轴下降后的前后/左右复查。 */
     property string autoVisionLocatePurpose: "center"
 
+    /* ===== 传送带误识别防御属性 ===== */
+    /* autoVisionFirstDetectConfirmFrames 记录首次检测到目标后的连续确认帧数。 */
+    property int autoVisionFirstDetectConfirmFrames: 0
+    /* autoVisionFirstDetectConfirmRequired 是进入跟踪前需要的连续确认帧数，防止单帧误触发。 */
+    property int autoVisionFirstDetectConfirmRequired: 2
+    /* autoVisionFirstDetectLastCenterY 记录上一帧确认时目标的 Y 坐标，用于位置一致性检查。 */
+    property int autoVisionFirstDetectLastCenterY: 0
+    /* autoVisionMinConfidenceForTracking 是进入跟踪的最低置信度，低于此值视为噪声。 */
+    property int autoVisionMinConfidenceForTracking: 45
+    /* autoVisionExpectedPartMinBboxArea 是扫描阶段零件期望最小 bbox 面积（像素²）。 */
+    property int autoVisionExpectedPartMinBboxArea: 800
+    /* autoVisionExpectedPartMaxBboxArea 是扫描阶段零件期望最大 bbox 面积（像素²）。 */
+    property int autoVisionExpectedPartMaxBboxArea: 12000
+
+    /* ===== 停止后自动回位属性 ===== */
+    /* autoVisionRecoveryInProgress 表示停止后正在执行自动回位序列（Z轴升+侧向归中）。 */
+    property bool autoVisionRecoveryInProgress: false
+    /* autoVisionRecoveryStage 记录当前回位阶段："z_up"=Z轴回升中, "lateral_return"=侧向归中中, ""=无。 */
+    property string autoVisionRecoveryStage: ""
+    /* autoVisionRecoveryTimeoutMs 是回位操作的总超时保护，超时后强制进入停止状态。 */
+    property int autoVisionRecoveryTimeoutMs: 5000
+    /* autoVisionZDownStepsUsed 记录本轮 Z 轴实际下降的步数，回位时用同样步数回升。 */
+    property int autoVisionZDownStepsUsed: 0
+
     /* autoVisionActuatorPhase 保存正在等待 F4 到位事件或等待稳定的执行器阶段，空字符串表示当前没有自动执行器动作。 */
     property string autoVisionActuatorPhase: ""
 
@@ -145,8 +169,8 @@ Rectangle {
     /* autoVisionFineTuneMaxStepMultiplier 限制单次微调最多放大到 minStep 的 12 倍，兼顾现场可见动作和防止一次过冲。 */
     property int autoVisionFineTuneMaxStepMultiplier: 12
 
-    /* autoVisionFineTuneProgressDeadbandPx 是判断“误差是否没有改善”的像素死区，避免 1~2px 抖动误触发加档。 */
-    property int autoVisionFineTuneProgressDeadbandPx: 2
+    /* autoVisionFineTuneProgressDeadbandPx 是判断”误差是否没有改善”的像素死区，1px 更敏感检测停滞以便快速加档。 */
+    property int autoVisionFineTuneProgressDeadbandPx: 1
 
     /* autoVisionFineTuneLastAxis 记录上一次微调的轴名，conveyor 表示 Y/传送带，lateral 表示 X/左右轴。 */
     property string autoVisionFineTuneLastAxis: ""
@@ -187,8 +211,8 @@ Rectangle {
     /* autoVisionRealtimeFineTuneLostFrames 记录实时闭环阶段连续丢目标的帧数。 */
     property int autoVisionRealtimeFineTuneLostFrames: 0
 
-    /* autoVisionRealtimeFineTuneSwitchDeadbandPx 是实时闭环切轴/反向的防抖门槛，避免误差刚到边缘就来回抽动。 */
-    property int autoVisionRealtimeFineTuneSwitchDeadbandPx: 8
+    /* autoVisionRealtimeFineTuneSwitchDeadbandPx 是实时闭环切轴/反向的防抖门槛，5px 更快切换轴而仍有防抖余量。 */
+    property int autoVisionRealtimeFineTuneSwitchDeadbandPx: 5
 
     /* autoVisionRealtimeFineTuneLostStopFrames 是实时闭环连续丢目标后触发 STOP 的帧数上限。 */
     property int autoVisionRealtimeFineTuneLostStopFrames: 4
@@ -196,17 +220,17 @@ Rectangle {
     /* autoVisionRealtimeTuneTimeoutMs 是实时闭环微调总时长上限，单位 ms；超过后直接 STOP 并退出。 */
     property int autoVisionRealtimeTuneTimeoutMs: 3000
 
-    /* autoVisionRealtimeTunePollMs 是实时闭环 LOCATE 轮询周期，单位 ms。 */
-    property int autoVisionRealtimeTunePollMs: 90
+    /* autoVisionRealtimeTunePollMs 是实时闭环 LOCATE 轮询周期，65ms 加快响应（需 overlay LOCATE 在 50ms 内返回）。 */
+    property int autoVisionRealtimeTunePollMs: 65
 
-    /* autoVisionRealtimeFineTuneSpeedStepPercent 是误差每升一档时的速度倍率步长百分比。 */
-    property int autoVisionRealtimeFineTuneSpeedStepPercent: 30
+    /* autoVisionRealtimeFineTuneSpeedStepPercent 是误差每升一档时的速度倍率步长百分比，40% 加快收敛。 */
+    property int autoVisionRealtimeFineTuneSpeedStepPercent: 40
 
-    /* autoVisionRealtimeFineTuneNoImproveSpeedPercent 是每档“无改善升速”叠加到基准速度的百分比。 */
-    property int autoVisionRealtimeFineTuneNoImproveSpeedPercent: 18
+    /* autoVisionRealtimeFineTuneNoImproveSpeedPercent 是每档”无改善升速”叠加到基准速度的百分比，25% 更快脱困。 */
+    property int autoVisionRealtimeFineTuneNoImproveSpeedPercent: 25
 
-    /* autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent 限制实时闭环速度最高放大倍率，避免高误差时速度过冲。 */
-    property int autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent: 220
+    /* autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent 限制实时闭环速度最高放大倍率，300% 允许大误差时快速逼近。 */
+    property int autoVisionRealtimeFineTuneMaxSpeedMultiplierPercent: 300
 
     /* autoVisionActuatorStepsPerRevEstimate 是 MP157 对执行器步数/转数换算的工程估算值，用于闭环位移与回位速度估算。 */
     property int autoVisionActuatorStepsPerRevEstimate: 200
@@ -220,8 +244,8 @@ Rectangle {
     /* autoVisionPendingLateralFineTuneDirection 暂存已经下发、但还没有收到完成回执的左右轴微调方向。 */
     property int autoVisionPendingLateralFineTuneDirection: 0
 
-    /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，单位 ms，现场经验约 3 秒。 */
-    property int autoVisionZFocusSettleMs: 3000
+    /* autoVisionZFocusSettleMs 是上下轴下降后的对焦稳定等待时间，1500ms 足够 USB 摄像头自动对焦完成。 */
+    property int autoVisionZFocusSettleMs: 1500
 
     /* autoVisionZMoveStepsPerRev 是 MP157 用来估算 Z 轴本地保护超时的每圈步数；正常完成以 F4 ACTUATOR_MOVE_DONE 事件为准。 */
     property int autoVisionZMoveStepsPerRev: 200
@@ -258,6 +282,12 @@ Rectangle {
 
     /* autoVisionNeedsZUp 表示本轮自动检测已经执行过 Z 轴下探，模型检测结束后必须请求回升。 */
     property bool autoVisionNeedsZUp: false
+
+    /* ===== 预测性减速属性 ===== */
+    /* autoVisionRealtimePrevAbsError 记录上一帧同轴的绝对误差，用于计算误差变化率并预测性降速。 */
+    property int autoVisionRealtimePrevAbsError: -1
+    /* autoVisionRealtimeErrorConverging 标记误差是否正在快速收敛（变化率 > error/3），此时降速防过冲。 */
+    property bool autoVisionRealtimeErrorConverging: false
 
     /* autoVisionDetectFromZFlow 表示当前检测由“居中后下探”自动链路触发，检测完成后需要进入 Z 轴回升阶段。 */
     property bool autoVisionDetectFromZFlow: false
@@ -933,6 +963,22 @@ Rectangle {
             return
         }
 
+        /* 重新开始前清理上一轮残留状态，确保新周期干净启动 */
+        if (action === "start") {
+            autoVisionNeedsZUp = false
+            autoVisionZDownStepsUsed = 0
+            autoVisionLateralReturnOffsetSteps = 0
+            autoVisionRecoveryInProgress = false
+            autoVisionRecoveryStage = ""
+            autoVisionFirstDetectConfirmFrames = 0
+            autoVisionRealtimePrevAbsError = -1
+            autoVisionRealtimeErrorConverging = false
+            autoVisionZFocusSettled = false
+            autoVisionDetectFromZFlow = false
+            autoVisionFineTuneAttempts = 0
+            resetAutoVisionFineTuneProgress()
+        }
+
         autoPendingAction = action
         autoPendingStateText = stateText
         autoControlBusy = true
@@ -1167,6 +1213,10 @@ Rectangle {
         autoVisionPendingZMoveDirection = 0
         autoVisionActuatorSettleTimer.stop()
         dxPixelsValid = false
+        /* 清理新增的传送带误识别防御和预测性减速状态 */
+        autoVisionFirstDetectConfirmFrames = 0
+        autoVisionRealtimePrevAbsError = -1
+        autoVisionRealtimeErrorConverging = false
         if (reason && reason.length > 0) {
             autoVisionLastText = reason
         }
@@ -1193,9 +1243,121 @@ Rectangle {
         autoWorkflowRunning = false
         autoCycleRunning = false
         autoWorkflowPaused = false
+        autoVisionRecoveryInProgress = false
+        autoVisionRecoveryStage = ""
         stopAutoVisionLoop(reason)
         workflowState = stateText
         storageState = reason
+    }
+
+    /*
+     * autoVisionStartStopRecoverySequence 的作用：
+     *   在 F4 确认 STOP_CYCLE 后，如果 Z 轴仍在下方或左右轴有偏移，
+     *   自动执行 Z 轴回升 → 侧向归中 序列，完成后才进入最终"已停止"状态。
+     *   包含 5 秒总超时保护，超时后强制停止并提示用户手动复位。
+     */
+    function autoVisionStartStopRecoverySequence() {
+        /* 启动超时保护 */
+        autoVisionActuatorSettleTimer.stop()
+        autoVisionActuatorSettleTimer.interval = autoVisionRecoveryTimeoutMs
+        autoVisionActuatorSettleTimer.restart()
+
+        if (autoVisionNeedsZUp) {
+            autoVisionRecoveryStage = "z_up"
+            autoVisionLastText = "回位：Z轴正在回升..."
+            storageState = autoVisionLastText
+            /* 复用现有 Z 轴回升命令发送逻辑 */
+            autoVisionRequestZUpForRecovery()
+        } else if (autoVisionLateralReturnOffsetSteps !== 0) {
+            autoVisionRecoveryStage = "lateral_return"
+            autoVisionLastText = "回位：侧向轴正在归中..."
+            storageState = autoVisionLastText
+            autoVisionRequestLateralReturnForRecovery()
+        } else {
+            /* 不需要回位 */
+            autoVisionRecoveryInProgress = false
+            stopAutoWorkflowSessionLocally("自动视觉已停止", "已停止")
+        }
+    }
+
+    /*
+     * autoVisionRequestZUpForRecovery 的作用：
+     *   回位序列中发送 Z 轴回升命令给 F4，使用默认 Z 下降步数的回升。
+     */
+    function autoVisionRequestZUpForRecovery() {
+        var steps = autoVisionZDownStepsUsed > 0 ? autoVisionZDownStepsUsed : Number(cameraZMotorSetting().zDownFixedSteps || 0)
+        var speed = Number(cameraZMotorSetting().normalSpeedRpm || 80)
+        if (steps <= 0) {
+            steps = 200
+        }
+        autoVisionActuatorPhase = "z-motion-up-wait"
+        var ok = deviceHealth.sendF4ActuatorPosMove(2, 1, speed, steps, 0)
+        if (!ok) {
+            autoVisionLastText = "回位：Z轴回升指令发送失败，请手动复位"
+            storageState = autoVisionLastText
+            autoVisionRecoveryInProgress = false
+            autoVisionRecoveryStage = ""
+            workflowState = "已停止(需手动回位)"
+        }
+    }
+
+    /*
+     * autoVisionRequestLateralReturnForRecovery 的作用：
+     *   回位序列中发送侧向轴归中命令给 F4，使用累计偏移量反向运动。
+     */
+    function autoVisionRequestLateralReturnForRecovery() {
+        var offsetSteps = Math.abs(autoVisionLateralReturnOffsetSteps)
+        var direction = autoVisionLateralReturnOffsetSteps > 0 ? 0 : 1
+        var speed = Math.max(1, Math.floor(Number(cameraLateralMotorSetting().normalSpeedRpm || 120)
+                                            * autoVisionLateralReturnSpeedMultiplier))
+        if (offsetSteps <= 0) {
+            autoVisionLateralReturnOffsetSteps = 0
+            autoVisionHandleRecoveryLateralDone()
+            return
+        }
+        autoVisionActuatorPhase = "lateral-return-wait"
+        var ok = deviceHealth.sendF4ActuatorPosMove(1, direction, speed, offsetSteps, 0)
+        if (!ok) {
+            autoVisionLastText = "回位：侧向归中指令发送失败，请手动复位"
+            storageState = autoVisionLastText
+            autoVisionLateralReturnOffsetSteps = 0
+            autoVisionRecoveryInProgress = false
+            autoVisionRecoveryStage = ""
+            workflowState = "已停止(需手动回位)"
+        }
+    }
+
+    /*
+     * autoVisionHandleRecoveryZUpDone 的作用：
+     *   Z 轴回升完成后的回调，清除 Z 状态并检查是否还需要侧向归中。
+     */
+    function autoVisionHandleRecoveryZUpDone() {
+        autoVisionNeedsZUp = false
+        autoVisionZFocusSettled = false
+        if (autoVisionLateralReturnOffsetSteps !== 0) {
+            autoVisionRecoveryStage = "lateral_return"
+            workflowState = "正在回位..."
+            autoVisionLastText = "回位：Z轴已回升，侧向轴正在归中..."
+            storageState = autoVisionLastText
+            autoVisionRequestLateralReturnForRecovery()
+        } else {
+            autoVisionActuatorSettleTimer.stop()
+            autoVisionRecoveryInProgress = false
+            autoVisionRecoveryStage = ""
+            stopAutoWorkflowSessionLocally("自动视觉已停止，电机已回位", "已停止")
+        }
+    }
+
+    /*
+     * autoVisionHandleRecoveryLateralDone 的作用：
+     *   侧向归中完成后的回调，清除偏移量并进入最终停止状态。
+     */
+    function autoVisionHandleRecoveryLateralDone() {
+        autoVisionLateralReturnOffsetSteps = 0
+        autoVisionActuatorSettleTimer.stop()
+        autoVisionRecoveryInProgress = false
+        autoVisionRecoveryStage = ""
+        stopAutoWorkflowSessionLocally("自动视觉已停止，电机已回位", "已停止")
     }
 
     /*
@@ -1300,6 +1462,51 @@ Rectangle {
         var centerX = result ? Number(result.center_x) : 0
         var centerY = result ? Number(result.center_y) : 0
         var confidence = result ? Number(result.confidence) : 0
+
+        /* --- 传送带误识别多层防御 --- */
+        if (hasTarget) {
+            /* 置信度过滤：低于阈值视为噪声/传送带纹理 */
+            if (confidence < autoVisionMinConfidenceForTracking) {
+                hasTarget = false
+            }
+            /* bbox 面积过滤：扫描阶段零件大小可预测 */
+            if (hasTarget && result) {
+                var bboxW = Number(result.bbox_w || 0)
+                var bboxH = Number(result.bbox_h || 0)
+                var bboxArea = bboxW * bboxH
+                if (bboxArea > 0 && (bboxArea < autoVisionExpectedPartMinBboxArea
+                                      || bboxArea > autoVisionExpectedPartMaxBboxArea)) {
+                    hasTarget = false
+                }
+            }
+        }
+
+        /* 多帧确认：首次检测到目标后需要连续确认帧才进入跟踪 */
+        if (hasTarget && !autoVisionHasSeenTarget) {
+            var posConsistent = autoVisionFirstDetectConfirmFrames === 0
+                    || Math.abs(Math.round(centerY) - autoVisionFirstDetectLastCenterY) < 30
+            if (posConsistent) {
+                autoVisionFirstDetectConfirmFrames += 1
+                autoVisionFirstDetectLastCenterY = Math.round(centerY)
+            } else {
+                /* 位置跳变，重新开始确认 */
+                autoVisionFirstDetectConfirmFrames = 1
+                autoVisionFirstDetectLastCenterY = Math.round(centerY)
+            }
+            if (autoVisionFirstDetectConfirmFrames < autoVisionFirstDetectConfirmRequired) {
+                /* 还没确认够帧数，暂不进入跟踪 */
+                autoVisionLastText = "自动视觉：疑似检测到目标，确认中 "
+                        + autoVisionFirstDetectConfirmFrames + "/"
+                        + autoVisionFirstDetectConfirmRequired
+                storageState = autoVisionLastText
+                return
+            }
+            /* 确认通过，清零计数器，继续进入正式跟踪流程 */
+            autoVisionFirstDetectConfirmFrames = 0
+        } else if (!hasTarget) {
+            /* 目标丢失或被过滤掉，重置确认计数 */
+            autoVisionFirstDetectConfirmFrames = 0
+        }
 
         autoVisionLastFrameId = frameId
 
@@ -1558,6 +1765,13 @@ Rectangle {
             autoVisionPendingZMoveSpeedRpm = 0
             autoVisionPendingZMoveDirection = 0
             autoVisionActuatorPhase = ""
+
+            /* 回位模式：Z轴回升完成后继续检查侧向归中 */
+            if (autoVisionRecoveryInProgress && autoVisionRecoveryStage === "z_up") {
+                autoVisionHandleRecoveryZUpDone()
+                return true
+            }
+
             workflowState = "高度已恢复"
             storageState = (estimatedDone
                     ? "F4估算Z轴回升完成，开始通知F4/ESP32S3机械臂流程："
@@ -1612,6 +1826,7 @@ Rectangle {
         autoVisionPendingZMoveSteps = steps
         autoVisionPendingZMoveSpeedRpm = speed
         autoVisionPendingZMoveDirection = 0
+        autoVisionZDownStepsUsed = steps
         autoVisionLastText = "自动视觉：上下电机下降 " + steps
                 + " step，最多等待 " + (timeoutMs / 1000.0).toFixed(1)
                 + " 秒后按 MP157 本地估算继续"
@@ -1920,6 +2135,9 @@ Rectangle {
         autoVisionRealtimeFineTuneSegmentStartMs = 0
         autoVisionRealtimeFineTuneStopReason = reason
         autoVisionRealtimeFineTunePendingNextStage = "none"
+        /* 切轴/停止时重置预测性减速状态 */
+        autoVisionRealtimePrevAbsError = -1
+        autoVisionRealtimeErrorConverging = false
 
         if (stage === "resume") {
             workflowState = "ROI实时微调"
@@ -2096,7 +2314,8 @@ Rectangle {
 
         if (autoVisionFineTuneLastAxis === axis) {
             if (currentError >= Math.max(0, autoVisionFineTuneLastAbsError - deadband)) {
-                autoVisionFineTuneNoImproveCount = Math.min(3, autoVisionFineTuneNoImproveCount + 1)
+                /* 最大计数提升到 5 档，允许更激进的加速脱困 */
+                autoVisionFineTuneNoImproveCount = Math.min(5, autoVisionFineTuneNoImproveCount + 1)
             } else {
                 autoVisionFineTuneNoImproveCount = 0
             }
@@ -2273,6 +2492,24 @@ Rectangle {
         desiredDirection = autoVisionRealtimeDirectionForAxis(selectedAxis, errorX, errorY)
         autoVisionFineTuneNoImproveBoost(selectedAxis, selectedAbsError)
         speed = autoVisionRealtimeSpeedForAxis(selectedAxis, selectedAbsError)
+
+        /* 预测性减速：如果误差在快速减小，主动降速防止过冲 */
+        if (autoVisionRealtimePrevAbsError > 0
+                && autoVisionRealtimeFineTuneAxis === selectedAxis
+                && autoVisionRealtimeFineTuneDirection === desiredDirection) {
+            var errorDelta = autoVisionRealtimePrevAbsError - selectedAbsError
+            /* 误差变化率大于当前误差的 1/3，说明正在快速收敛 */
+            if (errorDelta > 0 && errorDelta > selectedAbsError / 3 && selectedAbsError > 0) {
+                speed = Math.max(1, Math.floor(speed * 0.6))
+                autoVisionRealtimeErrorConverging = true
+            } else {
+                autoVisionRealtimeErrorConverging = false
+            }
+        } else {
+            autoVisionRealtimeErrorConverging = false
+        }
+        autoVisionRealtimePrevAbsError = selectedAbsError
+
         axisChanged = autoVisionRealtimeFineTuneAxis !== ""
                 && autoVisionRealtimeFineTuneAxis !== selectedAxis
         directionChanged = autoVisionRealtimeFineTuneDirection >= 0
@@ -6689,6 +6926,15 @@ Rectangle {
                 root.autoVisionZFocusSettled = true
                 root.autoVisionActuatorPhase = ""
                 root.autoVisionStartDetectDelay()
+            } else if (root.autoVisionRecoveryInProgress) {
+                /* 回位超时保护：5秒内未完成回位，强制进入停止状态 */
+                root.autoVisionActuatorPhase = ""
+                root.autoVisionRecoveryInProgress = false
+                root.autoVisionRecoveryStage = ""
+                root.stopAutoWorkflowSessionLocally(
+                    "回位超时：电机未在" + (root.autoVisionRecoveryTimeoutMs / 1000)
+                    + "秒内完成回位，请手动复位Z轴和侧向轴",
+                    "已停止(回位超时)")
             }
         }
     }
@@ -7015,7 +7261,18 @@ Rectangle {
                     root.workflowState = "继续检测"
                     root.startAutoVisionLoop()
                 } else if (action === "stop") {
-                    root.stopAutoWorkflowSessionLocally("自动视觉已停止", "停止")
+                    /* 停止确认后：检查是否需要自动回位（Z轴回升/侧向归中） */
+                    if (root.autoVisionNeedsZUp || root.autoVisionLateralReturnOffsetSteps !== 0) {
+                        root.autoVisionRecoveryInProgress = true
+                        root.autoWorkflowRunning = false
+                        root.autoCycleRunning = false
+                        root.autoWorkflowPaused = false
+                        root.workflowState = "正在回位..."
+                        root.storageState = "停止已确认，正在自动回位"
+                        root.autoVisionStartStopRecoverySequence()
+                    } else {
+                        root.stopAutoWorkflowSessionLocally("自动视觉已停止", "已停止")
+                    }
                 }
 
                 if (!root.usingKmsOverlay && !root.usingGstVideo) {
@@ -7155,6 +7412,14 @@ Rectangle {
                         root.autoVisionLastText = root.storageState
                         root.showStorageToast()
                         root.autoVisionStartF4ArmInspectionAfterZUp()
+                    } else if (root.autoVisionActuatorPhase === "lateral-return-wait") {
+                        /* 停止回位模式：侧向归中完成 */
+                        root.autoVisionActuatorPhase = ""
+                        if (root.autoVisionRecoveryInProgress) {
+                            root.autoVisionHandleRecoveryLateralDone()
+                        } else {
+                            root.autoVisionLateralReturnOffsetSteps = 0
+                        }
                     }
                 } else {
                     root.autoVisionLastText = "执行器失败：" + root.autoVisionActuatorPhase + " " + detail
@@ -8098,11 +8363,10 @@ Rectangle {
                     width: (overlayControls.width - overlayControls.columnSpacing) / 2
                     height: 24
                     radius: 6
-                    property bool actionEnabled: !root.autoControlBusy && !root.autoVisionCommandBusy
-                                                 && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
-                                                     || (modelData.action === "pause" && root.autoCycleRunning && !root.autoWorkflowPaused)
-                                                     || (modelData.action === "resume" && root.autoWorkflowPaused)
-                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoCycleRunning || root.autoWorkflowPaused)))
+                    property bool actionEnabled: (modelData.action === "stop")
+                                                 || (modelData.action === "pause" && !root.autoControlBusy && (root.autoWorkflowRunning || root.autoCycleRunning) && !root.autoWorkflowPaused)
+                                                 || (modelData.action === "resume" && !root.autoControlBusy && root.autoWorkflowPaused)
+                                                 || (modelData.action === "start" && !root.autoControlBusy && !root.autoVisionCommandBusy && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
                     color: !actionEnabled ? "#171b1e" : (overlayButtonMouse.pressed ? "#2d3338" : "#22272b")
                     border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1
@@ -14179,11 +14443,10 @@ Rectangle {
                     width: 64
                     height: 48
                     radius: 8
-                    property bool actionEnabled: !root.autoControlBusy && !root.autoVisionCommandBusy
-                                                 && ((modelData.action === "start" && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
-                                                     || (modelData.action === "pause" && root.autoCycleRunning && !root.autoWorkflowPaused)
-                                                     || (modelData.action === "resume" && root.autoWorkflowPaused)
-                                                     || (modelData.action === "stop" && (root.autoWorkflowRunning || root.autoCycleRunning || root.autoWorkflowPaused)))
+                    property bool actionEnabled: (modelData.action === "stop")
+                                                 || (modelData.action === "pause" && !root.autoControlBusy && (root.autoWorkflowRunning || root.autoCycleRunning) && !root.autoWorkflowPaused)
+                                                 || (modelData.action === "resume" && !root.autoControlBusy && root.autoWorkflowPaused)
+                                                 || (modelData.action === "start" && !root.autoControlBusy && !root.autoVisionCommandBusy && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
                     color: !actionEnabled ? "#171b1e" : (mouseArea.pressed ? "#2d3338" : "#22272b")
                     border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1

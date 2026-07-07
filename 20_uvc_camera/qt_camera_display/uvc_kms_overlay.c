@@ -83,8 +83,8 @@
 /* 自动视觉定位的横向搜索宽度，保持和模型检测 ROI 宽度一致，避免左右支架误入定位。 */
 #define AUTO_LOCATE_SEARCH_WIDTH DEFAULT_DETECT_ROI_SIZE
 
-/* 自动视觉定位的最小连通域面积，过滤相机噪声、反光点和压缩杂点。 */
-#define AUTO_LOCATE_MIN_COMPONENT_AREA 40U
+/* 自动视觉定位的最小连通域面积，30px 允许部分进入画面的零件，同时过滤细小噪点。 */
+#define AUTO_LOCATE_MIN_COMPONENT_AREA 30U
 
 /* 自动视觉定位的最大连通域面积比例分母，避免把整片背景误判成零件。 */
 #define AUTO_LOCATE_MAX_COMPONENT_AREA_DIVISOR 2U
@@ -104,20 +104,54 @@
 /* 自动视觉定位的中心孔采样分母，4 表示取 bbox 中央约 1/4 宽高区域判断垫圈中心孔。 */
 #define AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR 4U
 
-/* 自动视觉定位的中心孔背景占比阈值，中央采样区至少 35% 不是候选亮度才认为像垫圈孔。 */
-#define AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT 35U
+/* 自动视觉定位的中心孔背景占比阈值，中央采样区至少 25% 不是候选亮度才认为像垫圈孔（放宽以提高银色零件识别率）。 */
+#define AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT 25U
 
-/* 自动视觉定位的暗候选占比上限；暗像素过多时更像黑色传送带或阴影，不像带孔零件。 */
-#define AUTO_LOCATE_MAX_DARK_FILL_PERCENT 82U
+/* 自动视觉定位的暗候选占比上限；灰色传送带暗纹理斑块可能低于 82%，降到 65% 更积极拒绝。 */
+#define AUTO_LOCATE_MAX_DARK_FILL_PERCENT 65U
 
 /* 自动视觉定位的暗色贴边判断边距；贴近搜索带边缘的大暗区通常是传送带背景。 */
 #define AUTO_LOCATE_DARK_EDGE_MARGIN_PX 8U
 
-/* 自动视觉定位的暗色面积上限；暗候选面积超过搜索区域 18% 时优先按背景误检处理。 */
-#define AUTO_LOCATE_MAX_DARK_EDGE_AREA_PERCENT 18U
+/* 自动视觉定位的暗色面积上限；暗候选面积超过搜索区域 12% 时优先按背景误检处理。 */
+#define AUTO_LOCATE_MAX_DARK_EDGE_AREA_PERCENT 12U
 
 /* 自动视觉定位的中心孔背景最小对比度；孔区域与候选实体太接近时不认为是垫圈孔。 */
 #define AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST 10U
+
+/*
+ * 自动视觉定位的最小色度能量阈值。
+ *
+ * YUYV 中 U=128/V=128 表示消色差（灰色/黑色/白色）。
+ * 蓝色金属零件的 |U-128| + |V-128| 通常 > 30。
+ * 灰色传送带的 |U-128| + |V-128| 通常 < 10。
+ * 设为 15 可有效拒绝传送带纹理误检，同时不误杀有颜色的零件。
+ *
+ * 注意：银色/铝色零件同样为消色差，此过滤器会误杀银色零件。
+ * 当检测银色零件时应禁用此过滤器，改用圆度过滤。
+ * 设为 0 表示禁用色度过滤。
+ */
+#define AUTO_LOCATE_MIN_CHROMA_ENERGY 0U
+
+/*
+ * 自动视觉定位的最小圆度阈值（百分比，0~100）。
+ *
+ * 圆度 = 4π × area / perimeter² × 100
+ * 注意：环形零件（donut）包含外+内两条边界，数学圆度天然只有 15~33%，
+ * 加上 BFS 边界计数膨胀，实测环形只有 10~20%。
+ * 设为 0 禁用此过滤器，改用亮度主导+环孔检测来区分零件和传送带纹理。
+ */
+#define AUTO_LOCATE_MIN_CIRCULARITY_PERCENT 0U
+
+/*
+ * 自动视觉定位的最小亮像素占比百分比。
+ *
+ * 银白色零件在摄像头下呈现为亮候选（高于 bright_threshold），
+ * 灰色传送带纹理/反光通常呈现为暗候选或混合。
+ * 要求连通域中亮像素占比 >= 40% 才认为是银白色零件而非传送带暗斑。
+ * 设为 0 禁用此过滤器。
+ */
+#define AUTO_LOCATE_MIN_BRIGHT_FILL_PERCENT 40U
 
 /*
  * 自动视觉定位的基础亮度差阈值。
@@ -1997,6 +2031,37 @@ static unsigned int yuyv_luma_at(const struct latest_frame *frame,
 }
 
 /*
+ * yuyv_chroma_u_at 的作用：
+ *   从 YUYV422 原始帧中读取指定像素位置的 U 色度分量。
+ *   YUYV 每两个像素共享一组 U/V：字节序为 Y0 U Y1 V Y2 U Y3 V ...
+ *   U 位于像素对起始位置 +1 字节处。
+ */
+static unsigned int yuyv_chroma_u_at(const struct latest_frame *frame,
+                                     unsigned int x,
+                                     unsigned int y)
+{
+    const uint8_t *line = frame->yuyv_map + (size_t)y * frame->frame_width * 2U;
+
+    /* U 字节位于每对像素的第 2 个字节：(x & ~1) * 2 + 1 */
+    return (unsigned int)line[(x & ~1U) * 2U + 1U];
+}
+
+/*
+ * yuyv_chroma_v_at 的作用：
+ *   从 YUYV422 原始帧中读取指定像素位置的 V 色度分量。
+ *   V 位于像素对起始位置 +3 字节处。
+ */
+static unsigned int yuyv_chroma_v_at(const struct latest_frame *frame,
+                                     unsigned int x,
+                                     unsigned int y)
+{
+    const uint8_t *line = frame->yuyv_map + (size_t)y * frame->frame_width * 2U;
+
+    /* V 字节位于每对像素的第 4 个字节：(x & ~1) * 2 + 3 */
+    return (unsigned int)line[(x & ~1U) * 2U + 3U];
+}
+
+/*
  * clamp_luma_threshold 的作用：
  *   把均值加减阈值后的结果限制到 0~255，避免无符号计算下溢或越界。
  *
@@ -2301,6 +2366,12 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             uint64_t component_luma_sum = 0U;
             unsigned int dark_pixels = 0U;
             unsigned int bright_pixels = 0U;
+            /* 色度累加器：用于计算连通域平均 U/V，判断消色差传送带 */
+            uint64_t chroma_u_sum = 0U;
+            uint64_t chroma_v_sum = 0U;
+            unsigned int chroma_sample_count = 0U;
+            /* 边界像素计数器：用于计算圆度 = 4π×area/perimeter² */
+            unsigned int perimeter_pixels = 0U;
             unsigned int min_x = x;
             unsigned int max_x = x;
             unsigned int min_y = y;
@@ -2342,6 +2413,14 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 area++;
                 contrast_sum += (unsigned int)abs((int)luma - (int)mean_luma);
                 component_luma_sum += luma;
+
+                /* 每隔 4 个像素采样一次色度，降低计算开销同时保持统计精度 */
+                if ((area & 3U) == 0U) {
+                    chroma_u_sum += yuyv_chroma_u_at(frame, roi_x + local_x, roi_y + local_y);
+                    chroma_v_sum += yuyv_chroma_v_at(frame, roi_x + local_x, roi_y + local_y);
+                    chroma_sample_count++;
+                }
+
                 if (luma <= dark_threshold) {
                     dark_pixels++;
                 } else if (luma >= bright_threshold) {
@@ -2368,6 +2447,8 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
 
                     if (next_x < 0 || next_y < 0 ||
                         next_x >= (int)roi_w || next_y >= (int)roi_h) {
+                        /* 邻居越界 = 当前像素在连通域边缘 */
+                        perimeter_pixels++;
                         continue;
                     }
 
@@ -2383,6 +2464,8 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                                                        bright_threshold,
                                                        dark_threshold)) {
                         visited[neighbor_index] = 1U;
+                        /* 邻居不是候选 = 当前像素是边界像素 */
+                        perimeter_pixels++;
                         continue;
                     }
 
@@ -2411,6 +2494,25 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 continue;
             }
 
+            /*
+             * 贴边拒绝：候选连通域触及搜索条的左边缘或右边缘时拒绝。
+             * 铝框架/传送带侧边永远贴着左右边界，而零件从上方进入不会贴左右。
+             * 允许触及上/下边缘（零件正常从上方进入或从下方离开）。
+             */
+            if (min_x == 0U || max_x >= roi_w - 1U) {
+                continue;
+            }
+
+            /*
+             * 收紧长宽比：环形零件近似正方形外接框（长宽比 > 0.5）。
+             * 传送带边缘/框架阴影通常是窄长条（长宽比 < 0.35）。
+             * 比原来的 25% 更严格，用 40% 过滤长条形误检。
+             */
+            if (bbox_w * 100U < bbox_h * 40U ||
+                bbox_h * 100U < bbox_w * 40U) {
+                continue;
+            }
+
             contrast_avg = contrast_sum / area;
             component_mean_luma = (unsigned int)(component_luma_sum / area);
             dark_fill_percent = area > 0U ? (dark_pixels * 100U) / area : 0U;
@@ -2420,6 +2522,37 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             if (density < AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT ||
                 density > AUTO_LOCATE_MAX_SOLID_DENSITY_PERCENT) {
                 continue;
+            }
+
+            /*
+             * 色度能量过滤：当 AUTO_LOCATE_MIN_CHROMA_ENERGY > 0 时启用。
+             * 银色/铝色零件为消色差，与灰色传送带无法用色度区分，此时应设为 0 禁用。
+             */
+            if (AUTO_LOCATE_MIN_CHROMA_ENERGY > 0U && chroma_sample_count > 0U) {
+                unsigned int avg_u = (unsigned int)(chroma_u_sum / chroma_sample_count);
+                unsigned int avg_v = (unsigned int)(chroma_v_sum / chroma_sample_count);
+                unsigned int chroma_energy = (unsigned int)(abs((int)avg_u - 128)
+                                                            + abs((int)avg_v - 128));
+                if (chroma_energy < AUTO_LOCATE_MIN_CHROMA_ENERGY) {
+                    continue;
+                }
+            }
+
+            /*
+             * 圆度过滤：真实零件（环形/圆形）有规则的圆形轮廓，圆度高；
+             * 传送带纹理/反光斑块边界不规则，圆度低。
+             * circularity = 4π × area / perimeter² (×100 转整数百分比)
+             */
+            if (perimeter_pixels > 0U && AUTO_LOCATE_MIN_CIRCULARITY_PERCENT > 0U) {
+                /* 用 1257 / 100 近似 4π ≈ 12.566 */
+                unsigned int circularity_percent = (unsigned int)(
+                    (uint64_t)area * 1257U / ((uint64_t)perimeter_pixels * perimeter_pixels / 100U + 1U));
+                if (circularity_percent > 100U) {
+                    circularity_percent = 100U;
+                }
+                if (circularity_percent < AUTO_LOCATE_MIN_CIRCULARITY_PERCENT) {
+                    continue;
+                }
             }
 
             /*
@@ -2440,28 +2573,52 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 continue;
             }
 
-            if (!auto_locate_component_has_ring_hole(frame,
-                                                     roi_x,
-                                                     roi_y,
-                                                     min_x,
-                                                     max_x,
-                                                     min_y,
-                                                     max_y,
-                                                     bright_threshold,
-                                                     dark_threshold,
-                                                     component_mean_luma)) {
-                continue;
+            /*
+             * 亮度主导过滤：银白色零件在摄像头下是亮候选为主。
+             * 如果亮像素占比过低，说明更可能是传送带暗纹理/阴影而非金属零件。
+             * 设为 0 禁用此过滤器。
+             */
+            if (AUTO_LOCATE_MIN_BRIGHT_FILL_PERCENT > 0U) {
+                unsigned int bright_fill_percent = area > 0U ? (bright_pixels * 100U) / area : 0U;
+                if (bright_fill_percent < AUTO_LOCATE_MIN_BRIGHT_FILL_PERCENT) {
+                    continue;
+                }
             }
 
-            score = area + bbox_area / 4U + contrast_avg * 8U;
+            /*
+             * ring_hole 检测作为得分加成而非硬性条件：
+             * - 零件刚进入画面时只有部分弧形可见，中心孔不完整，硬过滤会误杀
+             * - 有环孔的候选获得 50% 得分加成和置信度加成
+             * - 没有环孔但通过其他过滤的候选仍可被接受（靠多帧确认防误检）
+             */
+            {
+                unsigned int has_ring = auto_locate_component_has_ring_hole(frame,
+                                                         roi_x,
+                                                         roi_y,
+                                                         min_x,
+                                                         max_x,
+                                                         min_y,
+                                                         max_y,
+                                                         bright_threshold,
+                                                         dark_threshold,
+                                                         component_mean_luma);
 
-            if (score <= best_score) {
-                continue;
-            }
+                score = area + bbox_area / 4U + contrast_avg * 8U;
+                if (has_ring) {
+                    score = score + score / 2U; /* 有环孔加 50% 得分 */
+                }
 
-            confidence = contrast_avg * 2U + density / 2U + area / 20U;
-            if (confidence > 100U) {
-                confidence = 100U;
+                if (score <= best_score) {
+                    continue;
+                }
+
+                confidence = contrast_avg * 2U + density / 2U + area / 20U;
+                if (has_ring) {
+                    confidence += 15U; /* 有环孔加 15 置信度 */
+                }
+                if (confidence > 100U) {
+                    confidence = 100U;
+                }
             }
 
             best_score = score;

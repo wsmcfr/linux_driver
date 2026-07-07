@@ -8367,13 +8367,23 @@ public:
                 payload.append(static_cast<char>(0x00)); /* resume_mode=0，表示从暂停点继续。 */
             }
         } else if (normalizedAction == QStringLiteral("stop")) {
-            if (!m_f4AutoRunning && !m_f4AutoPaused) {
-                rejectText = QStringLiteral("当前没有自动检测流程需要停止");
-            } else {
+            /*
+             * 停止允许在任何状态下发送：
+             * - 正常运行/暂停中：用当前 cycleId 停止
+             * - 本地状态已清除（Qt重启后）：发送 cycle_id=0 强制停止F4残留流程
+             */
+            if (m_f4AutoRunning || m_f4AutoPaused) {
                 command = BINARY_PROTOCOL_CMD_STOP_CYCLE;
                 appendLe16(&payload, cycleId);
                 payload.append(static_cast<char>(0x00)); /* stop_reason=0，表示用户按下停止。 */
                 payload.append(static_cast<char>(0x00)); /* stop_level=0，表示普通停止而非急停。 */
+            } else {
+                /* 本地无活跃流程但F4可能有残留：发送 cycle_id=0 强制清理 */
+                command = BINARY_PROTOCOL_CMD_STOP_CYCLE;
+                appendLe16(&payload, static_cast<quint16>(0U));
+                payload.append(static_cast<char>(0x01)); /* stop_reason=1，表示强制清理残留状态。 */
+                payload.append(static_cast<char>(0x00)); /* stop_level=0。 */
+                cycleId = 0U;
             }
         } else {
             rejectText = QStringLiteral("未知自动流程动作：") + action;
