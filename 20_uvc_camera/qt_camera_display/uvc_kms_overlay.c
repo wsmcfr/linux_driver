@@ -2460,6 +2460,60 @@ static void auto_locate_select_fallback_center_band(unsigned int frame_height,
 }
 
 /*
+ * auto_locate_expand_belt_band_to_model_roi 的作用：
+ *   把黑色传送带暗带搜索结果扩展到至少覆盖中心模型 ROI 的纵向范围。
+ *
+ * 主要流程：
+ *   1. 按 DEFAULT_DETECT_ROI_SIZE 计算当前帧中心模型 ROI 的上下边界。
+ *   2. 保留黑色传送带暗带检测得到的原始范围，避免丢掉真实传送带区域。
+ *   3. 用两者并集作为 LOCATE 纵向搜索带，保证垫圈进入绿色中心 ROI 后不会被只扫描上半截。
+ *
+ * 关键原因：
+ *   现场强高光垫圈会把黑色传送带行检测切断，旧代码可能只得到 `roi_y=0 roi_h≈197`。
+ *   此时垫圈真实中心在画面中部，但 LOCATE 只抓到上侧一条亮弧，bbox 变成约 `230x55`，
+ *   随后被长宽比过滤成 `diag=4`。扩展到中心模型 ROI 后，完整垫圈主体会进入连通域计算。
+ *
+ * 参数：
+ *   frame_height 是当前摄像头帧高度。
+ *   band_y0/band_y1 是输入输出参数，保存纵向搜索起止行，均为整帧坐标且包含端点。
+ *
+ * 返回值：
+ *   无返回值；参数非法或帧高为 0 时直接返回，保持调用方已有范围不变。
+ */
+static void auto_locate_expand_belt_band_to_model_roi(unsigned int frame_height,
+                                                      unsigned int *band_y0,
+                                                      unsigned int *band_y1)
+{
+    unsigned int model_roi_h;
+    unsigned int model_y0;
+    unsigned int model_y1;
+
+    if (band_y0 == NULL || band_y1 == NULL || frame_height == 0U) {
+        return;
+    }
+
+    model_roi_h = frame_height < DEFAULT_DETECT_ROI_SIZE ? frame_height : DEFAULT_DETECT_ROI_SIZE;
+    if (model_roi_h == 0U) {
+        return;
+    }
+
+    model_y0 = (frame_height - model_roi_h) / 2U;
+    model_y1 = model_y0 + model_roi_h - 1U;
+
+    if (*band_y0 > model_y0) {
+        *band_y0 = model_y0;
+    }
+
+    if (*band_y1 < model_y1) {
+        *band_y1 = model_y1;
+    }
+
+    if (*band_y1 >= frame_height) {
+        *band_y1 = frame_height - 1U;
+    }
+}
+
+/*
  * auto_locate_find_dark_belt_band 的作用：
  *   从水平居中的 300px 搜索带里，先找出连续的黑色传送带纵向区域，再交给零件定位逻辑使用。
  *
@@ -2744,10 +2798,11 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
  * 主要流程：
  *   1. 初始化输出结果，把 frame_id 和图像尺寸先写入 result，保证无目标时也能回传上下文。
  *   2. 先在水平居中的 300px 搜索带里查找黑色传送带纵向区域，排除传送带外白色支架和背景。
- *   3. 只统计黑色传送带区域内的亮度直方图、最暗值和最亮值，用 p50/p95 得到当前背景的自适应阈值。
- *   4. 只对明显亮于传送带背景的金属主体像素做四邻域连通域搜索，暗像素只作为背景/孔洞证据。
- *   5. 拒绝贴边、窄长、过密或过稀的连通域，避免把传送带高光斑误识别成零件。
- *   6. 选择面积、外接框和长宽比都合理的最佳连通域，输出中心点、bbox 和置信度。
+ *   3. 再把纵向搜索范围扩展到至少覆盖中心 300px 模型 ROI，避免强高光垫圈把暗带切断后漏掉完整主体。
+ *   4. 只统计最终搜索区域内的亮度直方图、最暗值和最亮值，用 p50/p95 得到当前背景的自适应阈值。
+ *   5. 只对明显亮于传送带背景的金属主体像素做四邻域连通域搜索，暗像素只作为背景/孔洞证据。
+ *   6. 拒绝贴边、窄长、过密或过稀的连通域，避免把传送带高光斑误识别成零件。
+ *   7. 选择面积、外接框和长宽比都合理的最佳连通域，输出中心点、bbox 和置信度。
  *
  * 参数：
  *   frame 是最新摄像头帧，必须包含原始 YUYV 指针。
@@ -2817,6 +2872,7 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
     if (!auto_locate_find_dark_belt_band(frame, roi_x, roi_w, &belt_y0, &belt_y1)) {
         auto_locate_select_fallback_center_band(frame->frame_height, &belt_y0, &belt_y1);
     }
+    auto_locate_expand_belt_band_to_model_roi(frame->frame_height, &belt_y0, &belt_y1);
 
     roi_y = belt_y0;
     roi_h = belt_y1 >= belt_y0 ? belt_y1 - belt_y0 + 1U : 0U;
@@ -3059,24 +3115,6 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             }
 
             /*
-             * 贴边拒绝：候选连通域触及搜索条的左边缘或右边缘时拒绝。
-             * 铝框架/传送带侧边永远贴着左右边界，而零件从上方进入不会贴左右。
-             * 允许触及上/下边缘（零件正常从上方进入或从下方离开）。
-             */
-            if (min_x == 0U || max_x >= roi_w - 1U) {
-                auto_locate_record_reject_candidate(result,
-                                                    LOCATE_DIAG_EDGE,
-                                                    bbox_area + area,
-                                                    bbox_w,
-                                                    bbox_h,
-                                                    area,
-                                                    0U,
-                                                    0U,
-                                                    0U);
-                continue;
-            }
-
-            /*
              * 收紧长宽比：环形零件近似正方形外接框（长宽比 > 0.5）。
              * 传送带边缘/框架阴影通常是窄长条（长宽比 < 0.35）。
              * 比原来的 25% 更严格，用 40% 过滤长条形误检。
@@ -3233,6 +3271,26 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 }
                 if (confidence > 100U) {
                     confidence = 100U;
+                }
+
+                /*
+                 * 贴边候选延后拒绝：
+                 *   旧逻辑在 ring_hole 检测前，只要候选触及左右搜索边界就直接拒绝。
+                 *   现场垫圈强高光会把右侧亮边短暂并入同一连通域，候选虽然贴边，
+                 *   但中心区域仍可能有真实垫圈孔；因此这里先看 has_ring。
+                 *   没有中心孔结构证据的贴边候选继续按背景/支架误检拒绝。
+                 */
+                if (!has_ring && (min_x == 0U || max_x >= roi_w - 1U)) {
+                    auto_locate_record_reject_candidate(result,
+                                                        LOCATE_DIAG_EDGE,
+                                                        score,
+                                                        bbox_w,
+                                                        bbox_h,
+                                                        area,
+                                                        density,
+                                                        confidence,
+                                                        has_ring);
+                    continue;
                 }
 
                 /*

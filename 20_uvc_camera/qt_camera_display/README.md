@@ -9,13 +9,86 @@
 | 视频显示 | 安全预览使用 V4L2 YUYV 帧上传到 OpenGL ES 纹理；正式路线使用 KMS overlay plane 显示视频 |
 | GPU 路径 | `galcore` + OpenGL ES + `eglfs` 或 `wayland-egl` |
 | 目标分辨率 | 1024x600 |
-| 当前检测逻辑 | 点击 `检测` 后先运行 MobileNetV3-Small 分类，再运行 UNet 分割；分类完成后首页立即显示零件类型、短类别、分类初判和置信度，但主状态保持“等待综合判定”；UNet 完成后按两个模型综合生成最终判定并显示双模型总耗时；首页窄栏只显示“分类良/分类坏/综合良品/综合坏品”等短结果，完整模型依据保留在历史详情；只要分类模型判坏或 UNet 检出缺陷像素，最终就不能判为良品；COS 上传完成后再把本次原始图片、UNet raw/overlay/mask 结果图、两个模型输出、综合判定和云端上传状态合并成一条历史记录。 |
+| 当前检测逻辑 | 点击 `检测` 或自动流程进入模型前，先通过 overlay `LOCATE` 确认当前帧 `has_target=1`，空 ROI/空皮带不允许进入模型；通过门禁后先运行 MobileNetV3-Small 分类，再运行 UNet 分割；分类完成后首页立即显示零件类型、短类别、分类初判和置信度，但主状态保持“等待综合判定”；UNet 完成后按两个模型综合生成最终判定并显示双模型总耗时；首页窄栏只显示“分类良/分类坏/综合良品/综合坏品”等短结果，完整模型依据保留在历史详情；只要分类模型判坏或 UNet 检出缺陷像素，最终就不能判为良品；COS 上传完成后再把本次原始图片、UNet raw/overlay/mask 结果图、两个模型输出、综合判定和云端上传状态合并成一条历史记录。 |
 | SD 卡按钮 | 右侧面板只保留 `检测` 和 `安全卸载`；独立 `保存图片` 按钮已取消，图片保存由双模型检测流程自动完成。 |
 | 板端 SSH | 从虚拟机执行 `ssh -i /home/cfr/.ssh/id_ed25519_github -o IdentitiesOnly=yes root@192.168.1.250` |
 
 > 记录：当前版本已经打通 Qt 界面和 UVC 摄像头显示，但它是“安全预览路径”，不是最终零拷贝视频路径。
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
+
+## 2026-07-09 自动开始清空旧检测结果修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场继续看到黑色传送带画面旁边显示“波形垫圈/坏品/置信度”等内容。板端 `--detect-self-test` 连续空 ROI 验证已经被 `ensureCurrentFrameHasLocateTarget()` 拦住，并没有进入模型；本次根因是自动流程点击 `开始` 后只重置了自动视觉状态，右侧“当前结果”面板仍可能保留上一轮模型结果，容易被误认为黑色传送带又被模型识别成零件。 |
+| 具体改动 | `Main.qml` 新增 `resetDetectResultPanel()`，统一清空 `detectStatus/detectState/detectPartName/detectClassName`、置信度、良坏概率、耗时和 `latestModelResultText`；`handleDetectAction()`、`startAutoVisionLoop()`、`handleDetectFailureText()` 都复用这个函数。自动流程刚进入“等待上料”时，右侧零件和类别立即回到“未检测”，模型行显示“等待上料”，不会继续展示上一轮结果。`test_qt_kms_overlay_assets.sh` 增加静态契约，防止以后某个入口绕过清理函数。 |
+| 使用方式变化 | 首页操作不变。点击 `开始` 后，如果画面里只有黑色传送带，右侧结果应显示未检测/等待上料/等待检测，不应继续显示上一轮“波形垫圈”“检测坏品”或旧置信度。真实零件进入 ROI 后，仍按 LOCATE、居中、Z 下降、ROI 微调、模型检测的原流程推进。 |
+| 生效边界 | 本次不修改分类模型、不修改 UNet、不修改 `uvc_kms_overlay` 识别阈值，也不修改 F4 固件；只是修复 MP157 Qt/QML 的结果面板状态复位。`Main.qml` 已编进 Qt resource，代码已写不等于板端生效，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display`。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `startAutoVisionLoop()`、`handleDetectAction()`、`handleDetectFailureText()` 都调用 `resetDetectResultPanel()`。 | 若失败，检查三个入口是否又手写部分字段、漏清 `latestModelResultText` 或漏清置信度。 |
+| 空传送带自动开始 | 开发板触摸屏 | 保持中心 ROI 内无零件，点击首页 `开始`。 | 右侧“当前结果”立即显示 `零件=未检测`、`类别=未检测`、`模型=等待上料`、置信度 `--%`；底部继续显示“自动视觉：等待零件从上方进入 ROI”。 | 若仍显示上一轮零件，先用 `strings /root/qt_camera_display/qt_camera_display | grep resetDetectResultPanel` 确认板端二进制已替换，再重启 Qt 服务。 |
+| 空 ROI 检测入口 | 开发板 SSH | `cd /root/qt_camera_display && ./qt_camera_display --detect-self-test` | 空 ROI 返回“检测失败：当前 ROI 未识别到零件...”，退出码非 0，不产生新的模型 RESULT。 | 若返回 RESULT，说明模型入口门禁失效；先检查 `strings /root/qt_camera_display/qt_camera_display | grep ensureCurrentFrameHasLocateTarget`，再查 overlay `LOCATE` 回包。 |
+
+## 2026-07-09 空 ROI 模型检测门禁修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场空传送带画面中没有真实零件，overlay 直连 `LOCATE` 连续返回 `has_target=0`，但右侧检测结果仍显示“波形垫圈 / 检测坏品 / 置信度 73%”。根因不是底层 LOCATE 把空皮带识别成零件，而是 `detectCurrentFrameOnce()` 在 `SAVE_DETECT` 和双模型推理前没有统一检查 `LOCATE has_target=1`，导致空图仍被分类模型按最相近类别输出结果。 |
+| 具体改动 | `main.cpp` 新增 `ensureCurrentFrameHasLocateTarget()`，在 `detectCurrentFrameOnce()` 创建图片目录后、发送 `SAVE_DETECT` 前先同步执行 `LOCATE`；只有 `OK LOCATE has_target=1` 才继续保存图片和运行 MobileNetV3/UNet。若 `LOCATE` 无回复、返回 `ERR`、格式异常或 `has_target!=1`，直接返回“检测失败：当前 ROI 未识别到零件”，并附带 `diag/roi/cand_box/cand_conf/cand_ring` 诊断字段。`test_qt_kms_overlay_assets.sh` 增加静态契约，禁止检测入口再次绕过 LOCATE 门禁。 |
+| 使用方式变化 | 首页操作不变。空皮带或零件还没有进入 ROI 时点击 `检测`，右侧应显示检测失败并清空旧结果，不再产生新的“波形垫圈/坏品”等模型结果；真实零件被 `LOCATE has_target=1` 确认后，模型检测流程保持原样。 |
+| 生效边界 | 本次不调整分类模型、不调整 UNet、不放松或收紧 overlay 识别阈值；只是给 MP157 Qt 检测入口加统一门禁。代码已改不等于板端生效，`main.cpp` 需要重新交叉编译成 `/root/qt_camera_display/qt_camera_display` 并重启服务。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `ensureCurrentFrameHasLocateTarget()` 出现在 `SAVE_DETECT` 之前。 | 若失败，检查 `detectCurrentFrameOnce()` 是否又直接发送 `SAVE_DETECT`，或测试脚本中门禁顺序判断是否被误删。 |
+| 空 ROI 手动检测 | 开发板触摸屏 | 保持传送带中心 ROI 内无零件，点击首页 `检测`。 | 右侧结果不应更新为垫圈类别；状态应显示“检测失败：当前 ROI 未识别到零件...”，并带有 `diag/cand_*` 诊断字段。 | 若仍出现零件类别，先用 `strings /root/qt_camera_display/qt_camera_display | grep ensureCurrentFrameHasLocateTarget` 确认板端二进制已替换，再查 Qt 日志是否仍是旧进程。 |
+| 真实零件检测 | 开发板触摸屏 | 把垫圈完整放入绿色中心 ROI，确认底部 `LOCATE` 已出现 `has_target=1` 后点击 `检测`。 | 模型检测继续生成 source、UNet raw/overlay/mask，并显示分类和综合结果。 | 若真实零件被挡在门禁外，先直连 overlay `LOCATE` 看是否返回 `has_target=1`；若直连也是 0，问题回到 LOCATE 识别链路，不是模型门禁。 |
+
+## 2026-07-09 LOCATE 中心 ROI 搜索带扩展修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 板端当前帧里铝色垫圈清楚位于画面中心，但连续 20 次 overlay 直连 `LOCATE` 都返回 `has_target=0`，诊断字段先是 `diag=4 roi_y=0 roi_h≈197 cand_box≈230x55`，搜索带扩展后又变成 `diag=5 roi_y=0 roi_h=390 cand_box≈257x202`。这说明底层 LOCATE 不是没看到亮像素，而是先只扫描到零件上半截被长宽比过滤；扩展搜索带后又因为真实垫圈与右侧亮边短暂连通，在中心孔判断前被贴边过滤一票否决。 |
+| 具体改动 | `uvc_kms_overlay.c` 新增 `auto_locate_expand_belt_band_to_model_roi()`：黑色传送带暗带检测仍然用于排除上下白色支架和背景，但最终纵向搜索范围会与中心 `300px` 模型 ROI 取并集，保证零件进入绿色 ROI 后完整主体参与亮度阈值、连通域、中心孔和 bbox 判定。同时把左右贴边过滤从 ring 检测前移到 ring 检测后：只有“贴边且没有中心孔结构证据”的候选才继续按背景/支架误检拒绝，避免真实垫圈被 `diag=5` 卡住。 |
+| 使用方式变化 | 首页自动流程操作不变。修复后，如果真实垫圈已经在绿色中心 ROI 内，overlay `LOCATE` 不应再只输出 `cand_box≈230x55 diag=4` 或 `cand_box≈257x202 diag=5` 这类被过滤候选，而应更稳定返回完整垫圈 bbox 和 `has_target=1`。 |
+| 生效边界 | 本次修改的是 MP157 板端 `uvc_kms_overlay` 定位进程，不修改模型检测程序、不修改 QML 模型判定、不修改 F4 固件。代码已写不等于板端生效；必须重新交叉编译并替换板端 `/root/qt_camera_display/uvc_kms_overlay` 后才会影响现场识别。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `auto_locate_expand_belt_band_to_model_roi`、中心 ROI 搜索带扩展调用，以及贴边过滤没有早于 `ring_hole` 检测。 | 若失败，检查 `uvc_kms_overlay.c` 是否仍只使用黑色传送带暗带范围、是否又在 ring 检测前直接 `LOCATE_DIAG_EDGE`，或测试脚本中的 LOCATE 契约是否被误删。 |
+| 板端 overlay 直连验证 | 开发板 SSH | 使用临时 Unix socket 客户端连续发送 `LOCATE`，或在板端有 `nc -U` 时执行 `printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock`。 | 垫圈静止在绿色中心 ROI 内时，连续回包应稳定出现 `has_target=1`，bbox 高度不应再长期停在约 `55px` 的长条候选。 | 若仍 `has_target=0 diag=4`，先保存 `SAVE_DETECT /mnt/sdcard/images` 当前帧，确认垫圈是否完整处在中心 `300x300` ROI；再看 `roi_y/roi_h/thr/cand_box/cand_conf/cand_ring`。 |
+| 板端自动流程验证 | 开发板触摸屏 + F4 日志 | 重启 KMS overlay 服务后点击首页 `开始`，让零件进入摄像头中心 ROI。 | 首页底部应从“尚未识别到零件”进入自动视觉坐标显示，随后完成居中停机、Z 下降和 ROI 实时微调；不应在垫圈清楚可见时频繁掉到未识别。 | 若首页仍掉识别，先区分 overlay 直连是否已经 `has_target=1`；若直连正常但首页丢，继续查 QML 的首次建链 `ring/conf/bbox` 二次过滤。 |
+
+## 2026-07-08 Z 下降后 ROI 微调与超时收口修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场出现两个新问题：一是上下电机下降后，如果垫圈只有中心点接近但 bbox 没有完整进入绿色中心 ROI，旧 QML 仍可能判定 ROI 通过并直接进入模型检测；二是 ROI 实时微调超时后，如果 `ACTUATOR_VEL_MOVE` 或 `ACTUATOR_STOP_NOW` 回调丢失，`autoVisionCommandBusy` 或 `pendingNextStage` 会让界面长时间停在“停止微调并进入模型检测/人工复核”附近。 |
+| 具体改动 | `Main.qml` 新增 `autoVisionFineTuneModelRoiGeometry()`、`autoVisionFineTuneBboxContainmentError()` 和 `autoVisionFineTuneApplyContainmentError()`：Z 下降后的 ROI 复查不再只看整帧中心，而是按中心 `300x300` 模型 ROI 计算中心误差，并检查 `bbox_x/bbox_y/bbox_w/bbox_h` 四边是否完整落在 ROI 安全边距内；如果 bbox 越界，会强制生成大于死区的 X/Y 误差继续左右轴或传送带实时微调。另新增 `autoVisionRealtimeCommandGuardTimer` 和 `autoVisionRealtimeStopGuardTimer`，分别兜底速度命令回调丢失和 STOP 收口回调丢失。 |
+| 使用方式变化 | 首页自动流程操作不变。Z 下降后底部状态会显示 `roi=...` 和 `contain=Y/X`，当垫圈半出绿色 ROI 时不会立即出现“ROI 实时闭环通过”，而是继续按主误差轴点动；微调超时或命令回调异常时，约 1.2~1.5 秒内会按 MP157 本地状态继续进入模型检测/人工复核，不再无限卡住。 |
+| 生效边界 | 本次只修改 MP157 Qt/QML 自动流程和静态测试，不修改 `uvc_kms_overlay.c`、MP157-F407 二进制协议、F4 固件或 ESP32S3 机械臂协议。代码已写不等于板端生效；`Main.qml` 编进 Qt resource，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display` 后才会在屏幕上生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 ROI bbox 包含判定、速度命令兜底 Timer、STOP 收口兜底 Timer 都存在。 | 若失败，按脚本提示检查 `autoVisionFineTuneModelRoiGeometry`、`autoVisionFineTuneBboxContainmentError`、`autoVisionRealtimeCommandGuardTimer` 或 `autoVisionRealtimeStopGuardTimer` 是否被删改。 |
+| 工作区格式检查 | Windows 仓库根目录 | `git diff --check` | 不应出现尾随空格、冲突标记或空白错误。 | 若失败，按输出文件和行号修复；CRLF 提示不是逻辑错误。 |
+| 板端 ROI 完整进入验证 | 开发板触摸屏 + F4 日志 | 重新部署新 `qt_camera_display` 后，点击首页 `开始`，让垫圈在 Z 下降后停在绿色 ROI 边缘，观察底部状态和 F4 收到的 `ACTUATOR_VEL_MOVE actuator=0/1`。 | 垫圈 bbox 未完全进入 ROI 时，底部应显示 `contain=...` 非零并继续 `左右实时微调` 或 `传送带实时微调`；只有 bbox 和中心误差都满足后才显示“ROI 实时闭环通过”并进入对焦稳定。 | 若仍直接检测，先确认板端二进制包含 `autoVisionFineTuneBboxContainmentError` 字符串；若包含但方向不对，再查参数页左右轴方向、F4 方向映射和电机接线。 |
+| 板端超时收口验证 | 开发板触摸屏 + F4 日志 | 人为让零件长时间不进中心，或临时断开/屏蔽 F4 回包后观察 ROI 实时微调超时。 | 约 3 秒触发“ROI 实时闭环超时”，随后 1.2~1.5 秒内应继续进入模型检测/人工复核，不应长时间停在等待 STOP 或等待综合判定前。 | 若仍卡住，查看底部是否仍显示 `autoVisionCommandBusy` 相关状态；再查 F4 是否收到 `ACTUATOR_STOP`、Qt 日志是否有 `STOP 收口等待 ... 未回调`。 |
 
 ## 2026-07-08 LOCATE 任意阶段丢帧后重捕获修复记录
 

@@ -195,6 +195,38 @@ require_grep "detectCurrentFrameFinished" "qml/Main.qml"
 require_grep "detectStatus" "qml/Main.qml"
 require_grep "detectConfidenceText" "qml/Main.qml"
 require_grep "handleDetectAction" "qml/Main.qml"
+require_grep "resetDetectResultPanel" "qml/Main.qml"
+reset_detect_panel_block="$(sed -n '/function resetDetectResultPanel/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$reset_detect_panel_block" | grep -q 'detectStatus = "WAIT"'; then
+    fail "resetDetectResultPanel() 必须把检测状态重置为 WAIT，避免黑色传送带等待上料时沿用上一轮 GOOD/BAD"
+fi
+if ! printf '%s\n' "$reset_detect_panel_block" | grep -q 'detectState = reasonText'; then
+    fail "resetDetectResultPanel() 必须用调用方传入的 reasonText 刷新模型状态文案"
+fi
+if ! printf '%s\n' "$reset_detect_panel_block" | grep -q 'detectPartName = partText'; then
+    fail "resetDetectResultPanel() 必须重置右侧零件名称，避免空传送带继续显示上一轮波形垫圈"
+fi
+if ! printf '%s\n' "$reset_detect_panel_block" | grep -q 'detectClassName = classText'; then
+    fail "resetDetectResultPanel() 必须重置右侧模型类别，避免旧类别被误认为本轮识别结果"
+fi
+if ! printf '%s\n' "$reset_detect_panel_block" | grep -q 'detectConfidenceRatio = 0.0'; then
+    fail "resetDetectResultPanel() 必须清零置信度进度条，避免旧置信度残留"
+fi
+if ! printf '%s\n' "$reset_detect_panel_block" | grep -q 'latestModelResultText = ""'; then
+    fail "resetDetectResultPanel() 必须清空 latestModelResultText，避免旧模型 RESULT 被自动流程复用"
+fi
+detect_action_block="$(sed -n '/function handleDetectAction()/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$detect_action_block" | grep -q 'resetDetectResultPanel("检测中...", "当前帧", "当前帧")'; then
+    fail "handleDetectAction() 必须复用 resetDetectResultPanel() 清理旧检测结果，避免手动检测残留上一轮状态"
+fi
+auto_start_block="$(sed -n '/function startAutoVisionLoop()/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$auto_start_block" | grep -q 'resetDetectResultPanel("等待上料", "未检测", "未检测")'; then
+    fail "startAutoVisionLoop() 启动等待上料时必须清空右侧旧模型结果，避免黑色传送带旁继续显示上一轮零件"
+fi
+detect_failure_block="$(sed -n '/function handleDetectFailureText/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$detect_failure_block" | grep -q 'resetDetectResultPanel(resultText, "检测失败", "检测失败")'; then
+    fail "handleDetectFailureText() 必须复用 resetDetectResultPanel()，让检测失败时同步清空上一轮模型 RESULT"
+fi
 require_grep "storageToastTimer" "qml/Main.qml"
 require_grep "storageToastVisible" "qml/Main.qml"
 require_grep "showStorageToast" "qml/Main.qml"
@@ -1045,6 +1077,13 @@ detect_once_block="$(sed -n '/QString detectCurrentFrameOnce(/,/^    QString run
 if printf '%s\n' "$detect_once_block" | grep -q 'uploadDetectImagesToCos'; then
     fail "detectCurrentFrameOnce() 只能保存图片和模型结果，自动流程必须等 WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE 收齐后再一次性上传"
 fi
+detect_locate_guard_line="$(printf '%s\n' "$detect_once_block" | grep -n 'ensureCurrentFrameHasLocateTarget' | head -n 1 | cut -d: -f1)"
+detect_save_line="$(printf '%s\n' "$detect_once_block" | grep -n 'sendRawOverlayCommand(QStringLiteral("SAVE_DETECT ' | head -n 1 | cut -d: -f1)"
+if [ -z "$detect_locate_guard_line" ] || [ -z "$detect_save_line" ] || [ "$detect_locate_guard_line" -ge "$detect_save_line" ]; then
+    fail "detectCurrentFrameOnce() 必须在 SAVE_DETECT 和双模型推理前先执行 LOCATE has_target=1 门禁，避免空 ROI/空皮带被分类模型误识别成零件"
+fi
+require_grep "检测入口 LOCATE" "main.cpp"
+require_grep "has_target" "main.cpp"
 retry_upload_block="$(sed -n '/Q_INVOKABLE void retryUploadRecord(int row)/,/workerThread->start();/p' "$SCRIPT_DIR/main.cpp")"
 if ! printf '%s\n' "$retry_upload_block" | grep -q 'weightContextJson'; then
     fail "历史重新发送必须复用历史记录里保存的 weight/ldc/f4/decision/vision 上下文，不能只重传图片"
@@ -1157,8 +1196,26 @@ require_fixed_grep "sendF4ActuatorStopNow(255, 0)" "qml/Main.qml"
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeFineTuneLostFrames'; then
     fail "ROI 实时闭环必须区分连续丢目标场景并触发停机收口"
 fi
+if printf '%s\n' "$fine_tune_block" | grep -q 'var targetY = Math.round(height / 2)'; then
+    fail "Z 下降后的 ROI 复查不能继续只用整帧中心；必须按模型 ROI 中心和 bbox 是否完整在 ROI 内共同判定"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionFineTuneModelRoiGeometry(result'; then
+    fail "ROI 实时闭环必须先计算中心模型 ROI 几何，避免零件未完全进入绿色 ROI 时直接进入模型检测"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionFineTuneBboxContainmentError'; then
+    fail "ROI 实时闭环必须检查 bbox 是否完整落在模型 ROI 内，不能只看中心点误差"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'containmentErrorX'; then
+    fail "ROI 实时闭环必须把 bbox 左右越界转换成左右轴误差，确保下降后零件半出 ROI 时仍继续左右微调"
+fi
 if ! grep -q 'property int autoVisionRealtimeTuneTimeoutMs: 3000' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "实时闭环微调总超时必须默认限制为 3000ms"
+fi
+if ! grep -q 'property int autoVisionRealtimeCommandGuardMs: 1500' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "实时闭环速度命令必须有 1500ms 本地兜底，避免 ACTUATOR_VEL_MOVE 回调丢失后长期卡住"
+fi
+if ! grep -q 'property int autoVisionRealtimeStopGuardMs: 1200' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "实时闭环 STOP 收口必须有 1200ms 本地兜底，避免超时后等待 STOP 回调而卡死"
 fi
 if ! grep -q 'property int autoVisionLateralReturnTimeoutMs: 3000' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "左右轴快速回位超时必须默认限制为 3000ms"
@@ -1219,6 +1276,29 @@ if ! printf '%s\n' "$actuator_finished_block" | grep -q 'ACTUATOR_STOP_NOW'; the
 fi
 if ! printf '%s\n' "$actuator_finished_block" | grep -q 'root.autoVisionActuatorPhase === "lateral-return-fast"'; then
     fail "左右轴快速回中完成回执必须有独立阶段处理，回中完成后才能继续 F4/ESP32S3 机械臂流程"
+fi
+if ! grep -q 'id: autoVisionRealtimeCommandGuardTimer' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 必须提供实时微调速度命令兜底 Timer，防止速度命令回调丢失后 autoVisionCommandBusy 永远为 true"
+fi
+if ! grep -q 'id: autoVisionRealtimeStopGuardTimer' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 必须提供实时微调 STOP 收口兜底 Timer，防止 STOP 回调丢失后一直停在等待综合判定前"
+fi
+stop_realtime_block="$(sed -n '/function autoVisionStopRealtimeFineTune/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+finalize_realtime_block="$(sed -n '/function autoVisionFinalizeRealtimeFineTuneStop/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeCommandGuardTimer.restart'; then
+    fail "发送 ACTUATOR_VEL_MOVE 后必须启动速度命令兜底 Timer"
+fi
+if ! printf '%s\n' "$stop_realtime_block" | grep -q 'autoVisionRealtimeStopGuardTimer.restart'; then
+    fail "发送 ACTUATOR_STOP_NOW 后必须启动 STOP 收口兜底 Timer"
+fi
+if ! printf '%s\n' "$finalize_realtime_block" | grep -q 'autoVisionRealtimeCommandGuardTimer.stop'; then
+    fail "实时微调最终收口时必须停止速度命令兜底 Timer"
+fi
+if ! printf '%s\n' "$finalize_realtime_block" | grep -q 'autoVisionRealtimeStopGuardTimer.stop'; then
+    fail "实时微调最终收口时必须停止 STOP 兜底 Timer"
+fi
+if ! printf '%s\n' "$finalize_realtime_block" | grep -q 'autoVisionCommandBusy = false'; then
+    fail "实时微调最终收口必须释放 autoVisionCommandBusy，否则超时后 autoVisionTimer 会一直被挡住"
 fi
 settle_timer_block="$(sed -n '/id: autoVisionActuatorSettleTimer/,/Connections {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$settle_timer_block" | grep -q 'autoVisionActuatorPhase === "focus-settle"'; then
@@ -1291,6 +1371,7 @@ require_grep "auto_locate_is_bright_candidate_luma" "uvc_kms_overlay.c"
 require_grep "auto_locate_body_threshold_from_delta" "uvc_kms_overlay.c"
 require_grep "auto_locate_measure_belt_row" "uvc_kms_overlay.c"
 require_grep "auto_locate_find_dark_belt_band" "uvc_kms_overlay.c"
+require_grep "auto_locate_expand_belt_band_to_model_roi" "uvc_kms_overlay.c"
 require_absent "luma >= bright_threshold \\|\\| luma <= dark_threshold" "uvc_kms_overlay.c"
 require_absent "roi_h = frame->frame_height;" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_touches_search_edge" "uvc_kms_overlay.c"
@@ -1308,11 +1389,19 @@ require_grep "autoVisionFirstDetectRequiredFramesForCandidate" "qml/Main.qml"
 require_grep "autoVisionLastLocateDiagText" "qml/Main.qml"
 locate_filter_block="$(sed -n '/ring_hole 检测作为/,/best_score = score/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 locate_body_block="$(sed -n '/body_threshold = auto_locate_body_threshold_from_delta/,/bbox_w = max_x - min_x/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+locate_roi_select_block="$(sed -n '/if (!auto_locate_find_dark_belt_band/,/pixel_count = roi_w \* roi_h/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+locate_pre_ring_filter_block="$(sed -n '/bbox_w = max_x - min_x/,/ring_hole 检测作为/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 if ! printf '%s\n' "$locate_body_block" | grep -q 'start_luma, bright_threshold'; then
     fail "LOCATE 必须继续使用高亮阈值作为连通域种子，避免把灰色皮带整体并入候选"
 fi
 if ! printf '%s\n' "$locate_body_block" | grep -q 'next_luma, body_threshold'; then
     fail "LOCATE 必须用较低 body_threshold 扩张金属主体，避免银色垫圈阴影把亮环切碎后无法形成 ring"
+fi
+if ! printf '%s\n' "$locate_roi_select_block" | grep -q 'auto_locate_expand_belt_band_to_model_roi'; then
+    fail "LOCATE 搜索带必须强制包含中心 300px 模型 ROI，避免垫圈高光把黑色传送带纵向暗带切断后只扫描零件上半截"
+fi
+if printf '%s\n' "$locate_pre_ring_filter_block" | grep -q 'LOCATE_DIAG_EDGE'; then
+    fail "LOCATE 贴边过滤不能早于 ring_hole 检测，否则真实垫圈与右侧亮边短暂连通时会被 diag=5 一票否决"
 fi
 if ! printf '%s\n' "$locate_filter_block" | grep -q 'body_threshold'; then
     fail "LOCATE 中心孔检测必须使用 body_threshold 判断背景，不能只按过高的高亮种子阈值判断 ring"

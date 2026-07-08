@@ -6137,6 +6137,92 @@ private:
     }
 
     /*
+     * ensureCurrentFrameHasLocateTarget 的作用：
+     *   在真正保存图片和运行模型前，先让 overlay 对当前原始帧执行一次 `LOCATE`，
+     *   确认绿色中心 ROI 附近确实存在零件，避免空皮带、空 ROI 或旧画面直接进入分类模型。
+     *
+     * 主要流程：
+     *   1. 通过 overlay 控制 socket 发送 `LOCATE`，复用底层找零件算法，不新增另一套图像判断。
+     *   2. 校验回复必须是 `OK LOCATE ...`；socket 错误或 overlay 异常直接阻断检测。
+     *   3. 读取 `has_target` 字段，只有值为 1 时才允许后续 `SAVE_DETECT` 和双模型推理。
+     *   4. 目标不存在时把 `diag/cand_box/cand_conf/cand_ring` 等诊断字段拼进错误文本，
+     *      现场可以直接判断是空皮带、候选过小、无中心孔还是搜索带位置不对。
+     *
+     * 参数：
+     *   errorText 用于返回给 QML 的中文失败原因；调用方会统一加上“检测失败：”前缀。
+     *
+     * 返回值：
+     *   true 表示当前帧已经由 `LOCATE has_target=1` 确认存在零件；
+     *   false 表示当前帧不允许进入模型检测，errorText 内保存阻断原因。
+     */
+    bool ensureCurrentFrameHasLocateTarget(QString *errorText)
+    {
+        const QString reply = sendRawOverlayCommand(QStringLiteral("LOCATE"));
+
+        if (reply.isEmpty()) {
+            if (errorText) {
+                *errorText = QStringLiteral("检测入口 LOCATE 无回复，已取消模型检测");
+            }
+            return false;
+        }
+
+        if (reply.startsWith(QStringLiteral("ERR "))) {
+            if (errorText) {
+                *errorText = QStringLiteral("检测入口 LOCATE 失败：") + reply.mid(4);
+            }
+            return false;
+        }
+
+        if (!reply.startsWith(QStringLiteral("OK LOCATE "))) {
+            if (errorText) {
+                *errorText = QStringLiteral("检测入口 LOCATE 回复格式异常：") + reply.left(160);
+            }
+            return false;
+        }
+
+        const QString hasTargetText = parseTokenValue(reply, QStringLiteral("has_target"));
+        if (hasTargetText != QStringLiteral("1")) {
+            const QString diagText = parseTokenValue(reply, QStringLiteral("diag"));
+            const QString roiYText = parseTokenValue(reply, QStringLiteral("roi_y"));
+            const QString roiHText = parseTokenValue(reply, QStringLiteral("roi_h"));
+            const QString candBoxText = parseTokenValue(reply, QStringLiteral("cand_box"));
+            const QString candConfText = parseTokenValue(reply, QStringLiteral("cand_conf"));
+            const QString candRingText = parseTokenValue(reply, QStringLiteral("cand_ring"));
+            QString detail = QStringLiteral("当前 ROI 未识别到零件，请放入零件后再检测");
+
+            if (!diagText.isEmpty()) {
+                detail += QStringLiteral("；diag=") + diagText;
+            }
+            if (!roiYText.isEmpty() || !roiHText.isEmpty()) {
+                detail += QStringLiteral(" roi=") + roiYText + QStringLiteral("/") + roiHText;
+            }
+            if (!candBoxText.isEmpty()) {
+                detail += QStringLiteral(" cand_box=") + candBoxText;
+            }
+            if (!candConfText.isEmpty()) {
+                detail += QStringLiteral(" cand_conf=") + candConfText;
+            }
+            if (!candRingText.isEmpty()) {
+                detail += QStringLiteral(" cand_ring=") + candRingText;
+            }
+
+            if (errorText) {
+                *errorText = detail;
+            }
+            return false;
+        }
+
+        qInfo() << "detect entry LOCATE accepted"
+                << "frame" << parseTokenValue(reply, QStringLiteral("frame_id"))
+                << "bbox" << (parseTokenValue(reply, QStringLiteral("bbox_w"))
+                               + QLatin1Char('x')
+                               + parseTokenValue(reply, QStringLiteral("bbox_h")))
+                << "confidence" << parseTokenValue(reply, QStringLiteral("confidence"))
+                << "ring" << parseTokenValue(reply, QStringLiteral("ring"));
+        return true;
+    }
+
+    /*
      * parseTokenValue 的作用：
      *   从脚本返回行中提取 `key=value` 形式的短字段。
      *
@@ -6923,11 +7009,12 @@ private:
      *
      * 主要流程：
      *   1. 确认 /mnt/sdcard 已挂载，并创建图片历史目录。
-     *   2. 发送 SAVE_DETECT 命令，让 overlay 保存当前帧 JPG 作为 source。
-     *   3. 调用 defect-classify，得到 MobileNetV3-Small GOOD/BAD 结果。
-     *   4. 调用 defect-segment，得到 UNet raw/overlay/mask 结果图和缺陷像素。
-     *   5. 把 source 和所有结果图保存到 bundle，先写 SD 卡历史，不在模型刚结束时上传云端。
-     *   6. 自动流程后续必须等待 F4 回传 WEIGHT_RESULT/LDC_RESULT，再一次性上传完整数据。
+     *   2. 先执行检测入口 LOCATE 门禁，确认当前帧有零件后才允许模型检测。
+     *   3. 发送 SAVE_DETECT 命令，让 overlay 保存当前帧 JPG 作为 source。
+     *   4. 调用 defect-classify，得到 MobileNetV3-Small GOOD/BAD 结果。
+     *   5. 调用 defect-segment，得到 UNet raw/overlay/mask 结果图和缺陷像素。
+     *   6. 把 source 和所有结果图保存到 bundle，先写 SD 卡历史，不在模型刚结束时上传云端。
+     *   7. 自动流程后续必须等待 F4 回传 WEIGHT_RESULT/LDC_RESULT，再一次性上传完整数据。
      *
      * 参数：
      *   mountPoint 是 SD 卡挂载点。
@@ -6991,6 +7078,10 @@ private:
 
         if (!QDir().mkpath(imageDir)) {
             return QStringLiteral("检测失败：无法创建检测图片目录 ") + imageDir;
+        }
+
+        if (!ensureCurrentFrameHasLocateTarget(&errorText)) {
+            return QStringLiteral("检测失败：") + errorText;
         }
 
         reply = sendRawOverlayCommand(QStringLiteral("SAVE_DETECT ") + imageDir);

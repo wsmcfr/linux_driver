@@ -234,8 +234,20 @@ Rectangle {
     /* autoVisionRealtimeTuneTimeoutMs 是实时闭环微调总时长上限，单位 ms；超过后直接 STOP 并退出。 */
     property int autoVisionRealtimeTuneTimeoutMs: 3000
 
+    /* autoVisionRealtimeCommandGuardMs 是 ACTUATOR_VEL_MOVE 回调兜底等待时间，避免速度命令线程丢回调后卡住 LOCATE 轮询。 */
+    property int autoVisionRealtimeCommandGuardMs: 1500
+
+    /* autoVisionRealtimeStopGuardMs 是 ACTUATOR_STOP_NOW 收口兜底等待时间，避免 STOP 写入回调丢失后停在“进入模型检测”之前。 */
+    property int autoVisionRealtimeStopGuardMs: 1200
+
     /* autoVisionRealtimeTunePollMs 是实时闭环 LOCATE 轮询周期，90ms 避免 overlay 定位请求过密导致忙等和抖动。 */
     property int autoVisionRealtimeTunePollMs: 90
+
+    /* autoVisionFineTuneModelRoiSizePx 必须和 uvc_kms_overlay.c 的 DEFAULT_DETECT_ROI_SIZE 保持一致，表示绿色中心模型 ROI 边长。 */
+    property int autoVisionFineTuneModelRoiSizePx: 300
+
+    /* autoVisionFineTuneRoiContainmentMarginPx 是 bbox 离绿色 ROI 边框的最小安全距离，小于该距离也继续微调。 */
+    property int autoVisionFineTuneRoiContainmentMarginPx: 6
 
     /* autoVisionRealtimeFineTuneSpeedStepPercent 是误差每升一档时的速度倍率步长百分比，40% 加快收敛。 */
     property int autoVisionRealtimeFineTuneSpeedStepPercent: 40
@@ -1110,6 +1122,37 @@ Rectangle {
     }
 
     /*
+     * resetDetectResultPanel 的作用：
+     *   把首页右侧“当前结果”面板恢复到一次新流程开始时的干净状态。
+     *
+     * 主要流程：
+     *   1. 把检测主状态重置为 WAIT，让大状态回到“等待检测”而不是保留 GOOD/BAD。
+     *   2. 按调用方传入的文案刷新模型状态、零件名和类别名，区分“等待上料”“检测中”和“检测失败”。
+     *   3. 清空置信度、良坏概率、耗时和 latestModelResultText，避免上一轮模型结果在空黑色传送带画面旁残留。
+     *
+     * 参数：
+     *   reasonText 是右侧模型状态行显示的原因，例如“等待上料”或“检测中...”。
+     *   partText 是右侧零件名称行显示的占位文本。
+     *   classText 是右侧类别名称行显示的占位文本。
+     *
+     * 返回值：
+     *   无返回值；函数只更新 root 的检测结果属性。
+     */
+    function resetDetectResultPanel(reasonText, partText, classText) {
+        detectStatus = "WAIT"
+        detectState = reasonText
+        detectPartName = partText
+        detectClassName = classText
+        detectConfidenceText = "--%"
+        detectConfidencePercentText = "--%"
+        detectConfidenceRatio = 0.0
+        detectBadTotalText = "坏品 --%"
+        detectGoodTotalText = "良品 --%"
+        detectTimeText = "耗时 -- ms"
+        latestModelResultText = ""
+    }
+
+    /*
      * handleDetectAction 的作用：
      *   处理首页“检测”按钮点击，异步请求 C++ 保存当前帧并串行调用分类和 UNet。
      *
@@ -1129,17 +1172,7 @@ Rectangle {
         }
 
         detectImageBusy = true
-        detectStatus = "WAIT"
-        detectState = "检测中..."
-        detectPartName = "当前帧"
-        detectClassName = "当前帧"
-        detectConfidenceText = "--%"
-        detectConfidencePercentText = "--%"
-        detectConfidenceRatio = 0.0
-        detectBadTotalText = "坏品 --%"
-        detectGoodTotalText = "良品 --%"
-        detectTimeText = "耗时 -- ms"
-        latestModelResultText = ""
+        resetDetectResultPanel("检测中...", "当前帧", "当前帧")
         storageState = "正在检测当前帧..."
         storageController.requestDetectCurrentFrame()
         showStorageToast()
@@ -1184,6 +1217,7 @@ Rectangle {
         dxPixels = 0
         dxPixelsValid = false
         autoVisionLastText = "自动视觉：等待零件从上方进入 ROI"
+        resetDetectResultPanel("等待上料", "未检测", "未检测")
         workflowState = "视觉居中"
         storageState = autoVisionLastText
         autoVisionDetectDelayTimer.stop()
@@ -2093,6 +2127,8 @@ Rectangle {
         autoVisionRealtimeFineTuneDirection = -1
         autoVisionRealtimeFineTuneSpeedRpm = 0
         autoVisionRealtimeFineTuneSegmentStartMs = 0
+        autoVisionRealtimeCommandGuardTimer.stop()
+        autoVisionRealtimeStopGuardTimer.stop()
         autoVisionLocateBusy = false
         autoVisionCommandBusy = false
         autoVisionTimer.interval = autoVisionRealtimeTunePollMs
@@ -2144,6 +2180,8 @@ Rectangle {
         autoVisionRealtimeFineTuneStopReason = ""
         autoVisionRealtimeFineTunePendingNextStage = "none"
         autoVisionRealtimeFineTuneLostFrames = 0
+        autoVisionRealtimeCommandGuardTimer.stop()
+        autoVisionRealtimeStopGuardTimer.stop()
     }
 
     /*
@@ -2236,6 +2274,123 @@ Rectangle {
 
         autoVisionRealtimeFineTuneSegmentStartMs = currentMs
         return autoVisionLateralReturnOffsetSteps
+    }
+
+    /*
+     * autoVisionFineTuneModelRoiGeometry 的作用：
+     *   根据 overlay LOCATE 返回的帧尺寸计算绿色中心模型 ROI 的几何范围。
+     *
+     * 主要流程：
+     *   1. 读取 result.width/result.height，得到当前摄像头帧尺寸。
+     *   2. 使用 autoVisionFineTuneModelRoiSizePx 作为中心 ROI 边长，并限制到不超过帧宽高。
+     *   3. 返回 ROI 左上角、宽高和中心点，供 Z 下降后的实时微调统一使用。
+     *
+     * 参数：
+     *   result 是 C++ 解析出的 LOCATE 结果，必须包含 width/height。
+     *
+     * 返回值：
+     *   返回对象 {x,y,w,h,centerX,centerY}；当帧尺寸异常时返回 1x1 的保底 ROI，避免后续除零。
+     */
+    function autoVisionFineTuneModelRoiGeometry(result) {
+        var frameWidth = Math.max(1, Math.floor(Number(result ? result.width : 0)))
+        var frameHeight = Math.max(1, Math.floor(Number(result ? result.height : 0)))
+        var configuredSize = Math.max(1, Math.floor(Number(autoVisionFineTuneModelRoiSizePx || 300)))
+        var roiSize = Math.max(1, Math.min(configuredSize, frameWidth, frameHeight))
+        var roiX = Math.max(0, Math.floor((frameWidth - roiSize) / 2))
+        var roiY = Math.max(0, Math.floor((frameHeight - roiSize) / 2))
+
+        return {
+            "x": roiX,
+            "y": roiY,
+            "w": roiSize,
+            "h": roiSize,
+            "centerX": Math.round(roiX + roiSize / 2),
+            "centerY": Math.round(roiY + roiSize / 2)
+        }
+    }
+
+    /*
+     * autoVisionFineTuneBboxContainmentError 的作用：
+     *   判断零件 bbox 是否完整落在绿色模型 ROI 内，并把四边越界量转换成 X/Y 方向误差。
+     *
+     * 主要流程：
+     *   1. 读取 LOCATE 返回的 bbox_x/bbox_y/bbox_w/bbox_h。
+     *   2. 给 ROI 四边留出 autoVisionFineTuneRoiContainmentMarginPx 安全边距。
+     *   3. 如果 bbox 左/右/上/下任一边越界，按越界方向返回带符号误差。
+     *
+     * 参数：
+     *   result 是 LOCATE 结果，roi 是 autoVisionFineTuneModelRoiGeometry() 返回的 ROI 对象。
+     *
+     * 返回值：
+     *   返回对象 {x,y,left,right,top,bottom,inside}；x/y 为带符号越界误差，正负号沿用中心误差定义。
+     */
+    function autoVisionFineTuneBboxContainmentError(result, roi) {
+        var bboxX = Math.floor(Number(result ? result.bbox_x : 0))
+        var bboxY = Math.floor(Number(result ? result.bbox_y : 0))
+        var bboxW = Math.max(0, Math.floor(Number(result ? result.bbox_w : 0)))
+        var bboxH = Math.max(0, Math.floor(Number(result ? result.bbox_h : 0)))
+        var bboxRight = bboxX + bboxW
+        var bboxBottom = bboxY + bboxH
+        var margin = Math.max(0, Math.floor(Number(autoVisionFineTuneRoiContainmentMarginPx || 0)))
+        var leftLimit = Math.floor(Number(roi.x || 0)) + margin
+        var topLimit = Math.floor(Number(roi.y || 0)) + margin
+        var rightLimit = Math.floor(Number(roi.x || 0)) + Math.floor(Number(roi.w || 0)) - margin
+        var bottomLimit = Math.floor(Number(roi.y || 0)) + Math.floor(Number(roi.h || 0)) - margin
+        var leftOverflow = Math.max(0, leftLimit - bboxX)
+        var rightOverflow = Math.max(0, bboxRight - rightLimit)
+        var topOverflow = Math.max(0, topLimit - bboxY)
+        var bottomOverflow = Math.max(0, bboxBottom - bottomLimit)
+        var errorX = 0
+        var errorY = 0
+
+        if (leftOverflow > 0 || rightOverflow > 0) {
+            errorX = rightOverflow >= leftOverflow ? rightOverflow : -leftOverflow
+        }
+
+        if (topOverflow > 0 || bottomOverflow > 0) {
+            errorY = bottomOverflow >= topOverflow ? bottomOverflow : -topOverflow
+        }
+
+        return {
+            "x": errorX,
+            "y": errorY,
+            "left": leftOverflow,
+            "right": rightOverflow,
+            "top": topOverflow,
+            "bottom": bottomOverflow,
+            "inside": errorX === 0 && errorY === 0
+        }
+    }
+
+    /*
+     * autoVisionFineTuneApplyContainmentError 的作用：
+     *   把“中心点偏差”和“bbox 越界偏差”合成为实时微调使用的最终误差。
+     *
+     * 主要流程：
+     *   1. bbox 没越界时直接返回中心点误差。
+     *   2. bbox 越界时按越界方向强制生成大于死区的误差，确保半个零件还在 ROI 外时不会被判定通过。
+     *   3. 如果中心点误差本来更大，则保留更大的动作幅度，但方向以 bbox 越界方向为准。
+     *
+     * 参数：
+     *   centerError 是零件中心相对 ROI 中心的带符号误差。
+     *   containmentError 是 bbox 相对 ROI 四边的带符号越界误差。
+     *
+     * 返回值：
+     *   返回实时闭环要使用的最终带符号误差，单位像素。
+     */
+    function autoVisionFineTuneApplyContainmentError(centerError, containmentError) {
+        var center = Math.round(Number(centerError || 0))
+        var edge = Math.round(Number(containmentError || 0))
+        var tolerance = Math.max(0, Math.floor(Number(autoVisionFineTuneTolerancePx || 0)))
+        var sign = edge >= 0 ? 1 : -1
+        var forcedAbsError = 0
+
+        if (edge === 0) {
+            return center
+        }
+
+        forcedAbsError = Math.max(Math.abs(center), tolerance + Math.abs(edge))
+        return sign * forcedAbsError
     }
 
     /*
@@ -2353,6 +2508,9 @@ Rectangle {
         var reason = String(reasonText || "")
         var stage = String(nextStage || "none")
 
+        autoVisionRealtimeCommandGuardTimer.stop()
+        autoVisionRealtimeStopGuardTimer.stop()
+        autoVisionCommandBusy = false
         autoVisionRealtimeFineTuneAxis = ""
         autoVisionRealtimeFineTuneDirection = -1
         autoVisionRealtimeFineTuneSpeedRpm = 0
@@ -2433,6 +2591,7 @@ Rectangle {
             return true
         }
 
+        autoVisionRealtimeCommandGuardTimer.stop()
         workflowState = stage === "resume" ? "实时微调切换" : "实时微调停止"
         autoVisionLastText = reason
         storageState = reason
@@ -2445,6 +2604,8 @@ Rectangle {
             return false
         }
 
+        autoVisionRealtimeStopGuardTimer.interval = autoVisionRealtimeStopGuardMs
+        autoVisionRealtimeStopGuardTimer.restart()
         return true
     }
 
@@ -2628,14 +2789,14 @@ Rectangle {
 
     /*
      * handleAutoVisionFineTuneLocateFinished 的作用：
-     *   处理 Z 轴下降后的 ROI 复查结果，必要时用传送带做前后短步微调、用摄像头左右电机做左右短步微调。
+     *   处理 Z 轴下降后的 ROI 复查结果，必要时用传送带和摄像头左右轴做实时闭环微调。
      *
      * 主要流程：
-     *   1. 定位失败或无目标时不继续移动，直接检测并把风险写到底部状态。
-     *   2. 同时计算 X/Y 两个方向误差，Y 代表传送带前后方向，X 代表左右电机方向。
-     *   3. 如果 Y 误差超出死区，优先发送传送带 ACTUATOR_POS_MOVE 微调一次。
-     *   4. 如果 Y 已经进死区但 X 误差超出死区，发送左右轴 ACTUATOR_POS_MOVE 微调一次。
-     *   5. 达到次数上限后停止继续微调，进入模型检测，避免现场机械反复抖动。
+     *   1. 定位失败或无目标时按丢帧计数收口，避免盲目继续移动。
+     *   2. 先计算绿色中心模型 ROI，再同时检查零件中心和 bbox 四边是否都进入 ROI。
+     *   3. bbox 越界时把越界方向转换为大于死区的 X/Y 误差，保证零件半出 ROI 时不会直接检测。
+     *   4. 根据 X/Y 误差选择主轴，通过 ACTUATOR_VEL_MOVE 持续点动。
+     *   5. 进入死区、切轴、切向、丢目标或超时时统一 STOP 收口。
      *
      * 参数：
      *   ok/result/detail 来自 autoVisionLocateFinished。
@@ -2681,10 +2842,16 @@ Rectangle {
         var centerY = Number(result.center_y)
         var width = Number(result.width)
         var height = Number(result.height)
-        var targetX = Math.round(width / 2)
-        var targetY = Math.round(height / 2)
-        var errorX = Math.round(centerX - targetX)
-        var errorY = Math.round(centerY - targetY)
+        var modelRoi = autoVisionFineTuneModelRoiGeometry(result)
+        var bboxContainment = autoVisionFineTuneBboxContainmentError(result, modelRoi)
+        var targetX = Math.round(Number(modelRoi.centerX || Math.round(width / 2)))
+        var targetY = Math.round(Number(modelRoi.centerY || Math.round(height / 2)))
+        var centerErrorX = Math.round(centerX - targetX)
+        var centerErrorY = Math.round(centerY - targetY)
+        var containmentErrorX = Math.round(Number(bboxContainment.x || 0))
+        var containmentErrorY = Math.round(Number(bboxContainment.y || 0))
+        var errorX = autoVisionFineTuneApplyContainmentError(centerErrorX, containmentErrorX)
+        var errorY = autoVisionFineTuneApplyContainmentError(centerErrorY, containmentErrorY)
         var absErrorX = Math.abs(errorX)
         var absErrorY = Math.abs(errorY)
         var xCentered = absErrorX <= autoVisionFineTuneTolerancePx
@@ -2705,6 +2872,7 @@ Rectangle {
             resetAutoVisionFineTuneProgress()
             autoVisionStopRealtimeFineTune("ROI 实时闭环通过：errorY=" + errorY
                                            + "，errorX=" + errorX
+                                           + "，bbox已进入ROI"
                                            + "，停止微调并进入 3 秒对焦稳定",
                                            "focus")
             return
@@ -2715,6 +2883,11 @@ Rectangle {
                                            + (elapsedMs / 1000.0).toFixed(2)
                                            + " 秒，当前 errorY=" + errorY
                                            + "，errorX=" + errorX
+                                           + "，bbox边界 left/right/top/bottom="
+                                           + Math.round(Number(bboxContainment.left || 0)) + "/"
+                                           + Math.round(Number(bboxContainment.right || 0)) + "/"
+                                           + Math.round(Number(bboxContainment.top || 0)) + "/"
+                                           + Math.round(Number(bboxContainment.bottom || 0))
                                            + "，停止微调并进入模型检测/人工复核",
                                            "detect")
             return
@@ -2753,6 +2926,8 @@ Rectangle {
             workflowState = "ROI实时微调"
             autoVisionLastText = "实时微调防抖：errorY=" + errorY
                     + "，errorX=" + errorX
+                    + "，centerErr=" + centerErrorY + "/" + centerErrorX
+                    + "，containErr=" + containmentErrorY + "/" + containmentErrorX
                     + "，主轴=" + selectedAxis
                     + "，误差仍在死区边缘，暂不反向"
             storageState = autoVisionLastText
@@ -2762,6 +2937,8 @@ Rectangle {
         if (axisChanged || directionChanged) {
             autoVisionStopRealtimeFineTune("实时微调切换：errorY=" + errorY
                                            + "，errorX=" + errorX
+                                           + "，centerErr=" + centerErrorY + "/" + centerErrorX
+                                           + "，containErr=" + containmentErrorY + "/" + containmentErrorX
                                            + "，切到主轴=" + selectedAxis
                                            + "，direction=" + desiredDirection,
                                            "resume")
@@ -2772,6 +2949,11 @@ Rectangle {
         autoVisionLastText = "实时微调：axis=" + selectedAxis
                 + "，errorY=" + errorY
                 + "，errorX=" + errorX
+                + "，roi=" + Math.round(Number(modelRoi.x || 0)) + ","
+                + Math.round(Number(modelRoi.y || 0)) + ","
+                + Math.round(Number(modelRoi.w || 0)) + "x"
+                + Math.round(Number(modelRoi.h || 0))
+                + "，contain=" + containmentErrorY + "/" + containmentErrorX
                 + "，direction=" + desiredDirection
                 + "，speed=" + speed + "rpm"
                 + "，elapsed=" + elapsedMs + "ms"
@@ -2801,6 +2983,8 @@ Rectangle {
             autoVisionRealtimeFineTuneDirection = desiredDirection
             autoVisionRealtimeFineTuneSpeedRpm = speed
             autoVisionRealtimeFineTuneSegmentStartMs = new Date().getTime()
+            autoVisionRealtimeCommandGuardTimer.interval = autoVisionRealtimeCommandGuardMs
+            autoVisionRealtimeCommandGuardTimer.restart()
             return
         }
 
@@ -3205,16 +3389,8 @@ Rectangle {
      *   无返回值；函数只更新 root 的检测属性。
      */
     function handleDetectFailureText(resultText) {
+        resetDetectResultPanel(resultText, "检测失败", "检测失败")
         detectStatus = "ERROR"
-        detectState = resultText
-        detectPartName = "检测失败"
-        detectClassName = "检测失败"
-        detectConfidenceText = "--%"
-        detectConfidencePercentText = "--%"
-        detectConfidenceRatio = 0.0
-        detectBadTotalText = "坏品 --%"
-        detectGoodTotalText = "良品 --%"
-        detectTimeText = "耗时 -- ms"
     }
 
     /*
@@ -7123,6 +7299,49 @@ Rectangle {
         }
     }
 
+    /* autoVisionRealtimeCommandGuardTimer 防止 ACTUATOR_VEL_MOVE 回调丢失后 autoVisionCommandBusy 一直挡住 LOCATE 轮询。 */
+    Timer {
+        id: autoVisionRealtimeCommandGuardTimer
+        interval: root.autoVisionRealtimeCommandGuardMs
+        repeat: false
+        running: false
+
+        onTriggered: {
+            if (!root.autoVisionRealtimeFineTuneActive || !root.autoVisionCommandBusy) {
+                return
+            }
+
+            root.autoVisionCommandBusy = false
+            root.autoVisionStopRealtimeFineTune("实时微调速度命令等待 "
+                                               + root.autoVisionRealtimeCommandGuardMs
+                                               + "ms 未回调，发送 STOP 并进入模型检测/人工复核",
+                                               "detect")
+        }
+    }
+
+    /* autoVisionRealtimeStopGuardTimer 防止 STOP 写入回调丢失后卡在“停止微调并进入模型检测/人工复核”。 */
+    Timer {
+        id: autoVisionRealtimeStopGuardTimer
+        interval: root.autoVisionRealtimeStopGuardMs
+        repeat: false
+        running: false
+
+        onTriggered: {
+            var nextStage = root.autoVisionRealtimeFineTunePendingNextStage
+            var stopReason = root.autoVisionRealtimeFineTuneStopReason
+
+            if (nextStage === "none") {
+                return
+            }
+
+            root.autoVisionFinalizeRealtimeFineTuneStop(stopReason
+                                                        + "；STOP 收口等待 "
+                                                        + root.autoVisionRealtimeStopGuardMs
+                                                        + "ms 未回调，按 MP157 本地状态继续",
+                                                        nextStage)
+        }
+    }
+
     /* autoVisionActuatorSettleTimer 统一承载 Z 轴物理等待、短步微调稳定和 3 秒对焦稳定等异步阶段。 */
     Timer {
         id: autoVisionActuatorSettleTimer
@@ -7687,6 +7906,7 @@ Rectangle {
 
             if (root.autoVisionRealtimeFineTuneActive || root.autoVisionRealtimeFineTunePendingNextStage !== "none") {
                 if (action === "ACTUATOR_VEL_MOVE") {
+                    root.autoVisionRealtimeCommandGuardTimer.stop()
                     if (ok) {
                         root.workflowState = root.autoVisionRealtimeFineTuneAxis === "lateral"
                                 ? "左右实时微调"
@@ -7704,6 +7924,7 @@ Rectangle {
                 }
 
                 if (action === "ACTUATOR_STOP_NOW") {
+                    root.autoVisionRealtimeStopGuardTimer.stop()
                     var stopReason = root.autoVisionRealtimeFineTuneStopReason
                     var nextStage = root.autoVisionRealtimeFineTunePendingNextStage
                     var finalReason = ok
