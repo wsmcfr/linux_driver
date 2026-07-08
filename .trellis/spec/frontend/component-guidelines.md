@@ -250,6 +250,147 @@ ssh root@192.168.1.250 'chmod 755 /root/qt_camera_display/qt_camera_display && /
 
 ---
 
+## Scenario: Qt Touch Calibration Weight Input And F4 Reply Display Contract
+
+Use this convention when the STM32MP157 Qt camera UI lets an operator enter a calibration weight, sends a calibration command to the STM32F4, or displays the serial reply returned by an F4 command.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/qml/Main.qml`, `20_uvc_camera/qt_camera_display/main.cpp`, `DeviceHealthController`, or `test_qt_kms_overlay_assets.sh` around weight calibration, F4 serial commands, or calibration result display.
+- Bug learned: a `TextInput` with `IntValidator` is not a complete touch workflow on the board, because the deployed Qt/Wayland image may not provide a usable system soft keyboard; if only preset buttons exist, the operator cannot enter arbitrary grams.
+- Bug learned: an F4 command can return more text than a compact label can show. If C++ truncates the reply with `reply.left(...)` and QML then renders the only copy in a single-line `Text` with `elide`, the operator loses the evidence needed to confirm calibration.
+- Goal: arbitrary `1..5000` gram values must be enterable by touch, validated once before sending, and F4 replies must remain readable to the last meaningful byte or line in the result overlay.
+
+### 2. Signatures
+
+| Operation | Signature / Marker |
+|---|---|
+| Calibration text state | `property string calibrationWeightText` in `Main.qml` |
+| Touch digit append | `appendCalibrationDigit(digit)` |
+| Touch digit delete | `backspaceCalibrationDigit()` |
+| Touch input clear | `clearCalibrationWeight()` |
+| Calibration send action | `sendCalibrationCommand()` |
+| Serial command bridge | `DeviceHealthController::sendF4Command(QString command)` |
+| F4 reply reader | `readF4ReplyText(int fd, QString *errorText)` |
+| Result scroll owner | `calibrationResultFlickable` |
+| Static contract test | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Touch input ownership | Numeric entry must not rely only on `TextInput`, `inputMethodHints`, or a platform soft keyboard. Provide in-app touch controls for digits, backspace, and clear, while keeping preset value buttons only as shortcuts. |
+| Validation owner | `sendCalibrationCommand()` or the single send path must validate the final integer range before calling C++; digit buttons may limit obvious overflow, but they must not be the only protection. |
+| Calibration range | Accept arbitrary integer grams in the supported range, currently `1..5000`. Reject empty text, non-numeric text, zero, negative values, and values above the allowed maximum with an operator-visible message. |
+| Preset behavior | Preset buttons such as `50g`, `100g`, or `500g` must assign the same `calibrationWeightText` state used by the keypad and send path, not a separate hidden state. |
+| Serial read length | The C++ F4 reply path must preserve enough response text for diagnostics. Do not create the displayed message from `reply.left(96)`, `reply.left(48)`, or another small fixed preview unless a full-detail field is also available. |
+| Display budget | The modal or result detail must use a bounded multi-line area such as `Flickable` plus wrapped `Text`. A toast, status chip, or one-line label may show a short summary only; it must not be the only copy of the reply. |
+| Reset behavior | Reopening a calibration result or sending a new command must reset the result `Flickable.contentY` to the top after assigning new text, so stale scroll position cannot hide the beginning. |
+| Resource packaging | QML changes are embedded through the Qt resource build. Rebuild and redeploy `qt_camera_display`; copying `Main.qml` alone is not a valid board fix. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Arbitrary touch entry | Tapping digits can build a value not present in the preset buttons, such as `137g` | UI still depends on an unavailable soft keyboard or only exposes fixed choices | Add or repair the in-app keypad path |
+| Delete and clear | Backspace removes one digit; clear returns the field to empty or the documented default | Operator cannot correct a mistyped weight without leaving the dialog | Add keypad correction controls |
+| Range rejection | Empty, `0`, and `5001` show a clear validation failure and do not send serial bytes | Invalid calibration payload can reach the F4 | Centralize validation in `sendCalibrationCommand()` |
+| Preset/keypad consistency | Preset and keypad values update the same displayed text and send the same command format | There are two sources of truth for calibration weight | Route both paths through `calibrationWeightText` |
+| Long F4 reply | A reply longer than one line remains scrollable/readable in the result overlay | C++ truncation or QML elide hides calibration proof | Preserve full-enough reply text and show it in `calibrationResultFlickable` |
+| Static test | `./test_qt_kms_overlay_assets.sh` finds keypad markers, F4 reader marker, result `Flickable`, and forbids `reply.left(96)` / `reply.left(48)` | A future edit can silently reintroduce the two bugs | Add or repair static assertions |
+| Binary marker proof | `strings build-mp157/qt_camera_display` and board-side `strings /root/qt_camera_display/qt_camera_display` find the keypad/result markers | The VM or board is running stale embedded QML/C++ | Resync sources, rebuild, redeploy, and restart Qt |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: preset buttons and keypad digits update one text state that the send path validates.
+function appendCalibrationDigit(digit) {
+    calibrationWeightText = calibrationWeightText + digit
+}
+
+function sendCalibrationCommand() {
+    var grams = parseInt(calibrationWeightText, 10)
+    if (isNaN(grams) || grams < 1 || grams > 5000) {
+        calibrationResultText = "请输入 1~5000g 的标定克重"
+        return
+    }
+    deviceHealthController.sendF4Command("CAL " + grams)
+}
+```
+
+```qml
+// Good: long F4 replies live in a scrollable detail area, not only in a toast.
+Flickable {
+    id: calibrationResultFlickable
+    clip: true
+    contentHeight: calibrationResultTextItem.paintedHeight
+
+    Text {
+        id: calibrationResultTextItem
+        width: calibrationResultFlickable.width
+        wrapMode: Text.Wrap
+        text: calibrationResultText
+    }
+}
+```
+
+```cpp
+/* Good: the serial helper returns the reply text collected for this command,
+ * and the UI decides how to present a short summary versus full details.
+ */
+QString detail = readF4ReplyText(fd, &errorText);
+```
+
+```qml
+// Bad: this depends on a platform keyboard that may not exist on the board.
+TextInput {
+    inputMethodHints: Qt.ImhDigitsOnly
+    validator: IntValidator { bottom: 1; top: 5000 }
+}
+```
+
+```cpp
+/* Bad: this destroys the diagnostic bytes before QML has any chance to show them. */
+return QStringLiteral("标定成功：") + reply.left(48);
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing calibration UI, F4 command code, QML result overlays, or the static marker list.
+- Add static assertions for `calibrationKeypadGrid`, `appendCalibrationDigit`, `backspaceCalibrationDigit`, `clearCalibrationWeight`, `calibrationResultFlickable`, `readF4ReplyText`, and the absence of known truncation calls such as `reply.left(96)` / `reply.left(48)`.
+- Cross-build `qt_camera_display` with the ST Qt SDK after every QML or C++ change, then verify the ARM binary contains the relevant QML/C++ markers with `strings`.
+- Deploy the rebuilt binary to the board, restart `/root/qt_camera_display/run_qt_kms_overlay_display.sh`, and verify the running board binary contains the same markers.
+- On the LCD, enter at least one non-preset value such as `137g`, correct it with backspace, clear it, send a valid value, and test invalid values `0` and `5001`.
+- For F4 reply display, use a real or simulated F4 response longer than one compact line and confirm the result overlay can scroll to the final line.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The QML has a TextInput and IntValidator, so the board operator can type any gram value.
+```
+
+#### Correct
+
+```text
+The board must prove arbitrary touch entry through in-app digit, backspace, and clear controls; TextInput validation is only an auxiliary text-state constraint.
+```
+
+#### Wrong
+
+```text
+The F4 reply is visible enough because the toast or one-line status label shows the first 48 bytes.
+```
+
+#### Correct
+
+```text
+Keep a short summary for the toast, but preserve the reply details and render them in a bounded scrollable result area.
+```
+
+---
+
 ## Qt Boot Display And Early Framebuffer Splash Contract
 
 Use this convention when changing the STM32MP157 Qt boot display chain, the SysV init scripts that start it, or any helper that draws before Qt/eglfs is ready.
@@ -428,7 +569,7 @@ Use this convention when the STM32MP157 Qt camera UI shows real 4G, camera, F4, 
 | Health controller | `class DeviceHealthController : public QObject` |
 | Periodic refresh | `m_healthTimer.setInterval(8000)` or slower unless a task explicitly requires faster diagnostics |
 | Network probe | `startNetworkProbe()` asynchronously starts `4g-ppp test` |
-| Cloud probe | `startCloudProbe()` asynchronously starts `curl -fsS --max-time 2 http://119.91.65.122/health` |
+| Cloud probe | `startCloudProbe()` asynchronously starts `curl -fsS --max-time 2 http://139.9.35.72/health` |
 | Process completion | `handleNetworkProcessFinished(...)`, `handleCloudProcessFinished(...)` update final state |
 | Process errors | `handleNetworkProcessError(...)`, `handleCloudProcessError(...)` update a failure state |
 | Probe timeout | `handleNetworkProbeTimeout()`, `handleCloudProbeTimeout()` kill the probe and set timeout/failure state |
@@ -461,7 +602,7 @@ Use this convention when the STM32MP157 Qt camera UI shows real 4G, camera, F4, 
 | Static health contract | `./test_qt_kms_overlay_assets.sh` passes checks for `m_healthTimer.setInterval(8000)`, no `waitForStarted`, and no repeated `检测中` writes inside network/cloud probe starters | Health refresh may flicker or block the UI thread |
 | Static overlay contract | The same test finds `bootOverlayRestoreFinished` and restore conditions containing `bootOverlayRestoreFinished`, `!splashOverlayVisible`, and `activePage === "home"` in both camera-status and page-return paths | Camera video can appear before Qt splash/home is ready |
 | 4G board check | `4g-ppp test; echo "exit=$?"` exits `0`, and Qt shows `在线` only after that success | UI is showing a guessed state instead of a real network probe |
-| Cloud board check | `curl -fsS --max-time 2 http://119.91.65.122/health; echo "exit=$?"` succeeds, and Qt shows `已连接` only after that success | UI is showing cloud connectivity without a live backend check |
+| Cloud board check | `curl -fsS --max-time 2 http://139.9.35.72/health; echo "exit=$?"` succeeds, and Qt shows `已连接` only after that success | UI is showing cloud connectivity without a live backend check |
 | Camera unplug check | Unplugging the USB camera changes Qt camera status to offline and does not freeze navigation | Camera state is cached, overlay polling is blocked, or hotplug recovery is not isolated |
 | Camera replug check | Replugging the USB camera lets `restart-overlay` recover frames while the Qt PID stays unchanged; the video becomes visible only on home after the boot gate | Recovery killed Qt, or QML restored overlay from the wrong page/state |
 | F4 serial check | Only a successful `/dev/ttySTM2` handshake changes F4 from `待接入` to `接入` | F4 status is hard-coded or not tied to serial communication |
@@ -759,6 +900,152 @@ The board saved a JPG/PNG pair from the same overlay frame, registered JPG as so
 
 ---
 
+## Scenario: MP157 Auto Vision LOCATE Reacquisition Contract
+
+Use this convention when the STM32MP157 Qt automatic flow asks `uvc_kms_overlay` to locate or reacquire a washer-like part before sending `VISION_POS`, stopping the conveyor, or starting ROI fine tuning.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c` around `LOCATE`, `locate_part_in_yuyv_frame()`, candidate filtering, brightness thresholds, ring-hole detection, or the `OK LOCATE ...` reply.
+- Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp` around `handleAutoVisionLocateReply()` or `sendF4VisionPosition()`.
+- Trigger: changing `20_uvc_camera/qt_camera_display/qml/Main.qml` around `handleAutoVisionLocateFinished()`, first-detect confirmation, auto vision bottom status, or ROI fine-tune locate handling.
+- Current target family: wave washer, flat washer, and split washer. These are ring/hole parts. Lighting can temporarily hide the hole, so a high-confidence no-ring candidate may be used only after this cycle has already established a real target; first detection defaults to ring evidence to avoid conveyor false positives.
+
+### 2. Signatures
+
+| Boundary | Signature / Marker |
+|---|---|
+| Overlay socket command | `LOCATE` sent to `/tmp/uvc-kms-overlay-control.sock` |
+| Overlay success reply | `OK LOCATE has_target=<0|1> frame_id=<n> width=<w> height=<h> center_x=<x> center_y=<y> bbox_x=<x> bbox_y=<y> bbox_w=<w> bbox_h=<h> confidence=<0..100> ring=<0|1> diag=<code> roi_y=<y> roi_h=<h> thr=<dark>,<body>,<bright> cand_box=<w>x<h> cand_area=<px> cand_density=<pct> cand_conf=<0..100> cand_ring=<0|1>` |
+| Overlay no-hard-gate marker | `#define AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET 0U` in `uvc_kms_overlay.c` |
+| Metal body expansion marker | `AUTO_LOCATE_MIN_BODY_LUMA_DELTA`, `AUTO_LOCATE_BODY_LUMA_DELTA_PERCENT`, and `auto_locate_body_threshold_from_delta()` |
+| Diagnostic marker | `LOCATE_DIAG_*` and `auto_locate_record_reject_candidate()` in `uvc_kms_overlay.c` |
+| Candidate structure marker | `struct locate_result` includes `unsigned int has_ring_hole` |
+| Qt parser marker | `result.insert(QStringLiteral("has_ring"), tokenValue(reply, QStringLiteral("ring")).toInt())` |
+| QML first-detect policy marker | `autoVisionFirstDetectRequiredFramesForCandidate(hasRing, confidence)` |
+| QML no-ring first-detect guard marker | `autoVisionAllowNonRingFirstDetect: false`, `autoVisionFirstDetectNonRingConfirmRequired`, and `autoVisionFirstDetectMinNonRingConfidence` |
+| QML operator marker | Bottom status includes `box=<w>x<h> ring=<0|1>` and `diag/cand/cconf/cring/cdens` |
+| QML bbox limit marker | `property int autoVisionExpectedPartMaxBboxArea: 45000` |
+| Static contract | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` checks the markers and rejects enabling first-detect no-ring by default |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Source frame | `LOCATE` must analyze the raw `latest_frame.yuyv_map`, not the decorated Qt/KMS framebuffer. Display-only ROI graphics must not influence target selection. |
+| Search region | The horizontal search width remains aligned to the model ROI width; the vertical region should be the detected black conveyor band or a conservative center fallback, not the entire frame when belt detection fails. |
+| Candidate growth | `bright_threshold` starts a component and `body_threshold` expands it. Do not start components from `body_threshold` alone, or gray belt texture can become a candidate; do not expand only with `bright_threshold`, or shadowed washer arcs can be split and fail ring detection. |
+| Candidate class | For the current washer-like part set, ring evidence is still the strongest signal, but it must not be the only signal at every stage. A real washer can become `ring=0` when exposure, highlight, shadow, or blur hides the center hole. |
+| No-ring handling | `AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET` defaults to `0U`. The overlay may return a no-ring candidate only after stricter bbox, size, and confidence gates. QML defaults `autoVisionAllowNonRingFirstDetect` to `false`, so a no-ring candidate cannot establish the first target; after `autoVisionHasSeenTarget` is true, no-ring candidates may help hold or reacquire the same part. |
+| Reply compatibility | Existing fields keep their names and units. Adding `ring=<0|1>` is additive; Qt must parse missing or malformed `ring` as `0`, not crash. |
+| Debuggability | `LOCATE` replies must keep diagnostic fields even when `has_target=0`, because field failures often occur while the part is moving and cannot be reconstructed from logs alone. Extra fields must remain additive so older QML parsers keep working. |
+| QML filtering | QML keeps confidence, bbox area, and multi-frame confirmation as the second defense. For first detection, `ring=1` uses the normal confirmation frame count. `ring=0` returns zero confirmation frames while `autoVisionAllowNonRingFirstDetect` is false; that default must stay false for board operation because the conveyor is a stable background. |
+| QML bbox budget | The QML bbox max area must fit real washer boxes observed from overlay. With the current 640x480 camera setup, a real washer can return about `173x173` (`~29929 px²`), so the max area contract is `45000`, not the earlier `12000`. |
+| Operator diagnostics | When a target is accepted or rejected, the bottom status must show `confidence`, `box`, `ring`, and `diag/cand/cconf/cring/cdens` so field testing can distinguish a washer outline from belt edge, white support artifacts, or a hidden center hole. |
+| F4 protocol boundary | `ring` is not sent to F4 in `VISION_POS`; it is an MP157-side validation/debug field. Do not change the F4 payload unless the MP157-F407 protocol document is updated. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Overlay no hard ring gate | `./test_qt_kms_overlay_assets.sh` finds `AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET 0U` and rejects `require_ring_hole_for_target > 0U && !has_ring` | A real washer can disappear permanently when the center hole is hidden by lighting | Keep overlay no-ring fallback, while retaining stricter bbox, size, and confidence gates |
+| First-detect no-ring guard | Static test finds `autoVisionAllowNonRingFirstDetect: false`, `autoVisionFirstDetectRequiredFramesForCandidate`, `autoVisionFirstDetectNonRingConfirmRequired`, and `autoVisionFirstDetectMinNonRingConfidence` | If enabled by default, the stable black conveyor can satisfy multi-frame confirmation and become a false part | Keep first-detect no-ring disabled by default; use no-ring fallback only after the current cycle has seen a real target |
+| Body expansion contract | Static test finds `auto_locate_body_threshold_from_delta`, a `start_luma, bright_threshold` seed check, a `next_luma, body_threshold` neighbor expansion check, and ring detection using `body_threshold` | Real washers under uneven light can be split into several bright arcs and never produce `ring=1` | Restore high-brightness seed plus lower metal-body expansion; do not require ring as the only final signal |
+| Locate diagnostic reply | Static test finds `diag=%u`, `roi_y=%u roi_h=%u`, `thr=%u,%u,%u`, `cand_box=%dx%d`, `LOCATE_DIAG_RING`, and `auto_locate_record_reject_candidate` | A moving washer can fail in the field with no evidence of which gate rejected it | Restore additive diagnostic fields and candidate rejection tracking |
+| QML bbox max | Static test finds `property int autoVisionExpectedPartMaxBboxArea: 45000` | Overlay can return a valid `173x173 ring=1` washer while QML turns it back into `VISION_LOST` | Restore the max area budget or replace it with a ring-aware QML filter backed by board evidence |
+| Reply parser | Static test finds the `ring` parser in `main.cpp` and `ring=` display in QML | The overlay may return ring evidence but the UI cannot show or validate it | Parse `ring` into `has_ring` and display it in the auto vision status |
+| Empty conveyor board test | With no part on the conveyor, repeated `LOCATE` does not stably return `has_target=1` | Belt edge, white support, or fixed reflection is being accepted as a part | Capture `box/ring/conf`, inspect the raw scene, and tighten the overlay candidate filter before tuning F4 motion |
+| Real washer board test | A washer fully entering the ROI returns `has_target=1` with a plausible `bbox_w/bbox_h`; first detection should establish from `ring=1`, and after that high-confidence `ring=0` candidates may hold/reacquire the same part | The ring-hole detector is too strict, lighting hides the hole, or the part never reaches a ring-visible frame | Check exposure/lighting and ROI placement, then inspect `diag/cand/cconf/cring/cdens` before adjusting thresholds |
+| QML motion boundary | `VISION_POS` is sent only after overlay accepted `has_target=1` and QML confirmation passes | QML can still drive conveyor movement from a rejected or malformed locate result | Keep QML `hasTarget` filtering, bbox checks, and first-detect confirmation active |
+| Deployment proof | Board `strings /root/qt_camera_display/qt_camera_display` shows `ring=` or the QML status marker, and board `uvc_kms_overlay` contains `AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET` marker if not stripped | Source was changed locally but old board binaries are still running | Rebuild on VM, deploy both binaries, restart the display stack, and verify with `strings` or checksums |
+
+### 5. Good / Base / Bad Cases
+
+```text
+Good: A real washer candidate has `ring=1`, a bbox close to the physical part, and QML enters normal first-detect confirmation.
+```
+
+```text
+Good: A bright washer highlight starts the component, then adjacent dimmer silver pixels expand the same bbox so the center hole can be sampled reliably.
+```
+
+```text
+Base: A partial washer entering from the top may return `ring=0`; before the cycle has seen a real target, QML keeps waiting instead of entering tracking from that no-ring candidate.
+```
+
+```text
+Bad: A large no-ring white support or conveyor reflection reaches `confidence=100` and enters `TRACKING` because first-detect no-ring was enabled by default.
+```
+
+```cpp
+/* Good: no-ring candidates are stricter, but not globally rejected. */
+if (!has_ring &&
+    (bbox_w < AUTO_LOCATE_RING_REQUIRED_BBOX_SIDE ||
+     bbox_h < AUTO_LOCATE_RING_REQUIRED_BBOX_SIDE ||
+     confidence < AUTO_LOCATE_MIN_NON_RING_CONFIDENCE)) {
+    continue;
+}
+```
+
+```qml
+// Good: ring=1 confirms quickly; ring=0 first-detect is disabled by default.
+firstDetectConfirmRequired = autoVisionFirstDetectRequiredFramesForCandidate(hasRing, confidence)
+if (firstDetectConfirmRequired <= 0) {
+    hasTarget = false
+}
+```
+
+```cpp
+/* Good: high threshold starts the component, lower body threshold only expands from that seed. */
+if (!auto_locate_is_bright_candidate_luma(start_luma, bright_threshold)) {
+    if (!auto_locate_is_bright_candidate_luma(start_luma, body_threshold)) {
+        visited[start_index] = 1U;
+    }
+    continue;
+}
+```
+
+```qml
+/* Bad: first detection allows no-ring candidates by default. */
+property bool autoVisionAllowNonRingFirstDetect: true
+```
+
+```qml
+/* Good: first detection can only use no-ring if a maintainer deliberately opens the debug gate. */
+property bool autoVisionAllowNonRingFirstDetect: false
+
+if (!autoVisionAllowNonRingFirstDetect) {
+    return 0
+}
+```
+
+### 6. Tests Required
+
+- Run `cd 20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh` after any `LOCATE`, overlay reply, Qt parser, QML auto vision, or README contract change.
+- Run `git diff --check` after editing C++, C, QML, shell, Markdown, or spec files.
+- Cross-build `uvc_kms_overlay` in `cfr-vm` and confirm the output is an ARM ELF before board deployment.
+- Cross-build `qt_camera_display` after QML or C++ parser changes, because `Main.qml` is embedded through Qt resources.
+- On the board, verify an empty conveyor does not repeatedly show `TRACKING`, verify first detection proceeds from `ring=1`, and verify already-seen targets can survive short no-ring drops without sending `VISION_LOST reason=1`.
+- When board `nc -U` is available, run `printf 'LOCATE\n' | nc -U /tmp/uvc-kms-overlay-control.sock`; otherwise use the home-page bottom status and overlay logs.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The bottom status shows `conf=100`, so it must be a real part.
+```
+
+High confidence can come from large fixed bright artifacts. For washer-like parts, ring evidence is required to establish the first target in normal board operation; no-ring recovery is only for an already-seen target.
+
+#### Correct
+
+```text
+The bottom status shows a plausible bbox and `ring=1` before the first tracking state. If a later frame becomes `ring=0`, QML can keep/reacquire the already-seen target without treating an empty conveyor as a new part.
+```
+
+---
+
 ## Qt Detection Result Payload Contract
 
 Use this convention when the STM32MP157 Qt defect screen runs the model detection chain, renders the latest result on the home page, writes local history, or sends a detection record to the defect cloud backend.
@@ -784,6 +1071,8 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 | Fused-to-history mapping | `historyTextFromFusedResult(const FusedDetectResult &fusedResult) -> 良品|待复核` |
 | Upload environment field | `CLOUD_RESULT=good|bad|review` |
 | Upload result validator | `validate_cloud_result "$CLOUD_RESULT"` |
+| Upload success helper | `isUploadStatusSuccess(QString uploadStatus)` in `main.cpp` |
+| Upload failure helper | `isUploadStatusFailure(rawStatus)` in `Main.qml` |
 | Cloud create-record field | JSON payload field `"result":"good|bad|review"` |
 | Local history fields | `classification_result`, `segmentation_result`, `total_time_ms`, `source_path`, `annotated_images` |
 | Home-page display fields | model-derived part name, percent confidence on a 0-100 scale, and `total_time_ms` when present |
@@ -805,6 +1094,8 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 | Final completion boundary | `detectCurrentFrameFinished` means the whole detect transaction finished, including upload attempt and history append eligibility. It should restore busy state and show final upload status, but it must not be the first moment when model result fields become visible. |
 | Total detection time | `total_time_ms` is measured from classifier start through segmentation completion. It must include both model runtimes and exclude COS upload time unless the field name is changed to an upload-inclusive metric. |
 | History/cloud parity | Local history and the cloud record must describe the same source frame, model class, status, annotated evidence, and total model time. UI success is incomplete until cloud detail round-trip confirms the same result fields. |
+| Upload success source of truth | Board UI, history, retry, alarms, and statistics must classify upload state through `upload_status=OK|FAIL|SKIP` or the shared success/failure helpers. Do not infer failure from a diagnostic string that merely contains Chinese `失败` after an `upload_status=OK` result. |
+| Post-upload verification warning | After create-record, COS prepare, PUT, and file registration have all succeeded, a later detail round-trip failure is a verification warning, not an upload failure. `defect-cos-upload` should keep stdout successful with `upload_status=OK record_id=... record_no=... verify_status=warning`, while stderr preserves the warning for troubleshooting. |
 | Legacy save paths | Old manual save or diagnostic paths that do not run the models may upload evidence only as `review` or mark it as local-only. They must not create a cloud `good` record just because image upload succeeded. |
 
 ### 4. Validation & Error Matrix
@@ -814,6 +1105,7 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 | Static model-to-cloud markers | `./test_qt_kms_overlay_assets.sh` finds `fusedResultFromModelResults`, `cloudResultFromFusedResult`, `historyTextFromFusedResult`, `CLOUD_RESULT`, `validate_cloud_result`, `fused_status`, and `total_time_ms` | Result mapping, validation, or total-time propagation can drift silently |
 | Fixed result search | `rg -n 'CLOUD_RESULT=.*good|"result":"good"|result=good|待接入|固定|/1000' main.cpp qml/Main.qml defect-cos-upload README.md` has no unreviewed detection payload defaults | A touched path may still send placeholder content or old confidence scaling |
 | Upload helper validation | `CLOUD_RESULT=bad sh defect-cos-upload ...` creates a `bad` payload; `CLOUD_RESULT=badness sh defect-cos-upload ...` fails before create-record | Invalid or missing result values can become cloud records |
+| Upload status interpretation | A helper line with `上传成功：upload_status=OK ... verify_status=warning` displays as upload success in history/statistics; a line with `upload_status=FAIL` displays as failure | UI logic is still scanning raw text for `失败` instead of parsing status tokens |
 | Board self-test BAD case | `--detect-self-test` can produce `fused_result=bad ... total_time_ms=<nonzero> upload_status=OK` when either the classifier is `BAD` or UNet reports defects | The classifier result, segmentation result, timing, fusion, or upload path is not wired together |
 | Cloud detail BAD round-trip | For the returned `record_id`, detail JSON contains `"result":"bad"` and `"effective_result":"bad"` | The board sent a fixed/default good payload or the backend interpreted it incorrectly |
 | Home part display | A class such as `washer_bad` displays part `washer` on the home page | The UI still shows a fixed part name or exposes quality suffix as part identity |
@@ -870,10 +1162,15 @@ Bad: the home page says the detection took only the classifier time even though 
 Bad: the classifier result is already known, but the home page still shows "当前帧" or "检测中..." for part/class until COS upload returns.
 ```
 
+```text
+Bad: source and annotated files were already uploaded and registered, but the final detail check timed out, so the board history records `上传失败` even though the cloud page shows the new record.
+```
+
 ### 6. Tests Required
 
 - Run `./test_qt_kms_overlay_assets.sh` after changing detection, result display, history, upload, or README contracts.
 - Run `sh -n defect-cos-upload` after changing the upload helper, then test at least one accepted `CLOUD_RESULT` and one rejected value.
+- Run `sh defect-cos-upload --self-test-json-parser` and `sh defect-cos-upload --self-test-args` after changing upload status parsing, argument parsing, create-record parsing, or post-upload verification handling.
 - Search touched files for old fixed payload/display markers: `CLOUD_RESULT`, hard-coded `good`, fixed part names, fixed IDs, placeholder text such as `待接入`, and confidence `/1000`.
 - Cross-build `qt_camera_display` in `cfr-vm` and confirm the ARM binary contains the expected detection markers such as `fusedResultFromModelResults`, `cloudResultFromFusedResult`, `CLOUD_RESULT`, `fused_status`, `total_time_ms`, `detectClassificationReady`, and `detectModelsReady`.
 - On the board, run `--detect-self-test` and assert the result line includes `classification_result`, `segmentation_result`, nonzero `total_time_ms`, and `upload_status=OK` when network credentials are available.
@@ -917,6 +1214,142 @@ The final `detectCurrentFrameFinished` signal already contains every field, so i
 
 ```text
 Emit `detectClassificationReady` after the first model returns and update part/class/confidence immediately; emit `detectModelsReady` after the last local model returns and update `total_time_ms`; reserve `detectCurrentFrameFinished` for final upload status and busy-state reset.
+```
+
+---
+
+## MP157 Cloud Part Auto-Create Upload Contract
+
+Use this convention when the STM32MP157 board uploads a detection record and the model can produce a part class that does not already exist in the cloud `parts` table.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/main.cpp`, `20_uvc_camera/qt_camera_display/defect-cos-upload`, retry-upload code, cloud record payload mapping, or README acceptance text for part identity.
+- Trigger: the Detect button or history retry reports upload failure before COS prepare/PUT/register, while local source and annotated images already exist on `/mnt/sdcard/images`.
+- Root-cause lesson from 2026-05-20: image upload can fail because create-record fails to resolve the part, not because COS or network upload failed. If the board stops after `GET /api/v1/parts?limit=100` with no matching part, the downstream image upload path never starts.
+- Goal: a new real part type such as `wave_washer` must create or reuse exactly one cloud part and then upload one source image plus all annotated images for the same record.
+
+### 2. Signatures
+
+| Operation | Signature |
+|---|---|
+| Qt part extraction | `partCodeFromClassificationResult("... class=wave_washer_good ...") -> "wave_washer"` |
+| Upload env from Qt | `CLOUD_PART_CODE=<part_code>` and `CLOUD_CLASS_LABEL=<raw_model_class>` |
+| Manual override | `CLOUD_PART_NAME=<display-name>` and `CLOUD_PART_CATEGORY=<category>` |
+| Upload command | `/root/qt_camera_display/defect-cos-upload --jpg <source.jpg> --annotated <overlay.jpg> --annotated <mask.png>` |
+| Existing part lookup | `GET /api/v1/parts?limit=100` |
+| Create record existing-part payload | `POST /api/v1/records` with `"part_id": <id>` |
+| Create record auto-create payload | `POST /api/v1/records` with `part_code`, `part_name`, `part_category`, `auto_create_part:true` |
+| Auto-create self-test | `sh defect-cos-upload --self-test-json-parser` must run `run_auto_create_part_self_test` |
+| Real detail proof | `GET /api/v1/records/<record_id>` must return `part.part_code`, `part.name`, `part.category`, and file counts |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Part vs result split | Model labels such as `gasket_good`, `gasket_bad`, and `wave_washer_good` contain both part identity and quality result. Strip only the final `_good/_bad/-good/-bad` suffix for `CLOUD_PART_CODE`; send quality through `CLOUD_RESULT`. |
+| Existing part priority | If `CLOUD_PART_ID` is a positive number, keep the legacy path and send only `part_id` to create-record. Do not also send auto-create fields. |
+| Lookup behavior | Without `CLOUD_PART_ID`, the helper may query `/api/v1/parts?limit=100` to reuse an existing part. A miss is not an upload failure when `CLOUD_PART_CODE` or `CLOUD_CLASS_LABEL` is present. |
+| Auto-create payload | On lookup miss, create-record must send top-level `part_code`, `part_name`, optional `part_category`, and `auto_create_part:true`. The helper must not fail with "please create the part first" in this case. |
+| Missing identity | If both `part_id` and normalized `part_code` are absent, fail locally before create-record. Do not create a record with the first arbitrary part as a fallback for a model-backed Detect action. |
+| Chinese name mapping | `gasket` is a historical training code for the same business object as `wave_washer`; both must map to `part_name=波形垫圈` and `part_category=垫圈类` unless explicitly overridden. `washer` maps to `平垫圈 / 垫圈类`; `splitwasher` maps to `弹性垫圈 / 垫圈类`. Do not translate `wave_washer` as `电平` or display `gasket` as `垫片`. |
+| Device context | Always write normalized `device_context.part_code` and raw `device_context.class_label` so cloud debugging can distinguish part identity from model quality labels. |
+| Retry parity | History retry must reconstruct the same `CLOUD_PART_CODE`, `CLOUD_CLASS_LABEL`, and `CLOUD_RESULT` from local `classification_result` and `segmentation_result`; retry must not drop the part identity and fall back to an unrelated cloud part. |
+| Upload completion proof | Upload is complete only after create-record succeeds, COS prepare/PUT/register succeeds for every file, and record detail contains the expected part plus `source_count=1` and `annotated_count=<input count>`. |
+
+Example auto-create create-record payload:
+
+```json
+{
+  "record_no": "MP157-20260520-125945",
+  "device_id": 3,
+  "part_code": "wave_washer",
+  "part_name": "波形垫圈",
+  "part_category": "垫圈类",
+  "auto_create_part": true,
+  "result": "good",
+  "device_context": {
+    "part_code": "wave_washer",
+    "class_label": "wave_washer_good"
+  },
+  "captured_at": "2026-05-20T12:59:45+08:00",
+  "detected_at": "2026-05-20T12:59:45+08:00"
+}
+```
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Part-code extraction | `wave_washer_good` becomes `wave_washer`; `gasket_bad` becomes `gasket` | Quality suffix is being treated as part identity | Fix Qt `partCodeFromClassificationResult` and shell `class_label_to_part_code` together |
+| Existing-part path | Known `part_code` logs `resolved_part_id=<id>` and create-record sends `part_id` | Existing parts may be duplicated | Fix `/parts` parser or matching keys |
+| Auto-create path | Unknown `part_code` logs `resolved_part_id=未匹配到云端零件，将由云端自动创建` and create-record succeeds | The helper still blocks before upload | Send `part_code/part_name/part_category/auto_create_part=true` instead of failing locally |
+| Missing identity | No `CLOUD_PART_ID`, no `CLOUD_PART_CODE`, and no `CLOUD_CLASS_LABEL` fails before record creation | The board may upload under the wrong first part | Reject the detection or fix Qt env propagation |
+| Cloud detail | Record detail returns `part.part_code=<code>`, expected `name/category`, one `source`, and all annotated files | Auto-create or file registration did not complete | Inspect `/tmp/defect-cos-record.json`, prepare logs, and register URLs |
+| UI retry | Retrying a failed history row creates a record with the same part code as the original classification | Retry drops part identity | Rebuild retry env from saved model results |
+
+### 5. Good/Base/Bad Cases
+
+```sh
+# Good: model-backed upload sends part identity and lets the cloud create a missing real part type.
+CLOUD_PART_CODE=wave_washer \
+CLOUD_CLASS_LABEL=wave_washer_good \
+CLOUD_RESULT=good \
+  ./defect-cos-upload --jpg "$raw_jpg" --annotated "$overlay_jpg" --annotated "$mask_png"
+```
+
+```sh
+# Base: manual test of the auto-create path with an intentionally unique part_code.
+CLOUD_PART_CODE=codex_auto_create_20260520125945 \
+CLOUD_PART_NAME=波形垫圈自动创建验证20260520125945 \
+CLOUD_PART_CATEGORY=垫圈类 \
+CLOUD_CLASS_LABEL=codex_auto_create_20260520125945_good \
+CLOUD_RESULT=good \
+  ./defect-cos-upload --jpg "$raw_jpg" --annotated "$overlay_jpg" --annotated "$mask_png"
+```
+
+```text
+Bad: `/parts` lookup does not find `wave_washer`, so the board reports image upload failed and tells the operator to create a part manually.
+```
+
+```text
+Correct: `/parts` lookup miss keeps `CLOUD_PART_CODE=wave_washer`, create-record sends auto-create fields, and the returned record detail contains `part.name=波形垫圈`.
+```
+
+### 6. Tests Required
+
+- Run `sh defect-cos-upload --self-test-json-parser` and assert it covers part-code normalization plus `auto_create_part=true` payload generation.
+- Run `sh defect-cos-upload --self-test-args` after changing `--jpg`, `--annotated`, or legacy `--png` parsing.
+- Run `./test_qt_kms_overlay_assets.sh` and require markers: `CLOUD_PART_CODE`, `CLOUD_CLASS_LABEL`, `partCodeFromClassificationResult`, `auto_create_part`, `part_name`, `part_category`, and `run_auto_create_part_self_test`.
+- On the board, deploy `/root/qt_camera_display/defect-cos-upload`, run both helper self-tests, and record the script hash before real upload validation.
+- Perform one real upload using a unique `CLOUD_PART_CODE` that does not exist in the cloud. Assert stdout contains `上传成功：record_id=... source_kind=source annotated_count=<n>`.
+- Query `GET /api/v1/records/<record_id>` and assert `part.part_code`, `part.name`, `part.category`, `source_count=1`, and `annotated_count=<n>`.
+- When diagnosing image upload failure, first check whether create-record failed on `part_not_found` or local "missing part type" before investigating COS PUT or preview URLs.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The raw/overlay/mask files exist locally but upload failed, so COS or network must be broken.
+```
+
+#### Correct
+
+```text
+Check the create-record stage first. If `CLOUD_PART_CODE` is missing or `/parts` lookup miss still aborts locally, no COS prepare/PUT/register request will happen.
+```
+
+#### Wrong
+
+```text
+Create separate cloud parts named `wave_washer_good` and `wave_washer_bad`.
+```
+
+#### Correct
+
+```text
+Create or reuse one part `wave_washer`; send `result=good|bad|review` separately and keep the raw class in `device_context.class_label`.
 ```
 
 ---
@@ -1371,6 +1804,189 @@ Cloud time and board history time are separate stores. Retry success updates the
 
 ---
 
+## Qt Fixed-Screen Layout Capacity Contract
+
+Use this convention when adding, resizing, or reorganizing Qt Quick panels on the fixed 1024x600 STM32MP157 LCD, especially dashboards, statistic cards, history panels, setting panels, alarm panels, and any `Repeater`/`Column`/`Grid` whose item count can change.
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/qml/Main.qml` page geometry, panel height/width, `Column`, `Row`, `Grid`, `Repeater`, `ListView`, chart bars, KPI cards, button groups, or status rows.
+- Trigger: adding one more metric, row, button, legend, status chip, chart series, or text line to an existing fixed-height panel.
+- Trigger: a board photo shows a row, button, chart, or label clipped by the panel border, covered by another component, or pushed below the visible 1024x600 screen.
+- Goal: before writing QML, prove the content has a display budget. If it does not fit, choose a layout strategy such as split columns, scrolling, pagination, summarization, or moving details to a secondary surface.
+
+### 2. Signatures
+
+| Operation | Signature / Marker |
+|---|---|
+| Fixed screen root | `root.width === 1024` and `root.height === 600` as the target design boundary |
+| Fixed panel geometry | `Rectangle { id: <panelId>; x: ...; y: ...; width: ...; height: ...; clip: true }` |
+| Vertical capacity formula | `availableHeight = panel.height - headerHeight - topPadding - bottomPadding` |
+| Repeated vertical demand | `requiredHeight = itemHeight * itemCount + spacing * Math.max(0, itemCount - 1)` |
+| Horizontal capacity formula | `requiredWidth = fixedColumnsWidth + spacing * gapCount + dynamicMinWidth` |
+| Split-column helper | `statsDistributionLeftBars()` and `statsDistributionRightBars()` split five metrics across two visible columns |
+| Scroll owner | `ListView { height: ...; clip: true; boundsBehavior: Flickable.StopAtBounds }` or `Flickable { contentHeight: ... }` |
+| Global toast layer | `Item { id: globalStorageToastLayer; z: 900; visible: true; Rectangle { id: storageToast; anchors.bottom: parent.bottom } }` |
+| Static contract | `test_qt_kms_overlay_assets.sh` greps helper names and panel IDs for fragile fixed-screen contracts |
+| Board proof | Photo/screenshot after deployment, or a marker check plus human LCD inspection when screenshots are not available |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Budget before implementation | Before adding visible items, calculate whether the worst-case count fits the panel. Use actual QML values: panel height, title `y`, title height, row height, delegate height, spacing, and bottom margin. Do not rely on visual intuition. |
+| One-row addition rule | Adding a new row to an existing `Column + Repeater` is a layout change, not a data-only change. Recompute the budget and update validation if item count changes. |
+| Fit decision | If `requiredHeight <= availableHeight`, keep the simple fixed layout. If it exceeds the budget, choose an explicit strategy: split into columns, reduce nonessential chrome, move overflow into `ListView/Flickable`, create a second detail page, or summarize visible text and preserve full data elsewhere. |
+| No hidden required content | `clip: true` is only an overlap guard. It is not a valid way to hide required metrics, action buttons, fault rows, or explanations. Required content must remain visible, scrollable, or reachable through a clear control. |
+| Stable repeated delegates | Repeated items must use fixed `height`, fixed row widths, bounded text, and stable spacing so dynamic values do not resize the panel or push later rows out of bounds. |
+| Split-column threshold | When a fixed-height panel contains five or more short metrics, first consider two-column grouping by meaning before shrinking fonts. For example, statistics distribution uses left `良品/坏品/待复核` and right `上传成功/上传失败`. |
+| Scroll threshold | When the operator must inspect arbitrary-length history, logs, alarms, or records, use a bounded `ListView` or `Flickable` inside the card rather than expanding the card height. |
+| Cross-page toast ownership | A toast that reports actions from multiple pages must be rendered in a root-level layer after ordinary pages, not inside a home/history/settings panel. It must have a documented z value above page content and below modal/boot overlays as appropriate, so bottom controls cannot cover it. |
+| Toast layer lifetime | The root-level toast layer must remain `visible: true`; only the toast rectangle itself may fade with `opacity` and toggle `visible`. Do not bind the parent layer to `storageToast.visible`, because a hidden parent can prevent the child animation/visibility path from bringing the toast back. |
+| Meaningful grouping | Layout compression must preserve meaning. Group by workflow boundary, such as detection result vs upload state, device health vs action buttons, summary vs full explanation. Do not split purely by arbitrary item order if it makes the screen harder to scan. |
+| Board font reality | Chinese font metrics on the board can differ from desktop expectation. The budget must include margins for longer Chinese labels, percent values, record numbers, and translated part names. |
+| Documentation sync | If a module README or plan describes a screen, update its validation matrix with the layout fit requirement and the first failure check. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Static marker check | `./test_qt_kms_overlay_assets.sh` finds the layout helper and panel IDs that protect the known fragile area | Future edits can silently regress to an overflowing layout | Add or update marker checks for the new layout contract |
+| Capacity arithmetic | `requiredHeight <= availableHeight` for every fixed `Column/Repeater`, or overflow is handled by split columns/scroll/detail page | A row can be clipped at the bottom on 1024x600 | Redesign the panel before coding more fields |
+| Panel border inspection | On the LCD, all required rows, bars, and buttons stay inside their panel border | Board font metrics or fixed sizes were underestimated | Adjust layout and rerun board check |
+| Repeated data stress | Test with the maximum planned metric count, longest status labels, and multi-digit counts/percentages | The layout only works for short demo data | Add elide/wrap, split columns, or scroll owner |
+| Touch target retention | Buttons and list rows remain large enough to tap after compression | A fit fix made controls hard to use | Prefer pagination/scrolling over shrinking below usable size |
+| Raw data retention | Summarized panels still keep full raw details in history JSON, logs, or a detail overlay | UI fit was achieved by deleting diagnostic evidence | Restore raw data in a reachable non-compact surface |
+| Toast layer visibility | Trigger storage/detection/settings/alarm actions from history, statistics, settings, alarm, and logs pages; the toast remains visible above page content | The toast is owned by a lower page layer, lacks a high enough z value, or the parent layer is hidden through `visible: storageToast.visible` | Move the toast to a root-level always-visible layer and add static marker checks |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: five short metrics do not fit one vertical stack, so the data is split by meaning.
+Row {
+    id: statsDistributionSplitRow
+    width: parent.width - 28
+    spacing: 16
+
+    Column {
+        id: statsDistributionLeftColumn
+        width: (statsDistributionSplitRow.width - statsDistributionSplitRow.spacing) / 2
+        Repeater { model: root.statsDistributionLeftBars() }
+    }
+
+    Column {
+        id: statsDistributionRightColumn
+        width: (statsDistributionSplitRow.width - statsDistributionSplitRow.spacing) / 2
+        Repeater { model: root.statsDistributionRightBars() }
+    }
+}
+```
+
+```qml
+// Base: arbitrary-length rows stay inside a bounded scroll owner instead of growing the page.
+ListView {
+    id: statsRecentListView
+    height: parent.height - 48
+    clip: true
+    model: root.statsRecentRows()
+    delegate: Rectangle {
+        width: statsRecentListView.width
+        height: 22
+    }
+}
+```
+
+```qml
+// Good: a cross-page action result lives in a root-level layer, not inside a specific page.
+Item {
+    id: globalStorageToastLayer
+    anchors.fill: parent
+    z: 900
+    visible: true
+
+    Rectangle {
+        id: storageToast
+        anchors.bottom: parent.bottom
+        opacity: root.storageToastVisible ? 1.0 : 0.0
+    }
+}
+```
+
+```qml
+// Bad: the parent layer depends on the child toast's visible state, so the whole layer
+// can stay hidden and the next toast request may never draw on the board.
+Item {
+    id: globalStorageToastLayer
+    visible: storageToast.visible
+
+    Rectangle {
+        id: storageToast
+        visible: opacity > 0.01
+    }
+}
+```
+
+```qml
+// Bad: five fixed rows are stacked in a 160px panel without checking title, spacing, and bottom margin.
+Column {
+    y: 34
+    spacing: 4
+    Repeater {
+        model: root.statsDistributionBars()
+    }
+}
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after any QML page geometry, repeated metric count, or fixed panel layout change.
+- For global action toasts, assert the static test checks `globalStorageToastLayer`, `storageToast`, `z: 900`, `visible: true`, bottom anchoring, and rejects `visible: storageToast.visible`.
+- Run `git diff --check` after documentation/QML layout edits.
+- For QML changes, cross-build `qt_camera_display` and verify the build log runs `rcc -name qml`, then verify the ARM binary contains the new layout marker strings with `strings`.
+- On the board, open the changed page and inspect the exact 1024x600 LCD, not only desktop source code. Required rows must be visible, scrollable, or reachable through a clear detail control.
+- Stress the screen with the largest expected visible data set: five distribution bars, many history rows, long upload status, multi-digit sample counts, long part names, or long alarm messages as applicable.
+- Update the module README validation table with columns for `测试目标`, `执行位置`, `命令/动作`, `预期输出/现象`, and `失败时排查`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+This panel currently has four rows and looks fine, so adding a fifth row is only a data change.
+```
+
+#### Correct
+
+```text
+Adding a fifth row changes the layout capacity. Recompute required height. If it exceeds the panel, split columns, scroll, or move details before implementation.
+```
+
+#### Wrong
+
+```text
+Set `clip: true`; then overflow is fixed because it no longer draws outside the card.
+```
+
+#### Correct
+
+```text
+`clip: true` only prevents overlap. Required information must still be visible inside the budget or reachable through scrolling/detail navigation.
+```
+
+#### Wrong
+
+```text
+Use a smaller font until all rows appear to fit.
+```
+
+#### Correct
+
+```text
+Keep touch/readability first. Prefer meaningful grouping, two-column layout, or bounded scrolling over shrinking text below board-readable size.
+```
+
+---
+
 ## Qt Small-Screen Text Budget Contract
 
 Use this convention when a Qt Quick screen on the 1024x600 STM32MP157 LCD displays model output, cloud status, file metadata, diagnostic text, or any operator-facing string whose length can change at runtime.
@@ -1507,10 +2123,13 @@ Use this convention when adding or changing the STM32MP157 Qt `统计分析` pag
 | Summary helper | `function statsSummary()` in `qml/Main.qml` |
 | Trend helper | `function statsRecentBars()` in `qml/Main.qml` |
 | Distribution helper | `function statsDistributionBars()` in `qml/Main.qml` |
+| Distribution left helper | `function statsDistributionLeftBars()` in `qml/Main.qml` |
+| Distribution right helper | `function statsDistributionRightBars()` in `qml/Main.qml` |
+| Distribution columns | `statsDistributionLeftColumn` and `statsDistributionRightColumn` inside `statsDistributionPanel` |
 | Recent rows helper | `function statsRecentRows()` in `qml/Main.qml` |
 | Recent rows view | `statsRecentListView` vertical `ListView` inside `statsRecentPanel` |
 | Detail handoff | `openHistoryDetailFromStats(index)` calls `switchPage("history")` and `showHistoryDetail(index)` |
-| Static contract | `./test_qt_kms_overlay_assets.sh` checks `statsPageVisible`, `statsSummary`, `statsRecentBars`, `statsDistributionBars`, `statsRecentRows`, `statsRecentListView`, `openHistoryDetailFromStats`, and `statsPage` panel IDs |
+| Static contract | `./test_qt_kms_overlay_assets.sh` checks `statsPageVisible`, `statsSummary`, `statsRecentBars`, `statsDistributionBars`, `statsDistributionLeftBars`, `statsDistributionRightBars`, `statsRecentRows`, `statsRecentListView`, `openHistoryDetailFromStats`, and `statsPage` panel IDs |
 
 ### 3. Contracts
 
@@ -1521,6 +2140,7 @@ Use this convention when adding or changing the STM32MP157 Qt `统计分析` pag
 | Empty state | If `uploadHistory.count <= 0`, show a clear empty state telling the operator to save an image first; do not render empty axes or blank panels. |
 | Chart implementation | Use lightweight QML rectangles for KPI cards, bars, and distribution strips. Do not introduce Qt Charts or another runtime dependency for this embedded 1024x600 screen without a separate design decision. |
 | Screen density | Keep the page data-dense but scannable: top KPI row, middle trend/distribution panels, bottom recent records and cloud/file state panels. Avoid showing raw JSON, long file paths, or script output on the statistics page. |
+| Distribution layout | `statsDistributionBars()` may contain five metrics, but the 160px distribution panel must render them as two columns: left column for `良品/坏品/待复核`, right column for `上传成功/上传失败`. Do not put all five bars in one vertical column on the 1024x600 LCD, because the last upload-failure row can overflow the panel. |
 | Recent rows scroll | `statsRecentRows()` should return the latest records in newest-first order, not only the first visible five rows. `statsRecentPanel` must contain a vertical `ListView` so operators can swipe inside the card to review more records without leaving the statistics page. |
 | Touch behavior | Touch targets on recent rows must be large enough to tap and should hand off to the existing history detail screen rather than duplicating image/detail UI. The vertical list must keep row tapping intact after a drag gesture ends. |
 | Overlay ownership | Entering `统计分析` hides the live KMS video plane. Returning to `首页` restores it. QML must not draw statistics under a visible external video plane. |
@@ -1534,6 +2154,7 @@ Use this convention when adding or changing the STM32MP157 Qt `统计分析` pag
 | QML navigation | Touch left `统计分析`; `activePage` becomes `stats` and `statsPageVisible` is true | Navigation item still behaves as placeholder text |
 | Overlay visibility | In KMS mode, statistics page is not covered by live camera video, and `首页` restores video | `setOverlayVisible(pageName === "home")` or overlay `VISIBLE` command is broken |
 | Count parity | Board `grep -c '"upload_time"' /mnt/sdcard/images/upload_history.json` matches the visible `总记录` | The page is reading stale data or calculating totals from a different source |
+| Distribution fit | `分布概览` shows `良品/坏品/待复核` in the left column and `上传成功/上传失败` in the right column, all inside the panel border | The panel regressed to a single vertical list or fixed heights no longer fit the LCD |
 | Recent rows scroll | With more records than fit the card, the operator can swipe `statsRecentListView` vertically and reveal older rows | The page still uses a fixed `Column + Repeater` or `statsRecentRows()` truncates to five records |
 | Recent handoff | Tapping a recent row opens the corresponding `历史记录` detail page | Row index mapping or `openHistoryDetailFromStats()` is broken |
 | Empty state | With no history JSON or zero records, the page shows a readable empty message | The page appears blank or misleadingly reports zeros without guidance |
@@ -1571,6 +2192,7 @@ Base: If cloud upload is offline, the statistics page still shows local file cou
 - Run `./test_qt_kms_overlay_assets.sh` after changing `Main.qml`, history fields, or statistics layout.
 - Cross-build `qt_camera_display` after QML changes and verify the ARM binary contains markers such as `统计分析`, `statsSummary`, and `statsPage`.
 - On the board, save at least one JPG/PNG pair, then open `统计分析` and compare visible `总记录` with `grep -c '"upload_time"' /mnt/sdcard/images/upload_history.json`.
+- On the board, confirm the distribution panel keeps all five metrics visible without clipping: left `良品/坏品/待复核`, right `上传成功/上传失败`.
 - In KMS overlay mode, verify statistics page hides the video plane and `首页` restores it.
 - With more than five history rows, swipe inside the `最近记录` card and confirm older rows become visible without moving the whole statistics page.
 - Tap a recent row and confirm the app opens the matching history detail page with JPG/PNG preview.
@@ -1840,6 +2462,428 @@ The segmentation ONNX proves export/inference/overlay flow only. For the MP157 p
 
 ---
 
+## Qt Detection Information Full Explanation Contract
+
+### 1. Scope / Trigger
+
+- Trigger: board-side history detail screens show cloud review reasons, fused model explanations, UNet hints, model raw output lines, upload status, or image-retention diagnostics.
+- Trigger: text can be longer than the 1024x600 detail panel can hold.
+- Affected screen: `20_uvc_camera/qt_camera_display/qml/Main.qml` history detail page.
+- The fixed right-side history panel must remain readable without truncating the only copy of cloud/operator text.
+
+### 2. Signatures
+
+| UI / Function | Required Marker |
+|---|---|
+| Short summary state | `historyAnalysisSummaryText(record)` |
+| Full explanation text | `historyFullAnalysisText(record)` |
+| Open control | `查看完整说明` |
+| Full explanation overlay | `historyAnalysisDetailOverlay` |
+| Scroll owner | `analysisDetailFlickable` |
+| Visibility state | `historyAnalysisDetailVisible` |
+| Static contract test | `test_qt_kms_overlay_assets.sh` checks these markers |
+
+### 3. Contracts
+
+| Boundary | Contract |
+|---|---|
+| Fixed panel | The compact history detail panel shows a short summary only. It may use `maximumLineCount`, tight `lineHeight`, and `clip: true`, but it must not be the only place containing the complete text. |
+| Full text access | Any long cloud review reason, UNet hint, fused reason, model raw output, or upload diagnostic must be available through a full explanation overlay or page. |
+| Scroll behavior | The full explanation surface must use a bounded scroll owner such as `Flickable`; long text must be readable to the end on the 1024x600 board screen. |
+| Meaning preservation | Short text may compress wording, but must not hide result-changing facts such as cloud corrected result, board original result, operator reason, or UNet defect hint. |
+| Part label display | Narrow panels use compact part names. `gasket` and `gasket_good/gasket_bad` display as `波形垫圈`; `washer` displays as `平垫圈`; `splitwasher` displays as `弹性垫圈`. Do not show the misleading literal `垫片` for legacy `gasket`. |
+| Binary verification | QML resource compression may be disabled for deploy verification when marker strings must be checked with `strings` in the built binary. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Bad Result | Required Action |
+|---|---|---|---|
+| Short panel content | Shows result, confidence, defect hint, and `查看完整说明` | Shows a long paragraph clipped at the bottom | Move long text to the full explanation surface and keep a short summary |
+| Full overlay | `historyAnalysisDetailOverlay` opens and contains scrollable `analysisDetailFlickable` | No way to read hidden cloud reason | Add a full explanation overlay/page before shipping |
+| Cloud reason | Full text includes `云端修正` and the operator-entered reason | Only first line appears in the fixed panel | Preserve full cloud review text in `historyFullAnalysisText()` |
+| Model raw text | Raw classification/segmentation details remain available for diagnostics | Raw text is removed completely to fit the card | Put raw lines in the full explanation, not the compact card |
+| Small-screen label | Part name fits as `波形垫圈`, `平垫圈`, or `弹性垫圈` | `gasket` becomes `垫片` or text overflows the result panel | Apply compact identity mapping before rendering |
+
+### 5. Good / Base / Bad Cases
+
+| Case | Example | Expected Result |
+|---|---|---|
+| Good cloud correction | Cloud reason is 300+ Chinese characters | Compact panel shows short summary; `查看完整说明` opens a scrollable full explanation containing the full reason |
+| Good model diagnostics | UNet and classification raw output are both present | Operator sees a human summary first, and diagnostics remain available in full explanation |
+| Base short record | No cloud correction and only normal model output | Compact panel is sufficient, but full explanation still opens with available fields |
+| Bad clipped text | The fixed panel directly renders full cloud reason with `clip: true` | The operator cannot understand why cloud changed the result |
+| Bad misleading label | Legacy `gasket` shows as `垫片` | User thinks the wrong physical part was detected |
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after any change to history detail QML, QML resource packaging, or compact label mapping.
+- Assert the test checks `historyAnalysisSummaryText`, `historyFullAnalysisText`, `historyAnalysisDetailOverlay`, `analysisDetailFlickable`, and `查看完整说明`.
+- On the board, open a record with a long cloud review reason:
+  - assert the compact panel does not overflow or hide surrounding UI;
+  - tap `查看完整说明`;
+  - assert the full explanation scrolls to the last line;
+  - assert cloud correction result, board original result, operator reason, UNet hint, and model raw output are present.
+- When verifying deployed binaries, run `strings /root/qt_camera_display/qt_camera_display | grep -E 'historyAnalysisDetailOverlay|查看完整说明|波形垫圈'`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```qml
+Text {
+    clip: true
+    text: root.historyFullAnalysisText(root.selectedHistoryRecord)
+}
+```
+
+This clips the only copy of the full cloud/model explanation.
+
+#### Correct
+
+```qml
+Text {
+    maximumLineCount: 4
+    text: root.historyAnalysisSummaryText(root.selectedHistoryRecord)
+}
+
+Flickable {
+    id: analysisDetailFlickable
+    contentHeight: fullAnalysisText.height
+    Text {
+        id: fullAnalysisText
+        text: root.historyFullAnalysisText(root.selectedHistoryRecord)
+    }
+}
+```
+
+#### Wrong
+
+```text
+gasket -> 垫片
+```
+
+#### Correct
+
+```text
+gasket -> 波形垫圈
+washer -> 平垫圈
+splitwasher -> 弹性垫圈
+```
+
+---
+
+## Scenario: Qt Alarm And Settings Detail Overlay Geometry Contract
+
+Use this convention when a fixed STM32MP157 Qt/QML card shows a compact alarm, maintenance, device-health, visual-detection strategy, F4 boundary, camera/storage setting, or any setting summary with a `查看全部`, `查看完整说明`, or `查看详情` control.
+
+### 1. Scope / Trigger
+
+- Trigger: adding a detail button to `20_uvc_camera/qt_camera_display/qml/Main.qml` cards such as `告警维护`, `处理建议`, `参数设置`, `视觉检测策略`, `F4接入边界`, or device-health panels.
+- Trigger: moving complete text from a compact card into a secondary page, overlay, or `Flickable`.
+- Trigger: a board photo shows a `查看详情` button covering the last summary row, status text, or another card element.
+- Trigger: two detail entries reuse one overlay and one scroll owner, and opening the second detail starts in the middle because the first detail was previously scrolled.
+- Goal: compact cards must keep essential status visible and tappable, while complete explanations remain reachable without geometry overlap or stale scroll position.
+
+### 2. Signatures
+
+| UI / Function | Required Marker / Shape |
+|---|---|
+| Alarm detail opener | `openAlarmAdviceDetail()` or an equivalent page-specific opener |
+| Alarm full text | `alarmAdviceDetailFlickable` owns the scrollable full advice text |
+| Settings detail opener | `openSettingsDetail(detailKey)` |
+| Settings full text | `settingsDetailFlickable` owns the scrollable visual-strategy or F4-boundary text |
+| Scroll reset | `settingsDetailFlickable.contentY = 0` after changing detail content |
+| Compact card geometry | Summary rows end before a reserved bottom action row |
+| Bottom action row | Left status text has bounded width; right detail button has fixed width/height and right margin |
+| Static contract | `test_qt_kms_overlay_assets.sh` checks detail markers, removed obsolete rows, reserved button geometry, and scroll reset |
+
+### 3. Contracts
+
+| Boundary | Contract |
+|---|---|
+| Card capacity calculation | Before adding a button or one more summary line, calculate the vertical budget with real QML values: `summaryEndY = summaryY + rowHeight * rowCount + spacing * (rowCount - 1)`. The action row must start after `summaryEndY + safeGap` and must still fit before `card.height - bottomMargin`. |
+| Button reservation | A detail button is not allowed to float over existing content. Reserve an explicit row or column for it. In narrow cards, use left status text plus right fixed-size button instead of stacking the button on top of the summary. |
+| Summary vs full text | The card shows only short operator-critical facts. Long maintenance advice, cloud upload explanations, visual-detection strategy, and F4 electrical/control boundaries belong in a scrollable detail overlay/page. |
+| Shared overlay state | When different entries share one detail overlay or one `Flickable`, each opener must set the title/body first, show the overlay, and reset `contentY` to `0` on the next event loop tick with `Qt.callLater()` or an equivalent post-layout hook. |
+| Independent scroll expectation | Scrolling one detail entry must not affect the initial position of another entry. Every detail open operation starts from the top unless the product intentionally stores per-entry scroll state. |
+| Obsolete configuration removal | Do not keep unused rows just to fill a card. If the current hardware plan has no fill light, remove `补光` from `相机、光源与存储` and use the freed budget for active camera, storage, or upload settings. |
+| Device-health truth source | Device health cards should show real board checks. For the 4G card, prefer the actual 4G/PPP online probe state instead of a generic or placeholder configuration label. |
+| Cloud-contract wording | Parameter detail text should be based on the MP157-to-cloud data contract: include record identity, source/annotated images, local retention, COS upload, retry/offline behavior, and backend-visible state when those are part of the screen's responsibility. |
+| F4 boundary wording | F4 detail text should make ownership clear: MP157 displays and uploads inspection results, while F4 and the linked sensors/actuators own motion, weight, inductance, limit, emergency-stop, or sorting control as applicable. Qt must not imply it directly controls the F4 motion path unless that control path exists. |
+| `clip` limitation | `clip: true` can prevent drawing outside the card, but it is not evidence that the button, final line, or status text is visible. Fit must be proven by geometry and board inspection. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Summary/action geometry | Last summary row, bottom status text, and `查看详情` button have non-overlapping rectangles | The new control covers content on the 1024x600 LCD | Reduce summary rows, reserve an action row, or move more text into detail |
+| Button touch area | Detail button is fully inside the card and remains at least the designed fixed width/height | The fit fix made the button hard to tap | Rebalance card rows before shrinking the button |
+| Detail full text | Long alarm advice, visual strategy, or F4 boundary text is readable to the final line in a `Flickable` | The compact card is still the only copy of required text | Add or repair the full detail overlay/page |
+| Scroll reset | Open detail A, scroll halfway, close it, open detail B; detail B starts at the top | Shared `Flickable.contentY` leaked between detail entries | Reset contentY in every opener after content is assigned |
+| Removed obsolete row | `相机、光源与存储` does not show `补光` when no fill-light plan exists | UI advertises an inactive configuration | Remove the row or mark it only in a future/disabled spec, not in the live card |
+| 4G health label | Device health shows online/offline from the 4G probe path | Health card is a placeholder setting, not real status | Wire the card to the existing device-health controller/probe result |
+| Static test | `./test_qt_kms_overlay_assets.sh` finds layout markers and scroll-reset markers | A future edit can reintroduce the overlap or stale scroll bug silently | Add marker checks for the changed card/overlay |
+| Board inspection | On the deployed 1024x600 LCD, no detail button covers text and each detail opens from the first line | Source inspection missed board font metrics or runtime state | Fix QML geometry and retest on the board |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: fixed-height summary rows end before the reserved bottom action row.
+Column {
+    id: settingsVisionSummaryColumn
+    x: 14
+    y: 38
+    spacing: 4
+    Repeater {
+        // Four rows fit the card; the complete explanation lives in the detail overlay.
+        model: root.settingsVisionSummaryRows()
+        delegate: Text {
+            width: settingsVisionSummaryColumn.width
+            height: 18
+            maximumLineCount: 1
+            elide: Text.ElideRight
+        }
+    }
+}
+
+Text {
+    id: settingsVisionStatusText
+    x: 14
+    y: 132
+    width: parent.width - 120
+    maximumLineCount: 1
+    elide: Text.ElideRight
+}
+
+Rectangle {
+    id: settingsVisionDetailButton
+    width: 86
+    height: 26
+    anchors.right: parent.right
+    anchors.rightMargin: 14
+    y: 132
+}
+```
+
+```qml
+// Good: a shared settings detail overlay always opens from the top.
+function openSettingsDetail(detailKey) {
+    settingsDetailTitle = root.settingsDetailTitle(detailKey)
+    settingsDetailText = root.settingsDetailBody(detailKey)
+    settingsDetailVisible = true
+    Qt.callLater(function() {
+        settingsDetailFlickable.contentY = 0
+    })
+}
+```
+
+```qml
+// Bad: five summary rows plus a bottom-right button can overlap in a 170px card.
+Column {
+    y: 38
+    spacing: 7
+    Repeater { model: root.settingsF4BoundaryRows() }
+}
+
+Rectangle {
+    anchors.right: parent.right
+    anchors.bottom: parent.bottom
+    anchors.bottomMargin: 10
+}
+```
+
+### 6. Tests Required
+
+- Run `./test_qt_kms_overlay_assets.sh` after changing alarm advice, device health, parameter settings cards, detail overlays, or QML scroll owners.
+- Add static assertions for every fragile marker introduced by the change: detail opener, detail `Flickable`, action-row geometry marker, removed inactive row, and `contentY = 0`.
+- Run `git diff --check` after editing QML, shell tests, README, plans, or spec files.
+- For QML changes, cross-build `qt_camera_display`, verify `rcc -name qml` reruns, and confirm the ARM binary contains detail markers such as `查看详情`, `settingsDetailFlickable`, or `alarmAdviceDetailFlickable`.
+- On the board, perform the overlap regression manually: open the changed page, inspect all cards at the 1024x600 LCD size, tap the detail button, scroll to the middle, close, open a different detail, and confirm it starts at the first line.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+The card still has empty-looking space, so place `查看详情` at the bottom-right without recalculating the summary height.
+```
+
+#### Correct
+
+```text
+Calculate the summary rows and reserve a bottom action row first. If the rows and button do not fit together, shorten the summary and move full content into the detail overlay.
+```
+
+#### Wrong
+
+```text
+Two detail buttons share one Flickable, so the second detail can keep the first detail's scroll position.
+```
+
+#### Correct
+
+```text
+Every detail opener resets the shared Flickable to the top after replacing its content, so each entry starts from the first line.
+```
+
+#### Wrong
+
+```text
+Keep `补光` in the settings card because the UI has room for one more line.
+```
+
+#### Correct
+
+```text
+Do not show inactive hardware configuration. Remove `补光` until the fill-light hardware and control path are actually planned.
+```
+
+---
+
+## Scenario: MP157-F407 Actuator Axis Contract
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/qml/Main.qml`, `20_uvc_camera/qt_camera_display/main.cpp`, `docs/stm32mp157-f407-binary-protocol.md`, `docs/stm32mp157-f407-auto-detect-debug-roadmap.md`, or F407 `binary_protocol_service` / `camera_motor_service` files around automatic ROI fine tuning, manual motor control, or stepper parameter settings.
+- Hardware decision: the former camera forward/backward motor channel is now the camera lateral axis. Forward/backward fine tuning belongs to the conveyor motor.
+
+### 2. Signatures
+
+| Boundary | Signature / Marker |
+|---|---|
+| MP157 position command | `sendF4ActuatorPositionMove(actuator, direction, mode, speedRpm, stepsValue, flags)` |
+| MP157 velocity command | `sendF4ActuatorVelocityMove(actuator, direction, speedRpm, flags)` |
+| Conveyor fine tune | `autoVisionFineTuneConveyor(errorY)` sends `ACTUATOR_POS_MOVE actuator=0` |
+| Lateral fine tune | `autoVisionFineTuneLateral(errorX)` sends `ACTUATOR_POS_MOVE actuator=1` |
+| Fine tune step scaling | `autoVisionFineTuneStepsForError(errorPixels, motorMinStep, axisName)` converts ROI pixel error into the `steps` field |
+| Lateral return offset | `autoVisionLateralReturnOffsetSteps` stores signed successful lateral movement in the current automatic cycle |
+| Lateral return command | `autoVisionRequestLateralReturnToBeltCenter()` sends reverse `ACTUATOR_POS_MOVE actuator=1` only when `autoVisionLateralReturnOffsetSteps !== 0` |
+| Stepper role mapping | `camera_lateral` maps to F4 role id `2`; legacy `camera_forward` may map to the same role only for compatibility |
+| F4 dispatch | `BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL == 1` dispatches to `CameraMotorService_RequestLateral...()` |
+| F4 text debug | `CAMLAT LEFT/RIGHT` is the primary text command; `CAMFWD` is a compatibility alias only |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Actuator numbering | Keep protocol numbers stable: `0=conveyor`, `1=camera lateral`, `2=camera Z`, `0xFF=all stop`. Do not renumber legacy frames. |
+| Address defaults | Conveyor uses `UART4 PC10/PC11 addr=0x01`; camera lateral uses `USART6 PC6/PC7 addr=0x03`; camera Z uses `USART6 PC6/PC7 addr=0x02`. |
+| Automatic fine tuning | After Z down and focus settle, `errorY` belongs to conveyor forward/backward fine tune, while `errorX` belongs to camera lateral left/right fine tune. |
+| Lateral direction sign | Camera lateral motion changes the image in the opposite direction. When `errorX > 0`, the part is right of the ROI center and MP157 must send `direction=1` so the camera moves right and the image shifts left toward center. |
+| Fine tune steps | ROI fine tune must not keep `steps` fixed at `motor.minStep`. Compute `steps` from the amount that `abs(errorX/errorY)` exceeds the ROI tolerance, use the configured pixel scale, clamp it to a bounded maximum, and show `steps`, `minStep`, and `direction` in the operator status text so no-motion or wrong-direction symptoms can be diagnosed. |
+| No-improvement escalation | When repeated LOCATE results on the same axis show no meaningful error reduction, increase the next fine tune step within the configured cap. This distinguishes "small step was invisible" from "F4 or the motor never moved." |
+| Lateral return to belt baseline | Lateral fine tuning moves the camera relative to the conveyor. Accumulate only successful `fine-tune-lateral` movements after F4 completion, then after model detection and Z-up send one reverse lateral position command before `MODEL_READY/ARM_JOB_START`. If the current cycle did not move lateral, skip this return command. |
+| Manual UI | The three motor pages must display conveyor, camera lateral, and camera Z. Conveyor/lateral pages use continuous velocity mode plus explicit stop; Z uses fixed-step position mode. |
+| Settings UI | The second stepper settings page must be named camera lateral. Saved JSON may keep numeric user fields, but visible name/role/serial should come from normalized defaults. |
+| Docs | Core protocol and roadmap docs must not describe actuator `1` as camera forward/backward except when explicitly naming legacy compatibility aliases. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Static contract | `./test_qt_kms_overlay_assets.sh` finds `cameraLateralMotor.address = 3`, `autoVisionFineTuneConveyor`, `autoVisionFineTuneLateral`, `ACT_CAMERA_LATERAL`, and `lateral_addr=3` | UI, protocol docs, or F4 code drifted back to the old axis model | Update all layers together before deploying |
+| Manual lateral move | QML sends `ACTUATOR_VEL_MOVE actuator=1 direction=0/1`, F4 calls `CameraMotorService_RequestLateralJog()` | Manual page still controls the old forward/backward abstraction | Rename UI text and dispatch to lateral service |
+| Automatic Y fine tune | QML sends `ACTUATOR_POS_MOVE actuator=0` when `errorY` exceeds tolerance | Conveyor is not doing forward/backward correction after Z down | Route Y-axis correction through conveyor settings |
+| Automatic X fine tune | QML sends `ACTUATOR_POS_MOVE actuator=1` when `errorX` exceeds tolerance | Lateral fine tuning is missing or uses the wrong actuator | Route X-axis correction through camera lateral settings |
+| Step scaling regression | `./test_qt_kms_overlay_assets.sh` rejects `var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))` inside conveyor/lateral fine tune blocks and requires `autoVisionFineTuneStepsForError(errorY/errorX, ...)` | The UI can keep printing "fine tuning" while the motor only receives a barely visible fixed minimum step | Restore pixel-error-based step scaling and include the operator-visible `steps/minStep` values |
+| Lateral direction regression | `./test_qt_kms_overlay_assets.sh` rejects `var direction = errorX > 0 ? 0 : 1` and requires `errorX > 0 ? 1 : 0` | The part appears right of ROI but the camera moves in the direction that pushes the image farther away | Restore the camera-motion/image-motion inversion in QML or adjust F4 runtime direction mapping after proving QML sends the intended direction |
+| Lateral return regression | `./test_qt_kms_overlay_assets.sh` finds `autoVisionLateralReturnOffsetSteps`, successful fine-tune commit, `lateral-return`, and the pre-arm return gate | Camera can remain shifted after one part, so the green ROI no longer aligns with the black conveyor baseline on the next cycle | Accumulate successful lateral moves and send a reverse return before starting the arm flow; skip return when offset is zero |
+| Hardware no-motion triage | During field testing, the bottom prompt shows larger `steps` when `errorX/errorY` is large; if the ROI error still never changes, F4 logs must show whether `ACTUATOR_POS_MOVE actuator=0/1` arrived and whether EMM42 returned motion status | The issue is no longer MP157 step sizing; it is likely F4 firmware, motor address, enable, direction, wiring, power, common ground, or driver response | Check F4 receive logs, `CAMINFO`, motor addresses `0x01/0x03`, EMM42 enable, direction mapping, and physical wiring |
+| F4 runtime config | `CAMINFO` prints `lateral_addr=3, z_addr=2` | F4 still runs old firmware or MP157 sent stale stepper settings | Rebuild/burn F4 and re-send stepper settings |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: Y-axis ROI error is handled by the conveyor.
+autoVisionFineTuneConveyor(errorY)
+steps = autoVisionFineTuneStepsForError(errorY, minStep, "conveyor")
+deviceHealth.sendF4ActuatorPositionMove(0, direction, 0, speed, steps, 0)
+```
+
+```qml
+// Good: X-axis ROI error is handled by the camera lateral axis.
+autoVisionFineTuneLateral(errorX)
+steps = autoVisionFineTuneStepsForError(errorX, minStep, "lateral")
+direction = errorX > 0 ? 1 : 0
+recordAutoVisionPendingLateralFineTune(direction, steps)
+deviceHealth.sendF4ActuatorPositionMove(1, direction, 0, speed, steps, 0)
+```
+
+```qml
+// Good: after Z-up, return the camera to the conveyor baseline only if lateral actually moved.
+if (autoVisionLateralReturnOffsetSteps !== 0) {
+    autoVisionRequestLateralReturnToBeltCenter()
+} else {
+    autoVisionStartF4ArmInspectionAfterZUp()
+}
+```
+
+```text
+Base: legacy JSON role `camera_forward` may still map to role id 2 so old config files do not break immediately, but all new UI labels and docs must say camera lateral.
+```
+
+```text
+Bad: after Z down, sending every small ROI offset to actuator=1 and documenting it as camera forward/backward. This leaves conveyor Y correction unused and makes the UI lie about the physical axis.
+```
+
+```text
+Bad: after Z down, always send `steps=minStep` even when `errorX/errorY` is far outside the ROI tolerance. On real hardware this can look like "fine tune attempt N" while the part never visibly moves.
+```
+
+```text
+Bad: leave the camera at the lateral fine-tuned position after model detection, then start the next cycle with the green ROI no longer aligned to the conveyor edges.
+```
+
+### 6. Tests Required
+
+- Run `cd 20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh` after any QML, settings, protocol-doc, or F4 motor-service edit.
+- Run `git diff --check` in the Windows repository and in `E:/hal/bisai_f407_project`.
+- Run the F4 host protocol test when changing `binary_protocol_service.c/.h` or its payload tests.
+- On hardware, verify the exact commands: `ACTUATOR_POS_MOVE actuator=0` changes conveyor position, `ACTUATOR_POS_MOVE actuator=1` changes lateral position, and `CAMINFO` reports `lateral_addr=3, z_addr=2`.
+- On hardware, force a part outside the ROI center after Z down and confirm the bottom status shows `steps` larger than `minStep` for large `errorX/errorY`; if `steps` grows but the ROI error remains unchanged, inspect F4 receive logs and motor wiring instead of changing MP157 scaling again.
+- On hardware, force a lateral fine tune, finish detection, and confirm Z-up is followed by a reverse `ACTUATOR_POS_MOVE actuator=1` only when `autoVisionLateralReturnOffsetSteps` is nonzero; after that the green ROI should again roughly align with both black conveyor edges.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+Z down -> ROI still offset -> actuator=1 forward/backward fine tune.
+```
+
+#### Correct
+
+```text
+Z down -> ROI still offset -> errorY uses conveyor actuator=0; errorX uses camera lateral actuator=1.
+```
+
+#### Wrong
+
+```qml
+var steps = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+deviceHealth.sendF4ActuatorPositionMove(0, direction, 0, speed, steps, 0)
+```
+
+#### Correct
+
+```qml
+var minStep = Math.max(1, Math.floor(Number(motor.minStep || 1)))
+var steps = autoVisionFineTuneStepsForError(errorY, minStep, "conveyor")
+deviceHealth.sendF4ActuatorPositionMove(0, direction, 0, speed, steps, 0)
+```
+
+#### Wrong
+
+```text
+Lateral fine tune moved the camera for this part, then Z-up immediately starts the arm flow and leaves the next camera view shifted from the conveyor.
+```
+
+#### Correct
+
+```text
+After Z-up, if the current cycle accumulated a successful lateral offset, send the reverse lateral position move first; if the offset is zero, skip the return and start the arm flow directly.
+```
+
 ## Common Mistakes
 
 - Forgetting to close the file descriptor on an error path.
@@ -1848,6 +2892,8 @@ The segmentation ONNX proves export/inference/overlay flow only. For the MP157 p
 - Returning success after a failed `write`, `read`, or `ioctl`.
 - Compiling an STM32MP157 Qt application in a fresh shell without first sourcing the ST OpenSTLinux Qt/Wayland SDK environment script.
 - Letting a non-Qt helper build script inherit ST SDK `CC`; use a script-specific variable such as `OVERLAY_CC` when the helper expects a plain compiler executable path.
+- Treating `TextInput` plus `IntValidator` as proof that a touchscreen operator can enter arbitrary numeric values; on the board, critical numeric settings need in-app digit, backspace, and clear controls.
+- Truncating an F4 calibration reply in C++ and then showing the only copy in a one-line QML label; preserve the diagnostic reply and put the full text in a scrollable result area.
 - Reading `/proc/mounts` or other procfs files in Qt with ordinary file-size/EOF assumptions; use a stream parser such as POSIX `fopen/fscanf/fclose` and prove the result against shell output.
 - Claiming QML touch support after only seeing buttons on the LCD; always prove Qt opened the Goodix input event node and confirm a human tap changes the visible status text.
 - Treating a stuck-looking `minicom` cursor as proof of UART/RS485 receive failure before checking newline, line wrap, local echo, and raw RX hex output.
@@ -1855,3 +2901,7 @@ The segmentation ONNX proves export/inference/overlay flow only. For the MP157 p
 - Parsing a create-record JSON response with a generic `"id"` matcher; use a top-level record parser and a regression fixture with nested `part.id/device.id` so a new save cannot be registered under an old cloud record.
 - Treating a correct COS upload timestamp as proof that the Qt screen clock is correct. The Qt top-bar clock comes from QML `new Date()` inside the `qt_camera_display` process, so always verify `/proc/$(pidof qt_camera_display)/environ` contains `TZ=CST-8`; fix `main.cpp` and the Qt startup scripts, not `defect-cos-upload`, backend time formatting, or QML `+8` hour arithmetic.
 - Treating correct text content as sufficient on the 1024x600 Qt screen. Dynamic model names, fused reasons, cloud status, and diagnostic lines must have a display budget: short helper, fixed width with elide, bounded wrap, compact line height, and board-screen verification.
+- Clipping the only copy of a cloud review reason or model diagnostic in a fixed-height history panel; keep short summaries in the panel and put full text in a scrollable detail overlay/page.
+- Treating an added metric, button, or chart row as a data-only change. Fixed 1024x600 QML panels need a capacity calculation first; if the required height does not fit, use split columns, scrolling, summarization, or a detail page instead of relying on `clip: true`.
+- Adding `查看全部` or `查看详情` to a fixed card without reserving a bottom action row; the button can cover the final summary/status line even when `clip: true` hides the overflow.
+- Reusing one `Flickable` for multiple detail entries without resetting `contentY`; scrolling one detail can make the next detail open in the middle.

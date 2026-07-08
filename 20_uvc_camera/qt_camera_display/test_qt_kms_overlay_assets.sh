@@ -247,6 +247,16 @@ fi
 if ! printf '%s\n' "$f4_auto_finished_block" | grep -q '当前流程未停止，请先按停止后再开始新检测'; then
     fail "首页自动流程回包分支必须识别 F4 仍在运行的拒绝原因，并把界面切回可停止状态"
 fi
+require_grep "autoStartAfterStopRequested" "qml/Main.qml"
+require_grep "requestAutoRestartAfterStop" "qml/Main.qml"
+require_grep "completeAutoStopAndMaybeRestart" "qml/Main.qml"
+always_enabled_button_count="$(grep -c 'property bool actionEnabled: true' "$SCRIPT_DIR/qml/Main.qml")"
+if [ "$always_enabled_button_count" -lt 2 ]; then
+    fail "首页和 KMS overlay 两组开始/暂停/继续/停止按钮必须始终可点击，具体动作由 handleControlAction 做幂等处理"
+fi
+if ! printf '%s\n' "$f4_auto_finished_block" | grep -q 'requestAutoRestartAfterStop'; then
+    fail "START_CYCLE 被 F4 拒绝为旧流程未停止时，QML 必须自动排队 STOP_CYCLE 后重新 START，而不是让用户反复手动点"
+fi
 require_grep "LogFileModel" "main.cpp"
 require_grep "logFileModel" "main.cpp"
 require_grep "refreshLogFileList" "qml/Main.qml"
@@ -1046,6 +1056,7 @@ require_grep "BINARY_PROTOCOL_CMD_START_CYCLE" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_PAUSE_CYCLE" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_RESUME_CYCLE" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_STOP_CYCLE" "main.cpp"
+require_grep "停止按钮固定发送 cycle_id=0" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_HEARTBEAT" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_QUERY_STATUS" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL" "main.cpp"
@@ -1251,6 +1262,14 @@ if printf '%s\n' "$z_motion_up_timer_block" | grep -q 'autoVisionStartF4ArmInspe
     fail "Z 回升本地保护超时不能启动机械臂；正常推进必须来自 F4 ACTUATOR_MOVE_DONE"
 fi
 require_grep "AUTO_LOCATE_MIN_LUMA_DELTA 12U" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MAX_LUMA_DELTA 45U" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_BODY_LUMA_DELTA" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_BODY_LUMA_DELTA_PERCENT" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_LUMA_HISTOGRAM_BUCKETS 256U" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_BELT_ROW_PERCENTILE" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_BELT_MIN_DARK_ROW_PERCENT" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_BELT_VERTICAL_PADDING_PX" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_BELT_FALLBACK_HEIGHT" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MAX_SOLID_DENSITY_PERCENT" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR" "uvc_kms_overlay.c"
@@ -1258,8 +1277,80 @@ require_grep "AUTO_LOCATE_MAX_DARK_FILL_PERCENT" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_DARK_EDGE_MARGIN_PX" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MAX_DARK_EDGE_AREA_PERCENT" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_PART_BBOX_AREA" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_PART_BBOX_SIDE" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_ACCEPT_CONFIDENCE" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_NON_RING_CONFIDENCE" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_RING_REQUIRED_BBOX_SIDE" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET" "uvc_kms_overlay.c"
+require_grep "LOCATE_DIAG_NONE" "uvc_kms_overlay.c"
+require_grep "LOCATE_DIAG_RING" "uvc_kms_overlay.c"
+require_grep "auto_locate_record_reject_candidate" "uvc_kms_overlay.c"
+require_grep "auto_locate_luma_percentile" "uvc_kms_overlay.c"
+require_grep "auto_locate_is_bright_candidate_luma" "uvc_kms_overlay.c"
+require_grep "auto_locate_body_threshold_from_delta" "uvc_kms_overlay.c"
+require_grep "auto_locate_measure_belt_row" "uvc_kms_overlay.c"
+require_grep "auto_locate_find_dark_belt_band" "uvc_kms_overlay.c"
+require_absent "luma >= bright_threshold \\|\\| luma <= dark_threshold" "uvc_kms_overlay.c"
+require_absent "roi_h = frame->frame_height;" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_touches_search_edge" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_has_ring_hole" "uvc_kms_overlay.c"
+require_fixed_grep 'result.insert(QStringLiteral("has_ring"), tokenValue(reply, QStringLiteral("ring")).toInt())' "main.cpp"
+require_fixed_grep 'result.insert(QStringLiteral("diag"), tokenValue(reply, QStringLiteral("diag")).toInt())' "main.cpp"
+require_fixed_grep 'result.insert(QStringLiteral("cand_ring"), tokenValue(reply, QStringLiteral("cand_ring")).toInt())' "main.cpp"
+require_fixed_grep 'result.insert(QStringLiteral("cand_conf"), tokenValue(reply, QStringLiteral("cand_conf")).toInt())' "main.cpp"
+require_fixed_grep '+ " ring=" + Math.round(hasRing)' "qml/Main.qml"
+require_grep "property int autoVisionExpectedPartMaxBboxArea: 45000" "qml/Main.qml"
+require_grep "property int autoVisionFirstDetectNonRingConfirmRequired" "qml/Main.qml"
+require_grep "property int autoVisionFirstDetectMinNonRingConfidence" "qml/Main.qml"
+require_grep "property bool autoVisionAllowNonRingFirstDetect: false" "qml/Main.qml"
+require_grep "autoVisionFirstDetectRequiredFramesForCandidate" "qml/Main.qml"
+require_grep "autoVisionLastLocateDiagText" "qml/Main.qml"
+locate_filter_block="$(sed -n '/ring_hole 检测作为/,/best_score = score/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+locate_body_block="$(sed -n '/body_threshold = auto_locate_body_threshold_from_delta/,/bbox_w = max_x - min_x/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+if ! printf '%s\n' "$locate_body_block" | grep -q 'start_luma, bright_threshold'; then
+    fail "LOCATE 必须继续使用高亮阈值作为连通域种子，避免把灰色皮带整体并入候选"
+fi
+if ! printf '%s\n' "$locate_body_block" | grep -q 'next_luma, body_threshold'; then
+    fail "LOCATE 必须用较低 body_threshold 扩张金属主体，避免银色垫圈阴影把亮环切碎后无法形成 ring"
+fi
+if ! printf '%s\n' "$locate_filter_block" | grep -q 'body_threshold'; then
+    fail "LOCATE 中心孔检测必须使用 body_threshold 判断背景，不能只按过高的高亮种子阈值判断 ring"
+fi
+if ! printf '%s\n' "$locate_filter_block" | grep -q 'if (!has_ring'; then
+    fail "LOCATE 不能只把环孔作为加分项；无环孔候选必须经过更高置信度和尺寸门槛，防止黑色传送带反光误触发"
+fi
+if ! grep -q 'AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET 0U' "$SCRIPT_DIR/uvc_kms_overlay.c"; then
+    fail "LOCATE 不能继续把 ring 作为 overlay 硬门槛；初次识别由 QML 要求 ring，跟踪阶段允许高置信 no-ring 候选避免垫圈高光造成持续丢失"
+fi
+if printf '%s\n' "$locate_filter_block" | grep -q 'require_ring_hole_for_target > 0U && !has_ring'; then
+    fail "overlay 端不能再直接拒绝所有 no-ring 候选，否则垫圈中心孔受曝光影响后会从检测区域内持续丢失"
+fi
+if grep -q 'autoVisionAllowNonRingFirstDetect: true' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 默认不能允许首次 no-ring 建链；黑色传送带静止反光会利用多帧稳定条件误触发自动流程"
+fi
+if ! grep -q 'firstDetectConfirmRequired = autoVisionFirstDetectRequiredFramesForCandidate(hasRing, confidence)' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 首次建链必须按 ring/confidence 选择确认帧数，默认 ring=1 才能建链，调试开关打开后 no-ring 才能走更长确认"
+fi
+if ! grep -q 'if (!autoVisionAllowNonRingFirstDetect) {' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 首次 no-ring 建链必须默认关闭，只允许在明确打开开关后才进入高置信多帧确认"
+fi
+if ! grep -q 'Number(confidence) < autoVisionFirstDetectMinNonRingConfidence' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 首次 no-ring 候选必须有更高置信度门槛，避免空传送带反光重新触发自动流程"
+fi
+locate_reply_block="$(sed -n '/LOCATE has_target=/,/send_control_reply(client_fd, "OK", detail)/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+if ! printf '%s\n' "$locate_reply_block" | grep -q 'diag=%u'; then
+    fail "LOCATE 回包必须包含 diag 字段，现场漏检时才能判断是否卡在 ring/bbox/density/threshold"
+fi
+if ! printf '%s\n' "$locate_reply_block" | grep -q 'roi_y=%u roi_h=%u'; then
+    fail "LOCATE 回包必须包含搜索带 roi_y/roi_h，避免真实零件在画面中但不在算法搜索带内时无法排查"
+fi
+if ! printf '%s\n' "$locate_reply_block" | grep -q 'thr=%u,%u,%u'; then
+    fail "LOCATE 回包必须包含 dark/body/bright 阈值，便于判断银色垫圈是否被亮度阈值挡掉"
+fi
+if ! printf '%s\n' "$locate_reply_block" | grep -q 'cand_box=%dx%d'; then
+    fail "LOCATE 回包必须包含最接近候选 cand_box，便于判断 bbox 尺寸、密度或 ring 门槛是否拒绝真实零件"
+fi
 require_grep "f4AutoControlFinished" "main.cpp"
 require_grep "readF4BinaryReply" "main.cpp"
 require_grep "describeF4FaultReport" "main.cpp"

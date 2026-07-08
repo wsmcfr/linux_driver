@@ -83,14 +83,14 @@
 /* 自动视觉定位的横向搜索宽度，保持和模型检测 ROI 宽度一致，避免左右支架误入定位。 */
 #define AUTO_LOCATE_SEARCH_WIDTH DEFAULT_DETECT_ROI_SIZE
 
-/* 自动视觉定位的最小连通域面积，30px 允许部分进入画面的零件，同时过滤细小噪点。 */
-#define AUTO_LOCATE_MIN_COMPONENT_AREA 30U
+/* 自动视觉定位的最小连通域面积，120px 允许铝色零件刚入画，同时过滤黑色传送带上的小反光点。 */
+#define AUTO_LOCATE_MIN_COMPONENT_AREA 120U
 
 /* 自动视觉定位的最大连通域面积比例分母，避免把整片背景误判成零件。 */
 #define AUTO_LOCATE_MAX_COMPONENT_AREA_DIVISOR 2U
 
 /* 自动视觉定位的最小外接框边长，太窄的亮线或暗线不作为完整零件。 */
-#define AUTO_LOCATE_MIN_BBOX_SIDE 6U
+#define AUTO_LOCATE_MIN_BBOX_SIDE 12U
 
 /* 自动视觉定位的最大外接框边长，首版零件必须小于中心 ROI 的大部分区域。 */
 #define AUTO_LOCATE_MAX_BBOX_SIDE 260U
@@ -119,6 +119,33 @@
 /* 自动视觉定位的中心孔背景最小对比度；孔区域与候选实体太接近时不认为是垫圈孔。 */
 #define AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST 10U
 
+/* 自动视觉定位的真实零件最小外接框面积，小于该面积的亮斑按传送带反光或凸起噪声处理。 */
+#define AUTO_LOCATE_MIN_PART_BBOX_AREA 900U
+
+/* 自动视觉定位的真实零件最小外接框边长，小于该边长的候选不足以作为稳定上料目标。 */
+#define AUTO_LOCATE_MIN_PART_BBOX_SIDE 20U
+
+/* 自动视觉定位的最低接收置信度，低置信候选即使满足面积也不能返回 has_target=1。 */
+#define AUTO_LOCATE_MIN_ACCEPT_CONFIDENCE 52U
+
+/* 自动视觉定位的无环孔候选最低置信度，无中心孔时必须更像完整零件而不是传送带高光。 */
+#define AUTO_LOCATE_MIN_NON_RING_CONFIDENCE 72U
+
+/* 自动视觉定位的无环孔候选最小边长，未看到中心孔时必须等零件主体足够大再进入跟踪。 */
+#define AUTO_LOCATE_RING_REQUIRED_BBOX_SIDE 38U
+
+/*
+ * 自动视觉定位是否在 overlay 端强制要求候选具备垫圈中心孔结构。
+ *
+ * 现场当前目标是波形垫圈、平垫圈和弹性垫圈，三类零件都应呈现环形/孔洞结构。
+ * 但是当前现场发现：同一只垫圈静止在绿色 ROI 内时，中心孔会被曝光、高光、阴影或模糊短暂压没。
+ * 如果 overlay 端直接拒绝所有 no-ring 候选，目标一旦丢帧就可能持续 has_target=0。
+ * 因此这里设为 0：overlay 允许尺寸和置信度足够高的 no-ring 候选回传；
+ * QML 首次建链时让 ring=1 快速确认；ring=0 高置信候选走更长多帧确认，
+ * 跟踪阶段再利用高置信候选提高稳定性。
+ */
+#define AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET 0U
+
 /*
  * 自动视觉定位的最小色度能量阈值。
  *
@@ -146,9 +173,9 @@
 /*
  * 自动视觉定位的最小亮像素占比百分比。
  *
- * 银白色零件在摄像头下呈现为亮候选（高于 bright_threshold），
- * 灰色传送带纹理/反光通常呈现为暗候选或混合。
- * 要求连通域中亮像素占比 >= 40% 才认为是银白色零件而非传送带暗斑。
+ * 银白色零件在摄像头下呈现为亮候选（高于 bright_threshold）。
+ * 当前 LOCATE 已改为“只用亮金属主体做连通域”，该阈值保留为防回退契约：
+ * 如果后续又把暗像素加入候选，亮像素占比必须继续用于拒绝黑色传送带暗斑。
  * 设为 0 禁用此过滤器。
  */
 #define AUTO_LOCATE_MIN_BRIGHT_FILL_PERCENT 40U
@@ -156,11 +183,64 @@
 /*
  * 自动视觉定位的基础亮度差阈值。
  *
- * 黑色波形零件在传送带、亚克力反光或曝光变化下，边缘亮度差有时低于 18，
- * 会造成“肉眼已经入画，但 LOCATE 间歇返回 has_target=0”的漏检。
- * 这里先降到 12，优先提高黑色零件的连续识别概率；若现场误检背景，再回调到 15~18。
+ * 铝色零件在黑色传送带上主要表现为“略亮于背景”的金属主体，
+ * 若阈值过高，会造成“肉眼已经入画，但 LOCATE 间歇返回 has_target=0”的漏检。
+ * 这里保持 12 作为最小差值，让低对比铝色边缘也能进入后续形状过滤。
  */
 #define AUTO_LOCATE_MIN_LUMA_DELTA 12U
+
+/*
+ * 自动视觉定位的最大自适应亮度差。
+ *
+ * 现场画面里可能有白色支架、线缆或局部高光。若直接用 max-min 计算阈值，
+ * 这些极端亮点会把 bright_threshold 拉得过高，导致铝色垫圈明明在黑色传送带上却识别不到。
+ * 因此 LOCATE 使用亮度直方图的中位数和百分位差，并把单次阈值增量限制到 45。
+ */
+#define AUTO_LOCATE_MAX_LUMA_DELTA 45U
+
+/* 自动视觉定位的金属主体最小亮度差，低于该差值会把传送带噪声并入零件主体。 */
+#define AUTO_LOCATE_MIN_BODY_LUMA_DELTA 10U
+
+/*
+ * 自动视觉定位的金属主体扩张比例。
+ *
+ * bright_threshold 只作为“高可信种子”，body_threshold 用较低阈值把同一垫圈上
+ * 被阴影压暗的银色环面并入连通域。65% 能连接真实垫圈亮弧，同时仍明显高于黑色皮带背景。
+ */
+#define AUTO_LOCATE_BODY_LUMA_DELTA_PERCENT 65U
+
+/* 自动视觉定位亮度直方图桶数量；YUYV 的 Y 分量刚好是 0~255。 */
+#define AUTO_LOCATE_LUMA_HISTOGRAM_BUCKETS 256U
+
+/* 自动视觉定位查找黑色传送带时，每隔 4 个像素采样一次行亮度，降低 LOCATE 的 CPU 开销。 */
+#define AUTO_LOCATE_BELT_ROW_SAMPLE_STEP 4U
+
+/* 自动视觉定位查找黑色传送带时，使用行平均亮度的 35 分位作为暗背景基准，避免白色支架污染阈值。 */
+#define AUTO_LOCATE_BELT_ROW_PERCENTILE 35U
+
+/* 自动视觉定位查找黑色传送带时，允许行亮度比暗背景基准高 28，覆盖铝件入画后的局部增亮。 */
+#define AUTO_LOCATE_BELT_ROW_LUMA_MARGIN 28U
+
+/* 自动视觉定位查找黑色传送带时，行暗阈值最低保持 85，避免单个极暗噪声点把阈值压得过低。 */
+#define AUTO_LOCATE_BELT_MIN_ROW_THRESHOLD 85U
+
+/* 自动视觉定位查找黑色传送带时，采样点中至少 45% 为暗像素即可认为该行主要属于传送带。 */
+#define AUTO_LOCATE_BELT_MIN_DARK_ROW_PERCENT 45U
+
+/* 自动视觉定位查找黑色传送带时，允许最多 10 行被零件高光或支架短暂打断，避免传送带区域被切碎。 */
+#define AUTO_LOCATE_BELT_MAX_GAP_ROWS 10U
+
+/* 自动视觉定位查找黑色传送带时，候选纵向带至少 80 像素高，过滤零散黑线和阴影。 */
+#define AUTO_LOCATE_BELT_MIN_HEIGHT_PX 80U
+
+/* 自动视觉定位查找黑色传送带时，候选纵向带至少占画面高度的 1/5，避免误把小暗块当成传送带。 */
+#define AUTO_LOCATE_BELT_MIN_HEIGHT_DIVISOR 5U
+
+/* 自动视觉定位查找黑色传送带后，上下各扩 12 像素，避免刚入画零件被传送带边界裁掉。 */
+#define AUTO_LOCATE_BELT_VERTICAL_PADDING_PX 12U
+
+/* 自动视觉定位找不到黑色传送带时，只回退到中心 300px 高区域，不再回退到整帧高度。 */
+#define AUTO_LOCATE_BELT_FALLBACK_HEIGHT DEFAULT_DETECT_ROI_SIZE
 
 /* V4L2 mmap 缓冲区数量；4 个缓冲区能避免偶发抖动。 */
 #define CAMERA_BUFFER_COUNT 4U
@@ -282,10 +362,40 @@ struct latest_frame {
 };
 
 /*
+ * locate_diag_code 描述 LOCATE 没有放行候选时最值得排查的拒绝位置。
+ *
+ * 这些值只用于 MP157 现场调试回包，不进入 MP157-F4 二进制协议：
+ *   0 表示没有候选或已经成功；
+ *   1 表示画面亮度对比不足；
+ *   2 表示候选面积不在允许范围；
+ *   3 表示候选 bbox 尺寸不在允许范围；
+ *   4 表示候选长宽比不像垫圈；
+ *   5 表示候选贴住搜索带左右边界；
+ *   6 表示候选实体密度不在允许范围；
+ *   7 表示候选亮像素占比不足；
+ *   8 表示候选置信度不足；
+ *   9 表示候选没有通过中心孔/ring 结构检测。
+ */
+enum locate_diag_code {
+    LOCATE_DIAG_NONE = 0U,
+    LOCATE_DIAG_LOW_CONTRAST = 1U,
+    LOCATE_DIAG_AREA = 2U,
+    LOCATE_DIAG_BBOX = 3U,
+    LOCATE_DIAG_ASPECT = 4U,
+    LOCATE_DIAG_EDGE = 5U,
+    LOCATE_DIAG_DENSITY = 6U,
+    LOCATE_DIAG_BRIGHT_FILL = 7U,
+    LOCATE_DIAG_CONFIDENCE = 8U,
+    LOCATE_DIAG_RING = 9U
+};
+
+/*
  * locate_result 保存一次内存级零件定位的结果。
  * has_target 表示是否找到可信连通域；frame_id 对应 latest_frame.serial，便于 Qt 和 F4 对齐日志。
  * frame_width/frame_height 是原始摄像头尺寸；center/bbox 都使用原始 YUYV 帧坐标，不含 KMS 居中偏移。
  * confidence 是 0~100 的粗略置信度，供 MP157 下发给 F4 和现场调参时观察。
+ * has_ring_hole 表示当前候选是否通过中心孔结构检测，便于 Qt 状态栏显示和现场排查误检来源。
+ * diag_* 字段只用于 LOCATE 现场调试，帮助判断真实零件被哪道过滤条件拒绝。
  */
 struct locate_result {
     int has_target;
@@ -299,6 +409,21 @@ struct locate_result {
     int bbox_w;
     int bbox_h;
     unsigned int confidence;
+    unsigned int has_ring_hole;
+    unsigned int diag_code;
+    unsigned int diag_roi_y;
+    unsigned int diag_roi_h;
+    unsigned int diag_median_luma;
+    unsigned int diag_dark_threshold;
+    unsigned int diag_body_threshold;
+    unsigned int diag_bright_threshold;
+    unsigned int diag_candidate_score;
+    unsigned int diag_candidate_bbox_w;
+    unsigned int diag_candidate_bbox_h;
+    unsigned int diag_candidate_area;
+    unsigned int diag_candidate_density;
+    unsigned int diag_candidate_confidence;
+    unsigned int diag_candidate_ring;
 };
 
 /*
@@ -2083,31 +2208,415 @@ static unsigned int clamp_luma_threshold(int value)
 }
 
 /*
- * auto_locate_is_candidate_luma 的作用：
- *   判断一个像素亮度是否属于零件候选区域。
+ * auto_locate_luma_percentile 的作用：
+ *   从 0~255 亮度直方图中取指定百分位亮度，用于构造抗极端高光的自适应阈值。
+ *
+ * 主要流程：
+ *   1. 把百分位限制到 0~100，避免调用者传入异常值导致目标计数越界。
+ *   2. 使用向上取整的目标计数，保证 p95 代表“累计达到 95% 的第一个亮度桶”。
+ *   3. 从低亮度到高亮度累加桶计数，首次达到目标计数时返回当前亮度。
+ *
+ * 参数：
+ *   histogram 是 256 桶亮度直方图，桶下标就是 Y 分量亮度。
+ *   total_pixels 是直方图对应的有效像素总数。
+ *   percentile 是需要提取的百分位，例如 50 表示中位数，95 表示高亮侧百分位。
+ *
+ * 返回值：
+ *   成功时返回 0~255 的亮度值；total_pixels 为 0 时返回 0。
+ */
+static unsigned int auto_locate_luma_percentile(const unsigned int histogram[AUTO_LOCATE_LUMA_HISTOGRAM_BUCKETS],
+                                                unsigned int total_pixels,
+                                                unsigned int percentile)
+{
+    uint64_t target_count;
+    uint64_t cumulative_count = 0U;
+    unsigned int bucket;
+
+    if (total_pixels == 0U) {
+        return 0U;
+    }
+
+    if (percentile > 100U) {
+        percentile = 100U;
+    }
+
+    target_count = ((uint64_t)total_pixels * percentile + 99U) / 100U;
+    if (target_count == 0U) {
+        target_count = 1U;
+    }
+
+    for (bucket = 0U; bucket < AUTO_LOCATE_LUMA_HISTOGRAM_BUCKETS; bucket++) {
+        cumulative_count += histogram[bucket];
+        if (cumulative_count >= target_count) {
+            return bucket;
+        }
+    }
+
+    return 255U;
+}
+
+/*
+ * auto_locate_is_bright_candidate_luma 的作用：
+ *   判断一个像素是否属于铝色零件的亮金属主体候选。
  *
  * 关键说明：
- *   金属零件在现场可能表现为亮边，也可能因为角度和阴影表现为暗边。
- *   因此首版同时接受“明显亮于背景”和“明显暗于背景”的像素，
- *   后续再通过连通域面积、边框尺寸和长宽比过滤误检。
+ *   本项目当前识别对象是铝色垫圈/弹垫，黑色传送带只能作为背景或中心孔背景。
+ *   如果把暗像素也加入连通域，传送带边缘、突起阴影和局部反光会与零件竞争，
+ *   造成 has_target=0 或把传送带误报为零件。
  *
  * 参数：
  *   luma 是当前像素亮度。
- *   bright_threshold 是亮候选阈值。
- *   dark_threshold 是暗候选阈值。
+ *   bright_threshold 是本帧根据亮度直方图得到的亮候选阈值。
  *
  * 返回值：
- *   属于候选像素返回 1；否则返回 0。
+ *   明显亮于背景返回 1；否则返回 0。
  */
-static int auto_locate_is_candidate_luma(unsigned int luma,
-                                         unsigned int bright_threshold,
-                                         unsigned int dark_threshold)
+static int auto_locate_is_bright_candidate_luma(unsigned int luma,
+                                                unsigned int bright_threshold)
 {
-    if (luma >= bright_threshold || luma <= dark_threshold) {
+    if (luma >= bright_threshold) {
         return 1;
     }
 
     return 0;
+}
+
+/*
+ * auto_locate_body_threshold_from_delta 的作用：
+ *   根据本帧黑色皮带背景和高亮种子差值，计算较低的金属主体扩张阈值。
+ *
+ * 主要流程：
+ *   1. 先按 AUTO_LOCATE_BODY_LUMA_DELTA_PERCENT 从 luma_delta 取一部分，避免直接用高亮种子阈值。
+ *   2. 再用 AUTO_LOCATE_MIN_BODY_LUMA_DELTA 保底，防止低对比画面把皮带噪声并入零件。
+ *   3. 最后保证 body_delta 不超过 luma_delta，使 body_threshold 不会高于 bright_threshold。
+ *
+ * 参数：
+ *   median_luma 是黑色传送带区域的亮度中位数。
+ *   luma_delta 是用于 high-confidence 种子的亮度差。
+ *   bright_threshold 是最终高亮种子阈值，用于上限保护。
+ *
+ * 返回值：
+ *   返回 body_threshold；像素亮度达到该值时，只能作为已发现高亮种子的连通域扩张像素。
+ */
+static unsigned int auto_locate_body_threshold_from_delta(unsigned int median_luma,
+                                                          unsigned int luma_delta,
+                                                          unsigned int bright_threshold)
+{
+    unsigned int body_delta = (luma_delta * AUTO_LOCATE_BODY_LUMA_DELTA_PERCENT + 99U) / 100U;
+    unsigned int body_threshold;
+
+    if (body_delta < AUTO_LOCATE_MIN_BODY_LUMA_DELTA) {
+        body_delta = AUTO_LOCATE_MIN_BODY_LUMA_DELTA;
+    }
+    if (body_delta > luma_delta) {
+        body_delta = luma_delta;
+    }
+
+    body_threshold = clamp_luma_threshold((int)median_luma + (int)body_delta);
+    if (body_threshold > bright_threshold) {
+        body_threshold = bright_threshold;
+    }
+
+    return body_threshold;
+}
+
+/*
+ * auto_locate_record_reject_candidate 的作用：
+ *   记录当前被拒绝候选的关键诊断字段，供 LOCATE 回包输出。
+ *
+ * 主要流程：
+ *   1. 用 candidate_score 代表候选的排查价值，较大的 bbox/面积/对比通常更接近真实零件。
+ *   2. 只有新候选分数更高时才覆盖旧诊断，避免小噪声覆盖真正值得看的垫圈候选。
+ *   3. 记录 bbox、area、density、confidence 和 ring，现场可以直接判断卡在哪道门槛。
+ *
+ * 参数：
+ *   result 是本次 LOCATE 输出结构。
+ *   diag_code 是拒绝原因，对应 enum locate_diag_code。
+ *   candidate_score 是候选优先级分数。
+ *   bbox_w/bbox_h/area/density/confidence/has_ring 是候选关键指标。
+ *
+ * 返回值：
+ *   无返回值；函数只更新 result->diag_* 字段。
+ */
+static void auto_locate_record_reject_candidate(struct locate_result *result,
+                                                unsigned int diag_code,
+                                                unsigned int candidate_score,
+                                                unsigned int bbox_w,
+                                                unsigned int bbox_h,
+                                                unsigned int area,
+                                                unsigned int density,
+                                                unsigned int confidence,
+                                                unsigned int has_ring)
+{
+    if (result == NULL) {
+        return;
+    }
+
+    if (candidate_score < result->diag_candidate_score) {
+        return;
+    }
+
+    result->diag_code = diag_code;
+    result->diag_candidate_score = candidate_score;
+    result->diag_candidate_bbox_w = bbox_w;
+    result->diag_candidate_bbox_h = bbox_h;
+    result->diag_candidate_area = area;
+    result->diag_candidate_density = density;
+    result->diag_candidate_confidence = confidence;
+    result->diag_candidate_ring = has_ring;
+}
+
+/*
+ * auto_locate_measure_belt_row 的作用：
+ *   在水平居中的定位搜索带内，抽样统计某一行的平均亮度和暗像素占比。
+ *
+ * 主要流程：
+ *   1. 从 roi_x 开始，只扫描 roi_w 这段水平范围，保证只看传送带宽度附近的画面。
+ *   2. 每隔 AUTO_LOCATE_BELT_ROW_SAMPLE_STEP 个像素取一个 Y 亮度，降低板端实时定位开销。
+ *   3. 累加亮度得到该行平均值，并按 dark_threshold 统计该行有多少采样点属于暗背景。
+ *
+ * 参数：
+ *   frame 是最新 YUYV 原始帧。
+ *   roi_x 是水平搜索带在整帧中的起始 x 坐标。
+ *   roi_w 是水平搜索带宽度，当前等于模型 ROI 宽度或整帧宽度中较小者。
+ *   row_y 是要统计的整帧 y 坐标。
+ *   dark_threshold 是判定“黑色传送带背景像素”的 Y 亮度阈值。
+ *   dark_percent 是输出暗像素占比的指针，可以传 NULL 表示只需要平均亮度。
+ *
+ * 返回值：
+ *   返回该行抽样点的平均 Y 亮度；roi_w 为 0 时返回 0。
+ */
+static unsigned int auto_locate_measure_belt_row(const struct latest_frame *frame,
+                                                 unsigned int roi_x,
+                                                 unsigned int roi_w,
+                                                 unsigned int row_y,
+                                                 unsigned int dark_threshold,
+                                                 unsigned int *dark_percent)
+{
+    unsigned int x;
+    unsigned int sample_count = 0U;
+    unsigned int dark_count = 0U;
+    uint64_t luma_sum = 0U;
+
+    if (dark_percent != NULL) {
+        *dark_percent = 0U;
+    }
+
+    if (roi_w == 0U) {
+        return 0U;
+    }
+
+    for (x = 0U; x < roi_w; x += AUTO_LOCATE_BELT_ROW_SAMPLE_STEP) {
+        unsigned int luma = yuyv_luma_at(frame, roi_x + x, row_y);
+
+        luma_sum += luma;
+        sample_count++;
+        if (luma <= dark_threshold) {
+            dark_count++;
+        }
+    }
+
+    if (sample_count == 0U) {
+        return 0U;
+    }
+
+    if (dark_percent != NULL) {
+        *dark_percent = dark_count * 100U / sample_count;
+    }
+
+    return (unsigned int)(luma_sum / sample_count);
+}
+
+/*
+ * auto_locate_select_fallback_center_band 的作用：
+ *   当现场光照过亮或传送带暗区不足，暂时找不到可靠黑色传送带时，选择画面中心 300px 高区域作为保守回退。
+ *
+ * 关键说明：
+ *   旧代码回退到整帧高度，会把传送带外的白色支架、金属边框和背景高光全部加入阈值统计。
+ *   这里即使找不到暗带，也只允许回退到模型 ROI 同口径的中心高度，避免重新引入同类污染。
+ *
+ * 参数：
+ *   frame_height 是当前摄像头帧高度。
+ *   band_y0/band_y1 是输出的纵向搜索起止行，均为整帧坐标且包含端点。
+ *
+ * 返回值：
+ *   无返回值；frame_height 为 0 时输出 0~0，调用者已在前面过滤非法帧。
+ */
+static void auto_locate_select_fallback_center_band(unsigned int frame_height,
+                                                    unsigned int *band_y0,
+                                                    unsigned int *band_y1)
+{
+    unsigned int fallback_h = frame_height < AUTO_LOCATE_BELT_FALLBACK_HEIGHT ?
+                              frame_height : AUTO_LOCATE_BELT_FALLBACK_HEIGHT;
+
+    if (fallback_h == 0U) {
+        *band_y0 = 0U;
+        *band_y1 = 0U;
+        return;
+    }
+
+    *band_y0 = (frame_height - fallback_h) / 2U;
+    *band_y1 = *band_y0 + fallback_h - 1U;
+}
+
+/*
+ * auto_locate_find_dark_belt_band 的作用：
+ *   从水平居中的 300px 搜索带里，先找出连续的黑色传送带纵向区域，再交给零件定位逻辑使用。
+ *
+ * 主要流程：
+ *   1. 对每一行采样平均亮度，建立“行平均亮度直方图”。
+ *   2. 取行亮度低分位作为黑色传送带背景基准，再加固定余量得到暗行阈值。
+ *   3. 第二遍扫描每一行，行平均亮度够低或暗像素比例够高时，认为该行属于传送带。
+ *   4. 寻找最长连续暗行段，并允许少量行被铝件高光、皮带接缝或支架遮挡打断。
+ *   5. 只有高度足够的暗行段才返回成功，避免把小阴影或黑线误认为传送带。
+ *
+ * 参数：
+ *   frame 是最新 YUYV 原始帧。
+ *   roi_x/roi_w 是水平搜索带范围。
+ *   band_y0/band_y1 是输出的黑色传送带纵向起止行，均为整帧坐标且包含端点。
+ *
+ * 返回值：
+ *   找到可靠黑色传送带返回 1；未找到返回 0，调用者会使用中心 300px 高度作为保守回退。
+ */
+static int auto_locate_find_dark_belt_band(const struct latest_frame *frame,
+                                           unsigned int roi_x,
+                                           unsigned int roi_w,
+                                           unsigned int *band_y0,
+                                           unsigned int *band_y1)
+{
+    unsigned int row_luma_histogram[AUTO_LOCATE_LUMA_HISTOGRAM_BUCKETS] = { 0U };
+    unsigned int frame_height;
+    unsigned int row_low_luma;
+    unsigned int row_dark_threshold;
+    unsigned int min_band_height;
+    unsigned int best_start = 0U;
+    unsigned int best_end = 0U;
+    unsigned int best_length = 0U;
+    unsigned int best_dark_rows = 0U;
+    unsigned int current_start = 0U;
+    unsigned int current_end = 0U;
+    unsigned int current_dark_rows = 0U;
+    unsigned int current_gap_rows = 0U;
+    unsigned int y;
+    int in_segment = 0;
+
+    if (frame == NULL || band_y0 == NULL || band_y1 == NULL || roi_w == 0U) {
+        return 0;
+    }
+
+    frame_height = frame->frame_height;
+    if (frame_height == 0U) {
+        return 0;
+    }
+
+    for (y = 0U; y < frame_height; y++) {
+        unsigned int row_mean = auto_locate_measure_belt_row(frame,
+                                                             roi_x,
+                                                             roi_w,
+                                                             y,
+                                                             255U,
+                                                             NULL);
+
+        row_luma_histogram[row_mean]++;
+    }
+
+    row_low_luma = auto_locate_luma_percentile(row_luma_histogram,
+                                               frame_height,
+                                               AUTO_LOCATE_BELT_ROW_PERCENTILE);
+    row_dark_threshold = clamp_luma_threshold((int)row_low_luma +
+                                              (int)AUTO_LOCATE_BELT_ROW_LUMA_MARGIN);
+    if (row_dark_threshold < AUTO_LOCATE_BELT_MIN_ROW_THRESHOLD) {
+        row_dark_threshold = AUTO_LOCATE_BELT_MIN_ROW_THRESHOLD;
+    }
+
+    for (y = 0U; y < frame_height; y++) {
+        unsigned int dark_percent = 0U;
+        unsigned int row_mean = auto_locate_measure_belt_row(frame,
+                                                             roi_x,
+                                                             roi_w,
+                                                             y,
+                                                             row_dark_threshold,
+                                                             &dark_percent);
+        int is_belt_row = (row_mean <= row_dark_threshold ||
+                           dark_percent >= AUTO_LOCATE_BELT_MIN_DARK_ROW_PERCENT);
+
+        if (is_belt_row) {
+            if (!in_segment) {
+                current_start = y;
+                current_dark_rows = 0U;
+                current_gap_rows = 0U;
+                in_segment = 1;
+            }
+
+            current_end = y;
+            current_dark_rows++;
+            current_gap_rows = 0U;
+            continue;
+        }
+
+        if (!in_segment) {
+            continue;
+        }
+
+        if (current_gap_rows < AUTO_LOCATE_BELT_MAX_GAP_ROWS) {
+            current_gap_rows++;
+            current_end = y;
+            continue;
+        }
+
+        {
+            unsigned int segment_end = current_end >= current_gap_rows ?
+                                       current_end - current_gap_rows : current_start;
+            unsigned int segment_length = segment_end >= current_start ?
+                                          segment_end - current_start + 1U : 0U;
+
+            if (segment_length > best_length ||
+                (segment_length == best_length && current_dark_rows > best_dark_rows)) {
+                best_start = current_start;
+                best_end = segment_end;
+                best_length = segment_length;
+                best_dark_rows = current_dark_rows;
+            }
+        }
+
+        in_segment = 0;
+        current_gap_rows = 0U;
+        current_dark_rows = 0U;
+    }
+
+    if (in_segment) {
+        unsigned int segment_end = current_end >= current_gap_rows ?
+                                   current_end - current_gap_rows : current_start;
+        unsigned int segment_length = segment_end >= current_start ?
+                                      segment_end - current_start + 1U : 0U;
+
+        if (segment_length > best_length ||
+            (segment_length == best_length && current_dark_rows > best_dark_rows)) {
+            best_start = current_start;
+            best_end = segment_end;
+            best_length = segment_length;
+            best_dark_rows = current_dark_rows;
+        }
+    }
+
+    min_band_height = frame_height / AUTO_LOCATE_BELT_MIN_HEIGHT_DIVISOR;
+    if (min_band_height < AUTO_LOCATE_BELT_MIN_HEIGHT_PX) {
+        min_band_height = AUTO_LOCATE_BELT_MIN_HEIGHT_PX;
+    }
+    if (min_band_height > frame_height) {
+        min_band_height = frame_height;
+    }
+
+    if (best_length < min_band_height) {
+        return 0;
+    }
+
+    *band_y0 = best_start > AUTO_LOCATE_BELT_VERTICAL_PADDING_PX ?
+               best_start - AUTO_LOCATE_BELT_VERTICAL_PADDING_PX : 0U;
+    *band_y1 = best_end + AUTO_LOCATE_BELT_VERTICAL_PADDING_PX < frame_height ?
+               best_end + AUTO_LOCATE_BELT_VERTICAL_PADDING_PX : frame_height - 1U;
+
+    return 1;
 }
 
 /*
@@ -2163,7 +2672,7 @@ static int auto_locate_component_touches_search_edge(unsigned int min_x,
  *   frame 是原始 YUYV 帧。
  *   roi_x/roi_y 是搜索 ROI 在整帧中的起点。
  *   min_x/max_x/min_y/max_y 是候选 bbox 在 ROI 内的范围。
- *   bright_threshold/dark_threshold 是本帧自适应候选阈值。
+ *   bright_threshold 是本帧自适应亮金属候选阈值。
  *   component_mean_luma 是候选连通域平均亮度，用于判断孔背景与实体的对比。
  *
  * 返回值：
@@ -2177,7 +2686,6 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
                                                unsigned int min_y,
                                                unsigned int max_y,
                                                unsigned int bright_threshold,
-                                               unsigned int dark_threshold,
                                                unsigned int component_mean_luma)
 {
     unsigned int bbox_w = max_x - min_x + 1U;
@@ -2210,7 +2718,7 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
                                              roi_y + sample_y0 + y);
 
             total++;
-            if (!auto_locate_is_candidate_luma(luma, bright_threshold, dark_threshold)) {
+            if (!auto_locate_is_bright_candidate_luma(luma, bright_threshold)) {
                 background++;
                 background_contrast_sum += (unsigned int)abs((int)luma - (int)component_mean_luma);
             }
@@ -2235,10 +2743,10 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
  *
  * 主要流程：
  *   1. 初始化输出结果，把 frame_id 和图像尺寸先写入 result，保证无目标时也能回传上下文。
- *   2. 只扫描水平居中的竖向搜索带，提前发现从画面上方进入的零件，同时避开左右支架干扰。
- *   3. 统计 ROI 的亮度均值、最暗值和最亮值，得到当前背景的自适应阈值。
- *   4. 对明显亮于或暗于背景的像素做四邻域连通域搜索，并统计亮/暗像素比例。
- *   5. 拒绝大面积贴边暗区，避免把黑色传送带背景误识别成零件。
+ *   2. 先在水平居中的 300px 搜索带里查找黑色传送带纵向区域，排除传送带外白色支架和背景。
+ *   3. 只统计黑色传送带区域内的亮度直方图、最暗值和最亮值，用 p50/p95 得到当前背景的自适应阈值。
+ *   4. 只对明显亮于传送带背景的金属主体像素做四邻域连通域搜索，暗像素只作为背景/孔洞证据。
+ *   5. 拒绝贴边、窄长、过密或过稀的连通域，避免把传送带高光斑误识别成零件。
  *   6. 选择面积、外接框和长宽比都合理的最佳连通域，输出中心点、bbox 和置信度。
  *
  * 参数：
@@ -2256,14 +2764,18 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
     unsigned int roi_h;
     unsigned int roi_x;
     unsigned int roi_y;
+    unsigned int belt_y0;
+    unsigned int belt_y1;
     unsigned int pixel_count;
-    uint64_t luma_sum = 0U;
+    unsigned int luma_histogram[AUTO_LOCATE_LUMA_HISTOGRAM_BUCKETS] = { 0U };
     unsigned int min_luma = 255U;
     unsigned int max_luma = 0U;
-    unsigned int mean_luma;
+    unsigned int median_luma;
+    unsigned int upper_luma;
     unsigned int contrast_span;
     unsigned int luma_delta;
     unsigned int bright_threshold;
+    unsigned int body_threshold;
     unsigned int dark_threshold;
     unsigned char *visited = NULL;
     unsigned int *queue = NULL;
@@ -2300,10 +2812,17 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
     }
 
     roi_w = frame->frame_width < AUTO_LOCATE_SEARCH_WIDTH ? frame->frame_width : AUTO_LOCATE_SEARCH_WIDTH;
-    roi_h = frame->frame_height;
     roi_x = (frame->frame_width - roi_w) / 2U;
-    roi_y = 0U;
+
+    if (!auto_locate_find_dark_belt_band(frame, roi_x, roi_w, &belt_y0, &belt_y1)) {
+        auto_locate_select_fallback_center_band(frame->frame_height, &belt_y0, &belt_y1);
+    }
+
+    roi_y = belt_y0;
+    roi_h = belt_y1 >= belt_y0 ? belt_y1 - belt_y0 + 1U : 0U;
     pixel_count = roi_w * roi_h;
+    result->diag_roi_y = roi_y;
+    result->diag_roi_h = roi_h;
 
     if (pixel_count == 0U) {
         errno = EINVAL;
@@ -2316,7 +2835,7 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
         for (x = 0; x < roi_w; x++) {
             unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
 
-            luma_sum += luma;
+            luma_histogram[luma]++;
             if (luma < min_luma) {
                 min_luma = luma;
             }
@@ -2326,19 +2845,31 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
         }
     }
 
-    mean_luma = (unsigned int)(luma_sum / pixel_count);
+    median_luma = auto_locate_luma_percentile(luma_histogram, pixel_count, 50U);
+    upper_luma = auto_locate_luma_percentile(luma_histogram, pixel_count, 95U);
     contrast_span = max_luma > min_luma ? max_luma - min_luma : 0U;
+    result->diag_median_luma = median_luma;
     if (contrast_span < AUTO_LOCATE_MIN_LUMA_DELTA) {
+        result->diag_code = LOCATE_DIAG_LOW_CONTRAST;
         return 0;
     }
 
-    luma_delta = contrast_span / 3U;
+    luma_delta = upper_luma > median_luma ? upper_luma - median_luma : 0U;
     if (luma_delta < AUTO_LOCATE_MIN_LUMA_DELTA) {
         luma_delta = AUTO_LOCATE_MIN_LUMA_DELTA;
     }
+    if (luma_delta > AUTO_LOCATE_MAX_LUMA_DELTA) {
+        luma_delta = AUTO_LOCATE_MAX_LUMA_DELTA;
+    }
 
-    bright_threshold = clamp_luma_threshold((int)mean_luma + (int)luma_delta);
-    dark_threshold = clamp_luma_threshold((int)mean_luma - (int)luma_delta);
+    bright_threshold = clamp_luma_threshold((int)median_luma + (int)luma_delta);
+    body_threshold = auto_locate_body_threshold_from_delta(median_luma,
+                                                           luma_delta,
+                                                           bright_threshold);
+    dark_threshold = clamp_luma_threshold((int)median_luma - (int)luma_delta);
+    result->diag_dark_threshold = dark_threshold;
+    result->diag_body_threshold = body_threshold;
+    result->diag_bright_threshold = bright_threshold;
 
     visited = calloc(pixel_count, sizeof(*visited));
     queue = malloc((size_t)pixel_count * sizeof(*queue));
@@ -2386,14 +2917,22 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             unsigned int density;
             unsigned int score;
             unsigned int confidence;
+            unsigned int has_ring;
 
             if (visited[start_index]) {
                 continue;
             }
 
             start_luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
-            if (!auto_locate_is_candidate_luma(start_luma, bright_threshold, dark_threshold)) {
-                visited[start_index] = 1U;
+            if (!auto_locate_is_bright_candidate_luma(start_luma, bright_threshold)) {
+                /*
+                 * 高亮种子仍然使用 bright_threshold，防止灰色皮带纹理自己启动连通域。
+                 * 但达到 body_threshold 的银色阴影像素不能提前标记 visited；
+                 * 它们需要保留给后续相邻高亮种子扩张，否则垫圈亮环会被切成几个小弧段。
+                 */
+                if (!auto_locate_is_bright_candidate_luma(start_luma, body_threshold)) {
+                    visited[start_index] = 1U;
+                }
                 continue;
             }
 
@@ -2411,7 +2950,7 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 unsigned int i;
 
                 area++;
-                contrast_sum += (unsigned int)abs((int)luma - (int)mean_luma);
+                contrast_sum += (unsigned int)abs((int)luma - (int)median_luma);
                 component_luma_sum += luma;
 
                 /* 每隔 4 个像素采样一次色度，降低计算开销同时保持统计精度 */
@@ -2423,7 +2962,7 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
 
                 if (luma <= dark_threshold) {
                     dark_pixels++;
-                } else if (luma >= bright_threshold) {
+                } else if (luma >= body_threshold) {
                     bright_pixels++;
                 }
 
@@ -2460,9 +2999,7 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                     next_luma = yuyv_luma_at(frame,
                                              roi_x + (unsigned int)next_x,
                                              roi_y + (unsigned int)next_y);
-                    if (!auto_locate_is_candidate_luma(next_luma,
-                                                       bright_threshold,
-                                                       dark_threshold)) {
+                    if (!auto_locate_is_bright_candidate_luma(next_luma, body_threshold)) {
                         visited[neighbor_index] = 1U;
                         /* 邻居不是候选 = 当前像素是边界像素 */
                         perimeter_pixels++;
@@ -2479,6 +3016,15 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             bbox_area = bbox_w * bbox_h;
 
             if (area < AUTO_LOCATE_MIN_COMPONENT_AREA || area > max_component_area) {
+                auto_locate_record_reject_candidate(result,
+                                                    LOCATE_DIAG_AREA,
+                                                    bbox_area + area,
+                                                    bbox_w,
+                                                    bbox_h,
+                                                    area,
+                                                    0U,
+                                                    0U,
+                                                    0U);
                 continue;
             }
 
@@ -2486,11 +3032,29 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 bbox_h < AUTO_LOCATE_MIN_BBOX_SIDE ||
                 bbox_w > AUTO_LOCATE_MAX_BBOX_SIDE ||
                 bbox_h > AUTO_LOCATE_MAX_BBOX_SIDE) {
+                auto_locate_record_reject_candidate(result,
+                                                    LOCATE_DIAG_BBOX,
+                                                    bbox_area + area,
+                                                    bbox_w,
+                                                    bbox_h,
+                                                    area,
+                                                    0U,
+                                                    0U,
+                                                    0U);
                 continue;
             }
 
             if (bbox_w * 100U < bbox_h * 25U ||
                 bbox_h * 100U < bbox_w * 25U) {
+                auto_locate_record_reject_candidate(result,
+                                                    LOCATE_DIAG_ASPECT,
+                                                    bbox_area + area,
+                                                    bbox_w,
+                                                    bbox_h,
+                                                    area,
+                                                    0U,
+                                                    0U,
+                                                    0U);
                 continue;
             }
 
@@ -2500,6 +3064,15 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
              * 允许触及上/下边缘（零件正常从上方进入或从下方离开）。
              */
             if (min_x == 0U || max_x >= roi_w - 1U) {
+                auto_locate_record_reject_candidate(result,
+                                                    LOCATE_DIAG_EDGE,
+                                                    bbox_area + area,
+                                                    bbox_w,
+                                                    bbox_h,
+                                                    area,
+                                                    0U,
+                                                    0U,
+                                                    0U);
                 continue;
             }
 
@@ -2510,6 +3083,15 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
              */
             if (bbox_w * 100U < bbox_h * 40U ||
                 bbox_h * 100U < bbox_w * 40U) {
+                auto_locate_record_reject_candidate(result,
+                                                    LOCATE_DIAG_ASPECT,
+                                                    bbox_area + area,
+                                                    bbox_w,
+                                                    bbox_h,
+                                                    area,
+                                                    0U,
+                                                    0U,
+                                                    0U);
                 continue;
             }
 
@@ -2521,6 +3103,15 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
 
             if (density < AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT ||
                 density > AUTO_LOCATE_MAX_SOLID_DENSITY_PERCENT) {
+                auto_locate_record_reject_candidate(result,
+                                                    LOCATE_DIAG_DENSITY,
+                                                    bbox_area + area,
+                                                    bbox_w,
+                                                    bbox_h,
+                                                    area,
+                                                    density,
+                                                    0U,
+                                                    0U);
                 continue;
             }
 
@@ -2528,13 +3119,21 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
              * 色度能量过滤：当 AUTO_LOCATE_MIN_CHROMA_ENERGY > 0 时启用。
              * 银色/铝色零件为消色差，与灰色传送带无法用色度区分，此时应设为 0 禁用。
              */
-            if (AUTO_LOCATE_MIN_CHROMA_ENERGY > 0U && chroma_sample_count > 0U) {
-                unsigned int avg_u = (unsigned int)(chroma_u_sum / chroma_sample_count);
-                unsigned int avg_v = (unsigned int)(chroma_v_sum / chroma_sample_count);
-                unsigned int chroma_energy = (unsigned int)(abs((int)avg_u - 128)
-                                                            + abs((int)avg_v - 128));
-                if (chroma_energy < AUTO_LOCATE_MIN_CHROMA_ENERGY) {
-                    continue;
+            {
+                /*
+                 * 使用局部变量承接宏值，避免宏为 0 时编译器把
+                 * `chroma_energy < 0U` 报成 -Wtype-limits。
+                 */
+                const unsigned int min_chroma_energy = AUTO_LOCATE_MIN_CHROMA_ENERGY;
+
+                if (min_chroma_energy > 0U && chroma_sample_count > 0U) {
+                    unsigned int avg_u = (unsigned int)(chroma_u_sum / chroma_sample_count);
+                    unsigned int avg_v = (unsigned int)(chroma_v_sum / chroma_sample_count);
+                    unsigned int chroma_energy = (unsigned int)(abs((int)avg_u - 128)
+                                                                + abs((int)avg_v - 128));
+                    if (chroma_energy < min_chroma_energy) {
+                        continue;
+                    }
                 }
             }
 
@@ -2543,23 +3142,31 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
              * 传送带纹理/反光斑块边界不规则，圆度低。
              * circularity = 4π × area / perimeter² (×100 转整数百分比)
              */
-            if (perimeter_pixels > 0U && AUTO_LOCATE_MIN_CIRCULARITY_PERCENT > 0U) {
-                /* 用 1257 / 100 近似 4π ≈ 12.566 */
-                unsigned int circularity_percent = (unsigned int)(
-                    (uint64_t)area * 1257U / ((uint64_t)perimeter_pixels * perimeter_pixels / 100U + 1U));
-                if (circularity_percent > 100U) {
-                    circularity_percent = 100U;
-                }
-                if (circularity_percent < AUTO_LOCATE_MIN_CIRCULARITY_PERCENT) {
-                    continue;
+            {
+                /*
+                 * 使用局部变量承接宏值，避免宏为 0 时编译器把
+                 * `circularity_percent < 0U` 报成 -Wtype-limits。
+                 */
+                const unsigned int min_circularity_percent = AUTO_LOCATE_MIN_CIRCULARITY_PERCENT;
+
+                if (perimeter_pixels > 0U && min_circularity_percent > 0U) {
+                    /* 用 1257 / 100 近似 4π ≈ 12.566 */
+                    unsigned int circularity_percent = (unsigned int)(
+                        (uint64_t)area * 1257U / ((uint64_t)perimeter_pixels * perimeter_pixels / 100U + 1U));
+                    if (circularity_percent > 100U) {
+                        circularity_percent = 100U;
+                    }
+                    if (circularity_percent < min_circularity_percent) {
+                        continue;
+                    }
                 }
             }
 
             /*
-             * 黑色零件需要保留暗候选，但黑色传送带通常表现为：
-             * 1. 连通域里绝大多数像素都是暗候选；
-             * 2. bbox 贴近搜索带边缘，或者暗像素面积已经很大。
-             * 同时满足这些条件时拒绝该候选，避免零件还没到时把传送带背景当成零件。
+             * 暗候选回退保护：
+             * 当前 BFS 只接受亮金属主体，正常情况下 dark_pixels 应接近 0。
+             * 保留该判断是为了防止后续维护时又把暗像素并回候选后，
+             * 仍能拒绝贴边大暗区，避免黑色传送带背景重新被当成零件。
              */
             if (dark_pixels > bright_pixels &&
                 dark_fill_percent >= AUTO_LOCATE_MAX_DARK_FILL_PERCENT &&
@@ -2581,27 +3188,35 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             if (AUTO_LOCATE_MIN_BRIGHT_FILL_PERCENT > 0U) {
                 unsigned int bright_fill_percent = area > 0U ? (bright_pixels * 100U) / area : 0U;
                 if (bright_fill_percent < AUTO_LOCATE_MIN_BRIGHT_FILL_PERCENT) {
+                    auto_locate_record_reject_candidate(result,
+                                                        LOCATE_DIAG_BRIGHT_FILL,
+                                                        bbox_area + area,
+                                                        bbox_w,
+                                                        bbox_h,
+                                                        area,
+                                                        density,
+                                                        0U,
+                                                        0U);
                     continue;
                 }
             }
 
             /*
-             * ring_hole 检测作为得分加成而非硬性条件：
-             * - 零件刚进入画面时只有部分弧形可见，中心孔不完整，硬过滤会误杀
-             * - 有环孔的候选获得 50% 得分加成和置信度加成
-             * - 没有环孔但通过其他过滤的候选仍可被接受（靠多帧确认防误检）
+             * ring_hole 检测作为强结构证据：
+             * - 有环孔的候选按垫圈类零件处理，允许较低置信度进入后续多帧确认。
+             * - 没有环孔的候选必须同时满足更大的 bbox 和更高置信度，避免黑色传送带凸起反光被当成零件。
+             * - 零件刚从上方进入时如果只露出很小亮边，宁可继续等待下一帧，也不要提前把传送带反光报成 has_target=1。
              */
             {
-                unsigned int has_ring = auto_locate_component_has_ring_hole(frame,
-                                                         roi_x,
-                                                         roi_y,
-                                                         min_x,
-                                                         max_x,
-                                                         min_y,
-                                                         max_y,
-                                                         bright_threshold,
-                                                         dark_threshold,
-                                                         component_mean_luma);
+                has_ring = auto_locate_component_has_ring_hole(frame,
+                                                               roi_x,
+                                                               roi_y,
+                                                               min_x,
+                                                               max_x,
+                                                               min_y,
+                                                               max_y,
+                                                               body_threshold,
+                                                               component_mean_luma);
 
                 score = area + bbox_area / 4U + contrast_avg * 8U;
                 if (has_ring) {
@@ -2619,9 +3234,61 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 if (confidence > 100U) {
                     confidence = 100U;
                 }
+
+                /*
+                 * 真实零件尺寸硬门槛：
+                 * 黑色传送带表面的亮点、接缝和局部凸起通常会形成较小 bbox，
+                 * 即使连续几帧存在，也不能作为自动流程的上料目标。
+                 */
+                if (bbox_area < AUTO_LOCATE_MIN_PART_BBOX_AREA ||
+                    bbox_w < AUTO_LOCATE_MIN_PART_BBOX_SIDE ||
+                    bbox_h < AUTO_LOCATE_MIN_PART_BBOX_SIDE) {
+                    continue;
+                }
+
+                /*
+                 * 低置信拒绝：
+                 * 只要 LOCATE 返回 has_target=1，QML 就可能下发视觉坐标给 F4，
+                 * 因此在 overlay 端先挡住低对比、低密度或面积不足的候选。
+                 */
+                if (confidence < AUTO_LOCATE_MIN_ACCEPT_CONFIDENCE) {
+                    auto_locate_record_reject_candidate(result,
+                                                        LOCATE_DIAG_CONFIDENCE,
+                                                        score,
+                                                        bbox_w,
+                                                        bbox_h,
+                                                        area,
+                                                        density,
+                                                        confidence,
+                                                        has_ring);
+                    continue;
+                }
+
+                /*
+                 * 无环孔候选加严：
+                 * 铝色平垫/弹垫在完整进入 ROI 后应能看到中心孔或较完整的环形主体。
+                 * 如果暂时没有检测到环孔，就必须等 bbox 更大且置信度更高再放行，
+                 * 这样空传送带上的稳定反光不会因为两帧确认而触发自动检测。
+                 */
+                if (!has_ring &&
+                    (bbox_w < AUTO_LOCATE_RING_REQUIRED_BBOX_SIDE ||
+                     bbox_h < AUTO_LOCATE_RING_REQUIRED_BBOX_SIDE ||
+                     confidence < AUTO_LOCATE_MIN_NON_RING_CONFIDENCE)) {
+                    auto_locate_record_reject_candidate(result,
+                                                        LOCATE_DIAG_RING,
+                                                        score,
+                                                        bbox_w,
+                                                        bbox_h,
+                                                        area,
+                                                        density,
+                                                        confidence,
+                                                        has_ring);
+                    continue;
+                }
             }
 
             best_score = score;
+            result->diag_code = LOCATE_DIAG_NONE;
             result->has_target = 1;
             result->center_x = (int)(roi_x + (min_x + max_x) / 2U);
             result->center_y = (int)(roi_y + (min_y + max_y) / 2U);
@@ -2630,6 +3297,7 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             result->bbox_w = (int)bbox_w;
             result->bbox_h = (int)bbox_h;
             result->confidence = confidence;
+            result->has_ring_hole = has_ring;
         }
     }
 
@@ -2894,7 +3562,7 @@ static void handle_visible_command(int client_fd,
 static void handle_locate_command(int client_fd, const struct latest_frame *frame)
 {
     struct locate_result result;
-    char detail[320];
+    char detail[768];
     int len;
 
     if (locate_part_in_yuyv_frame(frame, &result) != 0) {
@@ -2909,7 +3577,9 @@ static void handle_locate_command(int client_fd, const struct latest_frame *fram
                    sizeof(detail),
                    "LOCATE has_target=%d frame_id=%u width=%u height=%u "
                    "center_x=%d center_y=%d bbox_x=%d bbox_y=%d "
-                   "bbox_w=%d bbox_h=%d confidence=%u",
+                   "bbox_w=%d bbox_h=%d confidence=%u ring=%u "
+                   "diag=%u roi_y=%u roi_h=%u thr=%u,%u,%u "
+                   "cand_box=%dx%d cand_area=%u cand_density=%u cand_conf=%u cand_ring=%u",
                    result.has_target,
                    result.frame_id,
                    result.frame_width,
@@ -2920,7 +3590,20 @@ static void handle_locate_command(int client_fd, const struct latest_frame *fram
                    result.bbox_y,
                    result.bbox_w,
                    result.bbox_h,
-                   result.confidence);
+                   result.confidence,
+                   result.has_ring_hole,
+                   result.diag_code,
+                   result.diag_roi_y,
+                   result.diag_roi_h,
+                   result.diag_dark_threshold,
+                   result.diag_body_threshold,
+                   result.diag_bright_threshold,
+                   result.diag_candidate_bbox_w,
+                   result.diag_candidate_bbox_h,
+                   result.diag_candidate_area,
+                   result.diag_candidate_density,
+                   result.diag_candidate_confidence,
+                   result.diag_candidate_ring);
     if (len < 0 || (size_t)len >= sizeof(detail)) {
         send_control_reply(client_fd, "ERR", "LOCATE 回复过长");
         return;

@@ -82,6 +82,12 @@ Rectangle {
     /* autoRestartQueued 表示当前已经排队准备自动启动下一轮，防止本轮完成回调中重复触发 START_CYCLE。 */
     property bool autoRestartQueued: false
 
+    /* autoStartAfterStopRequested 表示用户在旧流程未彻底停止时又按了开始，需要 STOP 确认后自动开启下一轮。 */
+    property bool autoStartAfterStopRequested: false
+
+    /* autoStartAfterStopReason 保存排队重启的原因，用于 STOP ACK 后提示现场当前不是卡死而是在自动清旧流程。 */
+    property string autoStartAfterStopReason: ""
+
     /* autoLastAckText 保存最近一次 F4 二进制自动流程 ACK/NACK 文本，便于现场串口调试核对。 */
     property string autoLastAckText: "自动流程待开始"
 
@@ -134,12 +140,20 @@ Rectangle {
     property int autoVisionFirstDetectConfirmRequired: 2
     /* autoVisionFirstDetectLastCenterY 记录上一帧确认时目标的 Y 坐标，用于位置一致性检查。 */
     property int autoVisionFirstDetectLastCenterY: 0
-    /* autoVisionMinConfidenceForTracking 是进入跟踪的最低置信度，低于此值视为噪声。 */
-    property int autoVisionMinConfidenceForTracking: 45
+    /* autoVisionMinConfidenceForTracking 是进入跟踪的最低置信度，低于此值视为噪声或传送带反光。 */
+    property int autoVisionMinConfidenceForTracking: 55
     /* autoVisionExpectedPartMinBboxArea 是扫描阶段零件期望最小 bbox 面积（像素²）。 */
-    property int autoVisionExpectedPartMinBboxArea: 800
-    /* autoVisionExpectedPartMaxBboxArea 是扫描阶段零件期望最大 bbox 面积（像素²）。 */
-    property int autoVisionExpectedPartMaxBboxArea: 12000
+    property int autoVisionExpectedPartMinBboxArea: 1000
+    /* autoVisionExpectedPartMaxBboxArea 是扫描阶段零件期望最大 bbox 面积（像素²）；现场 640x480 垫圈 bbox 约 173x173，必须允许约 3 万像素²的真实目标。 */
+    property int autoVisionExpectedPartMaxBboxArea: 45000
+    /* autoVisionFirstDetectNonRingConfirmRequired 是 ring=0 候选首次建链所需的连续确认帧数，比 ring=1 更严格，用于降低空传送带反光误触发概率。 */
+    property int autoVisionFirstDetectNonRingConfirmRequired: 4
+    /* autoVisionFirstDetectMinNonRingConfidence 是 ring=0 候选首次建链的最低置信度，低于该值说明候选还不足以替代中心孔结构证据。 */
+    property int autoVisionFirstDetectMinNonRingConfidence: 88
+    /* autoVisionAllowNonRingFirstDetect 控制从未见过目标时是否允许 ring=0 候选建链；默认关闭，避免黑色传送带静止反光被多帧确认成零件。 */
+    property bool autoVisionAllowNonRingFirstDetect: false
+    /* autoVisionLastLocateDiagText 保存最近一次 LOCATE 的诊断字段，零件丢失时直接显示拒绝原因和候选指标。 */
+    property string autoVisionLastLocateDiagText: ""
 
     /* ===== 停止后自动回位属性 ===== */
     /* autoVisionRecoveryInProgress 表示停止后正在执行自动回位序列（Z轴升+侧向归中）。 */
@@ -211,8 +225,8 @@ Rectangle {
     /* autoVisionRealtimeFineTuneLostFrames 记录实时闭环阶段连续丢目标的帧数。 */
     property int autoVisionRealtimeFineTuneLostFrames: 0
 
-    /* autoVisionRealtimeFineTuneSwitchDeadbandPx 是实时闭环切轴/反向的防抖门槛，5px 更快切换轴而仍有防抖余量。 */
-    property int autoVisionRealtimeFineTuneSwitchDeadbandPx: 5
+    /* autoVisionRealtimeFineTuneSwitchDeadbandPx 是实时闭环切轴/反向的防抖门槛，8px 用于抑制 LOCATE 边缘抖动导致的频繁切轴。 */
+    property int autoVisionRealtimeFineTuneSwitchDeadbandPx: 8
 
     /* autoVisionRealtimeFineTuneLostStopFrames 是实时闭环连续丢目标后触发 STOP 的帧数上限。 */
     property int autoVisionRealtimeFineTuneLostStopFrames: 4
@@ -220,8 +234,8 @@ Rectangle {
     /* autoVisionRealtimeTuneTimeoutMs 是实时闭环微调总时长上限，单位 ms；超过后直接 STOP 并退出。 */
     property int autoVisionRealtimeTuneTimeoutMs: 3000
 
-    /* autoVisionRealtimeTunePollMs 是实时闭环 LOCATE 轮询周期，65ms 加快响应（需 overlay LOCATE 在 50ms 内返回）。 */
-    property int autoVisionRealtimeTunePollMs: 65
+    /* autoVisionRealtimeTunePollMs 是实时闭环 LOCATE 轮询周期，90ms 避免 overlay 定位请求过密导致忙等和抖动。 */
+    property int autoVisionRealtimeTunePollMs: 90
 
     /* autoVisionRealtimeFineTuneSpeedStepPercent 是误差每升一档时的速度倍率步长百分比，40% 加快收敛。 */
     property int autoVisionRealtimeFineTuneSpeedStepPercent: 40
@@ -916,6 +930,33 @@ Rectangle {
     }
 
     /*
+     * resetAutoVisionStateBeforeStart 的作用：
+     *   在准备发送 START_CYCLE 前清理上一轮 MP157 本地视觉状态。
+     *
+     * 主要流程：
+     *   1. 清除 Z 轴回升、左右轴回中和停止回位相关状态，避免上一轮残留影响新 cycle。
+     *   2. 清除首次识别确认、实时微调收敛和对焦检测标志，让新一轮从“等待上料”干净开始。
+     *   3. 复用已有 resetAutoVisionFineTuneProgress()，保持微调统计入口一致。
+     *
+     * 返回值：
+     *   无返回值；只修改 QML 本地状态，不直接下发 F4 命令。
+     */
+    function resetAutoVisionStateBeforeStart() {
+        autoVisionNeedsZUp = false
+        autoVisionZDownStepsUsed = 0
+        autoVisionLateralReturnOffsetSteps = 0
+        autoVisionRecoveryInProgress = false
+        autoVisionRecoveryStage = ""
+        autoVisionFirstDetectConfirmFrames = 0
+        autoVisionRealtimePrevAbsError = -1
+        autoVisionRealtimeErrorConverging = false
+        autoVisionZFocusSettled = false
+        autoVisionDetectFromZFlow = false
+        autoVisionFineTuneAttempts = 0
+        resetAutoVisionFineTuneProgress()
+    }
+
+    /*
      * handleControlAction 的作用：
      *   统一处理“开始、暂停、继续、停止”四个触摸按钮。
      *
@@ -935,13 +976,62 @@ Rectangle {
     function handleControlAction(action, stateText) {
         var forceRetry = arguments.length >= 3 && arguments[2] === true
 
+        /*
+         * 暂停/停止属于安全抢占动作：
+         * - 停止在任何状态都允许点击，空闲时也会发送 cycle_id=0 清理 F4 可能残留的旧流程。
+         * - 暂停在空闲时做本地幂等反馈，不向 F4 发送必然 NACK 的 PAUSE_CYCLE。
+         * - 正在 START/视觉/机械臂等异步阶段时，暂停/停止会先硬停执行器再重试同步 F4 状态。
+         */
         if ((action === "pause" || action === "stop") && !forceRetry) {
+            if (action === "pause" && !autoWorkflowRunning && !autoCycleRunning && !autoControlBusy) {
+                workflowState = "暂停"
+                autoWorkflowPaused = false
+                autoLastAckText = "首页暂停已响应：当前没有运行中的自动检测流程"
+                storageState = formatF4ToastText(autoLastAckText)
+                showStorageToast()
+                return
+            }
             root.requestImmediateAutoControlInterruption(action, stateText)
             return
         }
 
+        /*
+         * 开始按钮幂等重启：
+         * 用户在旧流程未完成、刚按停止、暂停中或 F4 仍持有旧 cycle 时再次点击开始，
+         * 不再直接发 START_CYCLE；先排队 STOP_CYCLE，等 F4 确认清掉旧流程后自动 START 新 cycle。
+         */
+        if (action === "start"
+                && (autoStartAfterStopRequested
+                    || autoForcedControlAction === "stop"
+                    || autoWorkflowRunning
+                    || autoCycleRunning
+                    || autoWorkflowPaused)) {
+            root.requestAutoRestartAfterStop("首页开始已接收：先停止旧自动流程，再自动开始下一轮")
+            return
+        }
+
+        /*
+         * 继续按钮幂等化：
+         * 已暂停时走 RESUME_CYCLE；空闲/已停止时按“开始新一轮”处理；运行中再次点继续只刷新提示。
+         */
+        if (action === "resume" && !autoWorkflowPaused) {
+            if (!autoWorkflowRunning && !autoCycleRunning) {
+                root.handleControlAction("start", "定位预览")
+                return
+            }
+
+            autoLastAckText = "首页继续已响应：当前自动流程已经在运行"
+            storageState = formatF4ToastText(autoLastAckText)
+            showStorageToast()
+            return
+        }
+
         if (autoControlBusy) {
-            storageState = formatF4ToastText("自动流程命令下发中，请等待F4回执")
+            if (action === "start" && (autoPendingAction === "stop" || autoForcedControlAction === "stop")) {
+                root.requestAutoRestartAfterStop("首页开始已接收：正在等待旧流程停止回执")
+                return
+            }
+            storageState = formatF4ToastText("自动流程命令下发中，本次按钮已响应，请等待F4回执")
             showStorageToast()
             return
         }
@@ -965,18 +1055,7 @@ Rectangle {
 
         /* 重新开始前清理上一轮残留状态，确保新周期干净启动 */
         if (action === "start") {
-            autoVisionNeedsZUp = false
-            autoVisionZDownStepsUsed = 0
-            autoVisionLateralReturnOffsetSteps = 0
-            autoVisionRecoveryInProgress = false
-            autoVisionRecoveryStage = ""
-            autoVisionFirstDetectConfirmFrames = 0
-            autoVisionRealtimePrevAbsError = -1
-            autoVisionRealtimeErrorConverging = false
-            autoVisionZFocusSettled = false
-            autoVisionDetectFromZFlow = false
-            autoVisionFineTuneAttempts = 0
-            resetAutoVisionFineTuneProgress()
+            resetAutoVisionStateBeforeStart()
         }
 
         autoPendingAction = action
@@ -1089,6 +1168,7 @@ Rectangle {
         autoVisionLastFrameId = 0
         autoVisionLastLostMs = 0
         autoVisionLastErrorY = 0
+        autoVisionLastLocateDiagText = ""
         autoVisionLocatePurpose = "center"
         autoVisionActuatorPhase = ""
         autoVisionFineTuneAttempts = 0
@@ -1125,6 +1205,81 @@ Rectangle {
     }
 
     /*
+     * requestAutoRestartAfterStop 的作用：
+     *   处理“旧流程未清干净时用户又按开始”的幂等重启请求。
+     *
+     * 主要流程：
+     *   1. 记录 STOP ACK 后需要自动 START，避免用户必须手工等停止完成再点开始。
+     *   2. 如果当前还没有 STOP 抢占在执行，立即调用 requestImmediateAutoControlInterruption("stop")。
+     *   3. 如果 STOP 已经在重试，只刷新提示并确保重试定时器继续运行。
+     *
+     * 参数：
+     *   reason 是显示给现场操作员的中文原因。
+     *
+     * 返回值：
+     *   无返回值；真正的新 START 会在 completeAutoStopAndMaybeRestart() 中触发。
+     */
+    function requestAutoRestartAfterStop(reason) {
+        autoStartAfterStopRequested = true
+        autoStartAfterStopReason = reason
+        autoRestartQueued = false
+        workflowState = "重启准备"
+        autoLastAckText = reason
+        storageState = formatF4ToastText(reason + "，正在清理旧流程")
+        showStorageToast()
+
+        if (autoForcedControlAction !== "stop") {
+            root.requestImmediateAutoControlInterruption("stop", "停止", true)
+            return
+        }
+
+        if (!autoControlBusy && !autoForcedControlRetryTimer.running) {
+            autoForcedControlRetryTimer.restart()
+        }
+    }
+
+    /*
+     * completeAutoStopAndMaybeRestart 的作用：
+     *   在 STOP_CYCLE 已确认、并且必要回位已经完成后，统一结束旧会话并按需自动开始下一轮。
+     *
+     * 参数：
+     *   reason 是停止完成时的底部提示。
+     *   stateText 是停止完成时的流程状态文本。
+     *
+     * 返回值：
+     *   无返回值；如果曾经排队重启，会通过 Qt.callLater() 异步调用 handleControlAction("start")。
+     */
+    function completeAutoStopAndMaybeRestart(reason, stateText) {
+        var restartRequested = autoStartAfterStopRequested
+        var restartReason = autoStartAfterStopReason
+
+        stopAutoWorkflowSessionLocally(reason, stateText)
+
+        if (!restartRequested) {
+            return
+        }
+
+        autoStartAfterStopRequested = false
+        autoStartAfterStopReason = ""
+        autoLastAckText = restartReason + "；旧流程已停止，正在开始下一轮"
+        storageState = formatF4ToastText(autoLastAckText)
+        workflowState = "重新开始中"
+        showStorageToast()
+
+        Qt.callLater(function() {
+            if (autoControlBusy || autoWorkflowRunning || autoCycleRunning || autoWorkflowPaused) {
+                autoStartAfterStopRequested = true
+                autoStartAfterStopReason = restartReason
+                storageState = formatF4ToastText(restartReason + "，等待本地状态清空后继续开始")
+                showStorageToast()
+                return
+            }
+
+            root.handleControlAction("start", "定位预览")
+        })
+    }
+
+    /*
      * requestImmediateAutoControlInterruption 的作用：
      *   把首页暂停/停止提升为最高优先级：按钮一按下，先立即强制停全部执行器和本地自动流程阶段，
      *   再异步重试向 F4 发送 PAUSE_CYCLE/STOP_CYCLE，让 F4 状态最终与 MP157 本地状态一致。
@@ -1134,10 +1289,15 @@ Rectangle {
      *   stateText 是界面显示状态文本。
      */
     function requestImmediateAutoControlInterruption(action, stateText) {
+        var keepQueuedRestart = arguments.length >= 3 && arguments[2] === true
         var actionName = action === "pause" ? "暂停" : "停止"
         var localReason = "用户按下首页" + actionName + "，立即强制停全部执行器"
 
         autoRestartQueued = false
+        if (action === "stop" && !keepQueuedRestart) {
+            autoStartAfterStopRequested = false
+            autoStartAfterStopReason = ""
+        }
         clearForcedAutoControlRequest()
         autoForcedControlAction = action
         autoForcedControlStateText = stateText
@@ -1276,7 +1436,7 @@ Rectangle {
         } else {
             /* 不需要回位 */
             autoVisionRecoveryInProgress = false
-            stopAutoWorkflowSessionLocally("自动视觉已停止", "已停止")
+            completeAutoStopAndMaybeRestart("自动视觉已停止", "已停止")
         }
     }
 
@@ -1344,7 +1504,7 @@ Rectangle {
             autoVisionActuatorSettleTimer.stop()
             autoVisionRecoveryInProgress = false
             autoVisionRecoveryStage = ""
-            stopAutoWorkflowSessionLocally("自动视觉已停止，电机已回位", "已停止")
+            completeAutoStopAndMaybeRestart("自动视觉已停止，电机已回位", "已停止")
         }
     }
 
@@ -1357,7 +1517,7 @@ Rectangle {
         autoVisionActuatorSettleTimer.stop()
         autoVisionRecoveryInProgress = false
         autoVisionRecoveryStage = ""
-        stopAutoWorkflowSessionLocally("自动视觉已停止，电机已回位", "已停止")
+        completeAutoStopAndMaybeRestart("自动视觉已停止，电机已回位", "已停止")
     }
 
     /*
@@ -1416,6 +1576,39 @@ Rectangle {
     }
 
     /*
+     * autoVisionFirstDetectRequiredFramesForCandidate 的作用：
+     *   根据 LOCATE 候选是否带有 ring 结构证据，决定首次进入跟踪前需要连续确认多少帧。
+     *
+     * 主要流程：
+     *   1. ring=1 说明中心孔结构已经通过，使用普通首次确认帧数，尽快进入视觉跟踪。
+     *   2. ring=0 说明当前候选可能是真实垫圈受曝光影响，也可能是传送带反光。
+     *   3. 默认从未见过目标时不允许 ring=0 建链，避免黑色传送带静止反光利用多帧稳定条件触发自动流程。
+     *   4. 如果后续明确打开调试开关，则 ring=0 还必须先通过更高置信度门槛和更多连续确认帧。
+     *
+     * 参数：
+     *   hasRing 表示 overlay 返回的 ring 字段，1 表示检测到中心孔结构。
+     *   confidence 表示 overlay 返回的候选置信度，单位为百分比 0~100。
+     *
+     * 返回值：
+     *   返回大于 0 的确认帧数表示候选可继续确认；返回 0 表示 ring=0 且置信度不足，必须当作未识别。
+     */
+    function autoVisionFirstDetectRequiredFramesForCandidate(hasRing, confidence) {
+        if (Number(hasRing) === 1) {
+            return autoVisionFirstDetectConfirmRequired
+        }
+
+        if (!autoVisionAllowNonRingFirstDetect) {
+            return 0
+        }
+
+        if (Number(confidence) < autoVisionFirstDetectMinNonRingConfidence) {
+            return 0
+        }
+
+        return autoVisionFirstDetectNonRingConfirmRequired
+    }
+
+    /*
      * handleAutoVisionLocateFinished 的作用：
      *   接收 C++ `requestAutoVisionLocate()` 返回的定位结果，并决定下发 VISION_POS、VISION_LOST 或居中停止。
      *
@@ -1461,7 +1654,22 @@ Rectangle {
         var height = result ? Number(result.height) : 0
         var centerX = result ? Number(result.center_x) : 0
         var centerY = result ? Number(result.center_y) : 0
+        var bboxW = result ? Number(result.bbox_w || 0) : 0
+        var bboxH = result ? Number(result.bbox_h || 0) : 0
         var confidence = result ? Number(result.confidence) : 0
+        var hasRing = result ? Number(result.has_ring || 0) : 0
+        var diagCode = result ? Number(result.diag || 0) : 0
+        var candBox = result ? String(result.cand_box || "0x0") : "0x0"
+        var candConf = result ? Number(result.cand_conf || 0) : 0
+        var candRing = result ? Number(result.cand_ring || 0) : 0
+        var candDensity = result ? Number(result.cand_density || 0) : 0
+        var firstDetectConfirmRequired = autoVisionFirstDetectConfirmRequired
+
+        autoVisionLastLocateDiagText = " diag=" + Math.round(diagCode)
+                + " cand=" + candBox
+                + " cconf=" + Math.round(candConf)
+                + " cring=" + Math.round(candRing)
+                + " cdens=" + Math.round(candDensity)
 
         /* --- 传送带误识别多层防御 --- */
         if (hasTarget) {
@@ -1471,11 +1679,20 @@ Rectangle {
             }
             /* bbox 面积过滤：扫描阶段零件大小可预测 */
             if (hasTarget && result) {
-                var bboxW = Number(result.bbox_w || 0)
-                var bboxH = Number(result.bbox_h || 0)
                 var bboxArea = bboxW * bboxH
                 if (bboxArea > 0 && (bboxArea < autoVisionExpectedPartMinBboxArea
                                       || bboxArea > autoVisionExpectedPartMaxBboxArea)) {
+                    hasTarget = false
+                }
+            }
+            /*
+             * 首次建链默认重新收紧：
+             * 黑色传送带是稳定背景，上一版允许 ring=0 首次多帧确认后，反光区域会被误认为零件。
+             * 因此从未见过目标时仍以 ring=1 作为建链依据；本轮已经见过目标后，no-ring 高置信候选仍可用于重捕获。
+             */
+            if (hasTarget && !autoVisionHasSeenTarget) {
+                firstDetectConfirmRequired = autoVisionFirstDetectRequiredFramesForCandidate(hasRing, confidence)
+                if (firstDetectConfirmRequired <= 0) {
                     hasTarget = false
                 }
             }
@@ -1493,11 +1710,14 @@ Rectangle {
                 autoVisionFirstDetectConfirmFrames = 1
                 autoVisionFirstDetectLastCenterY = Math.round(centerY)
             }
-            if (autoVisionFirstDetectConfirmFrames < autoVisionFirstDetectConfirmRequired) {
+            if (autoVisionFirstDetectConfirmFrames < firstDetectConfirmRequired) {
                 /* 还没确认够帧数，暂不进入跟踪 */
                 autoVisionLastText = "自动视觉：疑似检测到目标，确认中 "
                         + autoVisionFirstDetectConfirmFrames + "/"
-                        + autoVisionFirstDetectConfirmRequired
+                        + firstDetectConfirmRequired
+                        + " ring=" + Math.round(hasRing)
+                        + " conf=" + Math.round(confidence)
+                        + autoVisionLastLocateDiagText
                 storageState = autoVisionLastText
                 return
             }
@@ -1524,6 +1744,7 @@ Rectangle {
                 autoVisionLastText = autoVisionLastText
                         + autoVisionLostFrames + " 帧，保持停机等待重新识别"
                         + "，上次error=" + autoVisionLastErrorY
+                        + autoVisionLastLocateDiagText
                 if (autoVisionLostFrames >= autoVisionLostWarnFrames) {
                     autoVisionLastText += "；请检查光照、黑色波形零件边缘和搜索带位置"
                 }
@@ -1532,7 +1753,7 @@ Rectangle {
             }
 
             autoVisionLostFrames = 0
-            autoVisionLastText = "自动视觉：尚未识别到零件，继续等待上方来料"
+            autoVisionLastText = "自动视觉：尚未识别到零件，继续等待上方来料" + autoVisionLastLocateDiagText
             storageState = autoVisionLastText
 
             if (!autoVisionCommandBusy && nowMs - autoVisionLastLostMs >= 500) {
@@ -1568,6 +1789,9 @@ Rectangle {
                 + " stable=" + autoVisionStableFrames
                 + "/" + autoVisionStableRequiredFrames
                 + " conf=" + Math.round(confidence)
+                + " box=" + Math.round(bboxW) + "x" + Math.round(bboxH)
+                + " ring=" + Math.round(hasRing)
+                + autoVisionLastLocateDiagText
         storageState = autoVisionLastText
 
         if (autoVisionCommandBusy) {
@@ -2427,11 +2651,21 @@ Rectangle {
             return
         }
 
+        var fineTuneDiagText = result
+                ? (" diag=" + Math.round(Number(result.diag || 0))
+                   + " cand=" + String(result.cand_box || "0x0")
+                   + " cconf=" + Math.round(Number(result.cand_conf || 0))
+                   + " cring=" + Math.round(Number(result.cand_ring || 0))
+                   + " cdens=" + Math.round(Number(result.cand_density || 0)))
+                : ""
+        autoVisionLastLocateDiagText = fineTuneDiagText
+
         if (!ok || !result || Number(result.has_target) !== 1 || Number(result.width) <= 0 || Number(result.height) <= 0) {
             autoVisionRealtimeFineTuneLostFrames += 1
             workflowState = "ROI实时微调"
             autoVisionLastText = "ROI 实时闭环暂未稳定返回目标，第 "
                     + autoVisionRealtimeFineTuneLostFrames + " 帧丢失：" + detail
+                    + fineTuneDiagText
             storageState = autoVisionLastText
             if (autoVisionRealtimeFineTuneLostFrames >= autoVisionRealtimeFineTuneLostStopFrames) {
                 autoVisionStopRealtimeFineTune("ROI 实时闭环连续丢目标 "
@@ -6931,6 +7165,8 @@ Rectangle {
                 root.autoVisionActuatorPhase = ""
                 root.autoVisionRecoveryInProgress = false
                 root.autoVisionRecoveryStage = ""
+                root.autoStartAfterStopRequested = false
+                root.autoStartAfterStopReason = ""
                 root.stopAutoWorkflowSessionLocally(
                     "回位超时：电机未在" + (root.autoVisionRecoveryTimeoutMs / 1000)
                     + "秒内完成回位，请手动复位Z轴和侧向轴",
@@ -6959,6 +7195,8 @@ Rectangle {
             if (root.autoForcedControlRetryCount >= root.autoForcedControlMaxRetries) {
                 root.autoLastAckText = "首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止")
                         + " 已本地生效，但 F4 抢占同步超过重试上限，请检查 F4 串口状态后再操作"
+                root.autoStartAfterStopRequested = false
+                root.autoStartAfterStopReason = ""
                 root.storageState = root.formatF4ToastText(root.autoLastAckText)
                 root.showStorageToast()
                 return
@@ -7271,7 +7509,7 @@ Rectangle {
                         root.storageState = "停止已确认，正在自动回位"
                         root.autoVisionStartStopRecoverySequence()
                     } else {
-                        root.stopAutoWorkflowSessionLocally("自动视觉已停止", "已停止")
+                        root.completeAutoStopAndMaybeRestart("自动视觉已停止", "已停止")
                     }
                 }
 
@@ -7288,7 +7526,9 @@ Rectangle {
                 root.autoLastAckText = "自动流程失败：" + detail
                 if (action === "start"
                         && detail.indexOf("当前流程未停止，请先按停止后再开始新检测") >= 0) {
-                    root.markAutoWorkflowAbnormalStopRequired("F4仍认为旧自动流程在运行，请先按停止清理旧流程", "待人工停止")
+                    root.requestAutoRestartAfterStop("F4仍认为旧自动流程在运行，已自动先停止旧流程再开始下一轮")
+                    root.evaluateRuntimeAlarms()
+                    return
                 }
                 if (action === "start" || action === "resume") {
                     root.stopAutoVisionLoop("自动视觉未启动：" + detail)
@@ -8363,10 +8603,7 @@ Rectangle {
                     width: (overlayControls.width - overlayControls.columnSpacing) / 2
                     height: 24
                     radius: 6
-                    property bool actionEnabled: (modelData.action === "stop")
-                                                 || (modelData.action === "pause" && !root.autoControlBusy && (root.autoWorkflowRunning || root.autoCycleRunning) && !root.autoWorkflowPaused)
-                                                 || (modelData.action === "resume" && !root.autoControlBusy && root.autoWorkflowPaused)
-                                                 || (modelData.action === "start" && !root.autoControlBusy && !root.autoVisionCommandBusy && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                    property bool actionEnabled: true
                     color: !actionEnabled ? "#171b1e" : (overlayButtonMouse.pressed ? "#2d3338" : "#22272b")
                     border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1
@@ -14443,10 +14680,7 @@ Rectangle {
                     width: 64
                     height: 48
                     radius: 8
-                    property bool actionEnabled: (modelData.action === "stop")
-                                                 || (modelData.action === "pause" && !root.autoControlBusy && (root.autoWorkflowRunning || root.autoCycleRunning) && !root.autoWorkflowPaused)
-                                                 || (modelData.action === "resume" && !root.autoControlBusy && root.autoWorkflowPaused)
-                                                 || (modelData.action === "start" && !root.autoControlBusy && !root.autoVisionCommandBusy && !root.autoWorkflowRunning && !root.autoWorkflowPaused)
+                    property bool actionEnabled: true
                     color: !actionEnabled ? "#171b1e" : (mouseArea.pressed ? "#2d3338" : "#22272b")
                     border.color: actionEnabled ? modelData.color : "#3a4248"
                     border.width: 1

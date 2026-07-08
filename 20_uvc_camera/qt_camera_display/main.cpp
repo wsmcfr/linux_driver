@@ -8336,7 +8336,7 @@ public:
          * start 只在空闲、停止或完成后新建 cycle；
          * pause 只允许暂停正在运行且未暂停的 cycle；
          * resume 只允许恢复已暂停的同一个 cycle；
-         * stop 允许终止运行中或暂停中的 cycle，空闲时直接拒绝。
+         * stop 固定发送 cycle_id=0 强制清理 F4 残留流程，保证停止按钮任何时候都能作为恢复入口。
          */
         if (normalizedAction == QStringLiteral("start")) {
             if (m_f4AutoRunning || m_f4AutoPaused) {
@@ -8368,23 +8368,17 @@ public:
             }
         } else if (normalizedAction == QStringLiteral("stop")) {
             /*
-             * 停止允许在任何状态下发送：
-             * - 正常运行/暂停中：用当前 cycleId 停止
-             * - 本地状态已清除（Qt重启后）：发送 cycle_id=0 强制停止F4残留流程
+             * 停止按钮固定发送 cycle_id=0：
+             *   1. F4 协议已经约定 cycle_id=0 表示无条件清理当前 active_cycle_id。
+             *   2. MP157 可能因为 Qt 重启、上一条 STOP 超时、旧 ACK/NACK 延迟等原因不知道 F4 当前真实 cycle。
+             *   3. 若这里继续携带 MP157 本地旧 cycle_id，F4 active_cycle_id 不一致时会 NACK，
+             *      用户就会遇到“停止后马上开始下一轮仍被拒绝”的现场问题。
              */
-            if (m_f4AutoRunning || m_f4AutoPaused) {
-                command = BINARY_PROTOCOL_CMD_STOP_CYCLE;
-                appendLe16(&payload, cycleId);
-                payload.append(static_cast<char>(0x00)); /* stop_reason=0，表示用户按下停止。 */
-                payload.append(static_cast<char>(0x00)); /* stop_level=0，表示普通停止而非急停。 */
-            } else {
-                /* 本地无活跃流程但F4可能有残留：发送 cycle_id=0 强制清理 */
-                command = BINARY_PROTOCOL_CMD_STOP_CYCLE;
-                appendLe16(&payload, static_cast<quint16>(0U));
-                payload.append(static_cast<char>(0x01)); /* stop_reason=1，表示强制清理残留状态。 */
-                payload.append(static_cast<char>(0x00)); /* stop_level=0。 */
-                cycleId = 0U;
-            }
+            command = BINARY_PROTOCOL_CMD_STOP_CYCLE;
+            appendLe16(&payload, static_cast<quint16>(0U));
+            payload.append(static_cast<char>((m_f4AutoRunning || m_f4AutoPaused) ? 0x00 : 0x01));
+            payload.append(static_cast<char>(0x00)); /* stop_level=0，表示普通停止而非急停。 */
+            cycleId = 0U;
         } else {
             rejectText = QStringLiteral("未知自动流程动作：") + action;
         }
@@ -9237,7 +9231,7 @@ private slots:
      * 主要流程：
      *   1. 释放 m_autoVisionLocateRunning，允许下一次 100ms 定位请求继续执行。
      *   2. 校验回复必须以 `OK LOCATE` 开头；socket 或 overlay 错误直接通知 QML。
-     *   3. 逐项提取 has_target、frame_id、width、height、center、bbox 和 confidence。
+     *   3. 逐项提取 has_target、frame_id、width、height、center、bbox、confidence 和 ring。
      *
      * 参数：
      *   reply 是后台线程从 overlay 控制 socket 读取的一行文本。
@@ -9269,6 +9263,16 @@ private slots:
         result.insert(QStringLiteral("bbox_w"), tokenValue(reply, QStringLiteral("bbox_w")).toInt());
         result.insert(QStringLiteral("bbox_h"), tokenValue(reply, QStringLiteral("bbox_h")).toInt());
         result.insert(QStringLiteral("confidence"), tokenValue(reply, QStringLiteral("confidence")).toInt());
+        result.insert(QStringLiteral("has_ring"), tokenValue(reply, QStringLiteral("ring")).toInt());
+        result.insert(QStringLiteral("diag"), tokenValue(reply, QStringLiteral("diag")).toInt());
+        result.insert(QStringLiteral("roi_y"), tokenValue(reply, QStringLiteral("roi_y")).toInt());
+        result.insert(QStringLiteral("roi_h"), tokenValue(reply, QStringLiteral("roi_h")).toInt());
+        result.insert(QStringLiteral("thresholds"), tokenValue(reply, QStringLiteral("thr")));
+        result.insert(QStringLiteral("cand_box"), tokenValue(reply, QStringLiteral("cand_box")));
+        result.insert(QStringLiteral("cand_area"), tokenValue(reply, QStringLiteral("cand_area")).toInt());
+        result.insert(QStringLiteral("cand_density"), tokenValue(reply, QStringLiteral("cand_density")).toInt());
+        result.insert(QStringLiteral("cand_conf"), tokenValue(reply, QStringLiteral("cand_conf")).toInt());
+        result.insert(QStringLiteral("cand_ring"), tokenValue(reply, QStringLiteral("cand_ring")).toInt());
 
         emit autoVisionLocateFinished(true, result, reply);
     }
