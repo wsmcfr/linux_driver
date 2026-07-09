@@ -119,8 +119,11 @@
 /* 自动视觉定位的中心孔背景最小对比度；孔区域与候选实体太接近时不认为是垫圈孔。 */
 #define AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST 10U
 
-/* 自动视觉定位的中心孔四边主体支撑阈值；四边任一方向主体太少时，按白边夹黑带误检处理。 */
-#define AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT 8U
+/* 自动视觉定位的中心孔四边主体支撑阈值；四边任一方向主体太少时，按白边夹黑带或皮带突起误检处理。 */
+#define AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT 18U
+
+/* 自动视觉定位的 ring 结构最小 bbox 边长；过小候选即使中心发暗，也更像传送带突起而不是完整垫圈。 */
+#define AUTO_LOCATE_MIN_RING_BBOX_SIDE 45U
 
 /* 自动视觉定位的真实零件最小外接框面积，小于该面积的亮斑按传送带反光或凸起噪声处理。 */
 #define AUTO_LOCATE_MIN_PART_BBOX_AREA 900U
@@ -2768,6 +2771,16 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
     unsigned int ring_left_body = 0U;
     unsigned int ring_right_total = 0U;
     unsigned int ring_right_body = 0U;
+
+    /*
+     * 黑色传送带上的局部突起或反光斑可能在小 bbox 中形成“亮边包暗心”的假 ring。
+     * 真实垫圈在当前 640x480 现场完整入 ROI 时 bbox 约 173x173，因此首次承认 ring 前
+     * 要求候选至少达到 45px 级别；这样只会让零件稍晚一点建链，不会挡住完整零件。
+     */
+    if (bbox_w < AUTO_LOCATE_MIN_RING_BBOX_SIDE ||
+        bbox_h < AUTO_LOCATE_MIN_RING_BBOX_SIDE) {
+        return 0;
+    }
 
     if (sample_w < 1U) {
         sample_w = 1U;

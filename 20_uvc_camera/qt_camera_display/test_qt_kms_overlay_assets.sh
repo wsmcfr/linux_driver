@@ -1393,10 +1393,18 @@ require_absent "roi_h = frame->frame_height;" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_touches_search_edge" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_has_ring_hole" "uvc_kms_overlay.c"
 require_grep "AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_RING_BBOX_SIDE" "uvc_kms_overlay.c"
 require_grep "ring_top_body" "uvc_kms_overlay.c"
 require_grep "ring_bottom_body" "uvc_kms_overlay.c"
 require_grep "ring_left_body" "uvc_kms_overlay.c"
 require_grep "ring_right_body" "uvc_kms_overlay.c"
+if ! grep -q '#define AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT 18U' "$SCRIPT_DIR/uvc_kms_overlay.c"; then
+    fail "ring 四边主体支撑阈值必须至少收紧到 18%，否则黑色传送带突起和白边仍可能被误判成 ring=1"
+fi
+ring_hole_block="$(sed -n '/static int auto_locate_component_has_ring_hole/,/^}/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+if ! printf '%s\n' "$ring_hole_block" | grep -q 'bbox_w < AUTO_LOCATE_MIN_RING_BBOX_SIDE'; then
+    fail "ring 检测必须先检查候选 bbox 最小边长，避免小突起靠中心暗窗伪装成垫圈孔"
+fi
 require_fixed_grep 'result.insert(QStringLiteral("has_ring"), tokenValue(reply, QStringLiteral("ring")).toInt())' "main.cpp"
 require_fixed_grep 'result.insert(QStringLiteral("diag"), tokenValue(reply, QStringLiteral("diag")).toInt())' "main.cpp"
 require_fixed_grep 'result.insert(QStringLiteral("cand_ring"), tokenValue(reply, QStringLiteral("cand_ring")).toInt())' "main.cpp"
@@ -1406,7 +1414,11 @@ require_grep "property int autoVisionExpectedPartMaxBboxArea: 45000" "qml/Main.q
 require_grep "property int autoVisionFirstDetectNonRingConfirmRequired" "qml/Main.qml"
 require_grep "property int autoVisionFirstDetectMinNonRingConfidence" "qml/Main.qml"
 require_grep "property bool autoVisionAllowNonRingFirstDetect: false" "qml/Main.qml"
+require_grep "property int autoVisionFirstDetectMinRingBboxSide: 45" "qml/Main.qml"
+require_grep "property int autoVisionFirstDetectMinRingBboxArea: 2000" "qml/Main.qml"
 require_grep "autoVisionFirstDetectRequiredFramesForCandidate" "qml/Main.qml"
+require_grep "autoVisionRejectSmallRingBeltBumpFirstDetect" "qml/Main.qml"
+require_grep "autoVisionCandidateBoxFromText" "qml/Main.qml"
 require_grep "autoVisionLastLocateDiagText" "qml/Main.qml"
 locate_filter_block="$(sed -n '/ring_hole 检测作为/,/best_score = score/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 locate_body_block="$(sed -n '/body_threshold = auto_locate_body_threshold_from_delta/,/bbox_w = max_x - min_x/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
@@ -1447,6 +1459,46 @@ if ! grep -q 'if (!autoVisionAllowNonRingFirstDetect) {' "$SCRIPT_DIR/qml/Main.q
 fi
 if ! grep -q 'Number(confidence) < autoVisionFirstDetectMinNonRingConfidence' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "QML 首次 no-ring 候选必须有更高置信度门槛，避免空传送带反光重新触发自动流程"
+fi
+require_grep "autoVisionRejectBlackBeltCandidate" "qml/Main.qml"
+black_belt_guard_block="$(sed -n '/function autoVisionRejectBlackBeltCandidate/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$black_belt_guard_block" | grep -q 'Number(hasRing) === 1'; then
+    fail "黑色传送带门禁必须保留 ring=1 候选，不能把真实中心孔目标也拒掉"
+fi
+if ! printf '%s\n' "$black_belt_guard_block" | grep -q 'Number(diagCode) === 5'; then
+    fail "黑色传送带门禁必须识别 diag=5 的贴边候选，避免侧边黑带被当成零件重捕获"
+fi
+if ! printf '%s\n' "$black_belt_guard_block" | grep -q 'Number(candRing) !== 1'; then
+    fail "黑色传送带门禁必须结合 cand_ring=0，避免没有中心孔结构的候选进入跟踪或微调"
+fi
+if ! printf '%s\n' "$black_belt_guard_block" | grep -q 'bboxH >= Math.floor(autoVisionFineTuneModelRoiSizePx \* 0.70)'; then
+    fail "黑色传送带门禁必须识别接近中心 ROI 高度的大块黑带候选"
+fi
+if ! printf '%s\n' "$black_belt_guard_block" | grep -q 'bboxW >= Math.floor(autoVisionFineTuneModelRoiSizePx \* 0.35)'; then
+    fail "黑色传送带门禁必须识别宽度达到中心 ROI 三分之一以上的黑带候选"
+fi
+if ! printf '%s\n' "$black_belt_guard_block" | grep -q 'mediumNoRingBelt'; then
+    fail "黑色传送带门禁必须覆盖 cand_box≈130x179 这类中等尺寸突起，不能只拒绝接近整块 ROI 的大黑带"
+fi
+locate_tracking_block="$(sed -n '/function handleAutoVisionLocateFinished/,/function autoVisionNormalizeSpeedRpm/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$locate_tracking_block" | grep -q 'autoVisionRejectBlackBeltCandidate(hasRing, diagCode, candRing'; then
+    fail "首页自动视觉跟踪/重捕获必须复用黑色传送带门禁，不能只在首次建链拦截 no-ring 候选"
+fi
+if ! printf '%s\n' "$locate_tracking_block" | grep -q 'autoVisionRejectBlackBeltCandidate(0, diagCode, candRing'; then
+    fail "首页自动视觉在 has_target=0 但 diag/cand_box 指向黑带突起时，也必须标记 black_belt=1，避免现场误以为已经识别到零件"
+fi
+if ! printf '%s\n' "$locate_tracking_block" | grep -q 'autoVisionRejectSmallRingBeltBumpFirstDetect(hasRing, bboxW, bboxH)'; then
+    fail "首页首次建链必须拦截尺寸过小的 ring=1 候选，避免黑色传送带小突起伪装成零件"
+fi
+if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRejectBlackBeltCandidate(hasRing, diagCode, candRing'; then
+    fail "Z 下降后的 ROI 实时微调必须复用黑色传送带门禁，不能把黑带候选当作零件坐标继续微调或进入模型"
+fi
+detect_locate_guard_block="$(sed -n '/bool ensureCurrentFrameHasLocateTarget/,/^    QString parseTokenValue/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q 'kDetectLocateMinRingBboxSide'; then
+    fail "模型入口必须拒绝过小的 ring=1 候选，防止小突起绕过 ring=1 门禁进入双模型"
+fi
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q '当前 ROI 候选尺寸过小'; then
+    fail "模型入口过小候选拦截必须给出明确中文诊断，方便现场区分突起误检和真实零件"
 fi
 locate_reply_block="$(sed -n '/LOCATE has_target=/,/send_control_reply(client_fd, "OK", detail)/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 if ! printf '%s\n' "$locate_reply_block" | grep -q 'diag=%u'; then

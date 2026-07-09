@@ -6200,6 +6200,17 @@ private:
         const QString candBoxText = parseTokenValue(reply, QStringLiteral("cand_box"));
         const QString candConfText = parseTokenValue(reply, QStringLiteral("cand_conf"));
         const QString candRingText = parseTokenValue(reply, QStringLiteral("cand_ring"));
+        /*
+         * kDetectLocateMinRingBboxSide/kDetectLocateMinRingBboxArea 是模型入口的最后一道尺寸兜底。
+         * 真实垫圈现场完整入 ROI 时 bbox 约 173x173；黑色传送带小突起即使偶发被判 ring=1，
+         * 只要尺寸明显不够，就不能继续保存图片和运行双模型。
+         */
+        const int kDetectLocateMinRingBboxSide = 45;
+        const int kDetectLocateMinRingBboxArea = 2000;
+        bool bboxWOk = false;
+        bool bboxHOk = false;
+        const int bboxW = bboxWText.toInt(&bboxWOk);
+        const int bboxH = bboxHText.toInt(&bboxHOk);
 
         /* has_target 不为 1 表示当前帧没有可用候选，直接阻断模型入口，防止空 ROI 被分类模型硬分成某个类别。 */
         if (hasTargetText != QStringLiteral("1")) {
@@ -6257,6 +6268,48 @@ private:
             }
 
             qInfo() << "detect entry LOCATE rejected no-ring candidate"
+                    << "frame" << parseTokenValue(reply, QStringLiteral("frame_id"))
+                    << "bbox" << (bboxWText + QLatin1Char('x') + bboxHText)
+                    << "confidence" << confidenceText
+                    << "ring" << ringText
+                    << "diag" << diagText
+                    << "cand_box" << candBoxText
+                    << "cand_conf" << candConfText
+                    << "cand_ring" << candRingText;
+
+            if (errorText) {
+                *errorText = detail;
+            }
+            return false;
+        }
+
+        /*
+         * ring=1 只能证明“像中心孔”，不能证明候选尺寸像真实零件。
+         * 空转时黑色传送带突起可能靠亮边和暗心形成假 ring，因此模型入口继续做最小 bbox 兜底。
+         */
+        if (bboxWOk && bboxHOk &&
+            (bboxW < kDetectLocateMinRingBboxSide ||
+             bboxH < kDetectLocateMinRingBboxSide ||
+             bboxW * bboxH < kDetectLocateMinRingBboxArea)) {
+            QString detail = QStringLiteral("当前 ROI 候选尺寸过小，疑似黑色传送带突起，已取消模型检测");
+
+            detail += QStringLiteral("；ring=") + ringText;
+            detail += QStringLiteral(" confidence=") + confidenceText;
+            detail += QStringLiteral(" bbox=") + bboxWText + QLatin1Char('x') + bboxHText;
+            if (!diagText.isEmpty()) {
+                detail += QStringLiteral(" diag=") + diagText;
+            }
+            if (!candBoxText.isEmpty()) {
+                detail += QStringLiteral(" cand_box=") + candBoxText;
+            }
+            if (!candConfText.isEmpty()) {
+                detail += QStringLiteral(" cand_conf=") + candConfText;
+            }
+            if (!candRingText.isEmpty()) {
+                detail += QStringLiteral(" cand_ring=") + candRingText;
+            }
+
+            qInfo() << "detect entry LOCATE rejected small ring candidate"
                     << "frame" << parseTokenValue(reply, QStringLiteral("frame_id"))
                     << "bbox" << (bboxWText + QLatin1Char('x') + bboxHText)
                     << "confidence" << confidenceText

@@ -146,6 +146,10 @@ Rectangle {
     property int autoVisionExpectedPartMinBboxArea: 1000
     /* autoVisionExpectedPartMaxBboxArea 是扫描阶段零件期望最大 bbox 面积（像素²）；现场 640x480 垫圈 bbox 约 173x173，必须允许约 3 万像素²的真实目标。 */
     property int autoVisionExpectedPartMaxBboxArea: 45000
+    /* autoVisionFirstDetectMinRingBboxSide 是首次 ring=1 建链的最小 bbox 边长，过小的亮边包暗心更可能是黑色传送带突起。 */
+    property int autoVisionFirstDetectMinRingBboxSide: 45
+    /* autoVisionFirstDetectMinRingBboxArea 是首次 ring=1 建链的最小 bbox 面积，用于防止小突起靠假中心孔触发空转识别。 */
+    property int autoVisionFirstDetectMinRingBboxArea: 2000
     /* autoVisionFirstDetectNonRingConfirmRequired 是 ring=0 候选首次建链所需的连续确认帧数，比 ring=1 更严格，用于降低空传送带反光误触发概率。 */
     property int autoVisionFirstDetectNonRingConfirmRequired: 4
     /* autoVisionFirstDetectMinNonRingConfidence 是 ring=0 候选首次建链的最低置信度，低于该值说明候选还不足以替代中心孔结构证据。 */
@@ -1643,6 +1647,118 @@ Rectangle {
     }
 
     /*
+     * autoVisionRejectSmallRingBeltBumpFirstDetect 的作用：
+     *   在“从未见过目标”的首次建链阶段，拦截尺寸过小但被误判为 ring=1 的黑色传送带突起。
+     *
+     * 主要流程：
+     *   1. 只处理 ring=1 候选；ring=0 已由 autoVisionFirstDetectRequiredFramesForCandidate() 默认拒绝。
+     *   2. 读取候选 bbox 宽、高和面积，和现场垫圈的最小可信尺寸做比较。
+     *   3. 任一边长或面积低于门槛时返回 true，让外层继续按“未识别到零件”处理。
+     *
+     * 参数：
+     *   hasRing 表示 LOCATE ring 字段，1 表示 overlay 判断中心孔结构成立。
+     *   bboxWValue/bboxHValue 是当前 has_target 候选的外接框宽高。
+     *
+     * 返回值：
+     *   true 表示该 ring=1 候选太小，首次建链时应按黑带突起拒绝；false 表示尺寸可继续确认。
+     */
+    function autoVisionRejectSmallRingBeltBumpFirstDetect(hasRing, bboxWValue, bboxHValue) {
+        var bboxW = Math.max(0, Math.floor(Number(bboxWValue || 0)))
+        var bboxH = Math.max(0, Math.floor(Number(bboxHValue || 0)))
+        var minSide = Math.max(1, Math.floor(Number(autoVisionFirstDetectMinRingBboxSide || 1)))
+        var minArea = Math.max(1, Math.floor(Number(autoVisionFirstDetectMinRingBboxArea || 1)))
+
+        if (Number(hasRing) !== 1) {
+            return false
+        }
+
+        return bboxW < minSide || bboxH < minSide || bboxW * bboxH < minArea
+    }
+
+    /*
+     * autoVisionCandidateBoxFromText 的作用：
+     *   把 overlay 诊断字段 cand_box="宽x高" 转成 QML 可比较的宽高对象。
+     *
+     * 主要流程：
+     *   1. 先把任意输入转成字符串，防止 result 字段缺失时抛异常。
+     *   2. 按 `x` 分割宽高，解析失败时返回 0x0。
+     *   3. 调用方可把这个宽高复用到黑色传送带候选门禁中。
+     *
+     * 参数：
+     *   candBoxText 是 LOCATE 回包里的 cand_box 字段，例如 "130x179"。
+     *
+     * 返回值：
+     *   返回对象 {w,h}；解析失败时 w/h 均为 0。
+     */
+    function autoVisionCandidateBoxFromText(candBoxText) {
+        var parts = String(candBoxText || "0x0").split("x")
+        var parsedW = parts.length >= 1 ? Math.floor(Number(parts[0] || 0)) : 0
+        var parsedH = parts.length >= 2 ? Math.floor(Number(parts[1] || 0)) : 0
+
+        return {
+            "w": Math.max(0, parsedW),
+            "h": Math.max(0, parsedH)
+        }
+    }
+
+    /*
+     * autoVisionRejectBlackBeltCandidate 的作用：
+     *   识别“黑色传送带被 overlay 当成 no-ring 候选”的典型形态，并在 QML 状态机里统一拒绝。
+     *
+     * 主要流程：
+     *   1. ring=1 的候选直接放行，因为中心孔结构是垫圈类零件的强证据。
+     *   2. no-ring 候选如果同时满足 diag=5、cand_ring=0 和中等以上高瘦/高宽形态，就认为是贴边黑带或皮带突起。
+     *   3. no-ring 候选即使 diag 被 overlay 置为 0，只要高置信且尺寸接近中心 ROI 的黑带形态，也拒绝掉。
+     *   4. 只返回布尔结果，不直接修改流程状态，方便首次建链、重捕获和实时微调共用同一个门禁。
+     *
+     * 参数：
+     *   hasRing 是 LOCATE ring 字段，1 表示候选通过中心孔结构检测。
+     *   diagCode 是 LOCATE diag 字段，5 表示候选贴近搜索边界。
+     *   candRing 是 LOCATE cand_ring 字段，0 表示最接近候选也没有中心孔结构。
+     *   bboxW/bboxH 是当前 has_target 候选的外接框宽高。
+     *   confidence/candConfidence 是当前候选和诊断候选置信度，取较大值判断高置信黑带。
+     *
+     * 返回值：
+     *   true 表示这是黑色传送带型误检候选；false 表示不应由该门禁拒绝。
+     */
+    function autoVisionRejectBlackBeltCandidate(hasRing, diagCode, candRing, bboxWValue, bboxHValue, confidenceValue, candConfidenceValue) {
+        var bboxW = Math.max(0, Math.floor(Number(bboxWValue || 0)))
+        var bboxH = Math.max(0, Math.floor(Number(bboxHValue || 0)))
+        var bestConfidence = Math.max(Math.floor(Number(confidenceValue || 0)),
+                                      Math.floor(Number(candConfidenceValue || 0)))
+        var mediumNoRingBelt = bboxH >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.55)
+                && bboxW >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.30)
+                || bboxW >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.55)
+                && bboxH >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.30)
+        var tallNoRingBelt = bboxH >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.70)
+                && bboxW >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.35)
+        var wideNoRingBelt = bboxW >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.70)
+                && bboxH >= Math.floor(autoVisionFineTuneModelRoiSizePx * 0.35)
+        var largeNoRingArea = bboxW * bboxH >= Math.floor(autoVisionFineTuneModelRoiSizePx
+                                                          * autoVisionFineTuneModelRoiSizePx
+                                                          * 0.35)
+
+        if (Number(hasRing) === 1) {
+            return false
+        }
+
+        if (Number(candRing) !== 1
+                && Number(diagCode) === 5
+                && (mediumNoRingBelt || tallNoRingBelt || wideNoRingBelt)) {
+            return true
+        }
+
+        if (Number(candRing) !== 1
+                && bestConfidence >= 95
+                && largeNoRingArea
+                && (tallNoRingBelt || wideNoRingBelt)) {
+            return true
+        }
+
+        return false
+    }
+
+    /*
      * handleAutoVisionLocateFinished 的作用：
      *   接收 C++ `requestAutoVisionLocate()` 返回的定位结果，并决定下发 VISION_POS、VISION_LOST 或居中停止。
      *
@@ -1698,6 +1814,11 @@ Rectangle {
         var candRing = result ? Number(result.cand_ring || 0) : 0
         var candDensity = result ? Number(result.cand_density || 0) : 0
         var firstDetectConfirmRequired = autoVisionFirstDetectConfirmRequired
+        var blackBeltRejected = false
+        var candBoxSize = autoVisionCandidateBoxFromText(candBox)
+        var diagBlackBeltRejected = autoVisionRejectBlackBeltCandidate(0, diagCode, candRing,
+                                                                       candBoxSize.w, candBoxSize.h,
+                                                                       0, candConf)
 
         autoVisionLastLocateDiagText = " diag=" + Math.round(diagCode)
                 + " cand=" + candBox
@@ -1720,10 +1841,31 @@ Rectangle {
                 }
             }
             /*
+             * 重捕获门禁：
+             * 本轮已经见过目标后，旧逻辑允许 no-ring 高置信候选继续跟踪；
+             * 现场黑色传送带会以 diag=5/cand_ring=0/大块高置信形态混进来，
+             * 所以这里必须在首次建链之外再挡一次，避免黑带驱动 VISION_POS 或居中停机。
+             */
+            if (hasTarget) {
+                blackBeltRejected = autoVisionRejectBlackBeltCandidate(hasRing, diagCode, candRing,
+                                                                       bboxW, bboxH,
+                                                                       confidence, candConf)
+                if (blackBeltRejected) {
+                    hasTarget = false
+                    autoVisionLastLocateDiagText += " black_belt=1"
+                }
+            }
+            /*
              * 首次建链默认重新收紧：
              * 黑色传送带是稳定背景，上一版允许 ring=0 首次多帧确认后，反光区域会被误认为零件。
              * 因此从未见过目标时仍以 ring=1 作为建链依据；本轮已经见过目标后，no-ring 高置信候选仍可用于重捕获。
              */
+            if (hasTarget && !autoVisionHasSeenTarget) {
+                if (autoVisionRejectSmallRingBeltBumpFirstDetect(hasRing, bboxW, bboxH)) {
+                    hasTarget = false
+                    autoVisionLastLocateDiagText += " belt_bump=1"
+                }
+            }
             if (hasTarget && !autoVisionHasSeenTarget) {
                 firstDetectConfirmRequired = autoVisionFirstDetectRequiredFramesForCandidate(hasRing, confidence)
                 if (firstDetectConfirmRequired <= 0) {
@@ -1769,12 +1911,18 @@ Rectangle {
             autoVisionStableFrames = 0
             dxPixelsValid = false
 
+            if (diagBlackBeltRejected && autoVisionLastLocateDiagText.indexOf("black_belt=1") < 0) {
+                autoVisionLastLocateDiagText += " black_belt=1"
+            }
+
             if (autoVisionHasSeenTarget) {
                 autoVisionLostFrames += 1
                 workflowState = autoVisionLostFrames >= autoVisionLostWarnFrames ? "等待重识别" : "视觉保持"
-                autoVisionLastText = autoVisionLostFrames <= autoVisionLostHoldFrames
-                        ? "自动视觉：目标短暂丢失 "
-                        : "自动视觉：目标连续丢失但保持停机 "
+                autoVisionLastText = diagBlackBeltRejected
+                        ? "自动视觉：拒绝黑色传送带候选，保持停机 "
+                        : (autoVisionLostFrames <= autoVisionLostHoldFrames
+                           ? "自动视觉：目标短暂丢失 "
+                           : "自动视觉：目标连续丢失但保持停机 ")
                 autoVisionLastText = autoVisionLastText
                         + autoVisionLostFrames + " 帧，保持停机等待重新识别"
                         + "，上次error=" + autoVisionLastErrorY
@@ -1787,7 +1935,9 @@ Rectangle {
             }
 
             autoVisionLostFrames = 0
-            autoVisionLastText = "自动视觉：尚未识别到零件，继续等待上方来料" + autoVisionLastLocateDiagText
+            autoVisionLastText = diagBlackBeltRejected
+                    ? "自动视觉：拒绝黑色传送带候选，继续等待上方来料" + autoVisionLastLocateDiagText
+                    : "自动视觉：尚未识别到零件，继续等待上方来料" + autoVisionLastLocateDiagText
             storageState = autoVisionLastText
 
             if (!autoVisionCommandBusy && nowMs - autoVisionLastLostMs >= 500) {
@@ -2812,21 +2962,42 @@ Rectangle {
             return
         }
 
+        var hasRing = result ? Number(result.has_ring || 0) : 0
+        var diagCode = result ? Number(result.diag || 0) : 0
+        var candRing = result ? Number(result.cand_ring || 0) : 0
+        var candConf = result ? Number(result.cand_conf || 0) : 0
+        var bboxW = result ? Number(result.bbox_w || 0) : 0
+        var bboxH = result ? Number(result.bbox_h || 0) : 0
+        var confidence = result ? Number(result.confidence || 0) : 0
+        var width = result ? Number(result.width) : 0
+        var height = result ? Number(result.height) : 0
+        var blackBeltRejected = result && Number(result.has_target) === 1
+                && autoVisionRejectBlackBeltCandidate(hasRing, diagCode, candRing,
+                                                      bboxW, bboxH,
+                                                      confidence, candConf)
         var fineTuneDiagText = result
-                ? (" diag=" + Math.round(Number(result.diag || 0))
+                ? (" diag=" + Math.round(diagCode)
                    + " cand=" + String(result.cand_box || "0x0")
-                   + " cconf=" + Math.round(Number(result.cand_conf || 0))
-                   + " cring=" + Math.round(Number(result.cand_ring || 0))
+                   + " cconf=" + Math.round(candConf)
+                   + " cring=" + Math.round(candRing)
                    + " cdens=" + Math.round(Number(result.cand_density || 0)))
                 : ""
+        if (blackBeltRejected) {
+            fineTuneDiagText += " black_belt=1"
+        }
         autoVisionLastLocateDiagText = fineTuneDiagText
 
-        if (!ok || !result || Number(result.has_target) !== 1 || Number(result.width) <= 0 || Number(result.height) <= 0) {
+        if (!ok || !result || Number(result.has_target) !== 1 || width <= 0 || height <= 0 || blackBeltRejected) {
             autoVisionRealtimeFineTuneLostFrames += 1
             workflowState = "ROI实时微调"
             autoVisionLastText = "ROI 实时闭环暂未稳定返回目标，第 "
                     + autoVisionRealtimeFineTuneLostFrames + " 帧丢失：" + detail
                     + fineTuneDiagText
+            if (blackBeltRejected) {
+                autoVisionLastText = "ROI 实时闭环拒绝黑色传送带 no-ring 候选，第 "
+                        + autoVisionRealtimeFineTuneLostFrames + " 帧："
+                        + fineTuneDiagText
+            }
             storageState = autoVisionLastText
             if (autoVisionRealtimeFineTuneLostFrames >= autoVisionRealtimeFineTuneLostStopFrames) {
                 autoVisionStopRealtimeFineTune("ROI 实时闭环连续丢目标 "
@@ -2840,8 +3011,6 @@ Rectangle {
         autoVisionRealtimeFineTuneLostFrames = 0
         var centerX = Number(result.center_x)
         var centerY = Number(result.center_y)
-        var width = Number(result.width)
-        var height = Number(result.height)
         var modelRoi = autoVisionFineTuneModelRoiGeometry(result)
         var bboxContainment = autoVisionFineTuneBboxContainmentError(result, modelRoi)
         var targetX = Math.round(Number(modelRoi.centerX || Math.round(width / 2)))

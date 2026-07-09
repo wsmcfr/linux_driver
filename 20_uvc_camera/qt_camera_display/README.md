@@ -17,6 +17,44 @@
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
 
+## 2026-07-09 空转黑色传送带突起误识别加严记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c`、`20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场只让传送带空转、还没有执行 Z 轴下降时，黑色传送带上的一段局部突起仍容易被误以为“识别到零件”。板端空 ROI 自检实际返回 `diag=5 roi=0/480 cand_box≈130x179 cand_conf=100 cand_ring=0`，说明底层已经把它作为最像零件的诊断候选记录下来，但不应让首页自动流程、假 `ring=1` 小候选或模型入口把它当成真实垫圈。 |
+| 具体改动 | `uvc_kms_overlay.c` 将 ring 四边主体支撑阈值收紧到 `18%`，并新增 `AUTO_LOCATE_MIN_RING_BBOX_SIDE=45`，防止小突起靠亮边和暗心伪装成中心孔；`Main.qml` 新增首次 `ring=1` 建链最小 bbox 边长/面积门槛，并解析 `cand_box`，让 `diag=5/cand_ring=0/cand_box≈130x179` 这类中等黑带突起显示 `black_belt=1`；`main.cpp` 的模型入口增加过小 `ring=1` 候选兜底，避免小突起绕过 ring 门禁进入双模型。 |
+| 使用方式变化 | 首页操作不变。空转黑色传送带出现突起时，底部应显示“拒绝黑色传送带候选”或继续“尚未识别到零件”，并带 `black_belt=1`、`cand=...` 诊断；不应进入稳定视觉坐标、居中停机、Z 轴下降或模型检测。真实垫圈完整进入 ROI 后 bbox 约 `173x173`，高于本次最小门槛，仍可正常进入视觉居中和模型检测。 |
+| 生效边界 | 本次同时修改 QML、Qt C++ 和 `uvc_kms_overlay`，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display` 和 `/root/qt_camera_display/uvc_kms_overlay`；只替换其中一个文件不算板端生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `AUTO_LOCATE_MIN_RING_BBOX_SIDE`、`AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT 18U`、`autoVisionCandidateBoxFromText()`、首次小 ring 候选拦截和模型入口小 bbox 兜底。 | 若失败，按脚本提示恢复 overlay ring 最小尺寸、QML `black_belt=1` 诊断或模型入口尺寸兜底。 |
+| 空黑传送带自检 | 开发板 SSH | `cd /root/qt_camera_display && for i in $(seq 1 10); do ./qt_camera_display --detect-self-test; echo rc=$?; done` | 没有真实零件时不应出现 `RESULT `；典型输出应是 `当前 ROI 未识别到零件... cand_box=... cand_ring=0` 或过小候选拦截。 | 若出现 `RESULT`，先看 `ring/confidence/bbox/diag/cand_*`，判断是假 `ring=1` 还是模型入口被绕过，并确认板端两个二进制都已更新。 |
+| 首页空转验证 | 开发板触摸屏 | 保持绿色 ROI 内只有黑色传送带，点击首页 `开始` 并让传送带空转。 | 底部不应稳定显示零件坐标；遇到突起时应显示 `拒绝黑色传送带候选` 或 `black_belt=1`，右侧结果保持 `未检测/等待上料`。 | 若仍显示“视觉居中”并下发坐标，记录底部 `box/ring/conf/diag/cand/cconf/cring/cdens`，再查 QML 是否是新二进制。 |
+| 真实垫圈回归 | 开发板触摸屏 | 放入真实垫圈，让中心孔和完整外框进入绿色 ROI 后点击首页 `开始` 或 `检测`。 | bbox 明显大于 `45x45` 且 `ring=1` 时仍应进入视觉居中、停机、Z 下降、ROI 微调和模型检测。 | 若真实垫圈掉识别，优先保存当前帧并看 `diag/cand_*`，检查中心孔是否被曝光或模糊压没，而不是直接放松黑带门禁。 |
+
+## 2026-07-09 自动视觉黑色传送带重捕获门禁修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场黑色传送带在首页自动视觉阶段仍会被当成零件候选，位置正好落在绿色 ROI 附近。模型入口已经能拦截 `ring=0`，但 QML 自动视觉状态机在“本轮已经见过目标后的重捕获”和“Z 轴下降后的 ROI 实时微调”里仍允许 no-ring 高置信候选继续提供坐标，导致黑带看起来像被识别成零件。典型诊断是 `diag=5/cand_ring=0/cand_box` 较大，属于贴边黑带或皮带大块暗区域。 |
+| 具体改动 | `Main.qml` 新增 `autoVisionRejectBlackBeltCandidate()`，只拒绝 `ring=0` 且 `cand_ring=0`、`diag=5` 或高置信大块黑带形态的候选；`ring=1` 候选直接保留，避免真实垫圈被误伤。`handleAutoVisionLocateFinished()` 在首次建链之外增加重捕获门禁，`handleAutoVisionFineTuneLocateFinished()` 在实时微调阶段也复用同一门禁。静态测试新增黑带门禁契约，防止以后只修模型入口、不修自动视觉状态机。 |
+| 使用方式变化 | 首页操作不变。空黑传送带或黑带贴边候选不应再进入 `视觉居中`、`左右实时微调` 或触发 `VISION_POS/BELT_STOP_CENTERED`；底部会显示 `black_belt=1` 诊断并按目标丢失处理。真实垫圈若有 `ring=1` 仍按原流程跟踪、居中、Z 下降、ROI 微调和模型检测。 |
+| 生效边界 | 本次改的是 QML，必须重新交叉编译 `qt_camera_display` 并替换板端主程序；只拷贝 `Main.qml` 不会生效。模型入口 `ring=1` 门禁仍保留，用于最后一道兜底。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `autoVisionRejectBlackBeltCandidate()` 同时被自动跟踪和 ROI 实时微调调用。 | 若失败，检查 QML 是否缺少黑带门禁，或测试脚本是否没有覆盖 `diag=5/cand_ring=0` 的自动视觉路径。 |
+| 板端 marker 验证 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep -E 'autoVisionRejectBlackBeltCandidate|black_belt=1|拒绝黑色传送带'` | 能看到 QML marker，说明新 QML 已经编进板端二进制。 | 若没有输出，说明只改了源码或只拷贝 QML，必须重新交叉编译并替换 `/root/qt_camera_display/qt_camera_display`。 |
+| 空黑带自动视觉验证 | 开发板触摸屏 | 保持绿色 ROI 内只有黑色传送带，点击首页 `开始`，观察底部状态和 F4 串口日志。 | 底部不应进入稳定的零件坐标跟踪；若出现黑带候选，应显示 `black_belt=1` 或目标丢失提示；F4 不应因为黑带收到新的有效 `VISION_POS` 或 `BELT_STOP_CENTERED`。 | 若仍进入居中/微调，记录底部 `box/ring/conf/diag/cand/cconf/cring/cdens`，并确认板端二进制 marker 已更新。 |
+| 真实垫圈回归验证 | 开发板触摸屏 | 放入真实垫圈，让中心孔清晰进入绿色 ROI 后点击 `开始`。 | `ring=1` 候选仍能进入视觉居中，随后完成停机、Z 下降、ROI 微调和模型检测。 | 若真实零件掉识别，先看底部 `ring/conf/bbox/diag/cand_*`；若 `ring=0` 且无黑带形态，继续调光照/对焦或 ring 检测，不能把黑带门禁直接删掉。 |
+
 ## 2026-07-09 检测入口 no-ring 候选拦截修复记录
 
 | 项目 | 内容 |
@@ -501,6 +539,7 @@
 
 | 时间 | 修改点 | 结果 |
 |---|---|---|
+| 2026-07-09 | 加严空转黑色传送带突起过滤 | 板端空 ROI 自检显示当前突起典型诊断为 `diag=5 cand_box≈130x179 cand_conf=100 cand_ring=0`。`uvc_kms_overlay.c` 将 ring 四边主体支撑提高到 `18%` 并新增 ring 最小 bbox 边长 `45px`；`Main.qml` 首次建链拒绝过小 `ring=1` 候选，并把中等尺寸 no-ring 黑带突起标记为 `black_belt=1`；`main.cpp` 模型入口也拒绝过小 `ring=1` 候选，防止小突起绕过中心孔门禁。 |
 | 2026-07-09 | 修正 LOCATE ring 假阳性 | 板端空黑传送带自检证明黑带白边偶发会返回 `has_target=1 ring=1`，仅靠模型入口 `ring=1` 门禁不够；`uvc_kms_overlay.c` 的 `auto_locate_component_has_ring_hole()` 新增中心孔上/下/左/右四边主体支撑检查，要求四个方向都有足够主体像素才承认 `ring=1`，避免两条白边夹黑带伪装成垫圈孔。 |
 | 2026-07-09 | 阻断 no-ring 黑色传送带候选进入模型 | `main.cpp` 的 `ensureCurrentFrameHasLocateTarget()` 不再只看 `has_target=1`，而是要求垫圈类候选同时满足 `ring=1`；`has_target=1 ring=0` 会返回“当前 ROI 候选没有中心孔结构”，并带上 `ring/confidence/bbox/diag/cand_*` 现场诊断；静态测试固化检测入口必须解析 `ring/bbox_w/confidence` 并包含 no-ring 拦截分支。 |
 | 2026-07-08 | 修正 LOCATE 任意阶段丢帧后难以重捕获 | `uvc_kms_overlay.c` 不再把 `ring=1` 作为 overlay 全阶段硬门槛，允许 bbox 和置信度足够高的 no-ring 候选返回；`Main.qml` 默认关闭首次 no-ring 建链，首次识别仍以 `ring=1` 建立目标，避免黑色传送带静止反光被当成零件；本轮已经见过目标后继续允许高置信 no-ring 候选保持/重捕获；`main.cpp` 把 `diag/cand_*` 诊断字段传给 QML，底部可直接显示丢失原因。 |
