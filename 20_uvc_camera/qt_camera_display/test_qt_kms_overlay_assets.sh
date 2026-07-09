@@ -1084,6 +1084,22 @@ if [ -z "$detect_locate_guard_line" ] || [ -z "$detect_save_line" ] || [ "$detec
 fi
 require_grep "检测入口 LOCATE" "main.cpp"
 require_grep "has_target" "main.cpp"
+detect_locate_guard_block="$(sed -n '/bool ensureCurrentFrameHasLocateTarget/,/^    QString parseTokenValue/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q 'parseTokenValue(reply, QStringLiteral("ring"))'; then
+    fail "ensureCurrentFrameHasLocateTarget() 必须解析 LOCATE ring 字段，检测入口不能只看 has_target"
+fi
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q 'parseTokenValue(reply, QStringLiteral("bbox_w"))'; then
+    fail "ensureCurrentFrameHasLocateTarget() 必须解析 bbox_w/bbox_h，便于现场确认 no-ring 候选尺寸"
+fi
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q 'parseTokenValue(reply, QStringLiteral("confidence"))'; then
+    fail "ensureCurrentFrameHasLocateTarget() 必须解析 confidence，便于区分真实低置信和黑带高置信误报"
+fi
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q 'ringText != QStringLiteral("1")'; then
+    fail "ensureCurrentFrameHasLocateTarget() 必须要求 has_target=1 后继续满足 ring=1，阻断黑色传送带 no-ring 候选进入模型"
+fi
+if ! printf '%s\n' "$detect_locate_guard_block" | grep -q '当前 ROI 候选没有中心孔结构'; then
+    fail "ensureCurrentFrameHasLocateTarget() 的 no-ring 拦截错误文本必须明确提示中心孔缺失，方便现场判断黑色传送带误报"
+fi
 retry_upload_block="$(sed -n '/Q_INVOKABLE void retryUploadRecord(int row)/,/workerThread->start();/p' "$SCRIPT_DIR/main.cpp")"
 if ! printf '%s\n' "$retry_upload_block" | grep -q 'weightContextJson'; then
     fail "历史重新发送必须复用历史记录里保存的 weight/ldc/f4/decision/vision 上下文，不能只重传图片"
@@ -1376,6 +1392,11 @@ require_absent "luma >= bright_threshold \\|\\| luma <= dark_threshold" "uvc_kms
 require_absent "roi_h = frame->frame_height;" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_touches_search_edge" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_has_ring_hole" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT" "uvc_kms_overlay.c"
+require_grep "ring_top_body" "uvc_kms_overlay.c"
+require_grep "ring_bottom_body" "uvc_kms_overlay.c"
+require_grep "ring_left_body" "uvc_kms_overlay.c"
+require_grep "ring_right_body" "uvc_kms_overlay.c"
 require_fixed_grep 'result.insert(QStringLiteral("has_ring"), tokenValue(reply, QStringLiteral("ring")).toInt())' "main.cpp"
 require_fixed_grep 'result.insert(QStringLiteral("diag"), tokenValue(reply, QStringLiteral("diag")).toInt())' "main.cpp"
 require_fixed_grep 'result.insert(QStringLiteral("cand_ring"), tokenValue(reply, QStringLiteral("cand_ring")).toInt())' "main.cpp"

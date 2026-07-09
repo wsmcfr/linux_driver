@@ -6144,15 +6144,15 @@ private:
      * 主要流程：
      *   1. 通过 overlay 控制 socket 发送 `LOCATE`，复用底层找零件算法，不新增另一套图像判断。
      *   2. 校验回复必须是 `OK LOCATE ...`；socket 错误或 overlay 异常直接阻断检测。
-     *   3. 读取 `has_target` 字段，只有值为 1 时才允许后续 `SAVE_DETECT` 和双模型推理。
-     *   4. 目标不存在时把 `diag/cand_box/cand_conf/cand_ring` 等诊断字段拼进错误文本，
+     *   3. 读取 `has_target` 和 `ring` 字段，只有已找到候选且候选带中心孔结构时才允许后续 `SAVE_DETECT` 和双模型推理。
+     *   4. 目标不存在或候选没有中心孔时把 `bbox/confidence/diag/cand_*` 等诊断字段拼进错误文本，
      *      现场可以直接判断是空皮带、候选过小、无中心孔还是搜索带位置不对。
      *
      * 参数：
      *   errorText 用于返回给 QML 的中文失败原因；调用方会统一加上“检测失败：”前缀。
      *
      * 返回值：
-     *   true 表示当前帧已经由 `LOCATE has_target=1` 确认存在零件；
+     *   true 表示当前帧已经由 `LOCATE has_target=1 ring=1` 确认存在垫圈类零件；
      *   false 表示当前帧不允许进入模型检测，errorText 内保存阻断原因。
      */
     bool ensureCurrentFrameHasLocateTarget(QString *errorText)
@@ -6180,14 +6180,29 @@ private:
             return false;
         }
 
+        /* hasTargetText 表示 overlay 是否找到了候选目标；只有 1 才说明可以继续检查候选细节。 */
         const QString hasTargetText = parseTokenValue(reply, QStringLiteral("has_target"));
+
+        /* ringText 表示候选是否具备垫圈中心孔结构；黑色传送带误报通常是 has_target=1 但 ring=0。 */
+        const QString ringText = parseTokenValue(reply, QStringLiteral("ring"));
+
+        /* bboxWText/bboxHText 保存候选外框尺寸，现场可用它判断是否抓到了皮带亮边或支架。 */
+        const QString bboxWText = parseTokenValue(reply, QStringLiteral("bbox_w"));
+        const QString bboxHText = parseTokenValue(reply, QStringLiteral("bbox_h"));
+
+        /* confidenceText 保存 overlay 对当前候选的置信度；黑带反光可能出现高置信但无中心孔。 */
+        const QString confidenceText = parseTokenValue(reply, QStringLiteral("confidence"));
+
+        /* 以下诊断字段来自最接近但可能被拒绝的候选，用于定位搜索带、尺寸、密度或 ring 门槛问题。 */
+        const QString diagText = parseTokenValue(reply, QStringLiteral("diag"));
+        const QString roiYText = parseTokenValue(reply, QStringLiteral("roi_y"));
+        const QString roiHText = parseTokenValue(reply, QStringLiteral("roi_h"));
+        const QString candBoxText = parseTokenValue(reply, QStringLiteral("cand_box"));
+        const QString candConfText = parseTokenValue(reply, QStringLiteral("cand_conf"));
+        const QString candRingText = parseTokenValue(reply, QStringLiteral("cand_ring"));
+
+        /* has_target 不为 1 表示当前帧没有可用候选，直接阻断模型入口，防止空 ROI 被分类模型硬分成某个类别。 */
         if (hasTargetText != QStringLiteral("1")) {
-            const QString diagText = parseTokenValue(reply, QStringLiteral("diag"));
-            const QString roiYText = parseTokenValue(reply, QStringLiteral("roi_y"));
-            const QString roiHText = parseTokenValue(reply, QStringLiteral("roi_h"));
-            const QString candBoxText = parseTokenValue(reply, QStringLiteral("cand_box"));
-            const QString candConfText = parseTokenValue(reply, QStringLiteral("cand_conf"));
-            const QString candRingText = parseTokenValue(reply, QStringLiteral("cand_ring"));
             QString detail = QStringLiteral("当前 ROI 未识别到零件，请放入零件后再检测");
 
             if (!diagText.isEmpty()) {
@@ -6212,13 +6227,56 @@ private:
             return false;
         }
 
+        /* has_target=1 但 ring!=1 是本次现场黑色传送带误报的关键形态，不能再放行到模型检测。 */
+        if (ringText != QStringLiteral("1")) {
+            QString detail = QStringLiteral("当前 ROI 候选没有中心孔结构，疑似黑色传送带反光，已取消模型检测");
+
+            if (!ringText.isEmpty()) {
+                detail += QStringLiteral("；ring=") + ringText;
+            }
+            if (!confidenceText.isEmpty()) {
+                detail += QStringLiteral(" confidence=") + confidenceText;
+            }
+            if (!bboxWText.isEmpty() || !bboxHText.isEmpty()) {
+                detail += QStringLiteral(" bbox=") + bboxWText + QLatin1Char('x') + bboxHText;
+            }
+            if (!diagText.isEmpty()) {
+                detail += QStringLiteral(" diag=") + diagText;
+            }
+            if (!roiYText.isEmpty() || !roiHText.isEmpty()) {
+                detail += QStringLiteral(" roi=") + roiYText + QStringLiteral("/") + roiHText;
+            }
+            if (!candBoxText.isEmpty()) {
+                detail += QStringLiteral(" cand_box=") + candBoxText;
+            }
+            if (!candConfText.isEmpty()) {
+                detail += QStringLiteral(" cand_conf=") + candConfText;
+            }
+            if (!candRingText.isEmpty()) {
+                detail += QStringLiteral(" cand_ring=") + candRingText;
+            }
+
+            qInfo() << "detect entry LOCATE rejected no-ring candidate"
+                    << "frame" << parseTokenValue(reply, QStringLiteral("frame_id"))
+                    << "bbox" << (bboxWText + QLatin1Char('x') + bboxHText)
+                    << "confidence" << confidenceText
+                    << "ring" << ringText
+                    << "diag" << diagText
+                    << "cand_box" << candBoxText
+                    << "cand_conf" << candConfText
+                    << "cand_ring" << candRingText;
+
+            if (errorText) {
+                *errorText = detail;
+            }
+            return false;
+        }
+
         qInfo() << "detect entry LOCATE accepted"
                 << "frame" << parseTokenValue(reply, QStringLiteral("frame_id"))
-                << "bbox" << (parseTokenValue(reply, QStringLiteral("bbox_w"))
-                               + QLatin1Char('x')
-                               + parseTokenValue(reply, QStringLiteral("bbox_h")))
-                << "confidence" << parseTokenValue(reply, QStringLiteral("confidence"))
-                << "ring" << parseTokenValue(reply, QStringLiteral("ring"));
+                << "bbox" << (bboxWText + QLatin1Char('x') + bboxHText)
+                << "confidence" << confidenceText
+                << "ring" << ringText;
         return true;
     }
 

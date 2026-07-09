@@ -119,6 +119,9 @@
 /* 自动视觉定位的中心孔背景最小对比度；孔区域与候选实体太接近时不认为是垫圈孔。 */
 #define AUTO_LOCATE_MIN_RING_BACKGROUND_CONTRAST 10U
 
+/* 自动视觉定位的中心孔四边主体支撑阈值；四边任一方向主体太少时，按白边夹黑带误检处理。 */
+#define AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT 8U
+
 /* 自动视觉定位的真实零件最小外接框面积，小于该面积的亮斑按传送带反光或凸起噪声处理。 */
 #define AUTO_LOCATE_MIN_PART_BBOX_AREA 900U
 
@@ -2720,7 +2723,8 @@ static int auto_locate_component_touches_search_edge(unsigned int min_x,
  *   1. 在候选 bbox 中央取一个小窗口，窗口尺寸约为 bbox 的 1/4。
  *   2. 统计窗口内不属于候选亮度的像素占比。
  *   3. 统计孔背景与候选实体的亮度差，避免把黑色传送带纹理误判成中心孔。
- *   4. 背景占比和背景对比度都足够高时，才认为该连通域具有中心孔结构。
+ *   4. 继续检查中心暗窗上、下、左、右四个方向是否都有主体像素支撑。
+ *   5. 背景占比、背景对比度和四边主体支撑都足够高时，才认为该连通域具有中心孔结构。
  *
  * 参数：
  *   frame 是原始 YUYV 帧。
@@ -2747,13 +2751,23 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
     unsigned int sample_w = bbox_w / AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR;
     unsigned int sample_h = bbox_h / AUTO_LOCATE_CENTER_HOLE_SAMPLE_DIVISOR;
     unsigned int sample_x0;
+    unsigned int sample_x1;
     unsigned int sample_y0;
+    unsigned int sample_y1;
     unsigned int x;
     unsigned int y;
     unsigned int total = 0U;
     unsigned int background = 0U;
     unsigned int background_contrast_avg;
     uint64_t background_contrast_sum = 0U;
+    unsigned int ring_top_total = 0U;
+    unsigned int ring_top_body = 0U;
+    unsigned int ring_bottom_total = 0U;
+    unsigned int ring_bottom_body = 0U;
+    unsigned int ring_left_total = 0U;
+    unsigned int ring_left_body = 0U;
+    unsigned int ring_right_total = 0U;
+    unsigned int ring_right_body = 0U;
 
     if (sample_w < 1U) {
         sample_w = 1U;
@@ -2764,6 +2778,8 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
 
     sample_x0 = min_x + (bbox_w - sample_w) / 2U;
     sample_y0 = min_y + (bbox_h - sample_h) / 2U;
+    sample_x1 = sample_x0 + sample_w - 1U;
+    sample_y1 = sample_y0 + sample_h - 1U;
 
     for (y = 0; y < sample_h; y++) {
         for (x = 0; x < sample_w; x++) {
@@ -2785,6 +2801,64 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
 
     background_contrast_avg = (unsigned int)(background_contrast_sum / background);
     if ((background * 100U / total) < AUTO_LOCATE_MIN_CENTER_HOLE_BACKGROUND_PERCENT) {
+        return 0;
+    }
+
+    /*
+     * 四边主体支撑检查：
+     *   真实垫圈的中心孔四周应当都有金属环面；黑色传送带误检常见形态是左右有白边、
+     *   中心是黑带，但上方和下方没有环面主体。这里分别统计暗窗上/下/左/右方向的
+     *   body_threshold 像素比例，任一方向太低都不承认 ring=1。
+     */
+    for (y = min_y; y < sample_y0; y++) {
+        for (x = sample_x0; x <= sample_x1; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+            ring_top_total++;
+            if (auto_locate_is_bright_candidate_luma(luma, bright_threshold)) {
+                ring_top_body++;
+            }
+        }
+    }
+
+    for (y = sample_y1 + 1U; y <= max_y; y++) {
+        for (x = sample_x0; x <= sample_x1; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+            ring_bottom_total++;
+            if (auto_locate_is_bright_candidate_luma(luma, bright_threshold)) {
+                ring_bottom_body++;
+            }
+        }
+    }
+
+    for (y = sample_y0; y <= sample_y1; y++) {
+        for (x = min_x; x < sample_x0; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+            ring_left_total++;
+            if (auto_locate_is_bright_candidate_luma(luma, bright_threshold)) {
+                ring_left_body++;
+            }
+        }
+    }
+
+    for (y = sample_y0; y <= sample_y1; y++) {
+        for (x = sample_x1 + 1U; x <= max_x; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+            ring_right_total++;
+            if (auto_locate_is_bright_candidate_luma(luma, bright_threshold)) {
+                ring_right_body++;
+            }
+        }
+    }
+
+    if (ring_top_total == 0U || ring_bottom_total == 0U ||
+        ring_left_total == 0U || ring_right_total == 0U) {
+        return 0;
+    }
+
+    if ((ring_top_body * 100U / ring_top_total) < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT ||
+        (ring_bottom_body * 100U / ring_bottom_total) < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT ||
+        (ring_left_body * 100U / ring_left_total) < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT ||
+        (ring_right_body * 100U / ring_right_total) < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT) {
         return 0;
     }
 

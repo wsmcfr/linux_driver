@@ -9,13 +9,49 @@
 | 视频显示 | 安全预览使用 V4L2 YUYV 帧上传到 OpenGL ES 纹理；正式路线使用 KMS overlay plane 显示视频 |
 | GPU 路径 | `galcore` + OpenGL ES + `eglfs` 或 `wayland-egl` |
 | 目标分辨率 | 1024x600 |
-| 当前检测逻辑 | 点击 `检测` 或自动流程进入模型前，先通过 overlay `LOCATE` 确认当前帧 `has_target=1`，空 ROI/空皮带不允许进入模型；通过门禁后先运行 MobileNetV3-Small 分类，再运行 UNet 分割；分类完成后首页立即显示零件类型、短类别、分类初判和置信度，但主状态保持“等待综合判定”；UNet 完成后按两个模型综合生成最终判定并显示双模型总耗时；首页窄栏只显示“分类良/分类坏/综合良品/综合坏品”等短结果，完整模型依据保留在历史详情；只要分类模型判坏或 UNet 检出缺陷像素，最终就不能判为良品；COS 上传完成后再把本次原始图片、UNet raw/overlay/mask 结果图、两个模型输出、综合判定和云端上传状态合并成一条历史记录。 |
+| 当前检测逻辑 | 点击 `检测` 或自动流程进入模型前，先通过 overlay `LOCATE` 确认当前帧 `has_target=1` 且 `ring=1`，空 ROI、空皮带和没有中心孔结构的黑色传送带候选不允许进入模型；通过门禁后先运行 MobileNetV3-Small 分类，再运行 UNet 分割；分类完成后首页立即显示零件类型、短类别、分类初判和置信度，但主状态保持“等待综合判定”；UNet 完成后按两个模型综合生成最终判定并显示双模型总耗时；首页窄栏只显示“分类良/分类坏/综合良品/综合坏品”等短结果，完整模型依据保留在历史详情；只要分类模型判坏或 UNet 检出缺陷像素，最终就不能判为良品；COS 上传完成后再把本次原始图片、UNet raw/overlay/mask 结果图、两个模型输出、综合判定和云端上传状态合并成一条历史记录。 |
 | SD 卡按钮 | 右侧面板只保留 `检测` 和 `安全卸载`；独立 `保存图片` 按钮已取消，图片保存由双模型检测流程自动完成。 |
 | 板端 SSH | 从虚拟机执行 `ssh -i /home/cfr/.ssh/id_ed25519_github -o IdentitiesOnly=yes root@192.168.1.250` |
 
 > 记录：当前版本已经打通 Qt 界面和 UVC 摄像头显示，但它是“安全预览路径”，不是最终零拷贝视频路径。
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
+
+## 2026-07-09 检测入口 no-ring 候选拦截修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场空黑色传送带画面偶发被 overlay 识别成 `has_target=1 ring=0` 的大候选，随后 `detectCurrentFrameOnce()` 因为只检查 `has_target=1` 就继续执行 `SAVE_DETECT` 和模型推理，分类模型只能在已知类别中选一个，最终显示成“波形垫圈/坏品”。QML 自动流程首次建链已经默认禁止 no-ring 候选，但手动检测、`--detect-self-test` 和自动流程最终模型入口仍缺少同一条 `ring=1` 门禁。 |
+| 具体改动 | `ensureCurrentFrameHasLocateTarget()` 在 `has_target` 之外继续解析 `ring/bbox_w/bbox_h/confidence/diag/roi_y/roi_h/cand_box/cand_conf/cand_ring`；只有 `has_target=1` 且 `ring=1` 才允许进入 `SAVE_DETECT`。如果 `has_target=1` 但 `ring!=1`，直接返回“当前 ROI 候选没有中心孔结构，疑似黑色传送带反光，已取消模型检测”，并附带 `ring/confidence/bbox/diag/cand_*` 诊断。静态测试新增契约，防止以后模型入口又退回只看 `has_target`。 |
+| 使用方式变化 | 首页和手动页操作不变。空黑传送带、传送带亮边或支架反光即使偶发形成 `has_target=1`，只要没有中心孔 `ring=1`，也不会保存图片、不会跑模型、不会新增历史。真实垫圈需要先被 `LOCATE` 判定为 `ring=1` 后才能进入模型检测；如果真实垫圈被挡在门禁外，应优先查当前帧中心孔是否被曝光、模糊或遮挡压没，而不是继续调整分类模型。 |
+| 生效边界 | 本次不调整 MobileNetV3/UNet 模型、不修改 `uvc_kms_overlay` 亮度阈值、不修改 F4 固件；只是把 MP157 Qt 模型入口的准入条件与垫圈结构特征对齐。代码已改不等于板端生效，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display`。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `ensureCurrentFrameHasLocateTarget()` 解析 `ring/bbox_w/confidence` 且包含 `ringText != QStringLiteral("1")` 拦截分支。 | 若失败，检查模型入口是否又只判断 `has_target`，或 no-ring 错误文本是否没有保留中心孔诊断。 |
+| 空黑传送带连续自检 | 开发板 SSH | `cd /root/qt_camera_display && for i in $(seq 1 20); do echo ---detect_probe_$i---; ./qt_camera_display --detect-self-test; echo rc=$?; done` | 中心 ROI 没有零件时，不应出现任何以 `RESULT ` 开头的模型结果；每次应返回非 0，并提示 `当前 ROI 未识别到零件` 或 `当前 ROI 候选没有中心孔结构`，诊断中可看到 `ring=0` 或 `cand_ring=0`。 | 若出现 `RESULT`，说明板端 Qt 仍是旧二进制或入口门禁失效；先用 `strings /root/qt_camera_display/qt_camera_display | grep '当前 ROI 候选没有中心孔结构'` 验证部署，再查 Qt 日志和 overlay `LOCATE` 回包。 |
+| 真实垫圈检测 | 开发板触摸屏或 SSH | 把垫圈完整放入绿色中心 ROI，确认底部或 `LOCATE` 回包出现 `has_target=1 ring=1` 后点击 `检测`，或执行一次 `./qt_camera_display --detect-self-test`。 | 模型检测继续生成 source JPG、UNet raw/overlay/mask 和本地历史；这说明门禁只阻断 no-ring 黑带候选，没有阻断具备中心孔结构的真实垫圈。 | 若真实垫圈被拦截，先保存当前帧并查看 `ring/confidence/bbox/diag/cand_*`，重点排查中心孔曝光、零件是否完整进入 ROI、相机对焦和 `uvc_kms_overlay` 的 ring 检测。 |
+
+## 2026-07-09 LOCATE ring 假阳性拦截修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 部署 `has_target=1 && ring=1` 模型入口门禁后，板端空传送带连续 `--detect-self-test` 仍有 2 次进入模型。日志显示这两次 overlay 返回 `detect entry LOCATE accepted ... ring "1"`，source JPG 只有黑色传送带和左右白色结构，没有真实零件。根因是旧 `auto_locate_component_has_ring_hole()` 只证明候选中心区域较暗，左右白边夹着中间黑带时也会被误判为“中心孔”。 |
+| 具体改动 | `uvc_kms_overlay.c` 新增 `AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT`，在中心暗窗背景占比和背景对比度之外，继续统计暗窗上、下、左、右四个方向的主体像素比例。只有四边都有足够主体支撑时才返回 `ring=1`；任何一边缺少主体，就按白边夹黑带或支架误检处理。`test_qt_kms_overlay_assets.sh` 增加 `ring_top_body/ring_bottom_body/ring_left_body/ring_right_body` 静态契约，防止 ring 检测退回只看中心暗窗。 |
+| 使用方式变化 | 首页、手动检测和自动流程操作不变。空黑传送带即使因为两侧亮边形成大 bbox，也不应再被判成 `ring=1` 进入模型；真实垫圈中心孔四周有环面主体，仍应返回 `ring=1` 并允许进入后续模型检测。 |
+| 生效边界 | 本次修改的是 `uvc_kms_overlay` 定位进程，必须重新编译并替换板端 `/root/qt_camera_display/uvc_kms_overlay`，只替换 Qt 主程序不会让这条 ring 修复生效。若真实垫圈在强曝光或严重模糊下四边主体不足，可能表现为等待下一帧或提示未识别，需要现场保存原图和 `cand_*` 诊断继续调光照/对焦。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 ring 检测包含 `AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT` 和四个方向的主体计数。 | 若失败，检查 `auto_locate_component_has_ring_hole()` 是否只剩中心暗窗判断，或测试脚本是否没有覆盖四边主体支撑。 |
+| 空黑传送带连续自检 | 开发板 SSH | `cd /root/qt_camera_display && for i in $(seq 1 20); do echo ---detect_probe_$i---; ./qt_camera_display --detect-self-test; echo rc=$?; done` | 中心 ROI 没有零件时，20 次都不应出现 `RESULT `；应返回非 0，并显示未识别或 no-ring 拦截诊断。 | 若仍出现 `RESULT`，先确认板端 `uvc_kms_overlay` 和 `qt_camera_display` 都是新哈希，再保存对应 source JPG 和 LOCATE 回包，判断是假 `ring=1` 还是模型入口绕过。 |
+| 真实垫圈检测 | 开发板触摸屏或 SSH | 放入真实垫圈，让它完整位于绿色中心 ROI 内，再点击 `检测` 或执行 `./qt_camera_display --detect-self-test`。 | LOCATE 应能在垫圈孔四周有主体支撑时返回 `ring=1`，模型检测继续生成结果。 | 若真实垫圈被拦截，先查是否只有一侧亮弧、中心孔被曝光压没或对焦模糊；必要时用保存原图和 `cand_box/cand_conf/cand_ring/diag` 判断是否需要调整光照而不是分类模型。 |
 
 ## 2026-07-09 自动开始清空旧检测结果修复记录
 
@@ -465,6 +501,8 @@
 
 | 时间 | 修改点 | 结果 |
 |---|---|---|
+| 2026-07-09 | 修正 LOCATE ring 假阳性 | 板端空黑传送带自检证明黑带白边偶发会返回 `has_target=1 ring=1`，仅靠模型入口 `ring=1` 门禁不够；`uvc_kms_overlay.c` 的 `auto_locate_component_has_ring_hole()` 新增中心孔上/下/左/右四边主体支撑检查，要求四个方向都有足够主体像素才承认 `ring=1`，避免两条白边夹黑带伪装成垫圈孔。 |
+| 2026-07-09 | 阻断 no-ring 黑色传送带候选进入模型 | `main.cpp` 的 `ensureCurrentFrameHasLocateTarget()` 不再只看 `has_target=1`，而是要求垫圈类候选同时满足 `ring=1`；`has_target=1 ring=0` 会返回“当前 ROI 候选没有中心孔结构”，并带上 `ring/confidence/bbox/diag/cand_*` 现场诊断；静态测试固化检测入口必须解析 `ring/bbox_w/confidence` 并包含 no-ring 拦截分支。 |
 | 2026-07-08 | 修正 LOCATE 任意阶段丢帧后难以重捕获 | `uvc_kms_overlay.c` 不再把 `ring=1` 作为 overlay 全阶段硬门槛，允许 bbox 和置信度足够高的 no-ring 候选返回；`Main.qml` 默认关闭首次 no-ring 建链，首次识别仍以 `ring=1` 建立目标，避免黑色传送带静止反光被当成零件；本轮已经见过目标后继续允许高置信 no-ring 候选保持/重捕获；`main.cpp` 把 `diag/cand_*` 诊断字段传给 QML，底部可直接显示丢失原因。 |
 | 2026-07-08 | 修复铝色零件在黑色传送带上 LOCATE 漏检/误检 | `uvc_kms_overlay.c` 改为先找黑色传送带纵向区域，再在该区域内做亮度直方图 p50/p95 自适应阈值和亮金属主体连通域；暗像素不再参与 BFS，只用于垫圈中心孔/背景判断；最小连通域面积提高到 `80px`；`Main.qml` 恢复实时微调 `90ms` 轮询和 `8px` 切轴防抖；静态测试增加禁止旧 `luma >= bright_threshold || luma <= dark_threshold` 和 `roi_h = frame->frame_height` 回流的契约。 |
 | 2026-07-06 | 修正 Z 轴超时键盘清空仍回到 10 秒 | `Main.qml` 新增 `stepperStepReplaceOnNextDigit`，打开 Z 轴超时键盘后第一次数字键会替换当前 `10`，而不是追加成 `105`；`清空` 键不再把超时字段写回 `10`，而是真正清空输入框，方便直接输入 1~60 秒。 |
