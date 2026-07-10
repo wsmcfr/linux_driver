@@ -8406,7 +8406,7 @@ public:
      *
      * 主要流程：
      *   1. 校验 actuator 和 flags，仍然只允许 0/1/2 或 0xFF。
-     *   2. 组装 ACTUATOR_STOP 负载，协议内容和 sendF4ActuatorStop() 完全一致。
+     *   2. 强制 STOP 使用 cycle_id=0，表示安全停机不绑定当前自动流程号。
      *   3. 不检查 m_f4CommandRunning，也不等待 ACK，只要求后台线程把完整帧写入串口并 tcdrain。
      *
      * 关键原因：
@@ -8414,13 +8414,15 @@ public:
      *   普通 startF4ActuatorCommand() 会拒绝 STOP，现场就会表现为“停止键没有反应”。
      *   这里不抢读 ACK，避免两个后台线程同时读取 `/dev/ttySTM2` 导致回包被错误线程消费；
      *   F4 收到 STOP 后会在自己的摄像头电机队列中插队停止。
+     *   另外旧 F4 固件可能仍按 cycle_id 判断 STOP 是否属于当前流程；cycle_id=0 可以绕开
+     *   MP157 与 F4 自动流程号漂移，让“微调结束/超时/强制停机”优先停住真实电机。
      *
      * 返回值：
      *   true 表示强制停止写入线程已启动；false 表示参数非法或线程创建失败。
      */
     Q_INVOKABLE bool sendF4ActuatorStopNow(int actuator, int flags)
     {
-        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U;
+        const quint16 cycleId = 0U; /* 强制 STOP 使用 cycle_id=0，避免旧 F4 因流程号漂移拒绝安全停机。 */
         QByteArray payload;        /* payload 保存 ACTUATOR_STOP 的固定 4 字节负载。 */
         QString rejectText;        /* rejectText 保存本地参数校验失败原因。 */
 
@@ -8438,7 +8440,7 @@ public:
             return false;
         }
 
-        appendLe16(&payload, cycleId);                         /* cycle_id：自动流程中用于和本轮检测绑定，手动调试通常为 0。 */
+        appendLe16(&payload, cycleId);                         /* cycle_id=0：强制 STOP 是安全命令，不和某一轮检测流程绑定。 */
         payload.append(static_cast<char>(actuator & 0xFF));    /* actuator：0/1/2 指定轴，0xFF 表示全部执行器。 */
         payload.append(static_cast<char>(flags & 0xFF));       /* flags：首版保留，当前填 0。 */
 

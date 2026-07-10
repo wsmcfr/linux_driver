@@ -1174,6 +1174,26 @@ fi
 if ! printf '%s\n' "$z_up_send_block" | grep -q 'sendF4ActuatorPositionMoveWithTimeout'; then
     fail "Z 回升命令必须使用带参数页超时的发送入口，避免默认等待时间和参数页不一致"
 fi
+z_recovery_send_block="$(sed -n '/function autoVisionRequestZUpForRecovery/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$z_recovery_send_block" | grep -q 'sendF4ActuatorPosMove'; then
+    fail "停止/恢复回位的 Z 轴回升不能调用不存在的 sendF4ActuatorPosMove()，否则 QML TypeError 后流程会失败"
+fi
+if ! printf '%s\n' "$z_recovery_send_block" | grep -q 'cameraZMotionTimeoutMs'; then
+    fail "停止/恢复回位的 Z 轴回升必须复用 zMotionTimeoutMs，避免回位阶段无本地超时保护"
+fi
+if ! printf '%s\n' "$z_recovery_send_block" | grep -q 'sendF4ActuatorPositionMoveWithTimeout(2, 1, 0, speed, steps, 0, timeoutMs'; then
+    fail "停止/恢复回位的 Z 轴回升必须使用 sendF4ActuatorPositionMoveWithTimeout(2, 1, 0, ...)"
+fi
+lateral_recovery_send_block="$(sed -n '/function autoVisionRequestLateralReturnForRecovery/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if printf '%s\n' "$lateral_recovery_send_block" | grep -q 'sendF4ActuatorPosMove'; then
+    fail "停止/恢复回位的左右轴归中不能调用不存在的 sendF4ActuatorPosMove()，否则 QML TypeError 后流程会失败"
+fi
+if ! printf '%s\n' "$lateral_recovery_send_block" | grep -q 'autoVisionLateralReturnTimeoutMs'; then
+    fail "停止/恢复回位的左右轴归中必须使用 autoVisionLateralReturnTimeoutMs 作为本地超时保护"
+fi
+if ! printf '%s\n' "$lateral_recovery_send_block" | grep -q 'sendF4ActuatorPositionMoveWithTimeout(1, direction, 0, speed, offsetSteps, 0, timeoutMs'; then
+    fail "停止/恢复回位的左右轴归中必须使用 sendF4ActuatorPositionMoveWithTimeout(1, direction, 0, ...)"
+fi
 z_down_ack_block="$(sed -n '/root.autoVisionActuatorPhase === "z-down"/,/root.autoVisionActuatorPhase.indexOf("fine-tune")/p' "$SCRIPT_DIR/qml/Main.qml")"
 if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionZFocusSettleMs'; then
     fail "Z 下降 ACK 后不能直接等待 3s 对焦；必须先短稳定并用传送带+左右轴复查 ROI 中心"
@@ -1206,11 +1226,51 @@ fi
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeTuneTimeoutMs'; then
     fail "ROI 实时闭环必须限制总微调时长，避免流程拖太久"
 fi
+fine_tune_timeout_block="$(sed -n '/if (elapsedMs >= autoVisionRealtimeTuneTimeoutMs)/,/selectedAxis = autoVisionRealtimeSelectAxis/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_timeout_block" | grep -q 'autoVisionStopRealtimeFineTune'; then
+    fail "ROI 实时闭环超时后必须统一走 STOP 收口，不能继续保持速度微调"
+fi
+if ! printf '%s\n' "$fine_tune_timeout_block" | grep -q '"detect"'; then
+    fail "ROI 实时闭环超时后必须进入自动模型检测流程，不能继续微调、切到对焦等待或停在人工复核"
+fi
+if ! printf '%s\n' "$fine_tune_timeout_block" | grep -q 'true'; then
+    fail "ROI 实时闭环总超时进入模型检测前必须强制发送全部执行器 STOP，避免本地状态轴已清空但物理电机仍在转"
+fi
+if grep -q '模型检测/人工复核' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 实时微调超时文案必须明确进入自动模型检测流程，不能再写成模型检测/人工复核"
+fi
+fine_tune_centered_block="$(awk '/if \(xCentered && yCentered\)/{flag=1} flag{print} flag && /return/{exit}' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_centered_block" | grep -q '"focus"'; then
+    fail "ROI 实时闭环居中通过后必须进入 focus 对焦稳定阶段"
+fi
+if ! printf '%s\n' "$fine_tune_centered_block" | grep -q 'true'; then
+    fail "ROI 实时闭环居中进入 focus 前也必须强制发送全部执行器 STOP，避免模型检测时左右轴仍在速度模式转动"
+fi
+fine_tune_speed_fail_block="$(awk '/autoVisionStopRealtimeFineTune\("实时微调速度命令未启动/{flag=1} flag{print} flag && /\)/{exit}' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_speed_fail_block" | grep -q '"detect"'; then
+    fail "实时微调速度命令未启动时必须进入自动模型检测流程"
+fi
+if ! printf '%s\n' "$fine_tune_speed_fail_block" | grep -q 'true'; then
+    fail "实时微调速度命令未启动并进入检测前必须强制发送全部执行器 STOP，避免残留速度运动"
+fi
 require_grep "已硬停电机，等待 F4" "qml/Main.qml"
 require_grep "requestImmediateAutoControlInterruption" "qml/Main.qml"
 require_fixed_grep "sendF4ActuatorStopNow(255, 0)" "qml/Main.qml"
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeFineTuneLostFrames'; then
     fail "ROI 实时闭环必须区分连续丢目标场景并触发停机收口"
+fi
+fine_tune_lost_block="$(sed -n '/if (!ok || !result || Number(result.has_target) !== 1/,/autoVisionRealtimeFineTuneLostFrames = 0/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_lost_block" | grep -q 'elapsedMs >= autoVisionRealtimeTuneTimeoutMs'; then
+    fail "ROI 实时闭环丢帧分支也必须检查 10 秒总超时，丢帧等待时间不能绕过超时保护"
+fi
+if ! printf '%s\n' "$fine_tune_lost_block" | grep -q '"detect"'; then
+    fail "ROI 实时闭环丢帧累计到总超时后必须进入自动模型检测流程"
+fi
+if ! printf '%s\n' "$fine_tune_lost_block" | grep -q 'ROI 实时闭环丢帧，已停止当前电机'; then
+    fail "ROI 实时闭环单帧丢目标时必须立即停止当前持续运动，不能等目标恢复前继续移动电机"
+fi
+if ! printf '%s\n' "$fine_tune_lost_block" | grep -q '"resume"'; then
+    fail "ROI 实时闭环丢帧但未超时时应 STOP 后继续等待下一帧 LOCATE，不能重置总超时起点"
 fi
 if printf '%s\n' "$fine_tune_block" | grep -q 'var targetY = Math.round(height / 2)'; then
     fail "Z 下降后的 ROI 复查不能继续只用整帧中心；必须按模型 ROI 中心和 bbox 是否完整在 ROI 内共同判定"
@@ -1224,8 +1284,8 @@ fi
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'containmentErrorX'; then
     fail "ROI 实时闭环必须把 bbox 左右越界转换成左右轴误差，确保下降后零件半出 ROI 时仍继续左右微调"
 fi
-if ! grep -q 'property int autoVisionRealtimeTuneTimeoutMs: 3000' "$SCRIPT_DIR/qml/Main.qml"; then
-    fail "实时闭环微调总超时必须默认限制为 3000ms"
+if ! grep -q 'property int autoVisionRealtimeTuneTimeoutMs: 10000' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "实时闭环微调总超时必须默认限制为 10000ms，超过 10 秒必须停机并进入模型检测"
 fi
 if ! grep -q 'property int autoVisionRealtimeCommandGuardMs: 1500' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "实时闭环速度命令必须有 1500ms 本地兜底，避免 ACTUATOR_VEL_MOVE 回调丢失后长期卡住"
@@ -1287,6 +1347,10 @@ actuator_finished_block="$(sed -n '/onF4ActuatorCommandFinished:/,/if (root.step
 if ! printf '%s\n' "$actuator_finished_block" | grep -q 'ACTUATOR_VEL_MOVE'; then
     fail "执行器完成回调必须单独处理实时闭环 ACTUATOR_VEL_MOVE"
 fi
+vel_move_realtime_block="$(sed -n '/if (action === "ACTUATOR_VEL_MOVE") {/,/if (action === "ACTUATOR_STOP_NOW") {/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$vel_move_realtime_block" | grep -q 'root.autoVisionCommandBusy = false'; then
+    fail "ACTUATOR_VEL_MOVE 成功或失败回调必须释放 autoVisionCommandBusy，否则 autoVisionTimer 不会继续 LOCATE，微调会一直按旧方向运行"
+fi
 if ! printf '%s\n' "$actuator_finished_block" | grep -q 'ACTUATOR_STOP_NOW'; then
     fail "执行器完成回调必须单独处理实时闭环 STOP_NOW 收口"
 fi
@@ -1306,6 +1370,19 @@ if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeCommandGuardT
 fi
 if ! printf '%s\n' "$stop_realtime_block" | grep -q 'autoVisionRealtimeStopGuardTimer.restart'; then
     fail "发送 ACTUATOR_STOP_NOW 后必须启动 STOP 收口兜底 Timer"
+fi
+if ! printf '%s\n' "$stop_realtime_block" | grep -q 'forceAllActuators'; then
+    fail "实时微调 STOP 收口必须支持强制全轴 STOP，用于超时后兜住本地状态和物理电机状态不一致"
+fi
+if ! printf '%s\n' "$stop_realtime_block" | grep -q 'stopActuator'; then
+    fail "实时微调 STOP 收口必须用明确的 stopActuator 选择单轴或全部执行器"
+fi
+stop_now_cpp_block="$(sed -n '/Q_INVOKABLE bool sendF4ActuatorStopNow/,/return startF4ActuatorStopNowCommand/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$stop_now_cpp_block" | grep -q 'const quint16 cycleId = 0U'; then
+    fail "sendF4ActuatorStopNow() 必须固定使用 cycle_id=0，让强制 STOP 兼容旧 F4 固件和 cycle 漂移"
+fi
+if ! printf '%s\n' "$stop_now_cpp_block" | grep -q '强制 STOP 使用 cycle_id=0'; then
+    fail "sendF4ActuatorStopNow() 必须在注释中说明强制 STOP 使用 cycle_id=0 的安全原因"
 fi
 if ! printf '%s\n' "$finalize_realtime_block" | grep -q 'autoVisionRealtimeCommandGuardTimer.stop'; then
     fail "实时微调最终收口时必须停止速度命令兜底 Timer"
@@ -1388,6 +1465,8 @@ require_grep "auto_locate_body_threshold_from_delta" "uvc_kms_overlay.c"
 require_grep "auto_locate_measure_belt_row" "uvc_kms_overlay.c"
 require_grep "auto_locate_find_dark_belt_band" "uvc_kms_overlay.c"
 require_grep "auto_locate_expand_belt_band_to_model_roi" "uvc_kms_overlay.c"
+require_grep "AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE" "uvc_kms_overlay.c"
+require_grep "auto_locate_refine_oversized_ring_candidate" "uvc_kms_overlay.c"
 require_absent "luma >= bright_threshold \\|\\| luma <= dark_threshold" "uvc_kms_overlay.c"
 require_absent "roi_h = frame->frame_height;" "uvc_kms_overlay.c"
 require_grep "auto_locate_component_touches_search_edge" "uvc_kms_overlay.c"
@@ -1424,6 +1503,7 @@ locate_filter_block="$(sed -n '/ring_hole 检测作为/,/best_score = score/p' "
 locate_body_block="$(sed -n '/body_threshold = auto_locate_body_threshold_from_delta/,/bbox_w = max_x - min_x/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 locate_roi_select_block="$(sed -n '/if (!auto_locate_find_dark_belt_band/,/pixel_count = roi_w \* roi_h/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 locate_pre_ring_filter_block="$(sed -n '/bbox_w = max_x - min_x/,/ring_hole 检测作为/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
+oversized_bbox_filter_block="$(sed -n '/过大 bbox 先尝试环孔局部收缩/,/LOCATE_DIAG_BBOX/p' "$SCRIPT_DIR/uvc_kms_overlay.c")"
 if ! printf '%s\n' "$locate_body_block" | grep -q 'start_luma, bright_threshold'; then
     fail "LOCATE 必须继续使用高亮阈值作为连通域种子，避免把灰色皮带整体并入候选"
 fi
@@ -1435,6 +1515,12 @@ if ! printf '%s\n' "$locate_roi_select_block" | grep -q 'auto_locate_expand_belt
 fi
 if printf '%s\n' "$locate_pre_ring_filter_block" | grep -q 'LOCATE_DIAG_EDGE'; then
     fail "LOCATE 贴边过滤不能早于 ring_hole 检测，否则真实垫圈与右侧亮边短暂连通时会被 diag=5 一票否决"
+fi
+if ! printf '%s\n' "$oversized_bbox_filter_block" | grep -q 'auto_locate_refine_oversized_ring_candidate'; then
+    fail "LOCATE 过大 bbox 不能在 ring 检测前直接 diag=3 失败，必须先尝试从粘连候选内部收缩出环孔局部 bbox"
+fi
+if ! printf '%s\n' "$oversized_bbox_filter_block" | grep -q 'oversized_refined'; then
+    fail "LOCATE 过大 bbox 收缩结果必须有明确标志，避免收缩失败时误用旧的大 bbox 继续进入模型门禁"
 fi
 if ! printf '%s\n' "$locate_filter_block" | grep -q 'body_threshold'; then
     fail "LOCATE 中心孔检测必须使用 body_threshold 判断背景，不能只按过高的高亮种子阈值判断 ring"

@@ -17,6 +17,63 @@
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
 
+## 2026-07-09 ROI 微调结束全轴停机与回位接口修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场确认 ROI 实时微调超时后已经能进入模型检测，但左右微调电机仍持续转动，导致模型检测阶段电机还在动，后续上下轴回升/停止回位阶段失败。日志还出现 `sendF4ActuatorPosMove is not a function`，说明停止回位序列仍调用了 QML/C++ 不存在的旧接口。 |
+| 具体改动 | `Main.qml` 将 ROI 居中进入 `focus`、速度命令失败进入 `detect` 两条路径都改成 `autoVisionStopRealtimeFineTune(..., true)`，即先发送 `ACTUATOR_STOP_NOW actuator=255` 停全部执行器，再进入对焦或模型检测；停止回位的 Z 轴回升和左右轴归中改用现有 `sendF4ActuatorPositionMoveWithTimeout()`，并分别复用 `zMotionTimeoutMs` 和 `autoVisionLateralReturnTimeoutMs`；`main.cpp` 将 `sendF4ActuatorStopNow()` 固定为 `cycle_id=0`，兼容旧 F4 固件和自动流程号漂移。 |
+| 使用方式变化 | 首页自动流程操作不变。微调结束、微调超时、速度命令异常和模型检测前的收口都会先要求 F4 停全部执行器；停止/恢复回位不会再因为旧接口名抛 QML TypeError。 |
+| 生效边界 | MP157 Qt 主程序必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display` 才生效；QML 已编进二进制，不能只复制 `Main.qml`。F4 源码里 cycle mismatch 安全 STOP 的改动仍需要用户在 F4 工程里编译并下载，代码已写不等于 F4 板上已生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`；脚本会检查 focus/detect 前全轴 STOP、回位不再调用 `sendF4ActuatorPosMove()`、STOP_NOW 固定 `cycle_id=0`。 | 若失败，按脚本第一条 FAIL 排查；如果提示旧接口，检查 `autoVisionRequestZUpForRecovery()` 和 `autoVisionRequestLateralReturnForRecovery()`。 |
+| 板端二进制标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep -E '强制 STOP 使用 cycle_id=0|sendF4ActuatorPositionMoveWithTimeout|ROI 实时闭环居中'` | 能看到新 STOP 或回位接口标记，说明板端运行的是重新编译后的 Qt 二进制。 | 若没有输出，说明板端还是旧二进制；重新同步到虚拟机、交叉编译、替换并重启 Qt 服务。 |
+| 现场自动流程验证 | 开发板触摸屏 + F4 日志 | 点击首页 `开始`，让零件进入 ROI 微调并观察进入对焦/模型检测阶段。 | 微调结束后左右轴和传送带应停止；模型检测时电机不应继续转动；上下轴回升阶段不应再出现 QML `TypeError`。 | 若电机仍转，先查 `/tmp/qt-kms-overlay-shell.log` 是否是新二进制，再查 F4 是否收到 `ACTUATOR_STOP actuator=255 cycle_id=0`，最后确认 F4 固件是否已重新烧录。 |
+
+## 2026-07-09 ROI 实时微调丢帧停机与 F4 全轴 STOP 适配记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md`、`docs/stm32mp157-f407-binary-protocol.md`、`E:\hal\bisai_f407_project\User\App\binary_protocol_service.c` |
+| 修改原因 | 现场在 ROI 实时闭环阶段出现 `ROI 实时闭环超时 51.18 秒` 仍继续微调的现象。根因是丢帧分支只累计丢帧次数，没有先把丢帧等待时间纳入 `autoVisionRealtimeTuneTimeoutMs=10000ms` 的总超时判断；并且单帧丢目标时没有立即停止已启动的 `ACTUATOR_VEL_MOVE` 持续运动，导致摄像头左右轴或传送带可能在没有新视觉反馈时继续转。 |
+| F4 适配结论 | F4 当前源码已经具备主要停机能力：`binary_protocol_service.c` 的 `ACTUATOR_STOP actuator=0xFF` 会同时调用 `ConveyorMotorService_RequestStop()` 和 `CameraMotorService_RequestStopAll()`；传送带服务用长度为 1 的队列和 `xQueueOverwrite()` 让 STOP 覆盖旧命令；摄像头服务把 `STOP_ALL` 插到队首，队列满时会清掉未执行普通命令再投递 STOP。本次额外修正 F4 的 `ACTUATOR_STOP` cycle 处理：即使 `cycle_id` 与当前活动流程不匹配，也先执行停机并打印告警，避免超时兜底被流程号漂移挡住。 |
+| 具体改动 | `Main.qml` 给 `autoVisionStopRealtimeFineTune()` 增加 `forceAllActuators` 参数。普通居中、切轴、切方向仍只停当前运动轴；丢帧但未超时时立即 STOP 当前轴，STOP 回调后继续等待下一帧 `LOCATE`，且不重置实时微调开始时间；丢帧累计耗时超过 10 秒、连续丢目标直接进入检测、速度命令兜底超时和总超时分支都强制发送 `ACTUATOR_STOP_NOW actuator=255`，再进入自动模型检测流程。`binary_protocol_service.c` 中 `ACTUATOR_STOP` 不再因为 cycle mismatch 直接 NACK 返回，而是记录 `[WARN][PROTO] ACTUATOR_STOP ignores cycle mismatch for safety` 后继续投递 STOP。 |
+| 使用方式变化 | 首页自动流程操作不变。Z 轴下降后如果 `LOCATE` 丢帧，电机不再继续盲动；如果丢帧或无效候选持续占满 10 秒总窗口，会显示“丢帧时间已计入 10 秒总超时”，随后停止全部执行器并进入模型检测。 |
+| 生效边界 | MP157 Qt 主程序已重新交叉编译并可直接替换板端 `/root/qt_camera_display/qt_camera_display`；但 F4 源码修改不等于 F4 已编译或已下载生效。用户还需要在 `E:\hal\bisai_f407_project` 中编译并下载 F4 固件，才能让 cycle mismatch 也不停机的安全兜底在 F4 板上生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查丢帧分支包含 `elapsedMs >= autoVisionRealtimeTuneTimeoutMs`、丢帧停当前电机、超时走 `detect`、全轴 STOP 兜底。 | 若失败，先看脚本提示；若提示全轴 STOP 缺失，检查 `autoVisionStopRealtimeFineTune()` 是否仍只向当前轴发送 STOP。 |
+| F4 源码适配检查 | Windows 本地 F4 工程 | `rg -n "BINARY_PROTOCOL_ACTUATOR_ALL|CameraMotorService_RequestStopAll|ConveyorMotorService_RequestStop|xQueueOverwrite|STOP_ALL|ignores cycle mismatch for safety" E:\hal\bisai_f407_project\User\App` | 能看到 `ACTUATOR_STOP actuator=0xFF` 同时停传送带和摄像头两轴，摄像头 STOP 插队，传送带 STOP 覆盖旧命令，并且 cycle mismatch 只告警、不阻断停机。 | 若现场 F4 行为不符，说明板上固件可能不是当前源码版本；重新编译下载 F4 后再看 F4 串口日志。 |
+| 板端丢帧停机验证 | 开发板触摸屏 + F4 日志 | 部署新 `qt_camera_display` 后点击首页 `开始`，在 ROI 实时微调阶段临时制造丢帧或遮挡目标。 | 单帧丢目标时应先出现丢帧提示并停止当前运动轴；未超时会继续等待下一帧 `LOCATE`，总耗时不会清零。 | 若遮挡后电机仍持续转，先确认板端二进制包含 `ROI 实时闭环丢帧，已停止当前电机` marker，再查 F4 是否收到 `ACTUATOR_STOP`。 |
+| 板端 10 秒总超时验证 | 开发板触摸屏 + F4 日志 | 让零件长时间不进 ROI 中心，或持续遮挡让 `LOCATE` 丢帧。 | 约 10 秒后应发送 `ACTUATOR_STOP actuator=0xFF`，提示停止全部执行器并进入自动模型检测流程，不应继续调到几十秒。 | 若仍显示几十秒，说明板端运行旧 Qt 二进制或 `ACTUATOR_STOP_NOW` 回调/兜底没有收口；查看 `/tmp/qt-kms-overlay-shell.log` 和 F4 USART1 日志。 |
+
+## 2026-07-09 LOCATE 过大粘连候选收缩修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/uvc_kms_overlay.c`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | ROI 实时微调超时后进入模型检测前，屏幕显示 `检测失败`。板端告警日志实际为 `当前 ROI 未识别到零件；diag=3 roi=0/390 cand_box=300x261 cand_conf=0 cand_ring=0`，含义不是模型判坏，而是 overlay `LOCATE` 在模型入口前把当前帧拦下。根因是垫圈与右侧白色支架、高光或亮背景粘成了 `300x261` 的大连通域，旧逻辑在中心孔识别前就按 `AUTO_LOCATE_MAX_BBOX_SIDE=260` 直接 `diag=3` 失败，导致明明画面有垫圈却不能进入模型。 |
+| 具体改动 | `uvc_kms_overlay.c` 新增过大候选局部收缩逻辑：当 bbox 超过 `260px` 时，不再立刻失败，而是在大候选内部扫描“暗中心 + 上/下/左/右金属主体支撑”的环孔位置，收缩成最大 `210x210` 的局部候选，并重新统计面积、密度、亮度、色度和边界指标。收缩窗口再次通过 `auto_locate_component_has_ring_hole()` 后才允许继续后续过滤；如果找不到环孔局部，仍按 `diag=3` 拒绝，避免整片白支架或黑色传送带被放行。`test_qt_kms_overlay_assets.sh` 新增静态契约，禁止以后把过大 bbox 又改回 ring 检测前一票否决。 |
+| 使用方式变化 | 首页和自动流程操作不变。真实垫圈已经在绿色 ROI 内、但因为支架/高光粘连导致 `cand_box≈300x261` 时，overlay 应先尝试收缩出垫圈局部 bbox；收缩成功后模型入口不应再显示“当前 ROI 未识别到零件”。没有中心孔结构的大块黑带、白支架或背景粘连仍应被拒绝。 |
+| 生效边界 | 本次修改的是板端 `uvc_kms_overlay` 定位进程，不修改 Qt 主程序、不修改模型、不修改 F4 固件。代码已写不等于板端生效；必须重新交叉编译并替换板端 `/root/qt_camera_display/uvc_kms_overlay`，再重启 overlay/Qt 服务。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 `AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE`、`auto_locate_refine_oversized_ring_candidate()` 和“过大 bbox 先尝试环孔局部收缩”路径。 | 若失败，说明过大 bbox 仍可能在 ring 检测前直接 `diag=3`；先恢复 overlay 收缩 helper 和 bbox 过滤块。 |
+| overlay 交叉编译 | 虚拟机 `/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display` | `./build_uvc_kms_overlay.sh` | 生成 `build-mp157/uvc_kms_overlay`，编译无错误；脚本应继续使用 `OVERLAY_CC`，不继承 ST Qt SDK 的 `CC`。 | 若编译失败，先看 `uvc_kms_overlay.c` 新增 helper 的变量类型、无符号边界和 libdrm/libjpeg/libpng 依赖。 |
+| 板端 LOCATE 直连验证 | 开发板 SSH | `printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock` | 垫圈在绿色 ROI 内且日志曾出现 `cand_box=300x261` 的场景下，应尽量返回 `has_target=1 ring=1 bbox<=210x210`，不应长期停在 `has_target=0 diag=3 cand_box=300x261`。 | 若仍 `diag=3`，先保存当前帧，确认是否真有中心孔和四边主体支撑；若没有环孔结构，说明是支架/黑带粘连，不能放宽为直接通过。 |
+| 自动流程回归 | 开发板触摸屏 + 日志 | 重新部署 `uvc_kms_overlay` 后点击首页 `开始`，让零件完成 Z 下降和 ROI 微调，等待进入模型检测。 | 微调超时或居中后应停止微调并进入模型检测；真实垫圈在 ROI 中央时不应再因为 `diag=3 cand_box=300x261` 显示“当前 ROI 未识别到零件”。 | 若仍检测失败，先看 `/mnt/sdcard/logs/qt_alarm_*.log` 中的 `diag/cand_box/cand_ring/bbox/ring`，区分是 bbox 过大、ring 未通过、QML 最大面积过滤还是模型入口门禁。 |
+
 ## 2026-07-09 空转黑色传送带突起误识别加严记录
 
 | 项目 | 内容 |
@@ -145,14 +202,33 @@
 | 板端 overlay 直连验证 | 开发板 SSH | 使用临时 Unix socket 客户端连续发送 `LOCATE`，或在板端有 `nc -U` 时执行 `printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock`。 | 垫圈静止在绿色中心 ROI 内时，连续回包应稳定出现 `has_target=1`，bbox 高度不应再长期停在约 `55px` 的长条候选。 | 若仍 `has_target=0 diag=4`，先保存 `SAVE_DETECT /mnt/sdcard/images` 当前帧，确认垫圈是否完整处在中心 `300x300` ROI；再看 `roi_y/roi_h/thr/cand_box/cand_conf/cand_ring`。 |
 | 板端自动流程验证 | 开发板触摸屏 + F4 日志 | 重启 KMS overlay 服务后点击首页 `开始`，让零件进入摄像头中心 ROI。 | 首页底部应从“尚未识别到零件”进入自动视觉坐标显示，随后完成居中停机、Z 下降和 ROI 实时微调；不应在垫圈清楚可见时频繁掉到未识别。 | 若首页仍掉识别，先区分 overlay 直连是否已经 `has_target=1`；若直连正常但首页丢，继续查 QML 的首次建链 `ring/conf/bbox` 二次过滤。 |
 
+## 2026-07-09 ROI 实时微调持续右转与 10 秒超时修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场在 Z 轴下降后进入 ROI 实时微调时，垫圈只略偏右，但左右轴会一直按第一次计算出的 `direction=1` 右转，已经经过 ROI 中心也不停，并且超时保护没有进入模型检测。根因是 `ACTUATOR_VEL_MOVE` 回调成功后只停止了命令兜底 Timer，没有把 `autoVisionCommandBusy` 清回 `false`；而 `autoVisionTimer` 在 `autoVisionCommandBusy=true` 时会直接跳过 `LOCATE`，导致后续误差不再刷新，居中判断和超时判断都进不到。 |
+| 具体改动 | `Main.qml` 在实时微调的 `ACTUATOR_VEL_MOVE` 完成回调中立即执行 `root.autoVisionCommandBusy = false`，把“速度命令是否已经写入 F4”和“电机是否仍在持续运动”分开；电机持续运动状态继续由 `autoVisionRealtimeFineTuneAxis/Direction/Speed` 表示，后续每约 `90ms` 继续请求 `LOCATE`。同时把 `autoVisionRealtimeTuneTimeoutMs` 默认调整为 `10000ms`，超过 10 秒会发送 STOP，停止微调并进入自动模型检测流程；静态测试新增 busy 释放、10 秒超时和超时后走 `detect` 的契约。 |
+| 使用方式变化 | 首页自动流程操作不变。Z 轴下降后，底部 `实时微调：... elapsed=...ms` 应持续刷新；零件误差进入死区时会 STOP 并进入 3 秒对焦，若 10 秒仍未对齐会 STOP，不再继续微调，直接进入后续自动模型检测流程，不应再出现一直右转或一直等待超时却不收口。 |
+| 生效边界 | 本次只修改 MP157 Qt/QML 自动流程、静态测试和模块文档，不修改 F4 固件、MP157-F4 二进制协议、ESP32S3 机械臂协议或 KMS overlay 识别算法。代码已写不等于板端生效；`Main.qml` 编进 Qt resource，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display` 后才会在屏幕上生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查实时微调超时为 `10000ms`、`ACTUATOR_VEL_MOVE` 回调释放 `autoVisionCommandBusy`。 | 若失败，先看脚本提示；若提示 busy 未释放，检查 `onF4ActuatorCommandFinished` 的 `ACTUATOR_VEL_MOVE` 分支是否含 `root.autoVisionCommandBusy = false`。 |
+| 工作区格式检查 | Windows 仓库根目录 | `git diff --check` | 不应出现尾随空格、冲突标记或空白错误。 | 若失败，按输出文件和行号修复；CRLF 提示不是逻辑错误。 |
+| 板端持续微调验证 | 开发板触摸屏 + F4 日志 | 重新部署新 `qt_camera_display` 后点击首页 `开始`，让垫圈在 Z 下降后略偏 ROI 右侧，观察底部状态和 F4 `ACTUATOR_VEL_MOVE/ACTUATOR_STOP` 日志。 | 底部 `elapsed=...ms`、`errorX=...` 应持续变化；垫圈到中心后应发送 STOP 并进入对焦，不应一直右转。 | 若底部 `elapsed` 不刷新，先确认板端二进制包含 `ACTUATOR_VEL_MOVE 的 ACK 只代表速度命令已经写入 F4` marker；若刷新但方向仍越调越远，再查参数页左右轴方向、F4 方向映射和电机接线。 |
+| 板端 10 秒超时验证 | 开发板触摸屏 + F4 日志 | 人为让零件长时间不进中心，或让左右轴/传送带无法实际改变画面误差，然后观察 ROI 实时微调阶段。 | 约 10 秒应出现“ROI 实时闭环超时 ... 秒”，随后发送 `ACTUATOR_STOP`，不再继续微调，并进入自动模型检测流程。 | 若 10 秒后仍不停，先看底部是否还显示 `elapsed`；若 `elapsed` 卡住，说明 LOCATE 轮询仍被 busy 或 locateBusy 挡住；若 `elapsed` 继续增长但没有 STOP，检查板端是否仍运行旧二进制。 |
+
 ## 2026-07-08 Z 下降后 ROI 微调与超时收口修复记录
 
 | 项目 | 内容 |
 |---|---|
 | 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
-| 修改原因 | 现场出现两个新问题：一是上下电机下降后，如果垫圈只有中心点接近但 bbox 没有完整进入绿色中心 ROI，旧 QML 仍可能判定 ROI 通过并直接进入模型检测；二是 ROI 实时微调超时后，如果 `ACTUATOR_VEL_MOVE` 或 `ACTUATOR_STOP_NOW` 回调丢失，`autoVisionCommandBusy` 或 `pendingNextStage` 会让界面长时间停在“停止微调并进入模型检测/人工复核”附近。 |
+| 修改原因 | 现场出现两个新问题：一是上下电机下降后，如果垫圈只有中心点接近但 bbox 没有完整进入绿色中心 ROI，旧 QML 仍可能判定 ROI 通过并直接进入模型检测；二是 ROI 实时微调超时后，如果 `ACTUATOR_VEL_MOVE` 或 `ACTUATOR_STOP_NOW` 回调丢失，`autoVisionCommandBusy` 或 `pendingNextStage` 会让界面长时间停在“停止微调并进入自动模型检测流程”附近。 |
 | 具体改动 | `Main.qml` 新增 `autoVisionFineTuneModelRoiGeometry()`、`autoVisionFineTuneBboxContainmentError()` 和 `autoVisionFineTuneApplyContainmentError()`：Z 下降后的 ROI 复查不再只看整帧中心，而是按中心 `300x300` 模型 ROI 计算中心误差，并检查 `bbox_x/bbox_y/bbox_w/bbox_h` 四边是否完整落在 ROI 安全边距内；如果 bbox 越界，会强制生成大于死区的 X/Y 误差继续左右轴或传送带实时微调。另新增 `autoVisionRealtimeCommandGuardTimer` 和 `autoVisionRealtimeStopGuardTimer`，分别兜底速度命令回调丢失和 STOP 收口回调丢失。 |
-| 使用方式变化 | 首页自动流程操作不变。Z 下降后底部状态会显示 `roi=...` 和 `contain=Y/X`，当垫圈半出绿色 ROI 时不会立即出现“ROI 实时闭环通过”，而是继续按主误差轴点动；微调超时或命令回调异常时，约 1.2~1.5 秒内会按 MP157 本地状态继续进入模型检测/人工复核，不再无限卡住。 |
+| 使用方式变化 | 首页自动流程操作不变。Z 下降后底部状态会显示 `roi=...` 和 `contain=Y/X`，当垫圈半出绿色 ROI 时不会立即出现“ROI 实时闭环通过”，而是继续按主误差轴点动；微调超时或命令回调异常时，会按 MP157 本地状态停止微调并进入自动模型检测流程，不再无限卡住。 |
 | 生效边界 | 本次只修改 MP157 Qt/QML 自动流程和静态测试，不修改 `uvc_kms_overlay.c`、MP157-F407 二进制协议、F4 固件或 ESP32S3 机械臂协议。代码已写不等于板端生效；`Main.qml` 编进 Qt resource，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display` 后才会在屏幕上生效。 |
 
 ### 本次验证方式
@@ -162,7 +238,7 @@
 | 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并检查 ROI bbox 包含判定、速度命令兜底 Timer、STOP 收口兜底 Timer 都存在。 | 若失败，按脚本提示检查 `autoVisionFineTuneModelRoiGeometry`、`autoVisionFineTuneBboxContainmentError`、`autoVisionRealtimeCommandGuardTimer` 或 `autoVisionRealtimeStopGuardTimer` 是否被删改。 |
 | 工作区格式检查 | Windows 仓库根目录 | `git diff --check` | 不应出现尾随空格、冲突标记或空白错误。 | 若失败，按输出文件和行号修复；CRLF 提示不是逻辑错误。 |
 | 板端 ROI 完整进入验证 | 开发板触摸屏 + F4 日志 | 重新部署新 `qt_camera_display` 后，点击首页 `开始`，让垫圈在 Z 下降后停在绿色 ROI 边缘，观察底部状态和 F4 收到的 `ACTUATOR_VEL_MOVE actuator=0/1`。 | 垫圈 bbox 未完全进入 ROI 时，底部应显示 `contain=...` 非零并继续 `左右实时微调` 或 `传送带实时微调`；只有 bbox 和中心误差都满足后才显示“ROI 实时闭环通过”并进入对焦稳定。 | 若仍直接检测，先确认板端二进制包含 `autoVisionFineTuneBboxContainmentError` 字符串；若包含但方向不对，再查参数页左右轴方向、F4 方向映射和电机接线。 |
-| 板端超时收口验证 | 开发板触摸屏 + F4 日志 | 人为让零件长时间不进中心，或临时断开/屏蔽 F4 回包后观察 ROI 实时微调超时。 | 约 3 秒触发“ROI 实时闭环超时”，随后 1.2~1.5 秒内应继续进入模型检测/人工复核，不应长时间停在等待 STOP 或等待综合判定前。 | 若仍卡住，查看底部是否仍显示 `autoVisionCommandBusy` 相关状态；再查 F4 是否收到 `ACTUATOR_STOP`、Qt 日志是否有 `STOP 收口等待 ... 未回调`。 |
+| 板端超时收口验证 | 开发板触摸屏 + F4 日志 | 人为让零件长时间不进中心，或临时断开/屏蔽 F4 回包后观察 ROI 实时微调超时。 | 当前版本约 10 秒触发“ROI 实时闭环超时”，随后应停止微调并进入自动模型检测流程，不应长时间停在等待 STOP 或等待综合判定前。 | 若仍卡住，查看底部是否仍显示 `autoVisionCommandBusy` 相关状态；再查 F4 是否收到 `ACTUATOR_STOP`、Qt 日志是否有 `STOP 收口等待 ... 未回调`。 |
 
 ## 2026-07-08 LOCATE 任意阶段丢帧后重捕获修复记录
 
@@ -279,17 +355,17 @@
 |---|---|
 | 修改文件 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md`、`docs/plans/2026-07-07-mp157-auto-vision-realtime-fine-tune-design.md`、`docs/plans/2026-07-07-mp157-auto-vision-realtime-fine-tune.md` |
 | 修改原因 | 旧流程在 Z 轴下降后采用“单次位置微调 -> 等 ACK/DONE -> 短等待 -> 再 LOCATE”的离散链路，导致微调慢、最多 6 次时总耗时高，而且现场出现“误差几乎不变、电机看起来没动”的排障困难。本次改为基于实时 `LOCATE` 的 `ACTUATOR_VEL_MOVE/ACTUATOR_STOP` 闭环点动，补齐主误差轴选择、切轴/切向 STOP 收口、无改善自动升速、连续丢目标退出、左右轴运行时位移估算和 3 秒内快速回位。 |
-| 使用方式变化 | Z 轴下降完成后，Qt 会重新启动 `LOCATE` 轮询并进入 `ROI实时微调`；当前帧误差较大的主轴会持续点动，进入死区、切轴、切向、连续丢目标或总时长超过 3 秒时立即 STOP；模型检测完成且 Z 轴回升后，如左右轴本轮发生净偏移，会按估算偏移做一次 3 秒内快速回位。 |
+| 使用方式变化 | Z 轴下降完成后，Qt 会重新启动 `LOCATE` 轮询并进入 `ROI实时微调`；当前帧误差较大的主轴会持续点动，进入死区、切轴、切向、连续丢目标或总时长超过 10 秒时立即 STOP；模型检测完成且 Z 轴回升后，如左右轴本轮发生净偏移，会按估算偏移做一次 3 秒内快速回位。 |
 
 ### 本次验证方式
 
 | 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
 |---|---|---|---|---|
-| 静态契约通过 | Windows 仓库 | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，说明实时闭环 marker、快速回位 marker 和 3 秒保护 marker 都在源码中 | 若失败，先看脚本提示缺哪个 marker，再对照 `qml/Main.qml` 是否漏改阶段名或属性名 |
+| 静态契约通过 | Windows 仓库 | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，说明实时闭环 marker、快速回位 marker 和 10 秒保护 marker 都在源码中 | 若失败，先看脚本提示缺哪个 marker，再对照 `qml/Main.qml` 是否漏改阶段名或属性名 |
 | 工作区格式检查 | Windows 仓库 | `git diff --check` | 不应出现尾随空格、TAB/空白错误；当前可能只看到 Git 的 CRLF 提示，不属于逻辑错误 | 若出现真正 diff 错误，先修复对应行再重新检查 |
 | 板端实时微调 | 开发板首页 + F4 日志 | 首页按 `开始`，让零件在 ROI 中心外落下并观察底部状态 | 底部状态应出现 `实时微调：axis=... errorY=... errorX=... speed=...`，而不是老的“第 N 次短步微调”；误差应随持续点动明显变化 | 若状态只显示切换/超时但误差不降，先检查 F4 是否真的收到 `ACTUATOR_VEL_MOVE actuator=0/1`，再查速度、方向、驱动器地址和接线 |
 | 板端快速回位 | 开发板首页 + F4 日志 | 让左右轴实时微调明显偏离后完成一次完整检测链路 | Z 轴回升后应出现 `returnSpeed=... timeout=3000ms` 的快速回位提示，回位明显快于旧版本 | 若仍慢，检查参数页左右轴 `normal_speed_rpm` 是否过低，以及回位速度倍率是否已进入新二进制 |
-| 超时保护 | 开发板首页 | 人为制造零件长时间不进中心或电机不动作 | 约 3 秒内应出现“实时闭环超时”提示，并进入模型检测/人工复核，而不是长时间反复调 6 次 | 若超过 3 秒还在反复微调，检查板端二进制是否已替换为新版本，并确认状态文本包含 `elapsed=` |
+| 超时保护 | 开发板首页 | 人为制造零件长时间不进中心或电机不动作 | 约 10 秒内应出现“实时闭环超时”提示，并进入自动模型检测流程，而不是长时间反复微调 | 若超过 10 秒还在反复微调，检查板端二进制是否已替换为新版本，并确认状态文本包含 `elapsed=` |
 
 ## 2026-07-07 历史图片与长内容滑动体验优化记录
 
@@ -340,7 +416,7 @@
 | 模块目录 | `20_uvc_camera/qt_camera_display/` |
 | 默认 UI 技术 | Qt Quick/QML + eglfs + Vivante galcore OpenGL ES。 |
 | 当前正式视频路线 | Qt UI 运行在 primary surface，`uvc_kms_overlay` 运行在 KMS overlay plane 36，默认 `640x480@10fps`。 |
-| 自动视觉居中路线 | 首页按 `开始` 且 F4 `START_CYCLE` ACK 后，QML 启动 `autoVisionTimer`，每 100ms 通过 overlay socket 发送 `LOCATE`；`uvc_kms_overlay` 读取原始 YUYV 中水平居中的 300px 宽搜索带，先按行寻找连续黑色传送带纵向区域，只在该暗色传送带区域内使用亮度直方图 p50/p95 生成自适应亮阈值，只让铝色零件的亮金属主体进入连通域，暗像素只作为中心孔/背景证据，再用密度范围、中心孔采样、贴边和长宽比过滤黑色传送带高光误识别，并返回零件中心和 bbox；MP157 使用上方来料规则，把 `center_y` 作为 `VISION_POS.axis_px`、`height/2` 作为 `target_px` 下发 F4，由传送带完成上料和前后居中；传送带 SCAN 使用参数页 `scan_speed_rpm`，零件入画后的 TRACK 使用 `normal_speed_rpm`，自动流程不再固定限制到 40rpm；连续 3 帧满足 `abs(center_y-height/2)<=24px` 后发送 `BELT_STOP_CENTERED`；随后下发 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN` 让上下轴下降固定步数，C++ 会先等 ACK，再等同一 `related_seq` 的 F4 `EVENT_REPORT actuator-move-done`，其中 `status=0(reached-ack)` 表示 F4 收到张大头主动到位回包，`status=5(estimated-done)` 表示 F4 或 MP157 按速度、步数和安全余量估算完成；如果 F4 事件没有及时回来，MP157 会从本次实际发送的 `ACTUATOR_POS_MOVE` 帧内读取 `speed_rpm` 和 `steps`，并用参数页摄像头上下电机的 `z_motion_timeout_ms` 作为最大等待上限计算 `mp157-local-estimated-done` 本地兜底完成；QML 拿到 F4 完成事件或 MP157 本地兜底完成详情后进入 `ROI实时微调`：继续按约 `90ms` 轮询 `LOCATE`，比较 `errorX/errorY` 选出主误差轴，并通过 `ACTUATOR_VEL_MOVE actuator=0/1` 做持续闭环点动；切轴、切方向、进入死区、连续丢目标或总微调时长超过 `3000ms` 时，统一通过 `sendF4ActuatorStopNow()` 写入 `ACTUATOR_STOP` 收口；速度按误差档位和连续无改善次数动态升速，不再依赖“最多 6 次固定位置微调”；确认 X/Y 都在 ROI 检测中心后才进入 `focus-settle` 等待约 3 秒，再复用现有 `检测` 链路运行双模型；模型检测完成后自动下发 `ACTUATOR_POS_MOVE actuator=2 direction=UP`，同样使用 `z_motion_timeout_ms` 限制等待 F4 DONE 或 MP157 本地兜底完成的最长时间；如果本轮左右轴实时微调估算出了净偏移，Z 轴回升后会按累计偏移反向发送一次 `ACTUATOR_POS_MOVE actuator=1` 快速回位，回位速度单独放大且等待上限限制为 `3000ms`，把相机退回黑色传送带两边大致对齐的基准位置；如果左右轴没有动过，则不发送回中动作；最后再下发 `MODEL_READY/ARM_JOB_START` 通知 F4 和 ESP32S3 机械臂。 |
+| 自动视觉居中路线 | 首页按 `开始` 且 F4 `START_CYCLE` ACK 后，QML 启动 `autoVisionTimer`，每 100ms 通过 overlay socket 发送 `LOCATE`；`uvc_kms_overlay` 读取原始 YUYV 中水平居中的 300px 宽搜索带，先按行寻找连续黑色传送带纵向区域，只在该暗色传送带区域内使用亮度直方图 p50/p95 生成自适应亮阈值，只让铝色零件的亮金属主体进入连通域，暗像素只作为中心孔/背景证据，再用密度范围、中心孔采样、贴边和长宽比过滤黑色传送带高光误识别，并返回零件中心和 bbox；MP157 使用上方来料规则，把 `center_y` 作为 `VISION_POS.axis_px`、`height/2` 作为 `target_px` 下发 F4，由传送带完成上料和前后居中；传送带 SCAN 使用参数页 `scan_speed_rpm`，零件入画后的 TRACK 使用 `normal_speed_rpm`，自动流程不再固定限制到 40rpm；连续 3 帧满足 `abs(center_y-height/2)<=24px` 后发送 `BELT_STOP_CENTERED`；随后下发 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN` 让上下轴下降固定步数，C++ 会先等 ACK，再等同一 `related_seq` 的 F4 `EVENT_REPORT actuator-move-done`，其中 `status=0(reached-ack)` 表示 F4 收到张大头主动到位回包，`status=5(estimated-done)` 表示 F4 或 MP157 按速度、步数和安全余量估算完成；如果 F4 事件没有及时回来，MP157 会从本次实际发送的 `ACTUATOR_POS_MOVE` 帧内读取 `speed_rpm` 和 `steps`，并用参数页摄像头上下电机的 `z_motion_timeout_ms` 作为最大等待上限计算 `mp157-local-estimated-done` 本地兜底完成；QML 拿到 F4 完成事件或 MP157 本地兜底完成详情后进入 `ROI实时微调`：继续按约 `90ms` 轮询 `LOCATE`，比较 `errorX/errorY` 选出主误差轴，并通过 `ACTUATOR_VEL_MOVE actuator=0/1` 做持续闭环点动；切轴、切方向、进入死区、连续丢目标或总微调时长超过 `10000ms` 时，统一通过 `sendF4ActuatorStopNow()` 写入 `ACTUATOR_STOP` 收口；速度按误差档位和连续无改善次数动态升速，不再依赖“最多 6 次固定位置微调”；确认 X/Y 都在 ROI 检测中心后才进入 `focus-settle` 等待约 3 秒，再复用现有 `检测` 链路运行双模型；模型检测完成后自动下发 `ACTUATOR_POS_MOVE actuator=2 direction=UP`，同样使用 `z_motion_timeout_ms` 限制等待 F4 DONE 或 MP157 本地兜底完成的最长时间；如果本轮左右轴实时微调估算出了净偏移，Z 轴回升后会按累计偏移反向发送一次 `ACTUATOR_POS_MOVE actuator=1` 快速回位，回位速度单独放大且等待上限限制为 `3000ms`，把相机退回黑色传送带两边大致对齐的基准位置；如果左右轴没有动过，则不发送回中动作；最后再下发 `MODEL_READY/ARM_JOB_START` 通知 F4 和 ESP32S3 机械臂。 |
 | 检测历史路线 | 每次点击 `检测` 后，Qt 控制器后台依次执行当前帧 JPG 保存、MobileNetV3-Small 分类、UNet 分割，并先追加 `upload_status=LOCAL_READY` 的本地历史，不再在模型刚结束时直接上传云端；分类完成信号先刷新首页零件类型和类别，双模型完成信号再刷新 `fused_status/fused_result/fused_reason` 与 `total_time_ms`；自动流程中，Z 轴回升后 MP157 下发 `MODEL_READY 0x32` 和 `ARM_JOB_START 0x31`，等待 F4 回传 `WEIGHT_RESULT/LDC_RESULT` 后，把 `weight_context_json`、`ldc_context_json`、`f4_flow_context_json`、`decision_context_json`、`vision_context_json` 写回同一条 `/mnt/sdcard/images/upload_history_YYYYMMDD.json`，再一次性上传 source/annotated 图片、模型结果、重量、电感和流程上下文；上传成功后下发 `FINAL_SORT_RESULT` 按云端结果分拣，上传失败时历史保留可在历史页完整重传，并下发 `FINAL_SORT_RESULT upload_status=2 final_result=3 final_bin=3` 让零件进入待复核盘；启动时兼容读取旧 `/mnt/sdcard/images/upload_history.json` 和多天 `upload_history_*.json`，历史页/统计页仍汇总显示多天记录；云端 `records.result` 由分类和 UNet 综合结果映射为 `good/bad/review`，云端 `records.part_id` 由分类 `class=` 去掉 `_good/_bad` 后得到的零件类型映射，良品和坏品不能拆成两个零件类型。 |
 | 统计分析路线 | 左侧 `统计分析` 页面直接读取本地 `uploadHistory` 模型，汇总总记录、良品/待复核、上传成功率、图片数量、文件大小、最近检测趋势和云端状态；`分布概览` 用两列显示，左列是良品/坏品/待复核，右列是上传成功/上传失败，避免五条统计在 160px 面板中纵向越界；最近记录卡片内支持竖向滑动查看更多记录；当前统计基于双模型检测历史。 |
 | 手动控制路线 | 左侧 `手动控制` 页面提供传送带、检测辅助、安全状态、人工复核和命令日志；手动电机控制入口打开 `manualMotorPopup` 三页弹窗，第一页控制传送带，第二页控制摄像头左右轴，第三页控制摄像头上下轴；传送带和左右轴方向按钮通过 `/dev/ttySTM2` 向 F407 下发 `ACTUATOR_VEL_MOVE`，点击一次持续运动，停止按钮通过 `sendF4ActuatorStopNow()` 先递增 STOP 代际，再直接写入 `ACTUATOR_STOP` 帧并 `tcdrain()`，不等待上一条普通运动 ACK；普通执行器线程写运动帧前和位置等待期间会检查 STOP 代际，防止旧运动帧晚于 STOP 写出后重新启动电机；左右轴按钮显示为 `左移/右移`，传送带按钮仍显示 `后退/前进`；上下轴方向按钮仍下发 `ACTUATOR_POS_MOVE`，下降取 `zDownFixedSteps`，上升取 `zUpFixedSteps`，`回原位` 按最近一次设零后的本地偏移反向移动；如果上一条上下轴动作还在等待 ACK、DONE 或 MP157 本地估算完成，`回原位` 会提示等待上一条动作完成，不再误报已经在零点；模拟急停下发 `ACTUATOR_STOP actuator=0xFF`，同样走强制写入通道；传送带仍保留 `BELT_MANUAL_CONTROL/QUERY_STATUS` 巡航、停止和状态查询语义；安全状态区域使用 `manualSafetyFlickable` 可滑动查看，避免底部按钮遮挡长文本。 |
@@ -539,15 +615,18 @@
 
 | 时间 | 修改点 | 结果 |
 |---|---|---|
+| 2026-07-09 | 修正 ROI 实时微调丢帧仍移动和超时不停 | `Main.qml` 的丢帧分支先检查 10 秒总超时，丢帧时间不再绕过超时保护；未超时但当前有持续运动时立即 STOP 当前轴并继续等下一帧；总超时、连续丢目标和速度命令兜底进入检测前统一发 `ACTUATOR_STOP_NOW actuator=255`。F4 `ACTUATOR_STOP` 同步改为 cycle mismatch 时仍先停机并打印告警，避免安全 STOP 被流程号漂移挡住。 |
+| 2026-07-09 | 修正 LOCATE 过大粘连候选导致真实垫圈检测失败 | 板端模型入口前失败日志为 `diag=3 cand_box=300x261`，说明真实垫圈和右侧白色支架/高光粘成大连通域后，在 ring 检测前被 bbox 上限一票否决。`uvc_kms_overlay.c` 新增过大候选局部环孔收缩，先从大候选内部寻找“暗中心 + 四边主体支撑”的垫圈局部 bbox，最大收缩到 `210x210` 并重算面积、密度和置信度；找不到环孔时仍按 `diag=3` 拒绝。 |
 | 2026-07-09 | 加严空转黑色传送带突起过滤 | 板端空 ROI 自检显示当前突起典型诊断为 `diag=5 cand_box≈130x179 cand_conf=100 cand_ring=0`。`uvc_kms_overlay.c` 将 ring 四边主体支撑提高到 `18%` 并新增 ring 最小 bbox 边长 `45px`；`Main.qml` 首次建链拒绝过小 `ring=1` 候选，并把中等尺寸 no-ring 黑带突起标记为 `black_belt=1`；`main.cpp` 模型入口也拒绝过小 `ring=1` 候选，防止小突起绕过中心孔门禁。 |
 | 2026-07-09 | 修正 LOCATE ring 假阳性 | 板端空黑传送带自检证明黑带白边偶发会返回 `has_target=1 ring=1`，仅靠模型入口 `ring=1` 门禁不够；`uvc_kms_overlay.c` 的 `auto_locate_component_has_ring_hole()` 新增中心孔上/下/左/右四边主体支撑检查，要求四个方向都有足够主体像素才承认 `ring=1`，避免两条白边夹黑带伪装成垫圈孔。 |
+| 2026-07-09 | 修正 ROI 实时微调持续右转和超时不生效 | `Main.qml` 在 `ACTUATOR_VEL_MOVE` 完成回调中释放 `autoVisionCommandBusy`，避免速度命令 ACK 后 `autoVisionTimer` 一直被“命令忙”挡住而不再请求 `LOCATE`；实时微调总超时默认改为 `10000ms`，超过 10 秒会 STOP，停止微调并进入自动模型检测流程；静态测试新增该 busy 释放和超时后走 `detect` 的契约。 |
 | 2026-07-09 | 阻断 no-ring 黑色传送带候选进入模型 | `main.cpp` 的 `ensureCurrentFrameHasLocateTarget()` 不再只看 `has_target=1`，而是要求垫圈类候选同时满足 `ring=1`；`has_target=1 ring=0` 会返回“当前 ROI 候选没有中心孔结构”，并带上 `ring/confidence/bbox/diag/cand_*` 现场诊断；静态测试固化检测入口必须解析 `ring/bbox_w/confidence` 并包含 no-ring 拦截分支。 |
 | 2026-07-08 | 修正 LOCATE 任意阶段丢帧后难以重捕获 | `uvc_kms_overlay.c` 不再把 `ring=1` 作为 overlay 全阶段硬门槛，允许 bbox 和置信度足够高的 no-ring 候选返回；`Main.qml` 默认关闭首次 no-ring 建链，首次识别仍以 `ring=1` 建立目标，避免黑色传送带静止反光被当成零件；本轮已经见过目标后继续允许高置信 no-ring 候选保持/重捕获；`main.cpp` 把 `diag/cand_*` 诊断字段传给 QML，底部可直接显示丢失原因。 |
 | 2026-07-08 | 修复铝色零件在黑色传送带上 LOCATE 漏检/误检 | `uvc_kms_overlay.c` 改为先找黑色传送带纵向区域，再在该区域内做亮度直方图 p50/p95 自适应阈值和亮金属主体连通域；暗像素不再参与 BFS，只用于垫圈中心孔/背景判断；最小连通域面积提高到 `80px`；`Main.qml` 恢复实时微调 `90ms` 轮询和 `8px` 切轴防抖；静态测试增加禁止旧 `luma >= bright_threshold || luma <= dark_threshold` 和 `roi_h = frame->frame_height` 回流的契约。 |
 | 2026-07-06 | 修正 Z 轴超时键盘清空仍回到 10 秒 | `Main.qml` 新增 `stepperStepReplaceOnNextDigit`，打开 Z 轴超时键盘后第一次数字键会替换当前 `10`，而不是追加成 `105`；`清空` 键不再把超时字段写回 `10`，而是真正清空输入框，方便直接输入 1~60 秒。 |
 | 2026-07-07 | 修复手动停止键串口竞态和参数范围 | `main.cpp` 给强制 STOP 增加 `m_f4ActuatorStopGeneration` 代际和 `m_f4SerialWriteMutex` 短写锁，STOP 会取消尚未写出的旧 `ACTUATOR_VEL_MOVE/ACTUATOR_POS_MOVE`，并避免普通运动线程在 STOP 后再 `tcflush/write` 覆盖停止；`Main.qml` 删除 `manualActuatorStopRetryTimer` 固定延时补发；最小步长按钮改为 `步长-50/步长+50`；`main.cpp` 和 QML 把机械臂等待超时上限从 `180000ms` 提高到 `300000ms`。 |
 | 2026-07-07 | 修正上下轴回原位在途误判 | `Main.qml` 在 `sendManualActuatorZReturnHome()` 判断本地偏移前先检查 `manualPendingF4Command`，上一条上下轴动作未完成时提示等待完成或停止后重新设零，不再用旧偏移 0 误报已经在零点；三轴弹窗显示 `回原位按偏移 <N> step`，便于现场确认上升/下降完成后偏移是否刷新；静态测试同步检查该在途保护。 |
-| 2026-07-07 | 自动视觉 ROI 微调改成实时闭环点动 | `Main.qml` 新增 `autoVisionRealtimeFineTune*` 状态、主误差轴选择、方向切换防抖、连续无改善自动升速、连续丢目标退出和统一 `STOP_NOW` 收口；Z 轴下降后不再按“单次位置微调 -> 等 DONE -> 再 LOCATE”推进，而是继续按约 `90ms` 轮询 `LOCATE`，通过 `ACTUATOR_VEL_MOVE actuator=0/1` 持续修正误差；左右轴净偏移改为运行时估算，Z 轴回升后按快速回位速度在 3 秒内执行一次 `ACTUATOR_POS_MOVE actuator=1` 回到皮带基准。 |
+| 2026-07-07 | 自动视觉 ROI 微调改成实时闭环点动 | `Main.qml` 新增 `autoVisionRealtimeFineTune*` 状态、主误差轴选择、方向切换防抖、连续无改善自动升速、连续丢目标退出和统一 `STOP_NOW` 收口；Z 轴下降后不再按“单次位置微调 -> 等 DONE -> 再 LOCATE”推进，而是继续按约 `90ms` 轮询 `LOCATE`，通过 `ACTUATOR_VEL_MOVE actuator=0/1` 持续修正误差；左右轴净偏移改为运行时估算，Z 轴回升后按快速回位速度在 3 秒内执行一次 `ACTUATOR_POS_MOVE actuator=1` 回到皮带基准；后续 2026-07-09 已把实时微调总超时调整为 10 秒并修复 ACK 后 busy 未释放的问题。 |
 | 2026-07-07 | 首页暂停/停止提升为最高优先级硬停 | `Main.qml` 新增 `requestImmediateAutoControlInterruption()` 和 `autoForcedControlRetryTimer`；用户在首页按下 `暂停` 或 `停止` 后，MP157 先立刻本地打断自动视觉、Z 轴等待、实时微调、检测前延时和自动续跑排队，再立即写入 `ACTUATOR_STOP_NOW actuator=0xFF` 强制停全部执行器，不再等待当前 F4 指令自然结束；随后后台循环重试 `PAUSE_CYCLE/STOP_CYCLE`，直到 F4 状态同步到暂停或停止。 |
 | 2026-07-06 | 参数页新增 F4/ESP32S3 机械臂主动结果等待超时 | `DetectSettingsSnapshot` 新增 `f4ArmResultTimeoutMs`，默认 `75000ms`，JSON 字段为 `f4_arm_result_timeout_ms`，界面在参数设置页右下 `机械臂等待` 通过 `-10秒` / `+10秒` 调整，C++ 限幅当前为 `10000~300000ms`；等待 `WEIGHT_RESULT`、`LDC_RESULT`、`CYCLE_DONE` 都使用参数页值，不再把 75 秒写死到长流程函数里。 |
 | 2026-07-06 | 修正 Z 轴超时输入后仍显示 10 秒 | `Main.qml` 新增 `stepperMotorSettingsRevision`，在 `detectSettings.settingsChanged` 后递增版本号，强制 `stepperMotorPopupPanel.motorConfig` 重新读取 C++ 最新步进电机配置；`应用超时` 成功后直接提示 `本次自动检测Z轴下降/回升最多等待 <毫秒> ms`，现场可立即确认自动流程读取的不是固定 10 秒。 |

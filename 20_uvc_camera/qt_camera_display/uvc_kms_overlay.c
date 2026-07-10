@@ -95,6 +95,24 @@
 /* 自动视觉定位的最大外接框边长，首版零件必须小于中心 ROI 的大部分区域。 */
 #define AUTO_LOCATE_MAX_BBOX_SIDE 260U
 
+/* 自动视觉定位的大候选局部收缩最小窗口边长；小于该尺寸不认为能稳定覆盖真实垫圈。 */
+#define AUTO_LOCATE_OVERSIZE_REFINE_MIN_SIDE 80U
+
+/* 自动视觉定位的大候选局部收缩最大窗口边长；保持小于 QML 45000px² 最大目标面积门槛。 */
+#define AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE 210U
+
+/* 自动视觉定位的大候选环孔中心扫描步长，兼顾 10fps overlay 实时性和中心定位精度。 */
+#define AUTO_LOCATE_OVERSIZE_REFINE_SCAN_STEP 6U
+
+/* 自动视觉定位的大候选环孔支撑最小半径，用于过滤传送带小突起和局部高光。 */
+#define AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS 26U
+
+/* 自动视觉定位的大候选环孔支撑半径递增步长，避免每个像素半径都扫描导致 CPU 过高。 */
+#define AUTO_LOCATE_OVERSIZE_REFINE_RADIUS_STEP 10U
+
+/* 自动视觉定位的大候选环孔支撑最小厚度，防止支撑采样带太薄而被单行噪声影响。 */
+#define AUTO_LOCATE_OVERSIZE_REFINE_MIN_SUPPORT_THICKNESS 4U
+
 /* 自动视觉定位的最低实体密度百分比，过低通常是噪声边线，不是完整零件。 */
 #define AUTO_LOCATE_MIN_SOLID_DENSITY_PERCENT 8U
 
@@ -430,6 +448,35 @@ struct locate_result {
     unsigned int diag_candidate_density;
     unsigned int diag_candidate_confidence;
     unsigned int diag_candidate_ring;
+};
+
+/*
+ * auto_locate_refined_candidate 保存从过大粘连候选中收缩出来的局部候选统计值。
+ *
+ * 字段说明：
+ *   min_x/max_x/min_y/max_y 是收缩后 bbox 在搜索 ROI 内的范围，通常围绕垫圈中心孔。
+ *   area 是收缩窗口内达到 body_threshold 的金属主体像素数量。
+ *   contrast_sum/luma_sum 用于回填原 LOCATE 评分、置信度和中心孔背景对比计算。
+ *   dark_pixels/bright_pixels 保持与普通 BFS 候选相同的密度和亮度过滤输入。
+ *   chroma_u_sum/chroma_v_sum/chroma_sample_count 用于沿用原来的色度能量过滤。
+ *   perimeter_pixels 用于沿用原来的圆度过滤；当前圆度阈值为 0，但统计仍保持完整。
+ *   has_ring 表示收缩窗口已经通过中心孔结构验证，避免无环孔大黑带被当作目标。
+ */
+struct auto_locate_refined_candidate {
+    unsigned int min_x;
+    unsigned int max_x;
+    unsigned int min_y;
+    unsigned int max_y;
+    unsigned int area;
+    unsigned int contrast_sum;
+    uint64_t luma_sum;
+    unsigned int dark_pixels;
+    unsigned int bright_pixels;
+    uint64_t chroma_u_sum;
+    uint64_t chroma_v_sum;
+    unsigned int chroma_sample_count;
+    unsigned int perimeter_pixels;
+    unsigned int has_ring;
 };
 
 /*
@@ -2879,6 +2926,476 @@ static int auto_locate_component_has_ring_hole(const struct latest_frame *frame,
 }
 
 /*
+ * auto_locate_body_support_percent_in_rect 的作用：
+ *   统计指定矩形内达到 body_threshold 的金属主体像素比例。
+ *
+ * 主要流程：
+ *   1. 遍历矩形内每个 YUYV 亮度像素。
+ *   2. 使用 body_threshold 判断该像素是否属于垫圈主体支撑。
+ *   3. 返回主体像素百分比，并可选输出主体像素数量用于评分。
+ *
+ * 参数：
+ *   frame 是当前摄像头帧。
+ *   roi_x/roi_y 是定位搜索 ROI 在整帧中的起点。
+ *   min_x/max_x/min_y/max_y 是待统计矩形在 ROI 内的范围。
+ *   body_threshold 是金属主体扩张阈值。
+ *   body_count 是可选输出，保存主体像素数量。
+ *
+ * 返回值：
+ *   返回主体像素百分比；矩形为空时返回 0。
+ */
+static unsigned int auto_locate_body_support_percent_in_rect(const struct latest_frame *frame,
+                                                             unsigned int roi_x,
+                                                             unsigned int roi_y,
+                                                             unsigned int min_x,
+                                                             unsigned int max_x,
+                                                             unsigned int min_y,
+                                                             unsigned int max_y,
+                                                             unsigned int body_threshold,
+                                                             unsigned int *body_count)
+{
+    unsigned int total = 0U;
+    unsigned int body = 0U;
+    unsigned int x;
+    unsigned int y;
+
+    if (body_count != NULL) {
+        *body_count = 0U;
+    }
+
+    if (frame == NULL || min_x > max_x || min_y > max_y) {
+        return 0U;
+    }
+
+    for (y = min_y; y <= max_y; y++) {
+        for (x = min_x; x <= max_x; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+
+            total++;
+            if (auto_locate_is_bright_candidate_luma(luma, body_threshold)) {
+                body++;
+            }
+        }
+    }
+
+    if (body_count != NULL) {
+        *body_count = body;
+    }
+
+    return total > 0U ? (body * 100U) / total : 0U;
+}
+
+/*
+ * auto_locate_oversize_ring_support_score 的作用：
+ *   判断一个暗中心点周围是否具备垫圈中心孔的四边主体支撑，并输出评分。
+ *
+ * 主要流程：
+ *   1. 以 cx/cy 为疑似孔中心，按 radius 在上、下、左、右取四条主体采样带。
+ *   2. 四条采样带都必须达到 AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT。
+ *   3. 把四边主体像素数量相加作为候选评分，供大候选收缩时选择最像垫圈孔的位置。
+ *
+ * 参数：
+ *   min_x/max_x/min_y/max_y 是原始过大候选 bbox，用于限制支撑带仍在候选内部。
+ *   cx/cy 是疑似中心孔坐标，单位为搜索 ROI 内像素。
+ *   radius 是从中心孔到外侧主体采样带的大致半径。
+ *   body_threshold 是金属主体阈值。
+ *   score 是输出评分，只有返回 1 时有效。
+ *
+ * 返回值：
+ *   四边都有主体支撑返回 1；否则返回 0。
+ */
+static int auto_locate_oversize_ring_support_score(const struct latest_frame *frame,
+                                                   unsigned int roi_x,
+                                                   unsigned int roi_y,
+                                                   unsigned int min_x,
+                                                   unsigned int max_x,
+                                                   unsigned int min_y,
+                                                   unsigned int max_y,
+                                                   unsigned int cx,
+                                                   unsigned int cy,
+                                                   unsigned int radius,
+                                                   unsigned int body_threshold,
+                                                   unsigned int *score)
+{
+    unsigned int thickness = radius / 5U;
+    unsigned int span = radius / 2U;
+    unsigned int top_body = 0U;
+    unsigned int bottom_body = 0U;
+    unsigned int left_body = 0U;
+    unsigned int right_body = 0U;
+    unsigned int top_percent;
+    unsigned int bottom_percent;
+    unsigned int left_percent;
+    unsigned int right_percent;
+
+    if (score != NULL) {
+        *score = 0U;
+    }
+
+    if (radius == 0U ||
+        cx < min_x + radius ||
+        cy < min_y + radius ||
+        cx + radius > max_x ||
+        cy + radius > max_y) {
+        return 0;
+    }
+
+    if (thickness < AUTO_LOCATE_OVERSIZE_REFINE_MIN_SUPPORT_THICKNESS) {
+        thickness = AUTO_LOCATE_OVERSIZE_REFINE_MIN_SUPPORT_THICKNESS;
+    }
+    if (thickness > radius / 2U) {
+        thickness = radius / 2U;
+    }
+    if (span < AUTO_LOCATE_MIN_RING_BBOX_SIDE / 4U) {
+        span = AUTO_LOCATE_MIN_RING_BBOX_SIDE / 4U;
+    }
+    if (span > radius) {
+        span = radius;
+    }
+
+    top_percent = auto_locate_body_support_percent_in_rect(frame,
+                                                           roi_x,
+                                                           roi_y,
+                                                           cx - span,
+                                                           cx + span,
+                                                           cy - radius,
+                                                           cy - radius + thickness - 1U,
+                                                           body_threshold,
+                                                           &top_body);
+    bottom_percent = auto_locate_body_support_percent_in_rect(frame,
+                                                              roi_x,
+                                                              roi_y,
+                                                              cx - span,
+                                                              cx + span,
+                                                              cy + radius - thickness + 1U,
+                                                              cy + radius,
+                                                              body_threshold,
+                                                              &bottom_body);
+    left_percent = auto_locate_body_support_percent_in_rect(frame,
+                                                            roi_x,
+                                                            roi_y,
+                                                            cx - radius,
+                                                            cx - radius + thickness - 1U,
+                                                            cy - span,
+                                                            cy + span,
+                                                            body_threshold,
+                                                            &left_body);
+    right_percent = auto_locate_body_support_percent_in_rect(frame,
+                                                             roi_x,
+                                                             roi_y,
+                                                             cx + radius - thickness + 1U,
+                                                             cx + radius,
+                                                             cy - span,
+                                                             cy + span,
+                                                             body_threshold,
+                                                             &right_body);
+
+    if (top_percent < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT ||
+        bottom_percent < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT ||
+        left_percent < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT ||
+        right_percent < AUTO_LOCATE_MIN_RING_SIDE_BODY_PERCENT) {
+        return 0;
+    }
+
+    if (score != NULL) {
+        *score = top_body + bottom_body + left_body + right_body;
+    }
+
+    return 1;
+}
+
+/*
+ * auto_locate_measure_refined_ring_window 的作用：
+ *   对大候选收缩后的局部窗口重新统计 LOCATE 后续过滤需要的指标。
+ *
+ * 主要流程：
+ *   1. 把收缩窗口本身作为新的 bbox，保证中心点落在疑似垫圈孔附近。
+ *   2. 只把达到 body_threshold 的像素计入主体面积、亮度均值、色度和边界统计。
+ *   3. 用窗口内主体像素和周围背景重新生成 density/confidence 所需的输入。
+ *
+ * 参数：
+ *   win_min_x/win_max_x/win_min_y/win_max_y 是收缩窗口在搜索 ROI 内的范围。
+ *   median_luma/dark_threshold/body_threshold 是本帧 LOCATE 阈值。
+ *   refined 是输出结构。
+ *
+ * 返回值：
+ *   窗口内存在主体像素返回 1；否则返回 0。
+ */
+static int auto_locate_measure_refined_ring_window(const struct latest_frame *frame,
+                                                   unsigned int roi_x,
+                                                   unsigned int roi_y,
+                                                   unsigned int win_min_x,
+                                                   unsigned int win_max_x,
+                                                   unsigned int win_min_y,
+                                                   unsigned int win_max_y,
+                                                   unsigned int median_luma,
+                                                   unsigned int dark_threshold,
+                                                   unsigned int body_threshold,
+                                                   struct auto_locate_refined_candidate *refined)
+{
+    static const int neighbor_dx[4] = { -1, 1, 0, 0 };
+    static const int neighbor_dy[4] = { 0, 0, -1, 1 };
+    unsigned int x;
+    unsigned int y;
+
+    if (frame == NULL || refined == NULL ||
+        win_min_x > win_max_x ||
+        win_min_y > win_max_y) {
+        return 0;
+    }
+
+    memset(refined, 0, sizeof(*refined));
+    refined->min_x = win_min_x;
+    refined->max_x = win_max_x;
+    refined->min_y = win_min_y;
+    refined->max_y = win_max_y;
+
+    for (y = win_min_y; y <= win_max_y; y++) {
+        for (x = win_min_x; x <= win_max_x; x++) {
+            unsigned int luma = yuyv_luma_at(frame, roi_x + x, roi_y + y);
+            unsigned int i;
+
+            if (!auto_locate_is_bright_candidate_luma(luma, body_threshold)) {
+                continue;
+            }
+
+            refined->area++;
+            refined->contrast_sum += (unsigned int)abs((int)luma - (int)median_luma);
+            refined->luma_sum += luma;
+
+            if (luma <= dark_threshold) {
+                refined->dark_pixels++;
+            } else if (luma >= body_threshold) {
+                refined->bright_pixels++;
+            }
+
+            if ((refined->area & 3U) == 0U) {
+                refined->chroma_u_sum += yuyv_chroma_u_at(frame, roi_x + x, roi_y + y);
+                refined->chroma_v_sum += yuyv_chroma_v_at(frame, roi_x + x, roi_y + y);
+                refined->chroma_sample_count++;
+            }
+
+            for (i = 0U; i < 4U; i++) {
+                int next_x = (int)x + neighbor_dx[i];
+                int next_y = (int)y + neighbor_dy[i];
+                unsigned int next_luma;
+
+                if (next_x < (int)win_min_x || next_y < (int)win_min_y ||
+                    next_x > (int)win_max_x || next_y > (int)win_max_y) {
+                    refined->perimeter_pixels++;
+                    continue;
+                }
+
+                next_luma = yuyv_luma_at(frame,
+                                         roi_x + (unsigned int)next_x,
+                                         roi_y + (unsigned int)next_y);
+                if (!auto_locate_is_bright_candidate_luma(next_luma, body_threshold)) {
+                    refined->perimeter_pixels++;
+                }
+            }
+        }
+    }
+
+    return refined->area > 0U ? 1 : 0;
+}
+
+/*
+ * auto_locate_refine_oversized_ring_candidate 的作用：
+ *   当连通域 bbox 因垫圈、白色支架或高光粘连而过大时，从内部收缩出真实环孔局部 bbox。
+ *
+ * 主要流程：
+ *   1. 只处理超过 AUTO_LOCATE_MAX_BBOX_SIDE 的过大候选，普通候选继续走原过滤链。
+ *   2. 在过大候选内部扫描暗中心点，暗中心点必须不是金属主体像素。
+ *   3. 对每个暗中心点尝试多个半径，要求上、下、左、右都有金属主体支撑。
+ *   4. 选出评分最高的中心孔位置，并生成不超过 210x210 的局部窗口。
+ *   5. 对局部窗口重新统计面积、密度、置信度输入，并再次调用 ring 检测确认中心孔结构。
+ *
+ * 参数：
+ *   min_x/max_x/min_y/max_y 是原始过大候选 bbox。
+ *   median_luma/dark_threshold/body_threshold 是本帧定位阈值。
+ *   component_mean_luma 是原始大候选平均亮度，用于给暗中心对比度评分。
+ *   refined 是输出收缩候选。
+ *
+ * 返回值：
+ *   成功收缩出带中心孔的局部候选返回 1；否则返回 0，让外层继续按 diag=3 拒绝。
+ */
+static int auto_locate_refine_oversized_ring_candidate(const struct latest_frame *frame,
+                                                       unsigned int roi_x,
+                                                       unsigned int roi_y,
+                                                       unsigned int roi_w,
+                                                       unsigned int roi_h,
+                                                       unsigned int min_x,
+                                                       unsigned int max_x,
+                                                       unsigned int min_y,
+                                                       unsigned int max_y,
+                                                       unsigned int median_luma,
+                                                       unsigned int dark_threshold,
+                                                       unsigned int body_threshold,
+                                                       unsigned int component_mean_luma,
+                                                       struct auto_locate_refined_candidate *refined)
+{
+    unsigned int bbox_w;
+    unsigned int bbox_h;
+    unsigned int max_radius;
+    unsigned int best_cx = 0U;
+    unsigned int best_cy = 0U;
+    unsigned int best_radius = 0U;
+    unsigned int best_score = 0U;
+    unsigned int cy;
+    unsigned int side;
+    unsigned int half_side;
+    unsigned int win_min_x;
+    unsigned int win_min_y;
+    unsigned int win_max_x;
+    unsigned int win_max_y;
+    unsigned int refined_mean_luma;
+
+    if (frame == NULL || refined == NULL ||
+        min_x > max_x || min_y > max_y ||
+        roi_w == 0U || roi_h == 0U) {
+        return 0;
+    }
+
+    bbox_w = max_x - min_x + 1U;
+    bbox_h = max_y - min_y + 1U;
+    if (bbox_w <= AUTO_LOCATE_MAX_BBOX_SIDE &&
+        bbox_h <= AUTO_LOCATE_MAX_BBOX_SIDE) {
+        return 0;
+    }
+
+    if (bbox_w < AUTO_LOCATE_OVERSIZE_REFINE_MIN_SIDE ||
+        bbox_h < AUTO_LOCATE_OVERSIZE_REFINE_MIN_SIDE ||
+        min_x + AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS > max_x ||
+        min_y + AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS > max_y) {
+        return 0;
+    }
+
+    max_radius = AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE / 2U;
+    if (max_radius > bbox_w / 2U) {
+        max_radius = bbox_w / 2U;
+    }
+    if (max_radius > bbox_h / 2U) {
+        max_radius = bbox_h / 2U;
+    }
+    if (max_radius < AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS) {
+        return 0;
+    }
+
+    for (cy = min_y + AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS;
+         cy <= max_y - AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS;
+         cy += AUTO_LOCATE_OVERSIZE_REFINE_SCAN_STEP) {
+        unsigned int cx;
+
+        for (cx = min_x + AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS;
+             cx <= max_x - AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS;
+             cx += AUTO_LOCATE_OVERSIZE_REFINE_SCAN_STEP) {
+            unsigned int center_luma = yuyv_luma_at(frame, roi_x + cx, roi_y + cy);
+            unsigned int center_contrast;
+            unsigned int radius;
+
+            if (auto_locate_is_bright_candidate_luma(center_luma, body_threshold)) {
+                continue;
+            }
+
+            center_contrast = (unsigned int)abs((int)center_luma - (int)component_mean_luma);
+
+            for (radius = AUTO_LOCATE_OVERSIZE_REFINE_MIN_RADIUS;
+                 radius <= max_radius;
+                 radius += AUTO_LOCATE_OVERSIZE_REFINE_RADIUS_STEP) {
+                unsigned int support_score = 0U;
+                unsigned int candidate_score;
+
+                if (!auto_locate_oversize_ring_support_score(frame,
+                                                             roi_x,
+                                                             roi_y,
+                                                             min_x,
+                                                             max_x,
+                                                             min_y,
+                                                             max_y,
+                                                             cx,
+                                                             cy,
+                                                             radius,
+                                                             body_threshold,
+                                                             &support_score)) {
+                    continue;
+                }
+
+                candidate_score = support_score + center_contrast * 20U + radius * 3U;
+                if (candidate_score > best_score) {
+                    best_score = candidate_score;
+                    best_cx = cx;
+                    best_cy = cy;
+                    best_radius = radius;
+                }
+            }
+        }
+    }
+
+    if (best_score == 0U || best_radius == 0U) {
+        return 0;
+    }
+
+    side = best_radius * 2U + best_radius / 2U;
+    if (side < AUTO_LOCATE_OVERSIZE_REFINE_MIN_SIDE) {
+        side = AUTO_LOCATE_OVERSIZE_REFINE_MIN_SIDE;
+    }
+    if (side > AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE) {
+        side = AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE;
+    }
+    if (side > roi_w) {
+        side = roi_w;
+    }
+    if (side > roi_h) {
+        side = roi_h;
+    }
+    if (side == 0U) {
+        return 0;
+    }
+
+    half_side = side / 2U;
+    win_min_x = best_cx > half_side ? best_cx - half_side : 0U;
+    win_min_y = best_cy > half_side ? best_cy - half_side : 0U;
+    if (win_min_x + side > roi_w) {
+        win_min_x = roi_w > side ? roi_w - side : 0U;
+    }
+    if (win_min_y + side > roi_h) {
+        win_min_y = roi_h > side ? roi_h - side : 0U;
+    }
+    win_max_x = win_min_x + side - 1U;
+    win_max_y = win_min_y + side - 1U;
+
+    if (!auto_locate_measure_refined_ring_window(frame,
+                                                 roi_x,
+                                                 roi_y,
+                                                 win_min_x,
+                                                 win_max_x,
+                                                 win_min_y,
+                                                 win_max_y,
+                                                 median_luma,
+                                                 dark_threshold,
+                                                 body_threshold,
+                                                 refined)) {
+        return 0;
+    }
+
+    refined_mean_luma = (unsigned int)(refined->luma_sum / refined->area);
+    if (!auto_locate_component_has_ring_hole(frame,
+                                             roi_x,
+                                             roi_y,
+                                             refined->min_x,
+                                             refined->max_x,
+                                             refined->min_y,
+                                             refined->max_y,
+                                             body_threshold,
+                                             refined_mean_luma)) {
+        return 0;
+    }
+
+    refined->has_ring = 1U;
+    return 1;
+}
+
+/*
  * locate_part_in_yuyv_frame 的作用：
  *   在最新 YUYV 原始帧的中心 ROI 内定位传送带上的零件。
  *
@@ -3061,6 +3578,8 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
             unsigned int score;
             unsigned int confidence;
             unsigned int has_ring;
+            struct auto_locate_refined_candidate refined_candidate;
+            int oversized_refined = 0;
 
             if (visited[start_index]) {
                 continue;
@@ -3171,10 +3690,10 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                 continue;
             }
 
+            component_mean_luma = (unsigned int)(component_luma_sum / area);
+
             if (bbox_w < AUTO_LOCATE_MIN_BBOX_SIDE ||
-                bbox_h < AUTO_LOCATE_MIN_BBOX_SIDE ||
-                bbox_w > AUTO_LOCATE_MAX_BBOX_SIDE ||
-                bbox_h > AUTO_LOCATE_MAX_BBOX_SIDE) {
+                bbox_h < AUTO_LOCATE_MIN_BBOX_SIDE) {
                 auto_locate_record_reject_candidate(result,
                                                     LOCATE_DIAG_BBOX,
                                                     bbox_area + area,
@@ -3185,6 +3704,74 @@ static int locate_part_in_yuyv_frame(const struct latest_frame *frame,
                                                     0U,
                                                     0U);
                 continue;
+            }
+
+            /*
+             * 过大 bbox 先尝试环孔局部收缩：
+             *   现场 `cand_box=300x261` 这类候选通常不是“没有看到零件”，
+             *   而是垫圈亮边与白色支架、强反光或背景粘成了一个过大连通域。
+             *   如果这里在 ring_hole 前直接 diag=3，模型入口会显示“当前 ROI 未识别到零件”。
+             *   因此先在大候选内部寻找暗中心和四边主体支撑，把候选收缩为局部垫圈 bbox；
+             *   收缩失败时才继续按 bbox 过大拒绝，避免放行整片白色支架或黑色传送带。
+             */
+            if (bbox_w > AUTO_LOCATE_MAX_BBOX_SIDE ||
+                bbox_h > AUTO_LOCATE_MAX_BBOX_SIDE) {
+                oversized_refined = auto_locate_refine_oversized_ring_candidate(frame,
+                                                                                roi_x,
+                                                                                roi_y,
+                                                                                roi_w,
+                                                                                roi_h,
+                                                                                min_x,
+                                                                                max_x,
+                                                                                min_y,
+                                                                                max_y,
+                                                                                median_luma,
+                                                                                dark_threshold,
+                                                                                body_threshold,
+                                                                                component_mean_luma,
+                                                                                &refined_candidate);
+                if (!oversized_refined) {
+                    auto_locate_record_reject_candidate(result,
+                                                        LOCATE_DIAG_BBOX,
+                                                        bbox_area + area,
+                                                        bbox_w,
+                                                        bbox_h,
+                                                        area,
+                                                        0U,
+                                                        0U,
+                                                        0U);
+                    continue;
+                }
+
+                min_x = refined_candidate.min_x;
+                max_x = refined_candidate.max_x;
+                min_y = refined_candidate.min_y;
+                max_y = refined_candidate.max_y;
+                area = refined_candidate.area;
+                contrast_sum = refined_candidate.contrast_sum;
+                component_luma_sum = refined_candidate.luma_sum;
+                dark_pixels = refined_candidate.dark_pixels;
+                bright_pixels = refined_candidate.bright_pixels;
+                chroma_u_sum = refined_candidate.chroma_u_sum;
+                chroma_v_sum = refined_candidate.chroma_v_sum;
+                chroma_sample_count = refined_candidate.chroma_sample_count;
+                perimeter_pixels = refined_candidate.perimeter_pixels;
+                bbox_w = max_x - min_x + 1U;
+                bbox_h = max_y - min_y + 1U;
+                bbox_area = bbox_w * bbox_h;
+
+                if (area < AUTO_LOCATE_MIN_COMPONENT_AREA || area > max_component_area) {
+                    auto_locate_record_reject_candidate(result,
+                                                        LOCATE_DIAG_AREA,
+                                                        bbox_area + area,
+                                                        bbox_w,
+                                                        bbox_h,
+                                                        area,
+                                                        0U,
+                                                        0U,
+                                                        0U);
+                    continue;
+                }
             }
 
             if (bbox_w * 100U < bbox_h * 25U ||

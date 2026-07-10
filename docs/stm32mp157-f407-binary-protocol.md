@@ -569,6 +569,7 @@ F4 接收后的动作：
 | 手动页停止某一轴 | MP157 填对应 `actuator`，F4 只停该执行器。 |
 | 模拟急停 | MP157 填 `actuator=0xFF`，F4 停传送带、摄像头左右轴和摄像头上下轴。 |
 | 自动流程停止 | 仍优先使用 `STOP_CYCLE` 作废流程；`ACTUATOR_STOP` 只作为运动层补充制动。 |
+| `cycle_id` 不匹配 | `ACTUATOR_STOP` 是安全停机命令，F4 记录告警但仍先执行停止，不能因为流程号漂移而让物理电机继续运动；非法 `flags` 或非法 `actuator` 仍返回 NACK。 |
 
 ### 9.17 ACTUATOR_VEL_MOVE `0x52`
 
