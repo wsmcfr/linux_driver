@@ -95,7 +95,7 @@
 #include <cstdio>               /* fopen/fscanf/fclose 用于可靠读取 procfs；stdout 用于自检入口输出保存结果。 */
 #include <cstring>              /* strerror 用于把 errno 转成人可读文本。 */
 #include <fcntl.h>              /* open/O_NOCTTY 用于后台 F4 串口握手检测。 */
-#include <termios.h>            /* termios 用于配置 F4 串口 115200 8N1 原始模式。 */
+#include <termios.h>            /* termios 用于配置 F4 串口 57600 8N1 原始模式。 */
 
 #include <sys/socket.h>         /* socket/connect 负责与 overlay 控制端点通信。 */
 #include <sys/un.h>             /* sockaddr_un 描述 Unix domain socket 地址。 */
@@ -128,6 +128,21 @@ static const char *DEFAULT_GST_IO_MODE = "mmap";
 
 /* overlay 控制 socket 默认路径，需要与 uvc_kms_overlay.c 保持一致。 */
 static const char *DEFAULT_OVERLAY_CONTROL_SOCKET = "/tmp/uvc-kms-overlay-control.sock";
+
+/* overlay 控制 socket 连接超时，单位 ms；连接阶段只判断进程是否接收连接，保持短等待避免健康刷新卡住后台线程。 */
+static const int OVERLAY_CONTROL_CONNECT_TIMEOUT_MS = 150;
+
+/* overlay STATUS 回复超时，单位 ms；STATUS 只读短状态行，继续保持短超时用于快速判定相机在线状态。 */
+static const int OVERLAY_CONTROL_STATUS_REPLY_TIMEOUT_MS = 150;
+
+/* overlay LOCATE 回复超时，单位 ms；自动检测启动后 LOCATE 接近 10fps 帧周期，必须允许跨过一到数帧的采集/转换/定位抖动。 */
+static const int OVERLAY_CONTROL_LOCATE_REPLY_TIMEOUT_MS = 600;
+
+/* overlay 单次 read 缓冲大小；真实完整性由换行判断，这里只控制每次从 socket 取多少字节。 */
+static const int OVERLAY_CONTROL_REPLY_CHUNK_SIZE = 512;
+
+/* overlay 回复最大缓存，单位字节；覆盖 SAVE 路径和 LOCATE 诊断长行，防止异常端点无限输出撑爆内存。 */
+static const int OVERLAY_CONTROL_MAX_REPLY_BYTES = 8192;
 
 /* 默认 overlay 启动控制脚本；相机热拔插恢复时只后台重启 overlay 进程，不重启 Qt 界面。 */
 static const char *DEFAULT_OVERLAY_RESTART_SCRIPT = "/root/qt_camera_display/run_qt_kms_overlay_display.sh";
@@ -171,8 +186,8 @@ static const char *DEFAULT_CLOUD_HEALTH_URL = "http://139.9.35.72/health";
 /* 默认 F4 串口节点；真实接入时只有握手成功才显示接入。 */
 static const char *DEFAULT_F4_SERIAL_DEVICE = "/dev/ttySTM2";
 
-/* 默认 F4 串口波特率；当前项目串口测试工具和文档均使用 115200 8N1。 */
-static const int DEFAULT_F4_SERIAL_BAUD = 115200;
+/* 默认 F4 串口波特率；当前 MP157-F4 主链路约定使用 57600 8N1。 */
+static const int DEFAULT_F4_SERIAL_BAUD = 57600;
 
 /* F4 心跳发送间隔，单位毫秒；120000ms 等于 2 分钟，避免 Qt 每 8 秒健康刷新都占用 RS485 串口。 */
 static const int F4_HEARTBEAT_INTERVAL_MS = 120000;
@@ -315,6 +330,15 @@ static const int MP157_CAMERA_Z_TIMEOUT_MIN_MS = 1000;
 /* MP157 Z 轴参数页可配置超时上限：保持低于 C++ ACTUATOR_POS_MOVE 硬等待窗口，避免串口线程长时间占用。 */
 static const int MP157_CAMERA_Z_TIMEOUT_MAX_MS = 60000;
 
+/* 摄像头左右轴 ROI 位置微调默认步数：缺少 JSON 字段时每次走 20 step，避免继续依赖速度模式持续转动。 */
+static const quint32 MP157_CAMERA_LATERAL_FINE_TUNE_DEFAULT_STEPS = 20U;
+
+/* 摄像头左右轴 ROI 位置微调最小步数：F4 位置模式不接受 0 step，因此参数页必须至少为 1 step。 */
+static const quint32 MP157_CAMERA_LATERAL_FINE_TUNE_MIN_STEPS = 1U;
+
+/* 摄像头左右轴 ROI 位置微调最大步数：限制到 10000 step，避免误输入造成一次横移过大。 */
+static const quint32 MP157_CAMERA_LATERAL_FINE_TUNE_MAX_STEPS = 10000U;
+
 /* 二进制称重结果命令：F4 读取 HX711 稳定结果后主动上报给 MP157。 */
 static const quint8 BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U;
 
@@ -391,6 +415,7 @@ static const char *DEFAULT_BOARD_TIME_ZONE = "CST-8";
  *   normalSpeedRpm 是常规/对中运动速度，单位为 rpm，允许 0~5000 的现场任意整数配置。
  *   scanSpeedRpm 是传送带专用上料扫描速度，单位为 rpm；零件尚未入画时 F4 用它驱动传送带。
  *   direction 是方向映射，1 表示正向，-1 表示反向，用于现场坐标越调越远时快速反转。
+ *   lateralFineTuneFixedSteps 是摄像头左右轴 ROI 位置模式每次微调的固定步数，单位 step。
  *   zDownFixedSteps 是上下电机自动检测前下探的固定相对位置步数，单位为 step。
  *   zUpFixedSteps 是上下电机模型检测后回升的固定相对位置步数，单位为 step。
  *   zMotionTimeoutMs 是 MP157 等待上下电机下降/回升 DONE 或本地估算完成的最大时间，单位 ms。
@@ -405,6 +430,7 @@ struct StepperMotorSettings
     int normalSpeedRpm = 40;
     int scanSpeedRpm = 40;
     int direction = 1;
+    quint32 lateralFineTuneFixedSteps = 0U;
     quint32 zDownFixedSteps = 0U;
     quint32 zUpFixedSteps = 0U;
     int zMotionTimeoutMs = MP157_CAMERA_Z_TIMEOUT_DEFAULT_MS;
@@ -446,6 +472,7 @@ static QVector<StepperMotorSettings> defaultStepperMotorSettings()
     cameraLateralMotor.normalSpeedRpm = 120;
     cameraLateralMotor.scanSpeedRpm = 0;
     cameraLateralMotor.direction = 1;
+    cameraLateralMotor.lateralFineTuneFixedSteps = MP157_CAMERA_LATERAL_FINE_TUNE_DEFAULT_STEPS;
     motors.append(cameraLateralMotor);
 
     StepperMotorSettings cameraZMotor;
@@ -507,6 +534,7 @@ static QVariantMap stepperMotorToVariantMap(const StepperMotorSettings &motor, i
     map.insert(QStringLiteral("scanSpeedRpm"), motor.scanSpeedRpm);
     map.insert(QStringLiteral("direction"), motor.direction);
     map.insert(QStringLiteral("directionText"), stepperDirectionText(motor.direction));
+    map.insert(QStringLiteral("lateralFineTuneFixedSteps"), static_cast<double>(motor.lateralFineTuneFixedSteps));
     map.insert(QStringLiteral("zDownFixedSteps"), static_cast<double>(motor.zDownFixedSteps));
     map.insert(QStringLiteral("zUpFixedSteps"), static_cast<double>(motor.zUpFixedSteps));
     map.insert(QStringLiteral("zMotionTimeoutMs"), motor.zMotionTimeoutMs);
@@ -4140,14 +4168,14 @@ public:
      *   从 QML 数字键盘更新上下步进电机的固定下探或回升步数。
      *
      * 主要流程：
-     *   1. 校验 index 指向三台已知电机中的一台，通常只有摄像头上下电机页会显示该入口。
+     *   1. 校验 index 指向三台已知电机中的一台，通常只有摄像头上下电机页和左右电机页会显示该入口。
      *   2. 使用 clampedUInt32FromText() 解析十进制文本，确保范围完整覆盖 Emm42 位置模式 4 字节脉冲数。
-     *   3. 只接受 zDownFixedSteps 和 zUpFixedSteps 两个字段，避免 QML 误把其它参数绕过 int 限幅。
+     *   3. 只接受 zDownFixedSteps、zUpFixedSteps 和 lateralFineTuneFixedSteps 三个字段，避免 QML 误把其它参数绕过 int 限幅。
      *   4. 通过 applySettings() 统一归一化并通知 QML 刷新。
      *
      * 参数：
      *   index 是弹窗页序号，0=传送带，1=摄像头左右，2=摄像头上下。
-     *   key 是字段名，只支持 zDownFixedSteps/zUpFixedSteps。
+     *   key 是字段名，只支持 zDownFixedSteps/zUpFixedSteps/lateralFineTuneFixedSteps。
      *   valueText 是用户输入的十进制 step 文本，合法范围为 0~4294967295。
      *
      * 返回值：
@@ -4175,6 +4203,16 @@ public:
             motor.zDownFixedSteps = steps;
         } else if (key == QStringLiteral("zUpFixedSteps")) {
             motor.zUpFixedSteps = steps;
+        } else if (key == QStringLiteral("lateralFineTuneFixedSteps")) {
+            if (motor.role != QStringLiteral("camera_lateral")) {
+                setLastStatusText(QStringLiteral("左右轴微调步数只能在摄像头左右电机页设置"));
+                return false;
+            }
+            if (steps < MP157_CAMERA_LATERAL_FINE_TUNE_MIN_STEPS) {
+                setLastStatusText(QStringLiteral("左右轴微调步数必须至少为 1 step"));
+                return false;
+            }
+            motor.lateralFineTuneFixedSteps = steps;
         } else {
             setLastStatusText(QStringLiteral("步进电机位置参数：字段无效 ") + key);
             return false;
@@ -4253,6 +4291,10 @@ public:
             motor.scanSpeedRpm = motorObject.value(QStringLiteral("scan_speed_rpm")).toInt(
                 motorObject.value(QStringLiteral("scanSpeedRpm")).toInt(motor.normalSpeedRpm));
             motor.direction = motorObject.value(QStringLiteral("direction")).toInt(motor.direction);
+            motor.lateralFineTuneFixedSteps = clampedUInt32FromDouble(
+                motorObject.value(QStringLiteral("lateral_fine_tune_fixed_steps")).toDouble(
+                    motorObject.value(QStringLiteral("lateralFineTuneFixedSteps")).toDouble(
+                        static_cast<double>(motor.lateralFineTuneFixedSteps))));
             motor.zDownFixedSteps = clampedUInt32FromDouble(
                 motorObject.value(QStringLiteral("z_down_fixed_steps")).toDouble(
                     motorObject.value(QStringLiteral("zDownFixedSteps")).toDouble(
@@ -4319,6 +4361,8 @@ public:
             motorObject.insert(QStringLiteral("normal_speed_rpm"), motor.normalSpeedRpm);
             motorObject.insert(QStringLiteral("scan_speed_rpm"), motor.scanSpeedRpm);
             motorObject.insert(QStringLiteral("direction"), motor.direction);
+            motorObject.insert(QStringLiteral("lateral_fine_tune_fixed_steps"),
+                               static_cast<double>(motor.lateralFineTuneFixedSteps));
             motorObject.insert(QStringLiteral("z_down_fixed_steps"), static_cast<double>(motor.zDownFixedSteps));
             motorObject.insert(QStringLiteral("z_up_fixed_steps"), static_cast<double>(motor.zUpFixedSteps));
             motorObject.insert(QStringLiteral("z_motion_timeout_ms"), motor.zMotionTimeoutMs);
@@ -4451,6 +4495,15 @@ private:
             motor.normalSpeedRpm = clampedInt(source.normalSpeedRpm, 0, 5000);
             motor.scanSpeedRpm = clampedInt(source.scanSpeedRpm, 0, 5000);
             motor.direction = source.direction >= 0 ? 1 : -1;
+            if (motor.role == QStringLiteral("camera_lateral")) {
+                motor.lateralFineTuneFixedSteps = static_cast<quint32>(
+                    clampedInt(static_cast<int>(std::min<quint32>(source.lateralFineTuneFixedSteps,
+                                                                  MP157_CAMERA_LATERAL_FINE_TUNE_MAX_STEPS)),
+                               static_cast<int>(MP157_CAMERA_LATERAL_FINE_TUNE_MIN_STEPS),
+                               static_cast<int>(MP157_CAMERA_LATERAL_FINE_TUNE_MAX_STEPS)));
+            } else {
+                motor.lateralFineTuneFixedSteps = 0U;
+            }
             motor.zDownFixedSteps = source.zDownFixedSteps;
             motor.zUpFixedSteps = source.zUpFixedSteps;
             motor.zMotionTimeoutMs = clampedInt(source.zMotionTimeoutMs,
@@ -4488,6 +4541,7 @@ private:
                     || leftMotor.normalSpeedRpm != rightMotor.normalSpeedRpm
                     || leftMotor.scanSpeedRpm != rightMotor.scanSpeedRpm
                     || leftMotor.direction != rightMotor.direction
+                    || leftMotor.lateralFineTuneFixedSteps != rightMotor.lateralFineTuneFixedSteps
                     || leftMotor.zDownFixedSteps != rightMotor.zDownFixedSteps
                     || leftMotor.zUpFixedSteps != rightMotor.zUpFixedSteps
                     || leftMotor.zMotionTimeoutMs != rightMotor.zMotionTimeoutMs) {
@@ -10087,6 +10141,26 @@ private:
     }
 
     /*
+     * isMp157ToF4RequestCommand 的作用：
+     *   判断当前 CMD 是否属于 MP157 发给 F4 的请求帧，而不是 F4 返回给 MP157 的回包帧。
+     *
+     * 关键说明：
+     *   现场 RS485/串口助手/半双工转接环境可能把 MP157 刚发出的 HEARTBEAT 等请求帧回显到 RX。
+     *   F4->MP157 的正式回包统一从 ACK=0x80 开始；因此小于 ACK 的命令只能作为请求帧跳过，
+     *   不能让上层 sendF4BinaryHeartbeat() 把 HEARTBEAT 回显误判成“非 ACK/NACK 回包”。
+     *
+     * 参数：
+     *   command 是协议 CMD 字段。
+     *
+     * 返回值：
+     *   true 表示这是 MP157->F4 方向的请求命令；false 表示可以继续按 F4 回包处理。
+     */
+    static bool isMp157ToF4RequestCommand(quint8 command)
+    {
+        return command < BINARY_PROTOCOL_CMD_ACK;
+    }
+
+    /*
      * f4FaultSourceName 的作用：
      *   把 F4 FAULT_REPORT 中的故障来源编号转换成界面可读短名称。
      *
@@ -11247,6 +11321,48 @@ private:
     }
 
     /*
+     * overlayReplyTimeoutMs 的作用：
+     *   根据 overlay 控制命令类型选择回复等待时间。
+     *
+     * 主要流程：
+     *   1. LOCATE 是自动检测启动后的高频视觉定位命令，overlay 需要等采集主循环轮询到 socket 后再运行定位算法。
+     *   2. STATUS 只返回短状态行，仍使用短等待，避免健康刷新在 overlay 异常时占住后台线程。
+     *
+     * 参数：
+     *   commandBytes 是准备写入 overlay socket 的原始命令，通常带换行。
+     *
+     * 返回值：
+     *   返回本命令读取回复时允许等待的毫秒数。
+     */
+    static int overlayReplyTimeoutMs(const QByteArray &commandBytes)
+    {
+        if (commandBytes.startsWith(QByteArrayLiteral("LOCATE"))) {
+            return OVERLAY_CONTROL_LOCATE_REPLY_TIMEOUT_MS;
+        }
+
+        return OVERLAY_CONTROL_STATUS_REPLY_TIMEOUT_MS;
+    }
+
+    /*
+     * fillTimeoutValue 的作用：
+     *   把毫秒超时值转换成 POSIX select() 需要的 timeval。
+     *
+     * 参数：
+     *   timeoutMs 是等待时间，单位 ms；负数会被按 0 处理。
+     *   tv 是输出 timeval 指针。
+     *
+     * 返回值：
+     *   无返回值；tv 会被写入秒和微秒字段。
+     */
+    static void fillTimeoutValue(int timeoutMs, struct timeval *tv)
+    {
+        const int safeTimeoutMs = std::max(0, timeoutMs);
+
+        tv->tv_sec = safeTimeoutMs / 1000;
+        tv->tv_usec = (safeTimeoutMs % 1000) * 1000;
+    }
+
+    /*
      * queryOverlayControlCommand 的作用：
      *   连接 overlay 控制 socket，发送一条短命令并读取一行回复。
      *
@@ -11259,16 +11375,18 @@ private:
      */
     static QString queryOverlayControlCommand(const QString &socketPath, const QByteArray &commandBytes)
     {
-        int fd = -1;
-        struct sockaddr_un addr;
-        QByteArray socketPathBytes = socketPath.toLocal8Bit();
-        char buffer[256];
-        QByteArray reply;
-        fd_set wfds;
-        fd_set rfds;
-        struct timeval tv;
-        int optError = 0;
-        socklen_t optLen = sizeof(optError);
+        int fd = -1;                                           /* fd 保存本次 Unix socket 连接，函数退出前必须关闭。 */
+        struct sockaddr_un addr;                                /* addr 保存 overlay 控制 socket 的本地路径地址。 */
+        QByteArray socketPathBytes = socketPath.toLocal8Bit();   /* socketPathBytes 是 POSIX connect() 需要的窄字节路径。 */
+        char buffer[OVERLAY_CONTROL_REPLY_CHUNK_SIZE];           /* buffer 是单次 read 缓冲，完整回复由 reply 循环追加。 */
+        QByteArray reply;                                       /* reply 保存读到换行为止的完整 overlay 回复。 */
+        fd_set wfds;                                            /* wfds 用于等待非阻塞 connect 完成。 */
+        fd_set rfds;                                            /* rfds 用于等待 overlay 回复可读。 */
+        struct timeval tv;                                      /* tv 是每次 select() 的剩余等待时间。 */
+        int optError = 0;                                       /* optError 保存 getsockopt(SO_ERROR) 返回的连接结果。 */
+        socklen_t optLen = sizeof(optError);                    /* optLen 是 getsockopt() 参数长度。 */
+        const int replyTimeoutMs = overlayReplyTimeoutMs(commandBytes); /* replyTimeoutMs 按命令类型区分 STATUS 短等待和 LOCATE 长等待。 */
+        QElapsedTimer replyTimer;                               /* replyTimer 统计读取完整回复的总耗时，避免循环 read 无限等待。 */
 
         if (commandBytes.isEmpty()) {
             return QStringLiteral("ERR overlay命令为空");
@@ -11301,8 +11419,7 @@ private:
 
             FD_ZERO(&wfds);
             FD_SET(fd, &wfds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 150000;
+            fillTimeoutValue(OVERLAY_CONTROL_CONNECT_TIMEOUT_MS, &tv);
             if (select(fd + 1, NULL, &wfds, NULL, &tv) <= 0) {
                 ::close(fd);
                 return QStringLiteral("ERR overlay连接超时");
@@ -11323,23 +11440,61 @@ private:
             return QStringLiteral("ERR 发送失败");
         }
 
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 150000;
-        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
-            ::close(fd);
-            return QStringLiteral("ERR overlay回复超时");
+        replyTimer.start();
+        while (true) {
+            const int elapsedMs = static_cast<int>(replyTimer.elapsed());
+            const int remainingMs = replyTimeoutMs - elapsedMs;
+
+            if (remainingMs <= 0) {
+                ::close(fd);
+                return QStringLiteral("ERR overlay回复超时");
+            }
+
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            fillTimeoutValue(remainingMs, &tv);
+
+            const int selectRet = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (selectRet < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                ::close(fd);
+                return QStringLiteral("ERR overlay读取失败");
+            }
+            if (selectRet == 0) {
+                ::close(fd);
+                return QStringLiteral("ERR overlay回复超时");
+            }
+
+            const ssize_t nread = ::read(fd, buffer, sizeof(buffer));
+            if (nread < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                ::close(fd);
+                return QStringLiteral("ERR overlay读取失败");
+            }
+            if (nread == 0) {
+                break;
+            }
+
+            reply.append(buffer, static_cast<int>(nread));
+            if (reply.size() > OVERLAY_CONTROL_MAX_REPLY_BYTES) {
+                ::close(fd);
+                return QStringLiteral("ERR overlay回复过长");
+            }
+            if (reply.contains('\n')) {
+                break;
+            }
         }
 
-        const ssize_t nread = ::read(fd, buffer, sizeof(buffer) - 1U);
         ::close(fd);
-        if (nread <= 0) {
+        if (reply.isEmpty()) {
             return QStringLiteral("ERR 无回复");
         }
 
-        buffer[nread] = '\0';
-        reply = QByteArray(buffer, static_cast<int>(nread)).trimmed();
+        reply = reply.trimmed();
         return QString::fromLocal8Bit(reply);
     }
 
@@ -11376,7 +11531,7 @@ private:
         case 115200:
             return B115200;
         default:
-            return B115200;
+            return B57600;
         }
     }
 
@@ -11482,6 +11637,18 @@ private:
                      */
                     if (reply->command == BINARY_PROTOCOL_CMD_FAULT_REPORT) {
                         lastFrameError = describeF4FaultReport(*reply);
+                        continue;
+                    }
+                    /*
+                     * 如果读到 HEARTBEAT/START_CYCLE 等小于 0x80 的合法帧，
+                     * 说明当前串口链路把 MP157 自己发出的请求帧回显到了 RX，
+                     * 或者读取到了写入前遗留的旧请求帧。它不是 F4 回包，必须丢弃后继续等 ACK/NACK。
+                     */
+                    if (isMp157ToF4RequestCommand(reply->command)) {
+                        lastFrameError = QStringLiteral("跳过MP157请求帧/串口回显：")
+                                + f4BinaryCommandName(reply->command)
+                                + QStringLiteral(" raw=")
+                                + hexByteString(reply->rawFrame);
                         continue;
                     }
                     return true;
@@ -11647,7 +11814,7 @@ private:
      *   只向 F4 串口写入一帧二进制协议，不读取 ACK/NACK。
      *
      * 主要流程：
-     *   1. 打开 `/dev/ttySTM2` 并配置为 115200 8N1 raw 模式。
+     *   1. 打开 `/dev/ttySTM2` 并配置为 57600 8N1 raw 模式。
      *   2. 写入完整二进制帧，并调用 tcdrain() 等待内核发送队列排空。
      *   3. STOP 是幂等安全动作，允许按 repeatCount 重复写入，覆盖手动停止和普通 ACK 等待重叠的窗口。
      *   4. 不调用 readF4BinaryReply()，避免强制 STOP 和上一条普通命令线程同时抢读回包。
@@ -11776,14 +11943,14 @@ private:
      *   打开 MP157 到 F4 的串口，发送一帧自动流程二进制命令，并等待匹配的 ACK 或 NACK。
      *
      * 主要流程：
-     *   1. 使用现有 F4 串口节点和 115200 8N1 原始模式配置。
+     *   1. 使用现有 F4 串口节点和 57600 8N1 原始模式配置。
      *   2. 写入完整二进制帧并等待 F4 回复合法二进制帧。
      *   3. 对 ACK 校验 cycle_id、acked_seq 和 acked_cmd，防止旧 ACK 被误用。
      *   4. 对 NACK 提取 error_code、state 和 detail，返回给 QML 显示。
      *
      * 参数：
      *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
-     *   baud 是串口波特率，当前默认 115200。
+     *   baud 是串口波特率，当前默认 57600。
      *   frame 是已经组好的完整二进制帧。
      *   expectedCommand 是本次期望被 ACK 的命令字。
      *   expectedSequence 是本次期望被 ACK 的 MP157 帧序号。
@@ -12013,7 +12180,7 @@ private:
      *
      * 参数：
      *   device 是 Linux TTY 节点，当前默认 `/dev/ttySTM2`。
-     *   baud 是串口波特率，当前默认 115200。
+     *   baud 是串口波特率，当前默认 57600。
      *   frame 是已经组好的 ACTUATOR_POS_MOVE 完整帧。
      *   expectedSequence 是本次位置运动命令序号。
      *   expectedCycleId 是自动流程 ID，手动命令允许为 0。

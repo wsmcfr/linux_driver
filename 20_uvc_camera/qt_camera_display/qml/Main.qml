@@ -202,6 +202,9 @@ Rectangle {
     /* autoVisionRealtimeFineTuneActive 表示当前是否处于 ROI 复查后的实时闭环微调会话。 */
     property bool autoVisionRealtimeFineTuneActive: false
 
+    /* autoVisionRealtimeStopInFlight 表示 STOP 收口帧已经发出但还没完成回调，期间必须丢弃遗留 LOCATE 结果。 */
+    property bool autoVisionRealtimeStopInFlight: false
+
     /* autoVisionRealtimeFineTuneStartMs 记录实时闭环微调开始时间戳，用于总时长超时保护。 */
     property real autoVisionRealtimeFineTuneStartMs: 0
 
@@ -2294,16 +2297,33 @@ Rectangle {
      * autoVisionRequestFineTuneLocate 的作用：
      *   在 Z 轴下降对焦稳定或短步微调后重新请求 overlay LOCATE，确认零件是否仍在 ROI 中央。
      *
+     * 参数：
+     *   preserveRealtimeSession 为 true 时保留实时微调会话开始时间，用于左右轴位置模式多步复查时继续累计 10 秒总超时。
+     *
      * 返回值：
      *   true 表示 LOCATE 请求已启动；false 表示 overlay 请求被拒绝。
      */
-    function autoVisionRequestFineTuneLocate() {
+    function autoVisionRequestFineTuneLocate(preserveRealtimeSession) {
         var nowMs = new Date().getTime()
+        var keepRealtimeSession = preserveRealtimeSession === true
+                && autoVisionRealtimeFineTuneStartMs > 0
 
+        /*
+         * Z 轴下降完成后，autoVisionActuatorPhase 可能仍保存 z-motion-down-wait。
+         * 实时微调已经进入新的速度闭环阶段，必须在这里清空旧位置阶段；否则
+         * onF4ActuatorCommandFinished 会先按旧阶段处理 ACTUATOR_VEL_MOVE/STOP_NOW，
+         * 导致速度 ACK 和停止收口回调被吞掉，流程无法进入模型检测。
+         */
+        autoVisionActuatorPhase = ""
         autoVisionLocatePurpose = "fine-tune"
         autoVisionRealtimeFineTuneActive = true
-        autoVisionRealtimeFineTuneStartMs = nowMs
-        autoVisionRealtimeFineTuneElapsedMs = 0
+        autoVisionRealtimeStopInFlight = false
+        if (keepRealtimeSession) {
+            autoVisionRealtimeFineTuneElapsed()
+        } else {
+            autoVisionRealtimeFineTuneStartMs = nowMs
+            autoVisionRealtimeFineTuneElapsedMs = 0
+        }
         autoVisionRealtimeFineTuneLostFrames = 0
         autoVisionRealtimeFineTuneStopReason = ""
         autoVisionRealtimeFineTunePendingNextStage = "none"
@@ -2317,7 +2337,10 @@ Rectangle {
         autoVisionCommandBusy = false
         autoVisionTimer.interval = autoVisionRealtimeTunePollMs
         workflowState = "ROI实时微调"
-        autoVisionLastText = "自动视觉：Z轴下降后进入 ROI 实时闭环微调"
+        autoVisionLastText = keepRealtimeSession
+                ? ("自动视觉：左右轴位置微调完成，继续 ROI 复查；elapsed="
+                   + autoVisionRealtimeFineTuneElapsedMs + "ms")
+                : "自动视觉：Z轴下降后进入 ROI 实时闭环微调"
         storageState = autoVisionLastText
         showStorageToast()
         autoVisionTimer.restart()
@@ -2355,6 +2378,7 @@ Rectangle {
      */
     function resetAutoVisionRealtimeFineTuneState() {
         autoVisionRealtimeFineTuneActive = false
+        autoVisionRealtimeStopInFlight = false
         autoVisionRealtimeFineTuneStartMs = 0
         autoVisionRealtimeFineTuneElapsedMs = 0
         autoVisionRealtimeFineTuneAxis = ""
@@ -2696,6 +2720,7 @@ Rectangle {
         autoVisionRealtimeCommandGuardTimer.stop()
         autoVisionRealtimeStopGuardTimer.stop()
         autoVisionCommandBusy = false
+        autoVisionRealtimeStopInFlight = false
         autoVisionRealtimeFineTuneAxis = ""
         autoVisionRealtimeFineTuneDirection = -1
         autoVisionRealtimeFineTuneSpeedRpm = 0
@@ -2707,6 +2732,11 @@ Rectangle {
         autoVisionRealtimeErrorConverging = false
 
         if (stage === "resume") {
+            autoVisionRealtimeFineTuneActive = true
+            autoVisionLocatePurpose = "fine-tune"
+            autoVisionLocateBusy = false
+            autoVisionTimer.interval = autoVisionRealtimeTunePollMs
+            autoVisionTimer.restart()
             workflowState = "ROI实时微调"
             storageState = reason
             autoVisionLastText = reason
@@ -2764,6 +2794,10 @@ Rectangle {
         var stopActuator = stopAllActuators ? 255 : movingActuator
         var shouldSendStop = stopAllActuators || hasActiveMotion
 
+        if (autoVisionRealtimeStopInFlight) {
+            return true
+        }
+
         if (!autoVisionRealtimeFineTuneActive && !shouldSendStop) {
             autoVisionFinalizeRealtimeFineTuneStop(reason, stage)
             return false
@@ -2780,6 +2814,10 @@ Rectangle {
         }
 
         autoVisionRealtimeCommandGuardTimer.stop()
+        autoVisionRealtimeFineTuneActive = false
+        autoVisionRealtimeStopInFlight = true
+        autoVisionTimer.stop()
+        autoVisionLocateBusy = false
         workflowState = stage === "resume" ? "实时微调切换" : "实时微调停止"
         autoVisionLastText = reason
         storageState = reason
@@ -3203,6 +3241,54 @@ Rectangle {
             autoVisionUpdateRealtimeLateralEstimate(new Date().getTime())
         }
 
+        /*
+         * 左右轴实时微调位置模式分支：
+         *   左右轴不再使用 ACTUATOR_VEL_MOVE 持续速度模式，而是每次只发送固定步数的
+         *   ACTUATOR_POS_MOVE。F4 到位或 MP157 本地等待结束后再重新 LOCATE，因此即使后续
+         *   STOP 回调异常，左右轴也不会因为速度模式残留而一直转。
+         */
+        if (selectedAxis === "lateral") {
+            var steps = cameraLateralFineTuneFixedSteps()
+            var timeoutMs = Math.max(500, Math.min(3000, Math.floor(Number(autoVisionLateralReturnTimeoutMs || 3000))))
+
+            autoVisionFineTuneAttempts += 1
+            autoVisionActuatorPhase = "fine-tune-lateral"
+            autoVisionRealtimeFineTuneAxis = "lateral"
+            autoVisionRealtimeFineTuneDirection = desiredDirection
+            autoVisionRealtimeFineTuneSpeedRpm = 0
+            autoVisionRealtimeFineTuneSegmentStartMs = 0
+            workflowState = "左右位置微调"
+            autoVisionLastText = "实时微调：左右轴位置模式第 " + autoVisionFineTuneAttempts
+                    + " 次，errorX=" + errorX
+                    + "，errorY=" + errorY
+                    + "，fixedSteps=" + steps
+                    + "，direction=" + desiredDirection
+                    + (desiredDirection === 1 ? "(相机右移/画面左移)" : "(相机左移/画面右移)")
+                    + "，speed=" + speed + "rpm"
+                    + "，timeout=" + timeoutMs + "ms"
+                    + "，elapsed=" + elapsedMs + "ms"
+            storageState = autoVisionLastText
+            showStorageToast()
+
+            recordAutoVisionPendingLateralFineTune(desiredDirection, steps)
+            autoVisionTimer.stop()
+            autoVisionLocateBusy = false
+            if (deviceHealth.sendF4ActuatorPositionMoveWithTimeout(1, desiredDirection, 0, speed, steps, 0, timeoutMs)) {
+                autoVisionCommandBusy = true
+                return
+            }
+
+            clearAutoVisionPendingLateralFineTune()
+            autoVisionActuatorPhase = ""
+            autoVisionStopRealtimeFineTune("实时微调左右轴位置命令未启动：direction="
+                                           + desiredDirection
+                                           + "，steps=" + steps
+                                           + "，改为直接进入模型检测",
+                                           "detect",
+                                           true)
+            return
+        }
+
         if (deviceHealth.sendF4ActuatorVelocityMove(selectedAxis === "lateral" ? 1 : 0,
                                                     desiredDirection,
                                                     speed,
@@ -3283,17 +3369,17 @@ Rectangle {
      */
     function autoVisionFineTuneLateral(errorX) {
         var motor = cameraLateralMotorSetting()
-        var minStep = Math.max(1, Math.floor(Number(motor.minStep || 1)))
-        var steps = autoVisionFineTuneStepsForError(errorX, minStep, "lateral")
+        var steps = cameraLateralFineTuneFixedSteps()
         var speed = autoVisionNormalizeSpeedRpm(motor.normalSpeedRpm || 0, autoVisionFallbackSpeedRpm)
         var direction = errorX > 0 ? 1 : 0
+        var timeoutMs = Math.max(500, Math.min(3000, Math.floor(Number(autoVisionLateralReturnTimeoutMs || 3000))))
 
         autoVisionFineTuneAttempts += 1
         autoVisionActuatorPhase = "fine-tune-lateral"
         workflowState = "左右微调"
         autoVisionLastText = "自动视觉：左右轴微调第 " + autoVisionFineTuneAttempts
                 + " 次，errorX=" + errorX + "，steps=" + steps
-                + "，minStep=" + minStep
+                + "，fixedSteps=" + steps
                 + "，direction=" + direction
                 + (direction === 1 ? "(相机右移/画面左移)" : "(相机左移/画面右移)")
                 + (autoVisionFineTuneNoImproveCount > 0
@@ -3303,7 +3389,7 @@ Rectangle {
         showStorageToast()
 
         recordAutoVisionPendingLateralFineTune(direction, steps)
-        if (deviceHealth.sendF4ActuatorPositionMove(1, direction, 0, speed, steps, 0)) {
+        if (deviceHealth.sendF4ActuatorPositionMoveWithTimeout(1, direction, 0, speed, steps, 0, timeoutMs)) {
             autoVisionCommandBusy = true
             return true
         }
@@ -4523,6 +4609,27 @@ Rectangle {
     }
 
     /*
+     * cameraLateralFineTuneFixedSteps 的作用：
+     *   从参数页读取摄像头左右轴每次 ROI 位置微调的固定步数。
+     *
+     * 主要流程：
+     *   1. 优先读取 C++ 暴露的 lateralFineTuneFixedSteps。
+     *   2. 旧 JSON 没有该字段时回退到 minStep，避免升级后现场参数为空。
+     *   3. 最终限制到 1~10000 step，匹配 F4 ACTUATOR_POS_MOVE 的非零步数要求和现场安全上限。
+     *
+     * 返回值：
+     *   返回本次左右轴位置模式微调步数，单位 step。
+     */
+    function cameraLateralFineTuneFixedSteps() {
+        var motor = cameraLateralMotorSetting()
+        var configuredSteps = Number(motor.lateralFineTuneFixedSteps || 0)
+        var fallbackSteps = Number(motor.minStep || 1)
+        var steps = Math.floor(configuredSteps > 0 ? configuredSteps : fallbackSteps)
+
+        return Math.max(1, Math.min(10000, steps))
+    }
+
+    /*
      * cameraZMotorSetting 的作用：
      *   读取参数页第三台摄像头上下电机配置，供自动下探/回升和手动三轴弹窗复用。
      *
@@ -4701,6 +4808,7 @@ Rectangle {
             lines.push(prefix + ".normal_speed_rpm=" + motor.normalSpeedRpm)
             lines.push(prefix + ".scan_speed_rpm=" + (motor.scanSpeedRpm || 0))
             lines.push(prefix + ".direction=" + motor.direction + " (" + root.stepperMotorDirectionText(motor.direction) + ")")
+            lines.push(prefix + ".lateral_fine_tune_fixed_steps=" + (motor.lateralFineTuneFixedSteps || 0))
             lines.push(prefix + ".z_down_fixed_steps=" + (motor.zDownFixedSteps || 0))
             lines.push(prefix + ".z_up_fixed_steps=" + (motor.zUpFixedSteps || 0))
             lines.push(prefix + ".z_motion_timeout_ms=" + (motor.zMotionTimeoutMs || 10000))
@@ -4770,6 +4878,17 @@ Rectangle {
     }
 
     /*
+     * stepperStepEditorIsLateralFineTuneSteps 的作用：
+     *   判断复用数字键盘当前是否正在编辑左右轴每次位置微调步数。
+     *
+     * 返回值：
+     *   true 表示字段为 lateralFineTuneFixedSteps；false 表示其它步数或超时字段。
+     */
+    function stepperStepEditorIsLateralFineTuneSteps() {
+        return stepperStepEditKey === "lateralFineTuneFixedSteps"
+    }
+
+    /*
      * stepperStepEditorUnitText 的作用：
      *   返回当前数字键盘应该显示的单位文本。
      *
@@ -4785,9 +4904,12 @@ Rectangle {
      *   返回当前数字键盘允许输入的最大整数。
      *
      * 返回值：
-     *   Z 轴超时最大 60 秒；固定步数最大 4294967295 step。
+     *   Z 轴超时最大 60 秒；左右微调步数最大 10000 step；Z 轴固定步数最大 4294967295 step。
      */
     function stepperStepEditorMaxValue() {
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            return 10000
+        }
         return stepperStepEditorIsTimeout() ? 60 : 4294967295
     }
 
@@ -4796,9 +4918,12 @@ Rectangle {
      *   返回当前数字键盘允许应用的最小整数。
      *
      * 返回值：
-     *   Z 轴超时最小 1 秒；固定步数允许 0 step，用于跳过下探或回升。
+     *   Z 轴超时和左右微调步数最小 1；Z 轴固定步数允许 0 step，用于跳过下探或回升。
      */
     function stepperStepEditorMinValue() {
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            return 1
+        }
         return stepperStepEditorIsTimeout() ? 1 : 0
     }
 
@@ -4816,6 +4941,9 @@ Rectangle {
         if (stepperStepEditKey === "zUpFixedSteps") {
             return "回升固定步数"
         }
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            return "左右微调步数"
+        }
         return "Z轴超时等待"
     }
 
@@ -4830,6 +4958,9 @@ Rectangle {
         if (stepperStepEditorIsTimeout()) {
             return "范围 1~60 秒；自动 Z 轴下降或回升未收到 F4 DONE 时，最多等待到该时间后按 MP157 本地估算继续。"
         }
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            return "范围 1~10000 step；ROI 左右轴实时微调每次只下发一条位置模式命令，F4 到位后再重新识别。"
+        }
         return "范围 0~4294967295 step，对应张大头42步进电机位置模式 4 字节脉冲数。"
     }
 
@@ -4841,24 +4972,37 @@ Rectangle {
      *   返回包含数值和单位的中文提示。
      */
     function stepperStepEditorPendingText() {
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            return "左右微调步数待应用：" + stepperStepInputText + " step"
+        }
         return (stepperStepEditorIsTimeout() ? "Z轴超时待应用：" : "位置步数待应用：")
                 + stepperStepInputText + " " + stepperStepEditorUnitText()
     }
 
     /*
      * openStepperStepEditor 的作用：
-     *   打开上下电机固定下探/回升步数或 Z 轴超时数字键盘，并载入当前字段值。
+     *   打开上下电机固定下探/回升步数、Z 轴超时或左右轴微调步数数字键盘，并载入当前字段值。
      *
      * 参数：
-     *   key 是 zDownFixedSteps、zUpFixedSteps 或 zMotionTimeoutMs。
+     *   key 是 zDownFixedSteps、zUpFixedSteps、zMotionTimeoutMs 或 lateralFineTuneFixedSteps。
      *
      * 返回值：
      *   无返回值；字段非法时只更新提示，不打开数字键盘。
      */
     function openStepperStepEditor(key) {
         var motor = currentStepperMotorSetting()
-        if (key !== "zDownFixedSteps" && key !== "zUpFixedSteps" && key !== "zMotionTimeoutMs") {
+        if (key !== "zDownFixedSteps"
+                && key !== "zUpFixedSteps"
+                && key !== "zMotionTimeoutMs"
+                && key !== "lateralFineTuneFixedSteps") {
             stepperMotorResultText = "上下电机数字字段无效：" + key
+            storageState = stepperMotorResultText
+            showStorageToast()
+            return
+        }
+        if (key === "lateralFineTuneFixedSteps"
+                && String(motor.role || "") !== "camera_lateral") {
+            stepperMotorResultText = "左右微调步数只能在摄像头左右电机页设置"
             storageState = stepperMotorResultText
             showStorageToast()
             return
@@ -4867,6 +5011,8 @@ Rectangle {
         stepperStepEditKey = key
         if (stepperStepEditorIsTimeout()) {
             stepperStepInputText = "" + Math.max(1, Math.min(60, Math.floor(Number(motor.zMotionTimeoutMs || 10000) / 1000)))
+        } else if (stepperStepEditorIsLateralFineTuneSteps()) {
+            stepperStepInputText = "" + cameraLateralFineTuneFixedSteps()
         } else {
             stepperStepInputText = "" + Math.floor(Number(motor[key] || 0))
         }
@@ -5036,6 +5182,11 @@ Rectangle {
             stepperMotorResultText = "Z轴超时已清空，请输入1~60秒"
             return
         }
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            stepperStepInputText = ""
+            stepperMotorResultText = "左右微调步数已清空，请输入1~10000 step"
+            return
+        }
 
         stepperStepInputText = "0"
         stepperMotorResultText = stepperStepEditorPendingText()
@@ -5091,15 +5242,24 @@ Rectangle {
         var visibleTimeoutMs = editingTimeout
                 ? appliedTimeoutMs
                 : Math.floor(Number(motor.zMotionTimeoutMs || autoVisionZMotionMaximumWaitMs))
-        stepperMotorResultText = motor.name + "：下探 " + (motor.zDownFixedSteps || 0)
-                + " step，回升 " + (motor.zUpFixedSteps || 0)
-                + " step，Z轴超时 " + (visibleTimeoutMs / 1000.0).toFixed(1)
-                + " 秒，本次自动检测Z轴下降/回升最多等待 " + visibleTimeoutMs
-                + " ms；点击保存并下发写入JSON并通知F4"
-        settingsLastActionText = editingTimeout
-                ? "上下电机Z轴超时已更新为 " + (visibleTimeoutMs / 1000.0).toFixed(1)
-                    + " 秒，本次自动检测立即使用；保存后重启仍生效"
-                : "上下电机固定位置步数已更新"
+        if (stepperStepEditorIsLateralFineTuneSteps()) {
+            stepperMotorResultText = motor.name + "：ROI 左右轴每次位置微调 "
+                    + cameraLateralFineTuneFixedSteps()
+                    + " step；本参数由 MP157 用于 ACTUATOR_POS_MOVE，不需要 F4 额外保存"
+            settingsLastActionText = "左右轴 ROI 位置微调步数已更新为 "
+                    + cameraLateralFineTuneFixedSteps()
+                    + " step，本次自动检测立即使用；保存后重启仍生效"
+        } else {
+            stepperMotorResultText = motor.name + "：下探 " + (motor.zDownFixedSteps || 0)
+                    + " step，回升 " + (motor.zUpFixedSteps || 0)
+                    + " step，Z轴超时 " + (visibleTimeoutMs / 1000.0).toFixed(1)
+                    + " 秒，本次自动检测Z轴下降/回升最多等待 " + visibleTimeoutMs
+                    + " ms；点击保存并下发写入JSON并通知F4"
+            settingsLastActionText = editingTimeout
+                    ? "上下电机Z轴超时已更新为 " + (visibleTimeoutMs / 1000.0).toFixed(1)
+                        + " 秒，本次自动检测立即使用；保存后重启仍生效"
+                    : "上下电机固定位置步数已更新"
+        }
         storageState = settingsLastActionText
         showStorageToast()
     }
@@ -5209,6 +5369,7 @@ Rectangle {
                 + "，最小步长 " + motor.minStep + " step"
                 + "，常规速度 " + motor.normalSpeedRpm + " rpm"
                 + "，上料速度 " + (motor.scanSpeedRpm || 0) + " rpm"
+                + "，左右微调 " + (motor.lateralFineTuneFixedSteps || 0) + " step"
                 + "，方向 " + root.stepperMotorDirectionText(motor.direction)
                 + "，Z轴超时 " + (Math.floor(Number(motor.zMotionTimeoutMs || 10000)) / 1000.0).toFixed(1) + " 秒"
         settingsLastActionText = "步进电机参数已更新，点击保存配置写入JSON"
@@ -5272,7 +5433,7 @@ Rectangle {
     function settingsF4DetailText() {
         var lines = [
             "[串口接入]",
-            "1. MP157 当前通过 /dev/ttySTM2、115200 波特率访问传送带/称重 F407 USART1。",
+            "1. MP157 当前通过 /dev/ttySTM2、57600 波特率访问传送带/称重 F407 USART1。",
             "2. 摄像头左右轴和上下轴已通过 F407 ACTUATOR/STEPPER 二进制协议接入，当前主链路设备节点为 /dev/ttySTM2。",
             "3. 每条检测记录建议携带 f4_uart.status、last_frame_seq、last_frame_crc_ok 和 last_frame_at。",
             "4. F4 心跳超时、CRC 错误或串口断开时，只能显示接入异常，不能在 Qt 里假定硬件已经恢复。",
@@ -7603,6 +7764,8 @@ Rectangle {
                 root.storageState = "未收到F4 ACTUATOR_MOVE_DONE，禁止启动机械臂抓取，请手动确认Z轴已离开零件"
                 root.autoVisionLastText = root.storageState
                 root.showStorageToast()
+            } else if (root.autoVisionActuatorPhase === "fine-tune-lateral") {
+                root.autoVisionRequestFineTuneLocate(true)
             } else if (root.autoVisionActuatorPhase === "z-down-skip"
                     || root.autoVisionActuatorPhase.indexOf("fine-tune") === 0) {
                 root.autoVisionRequestFineTuneLocate()
@@ -7912,7 +8075,7 @@ Rectangle {
                         + "，继续抢占同步 F4"
                 root.storageState = root.formatF4ToastText(root.autoLastAckText)
                 root.showStorageToast()
-                root.autoForcedControlRetryTimer.restart()
+                autoForcedControlRetryTimer.restart()
                 root.evaluateRuntimeAlarms()
                 return
             }
@@ -7923,7 +8086,7 @@ Rectangle {
                 root.storageState = root.formatF4ToastText(root.autoLastAckText)
                 root.showStorageToast()
                 if (root.autoForcedControlRetryCount < root.autoForcedControlMaxRetries) {
-                    root.autoForcedControlRetryTimer.restart()
+                    autoForcedControlRetryTimer.restart()
                 }
                 root.evaluateRuntimeAlarms()
                 return
@@ -8073,6 +8236,50 @@ Rectangle {
             root.autoVisionCommandBusy = false
             root.autoCycleId = cycleId
 
+            /*
+             * 实时微调使用速度模式和强制 STOP，它们的回调必须优先于通用位置阶段处理。
+             * 即使现场异常导致 autoVisionActuatorPhase 残留，也不能让旧的 Z 轴阶段吞掉
+             * ACTUATOR_VEL_MOVE 或 ACTUATOR_STOP_NOW，否则 LOCATE 轮询和模型检测都无法推进。
+             */
+            if (root.autoVisionRealtimeFineTuneActive || root.autoVisionRealtimeFineTunePendingNextStage !== "none") {
+                if (action === "ACTUATOR_VEL_MOVE") {
+                    autoVisionRealtimeCommandGuardTimer.stop()
+                    /* ACTUATOR_VEL_MOVE 的 ACK 只代表速度命令已经写入 F4。
+                     * 电机是否继续运动由 autoVisionRealtimeFineTuneAxis/Direction/Speed 表示，
+                     * autoVisionCommandBusy 必须在 ACK 后释放，否则 autoVisionTimer 会一直跳过 LOCATE，
+                     * 导致误差不再刷新、10 秒超时也无法触发，电机会按第一次方向持续转动。
+                     */
+                    root.autoVisionCommandBusy = false
+                    if (ok) {
+                        root.workflowState = root.autoVisionRealtimeFineTuneAxis === "lateral"
+                                ? "左右实时微调"
+                                : "传送带实时微调"
+                        root.storageState = "实时微调速度命令已生效：" + detail
+                        root.autoVisionLastText = root.storageState
+                    } else {
+                        root.autoVisionFinalizeRealtimeFineTuneStop("实时微调速度命令失败：" + detail
+                                                                    + "；停止闭环并进入模型检测",
+                                                                    "detect")
+                    }
+                    root.showStorageToast()
+                    root.evaluateRuntimeAlarms()
+                    return
+                }
+
+                if (action === "ACTUATOR_STOP_NOW") {
+                    autoVisionRealtimeStopGuardTimer.stop()
+                    var stopReason = root.autoVisionRealtimeFineTuneStopReason
+                    var nextStage = root.autoVisionRealtimeFineTunePendingNextStage
+                    var finalReason = ok
+                            ? (stopReason + "；STOP 已写入 F407")
+                            : (stopReason + "；STOP 写入失败：" + detail + "，按 MP157 本地状态继续收口")
+
+                    root.autoVisionFinalizeRealtimeFineTuneStop(finalReason, nextStage)
+                    root.evaluateRuntimeAlarms()
+                    return
+                }
+            }
+
             if (root.autoVisionActuatorPhase !== "") {
                 if (ok) {
                     root.autoVisionLastText = "执行器完成：" + root.autoVisionActuatorPhase + " " + detail
@@ -8135,45 +8342,6 @@ Rectangle {
                 return
             }
 
-            if (root.autoVisionRealtimeFineTuneActive || root.autoVisionRealtimeFineTunePendingNextStage !== "none") {
-                if (action === "ACTUATOR_VEL_MOVE") {
-                    root.autoVisionRealtimeCommandGuardTimer.stop()
-                    /* ACTUATOR_VEL_MOVE 的 ACK 只代表速度命令已经写入 F4。
-                     * 电机是否继续运动由 autoVisionRealtimeFineTuneAxis/Direction/Speed 表示，
-                     * autoVisionCommandBusy 必须在 ACK 后释放，否则 autoVisionTimer 会一直跳过 LOCATE，
-                     * 导致误差不再刷新、10 秒超时也无法触发，电机会按第一次方向持续转动。
-                     */
-                    root.autoVisionCommandBusy = false
-                    if (ok) {
-                        root.workflowState = root.autoVisionRealtimeFineTuneAxis === "lateral"
-                                ? "左右实时微调"
-                                : "传送带实时微调"
-                        root.storageState = "实时微调速度命令已生效：" + detail
-                        root.autoVisionLastText = root.storageState
-                    } else {
-                        root.autoVisionFinalizeRealtimeFineTuneStop("实时微调速度命令失败：" + detail
-                                                                    + "；停止闭环并进入模型检测",
-                                                                    "detect")
-                    }
-                    root.showStorageToast()
-                    root.evaluateRuntimeAlarms()
-                    return
-                }
-
-                if (action === "ACTUATOR_STOP_NOW") {
-                    root.autoVisionRealtimeStopGuardTimer.stop()
-                    var stopReason = root.autoVisionRealtimeFineTuneStopReason
-                    var nextStage = root.autoVisionRealtimeFineTunePendingNextStage
-                    var finalReason = ok
-                            ? (stopReason + "；STOP 已写入 F407")
-                            : (stopReason + "；STOP 写入失败：" + detail + "，按 MP157 本地状态继续收口")
-
-                    root.autoVisionFinalizeRealtimeFineTuneStop(finalReason, nextStage)
-                    root.evaluateRuntimeAlarms()
-                    return
-                }
-            }
-
             if (root.autoForcedControlAction !== "" && action === "ACTUATOR_STOP_NOW") {
                 var forcedStopResult = ok
                         ? ("首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止") + " 已硬停电机，等待 F4 流程状态同步：" + detail)
@@ -8182,7 +8350,7 @@ Rectangle {
                 root.storageState = root.formatF4ToastText(forcedStopResult)
                 root.showStorageToast()
                 if (!root.autoControlBusy) {
-                    root.autoForcedControlRetryTimer.restart()
+                    autoForcedControlRetryTimer.restart()
                 }
                 root.evaluateRuntimeAlarms()
                 return
@@ -12396,7 +12564,7 @@ Rectangle {
                         width: stepperMotorSettingsFlickable.width
                         height: (stepperMotorPopupPanel.motorConfig.role || "") === "camera_z"
                                 ? 360
-                                : ((stepperMotorPopupPanel.motorConfig.role || "") === "conveyor" ? 280 : 240)
+                                : 280
                     }
                 }
 
@@ -12922,6 +13090,70 @@ Rectangle {
 
                             onClicked: {
                                 root.changeStepperMotorValue("direction", 1)
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    parent: stepperMotorSettingsContent
+                    x: 14
+                    y: 232
+                    width: parent.width - 28
+                    height: 34
+                    spacing: 8
+                    visible: (stepperMotorPopupPanel.motorConfig.role || "") === "camera_lateral"
+
+                    Text {
+                        width: 92
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "微调步数"
+                        color: "#dce3e6"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: "#20262a"
+                        border.color: "#3b454b"
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: Math.floor(Number(stepperMotorPopupPanel.motorConfig.lateralFineTuneFixedSteps || 0)) + " step"
+                            color: "#eef3f4"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    Rectangle {
+                        width: 172
+                        height: 34
+                        radius: 7
+                        color: stepperLateralFineTuneInputMouse.pressed ? "#3c3322" : "#33291b"
+                        border.color: root.accentAmber
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "输入1~10000"
+                            color: "#fff3d5"
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+
+                        MouseArea {
+                            id: stepperLateralFineTuneInputMouse
+                            anchors.fill: parent
+                            preventStealing: true
+
+                            onClicked: {
+                                root.openStepperStepEditor("lateralFineTuneFixedSteps")
                             }
                         }
                     }
@@ -13725,7 +13957,7 @@ Rectangle {
                 y: 54
                 width: parent.width - 36
                 height: 42
-                text: "F4状态：" + deviceHealth.f4StatusText + "；串口 /dev/ttySTM2 115200；MP157-F4主链路只发送二进制帧"
+                text: "F4状态：" + deviceHealth.f4StatusText + "；串口 /dev/ttySTM2 57600；MP157-F4主链路只发送二进制帧"
                 color: "#cfd7db"
                 font.pixelSize: 13
                 font.bold: true
@@ -13947,7 +14179,7 @@ Rectangle {
 
                     onClicked: {
                         deviceHealth.refreshF4StatusNow()
-                        root.calibrationResultText = "已发送 STATUS，等待F4状态刷新"
+                        root.calibrationResultText = "已发送 HEARTBEAT，等待F4 ACK刷新在线状态"
                     }
                 }
             }

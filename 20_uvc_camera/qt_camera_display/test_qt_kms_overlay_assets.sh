@@ -1211,11 +1211,36 @@ if printf '%s\n' "$z_down_ack_block" | grep -q 'autoVisionShortSettleMs'; then
     fail "Z 下降 ACK 后不能直接用短稳定替代物理运动完成等待"
 fi
 fine_tune_block="$(sed -n '/function handleAutoVisionFineTuneLocateFinished/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+settle_timer_block="$(sed -n '/id: autoVisionActuatorSettleTimer/,/Connections {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionStopRealtimeFineTune'; then
     fail "ROI 复查阶段必须进入实时闭环 STOP 收口逻辑，不能继续沿用单次位置微调后直接推进"
 fi
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'deviceHealth.sendF4ActuatorVelocityMove'; then
-    fail "ROI 复查阶段必须改成 ACTUATOR_VEL_MOVE 实时闭环点动"
+    fail "ROI 复查阶段的传送带主轴必须保留 ACTUATOR_VEL_MOVE 实时闭环点动"
+fi
+require_grep "lateralFineTuneFixedSteps" "main.cpp"
+require_grep "lateralFineTuneFixedSteps" "qml/Main.qml"
+require_grep "lateralFineTuneFixedSteps" "README.md"
+require_grep "cameraLateralFineTuneFixedSteps" "qml/Main.qml"
+lateral_realtime_position_block="$(sed -n '/左右轴实时微调位置模式分支/,/return/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$lateral_realtime_position_block" | grep -q 'selectedAxis === "lateral"'; then
+    fail "ROI 实时微调必须给左右轴单独建立位置模式分支，不能继续和传送带共用速度模式"
+fi
+if ! printf '%s\n' "$lateral_realtime_position_block" | grep -q 'sendF4ActuatorPositionMoveWithTimeout(1, desiredDirection, 0, speed, steps, 0, timeoutMs'; then
+    fail "左右轴实时微调必须使用 ACTUATOR_POS_MOVE actuator=1 固定步数位置模式，并带本地超时保护"
+fi
+if ! printf '%s\n' "$lateral_realtime_position_block" | grep -q 'recordAutoVisionPendingLateralFineTune(desiredDirection, steps)'; then
+    fail "左右轴位置微调必须先暂存 direction/steps，等 F4 DONE 后才能累计回中偏移"
+fi
+if printf '%s\n' "$lateral_realtime_position_block" | grep -q 'sendF4ActuatorVelocityMove'; then
+    fail "左右轴实时微调禁止再发送 ACTUATOR_VEL_MOVE，避免超时或 STOP 异常后电机持续转动"
+fi
+if ! printf '%s\n' "$settle_timer_block" | grep -q 'autoVisionRequestFineTuneLocate(true)'; then
+    fail "左右轴位置微调 DONE 后继续 LOCATE 时必须保留本轮实时微调总超时起点，不能每走一步重置 10 秒"
+fi
+fine_tune_request_block="$(sed -n '/function autoVisionRequestFineTuneLocate/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_request_block" | grep -q 'preserveRealtimeSession'; then
+    fail "autoVisionRequestFineTuneLocate() 必须支持保留实时微调会话起点，供左右轴位置模式多步复查使用"
 fi
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeSelectAxis'; then
     fail "ROI 实时闭环必须按 errorX/errorY 选择主误差轴，不能固定只先调一根轴"
@@ -1326,8 +1351,8 @@ fi
 if ! printf '%s\n' "$conveyor_fine_tune_block" | grep -q 'autoVisionFineTuneStepsForError(errorY'; then
     fail "传送带 ROI 微调必须通过 autoVisionFineTuneStepsForError(errorY, ...) 计算实际 steps"
 fi
-if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'autoVisionFineTuneStepsForError(errorX'; then
-    fail "左右轴 ROI 微调必须通过 autoVisionFineTuneStepsForError(errorX, ...) 计算实际 steps"
+if ! printf '%s\n' "$lateral_fine_tune_block" | grep -q 'cameraLateralFineTuneFixedSteps()'; then
+    fail "左右轴 ROI 微调必须使用参数页 lateralFineTuneFixedSteps 固定步数，避免继续按速度或隐式缩放导致停不住"
 fi
 require_grep "autoVisionLateralReturnOffsetSteps" "qml/Main.qml"
 require_grep "resetAutoVisionLateralReturnState" "qml/Main.qml"
@@ -1347,6 +1372,15 @@ actuator_finished_block="$(sed -n '/onF4ActuatorCommandFinished:/,/if (root.step
 if ! printf '%s\n' "$actuator_finished_block" | grep -q 'ACTUATOR_VEL_MOVE'; then
     fail "执行器完成回调必须单独处理实时闭环 ACTUATOR_VEL_MOVE"
 fi
+fine_tune_request_block="$(sed -n '/function autoVisionRequestFineTuneLocate/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fine_tune_request_block" | grep -q 'autoVisionActuatorPhase = ""'; then
+    fail "进入 ROI 实时微调前必须清空 Z 轴旧阶段，避免 z-motion-down-wait 截获后续速度和 STOP 回调"
+fi
+realtime_callback_line="$(printf '%s\n' "$actuator_finished_block" | grep -n 'if (root.autoVisionRealtimeFineTuneActive' | head -n 1 | cut -d: -f1)"
+position_phase_line="$(printf '%s\n' "$actuator_finished_block" | grep -n 'if (root.autoVisionActuatorPhase !== "")' | head -n 1 | cut -d: -f1)"
+if [ -z "$realtime_callback_line" ] || [ -z "$position_phase_line" ] || [ "$realtime_callback_line" -ge "$position_phase_line" ]; then
+    fail "ACTUATOR_VEL_MOVE/STOP_NOW 实时闭环回调必须先于通用位置阶段处理，避免残留阶段吞掉 STOP 收口"
+fi
 vel_move_realtime_block="$(sed -n '/if (action === "ACTUATOR_VEL_MOVE") {/,/if (action === "ACTUATOR_STOP_NOW") {/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$vel_move_realtime_block" | grep -q 'root.autoVisionCommandBusy = false'; then
     fail "ACTUATOR_VEL_MOVE 成功或失败回调必须释放 autoVisionCommandBusy，否则 autoVisionTimer 不会继续 LOCATE，微调会一直按旧方向运行"
@@ -1363,8 +1397,34 @@ fi
 if ! grep -q 'id: autoVisionRealtimeStopGuardTimer' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "QML 必须提供实时微调 STOP 收口兜底 Timer，防止 STOP 回调丢失后一直停在等待综合判定前"
 fi
+if grep -qE 'root\.[A-Za-z0-9_]*Timer\.(stop|start|restart)\(' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "QML 的 Timer id 不能写成 root.xxxTimer.stop()/restart()；id 不是 root 属性，板端会 TypeError 并打断 STOP 收口"
+fi
+require_fixed_grep "isMp157ToF4RequestCommand" "main.cpp"
+require_fixed_grep "isMp157ToF4RequestCommand(reply->command)" "main.cpp"
+require_fixed_grep "跳过MP157请求帧/串口回显" "main.cpp"
+require_fixed_grep "DEFAULT_F4_SERIAL_BAUD = 57600" "main.cpp"
+require_fixed_grep "串口 /dev/ttySTM2 57600" "qml/Main.qml"
+if grep -Eq '/dev/ttySTM2[^0-9A-Za-z_]+115200|DEFAULT_F4_SERIAL_BAUD[[:space:]]*=[[:space:]]*115200' "$SCRIPT_DIR/main.cpp" "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "MP157-F4 主链路默认波特率必须保持 57600，不能退回 /dev/ttySTM2 115200"
+fi
+if ! grep -q '已发送 HEARTBEAT，等待F4 ACK刷新在线状态' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "刷新 F4 在线状态按钮必须提示实际发送的是 HEARTBEAT，不能继续误写 STATUS"
+fi
 stop_realtime_block="$(sed -n '/function autoVisionStopRealtimeFineTune/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
 finalize_realtime_block="$(sed -n '/function autoVisionFinalizeRealtimeFineTuneStop/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! grep -q 'property bool autoVisionRealtimeStopInFlight: false' "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "ROI 实时微调必须提供独立 STOP 收口互斥标志，避免遗留 LOCATE 结果重复发送全轴 STOP"
+fi
+if ! printf '%s\n' "$stop_realtime_block" | grep -q 'if (autoVisionRealtimeStopInFlight)'; then
+    fail "autoVisionStopRealtimeFineTune() 必须在已有 STOP 收口进行中时直接返回，禁止重复发送 STOP"
+fi
+if ! printf '%s\n' "$stop_realtime_block" | grep -q 'autoVisionRealtimeFineTuneActive = false'; then
+    fail "实时微调开始 STOP 收口时必须立即关闭 active 标志，阻止遗留 LOCATE 回调再次进入停止分支"
+fi
+if ! printf '%s\n' "$stop_realtime_block" | grep -q 'autoVisionTimer.stop'; then
+    fail "实时微调开始 STOP 收口时必须立即停止 LOCATE 定时器，不能等异步 STOP 回调后才停止"
+fi
 if ! printf '%s\n' "$fine_tune_block" | grep -q 'autoVisionRealtimeCommandGuardTimer.restart'; then
     fail "发送 ACTUATOR_VEL_MOVE 后必须启动速度命令兜底 Timer"
 fi
@@ -1599,6 +1659,18 @@ fi
 if ! printf '%s\n' "$locate_reply_block" | grep -q 'cand_box=%dx%d'; then
     fail "LOCATE 回包必须包含最接近候选 cand_box，便于判断 bbox 尺寸、密度或 ring 门槛是否拒绝真实零件"
 fi
+require_grep "OVERLAY_CONTROL_LOCATE_REPLY_TIMEOUT_MS" "main.cpp"
+require_grep "overlayReplyTimeoutMs" "main.cpp"
+overlay_control_query_block="$(sed -n '/static QString queryOverlayControlCommand/,/^    static QString queryOverlayStatus/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$overlay_control_query_block" | grep -q 'while (true)'; then
+    fail "自动视觉 LOCATE 必须循环读取 overlay 一整行回复，不能只 read 一次导致 diag/cand_* 长回包被截断"
+fi
+if printf '%s\n' "$overlay_control_query_block" | grep -q 'char buffer\[256\]'; then
+    fail "自动视觉 LOCATE 不能继续使用 256 字节固定短缓冲作为唯一读取窗口，长诊断回包会被截断"
+fi
+if ! printf '%s\n' "$overlay_control_query_block" | grep -q 'reply.contains'; then
+    fail "自动视觉 LOCATE 读取 overlay 回复时必须以换行作为完整回包结束条件"
+fi
 require_grep "f4AutoControlFinished" "main.cpp"
 require_grep "readF4BinaryReply" "main.cpp"
 require_grep "describeF4FaultReport" "main.cpp"
@@ -1666,8 +1738,8 @@ require_repo_grep "uint32_t timeout_ms" "docs/f4_esp32s3_arm_protocol/arm_link_p
 require_repo_grep "ArmLinkProtocol_WriteU32Le.*out_payload\\[6\\].*payload->timeout_ms" "docs/f4_esp32s3_arm_protocol/arm_link_protocol.c"
 F4_UART_COMMAND_SOURCE="/e/hal/bisai_f407_project/User/App/uart_command.c"
 if [ -f "$F4_UART_COMMAND_SOURCE" ]; then
-    grep -q 'UART_COMMAND_USART1_TEXT_ENABLE' "$F4_UART_COMMAND_SOURCE" || fail "F407 USART1 必须提供文本输出静默开关，MP157 主链路不能再收到 [OK]/[ERROR] 文本日志"
-    grep -q '#define UART_COMMAND_USART1_TEXT_ENABLE[[:space:]]*(0U)' "$F4_UART_COMMAND_SOURCE" || fail "F407 USART1 面向 MP157 时文本输出默认必须关闭，只保留二进制协议帧"
+    grep -q 'UART_COMMAND_MP157_TEXT_ENABLE' "$F4_UART_COMMAND_SOURCE" || fail "F407 MP157 主链路必须提供文本输出静默开关，主链路不能再收到 [OK]/[ERROR] 文本日志"
+    grep -q '#define UART_COMMAND_MP157_TEXT_ENABLE[[:space:]]*(0U)' "$F4_UART_COMMAND_SOURCE" || fail "F407 MP157 主链路文本输出默认必须关闭，只保留二进制协议帧"
 fi
 F4_CAMERA_MOTOR_SOURCE="/e/hal/bisai_f407_project/User/App/camera_motor_service.c"
 if [ -f "$F4_CAMERA_MOTOR_SOURCE" ]; then

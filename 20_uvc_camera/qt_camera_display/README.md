@@ -17,6 +17,144 @@
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
 
+## 2026-07-17 MP157-F4 主链路波特率改为 57600 记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场要求把 MP157 与 F4 的主通讯串口波特率从 `115200` 改为 `57600`。F4 端固件由人工另行修改，本次只修改 MP157 Qt 程序默认串口参数和界面/文档提示。 |
+| 具体改动 | `main.cpp` 将 `DEFAULT_F4_SERIAL_BAUD` 改为 `57600`，`baudToSpeed()` 的未知波特率兜底也改为 `B57600`；`Main.qml` 中参数详情和称重标定弹窗状态文本改为 `/dev/ttySTM2 57600`；静态测试增加 57600 契约，防止 `/dev/ttySTM2 115200` 文案或默认值回流。 |
+| 使用方式变化 | MP157 Qt 后台所有 F4 二进制帧仍走 `/dev/ttySTM2`、8N1 raw 模式，帧格式和命令字不变，只改变串口速率为 `57600`。F4 端必须同步改成 `57600` 后才能正常 ACK。 |
+| 生效边界 | 源码修改不等于板端生效；必须同步到虚拟机、交叉编译 `qt_camera_display`、替换板端 `/root/qt_camera_display/qt_camera_display` 并重启服务。镜像打包完成也不等于 eMMC/SD 卡已烧录生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`；脚本确认 `DEFAULT_F4_SERIAL_BAUD = 57600`，界面显示 `/dev/ttySTM2 57600`。 | 若失败，先检查 `main.cpp`、`qml/Main.qml` 是否仍有 `/dev/ttySTM2 115200` 或默认值 `115200`。 |
+| 板端二进制标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep -E 'ttySTM2 57600|57600 波特率'` | 能看到 57600 文案，说明新 QML/C++ 已编进板端二进制。 | 若无输出，说明板端仍是旧二进制；重新同步、交叉编译、替换主程序并重启 Qt 服务。 |
+| F4 心跳验证 | 开发板触摸屏 + F4 主链路 | F4 固件改为 `57600` 并烧录后，点击 `刷新F4状态`。 | MP157 通过 `/dev/ttySTM2 57600` 发送 `HEARTBEAT`，收到 F4 `ACK` 后顶部 F4 显示接入。 | 若待接入，优先确认 F4 固件实际波特率、TX/RX 是否交叉、共地、串口1是否接到 MP157 `/dev/ttySTM2`。 |
+
+## 2026-07-17 自动检测启动后 LOCATE 超时修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场现象是未点击 `开始` 时摄像头预览稳定，点击 `开始` 进入自动检测后才特别容易显示超时或看不到画面。这说明故障不优先指向 UVC 摄像头一直离线，而是自动流程启动后 `autoVisionTimer` 每 `100ms/90ms` 高频请求 overlay `LOCATE`，触发了 Qt 到 `uvc_kms_overlay` 控制 socket 的短超时边界。旧 `queryOverlayControlCommand()` 对所有 overlay 命令都只等待 `150ms`，且只 `read()` 一次 `256` 字节；而 `uvc_kms_overlay` 只在采集主循环每帧转换显示后才处理控制 socket，`LOCATE` 回包还包含 `diag/roi/thr/cand_*` 等较长诊断字段。传送带运动、F4 串口线程和图像定位同时运行时，150ms 容易不够，256 字节也可能截断长回包。 |
+| 具体改动 | `main.cpp` 新增 `OVERLAY_CONTROL_LOCATE_REPLY_TIMEOUT_MS=600`、`OVERLAY_CONTROL_STATUS_REPLY_TIMEOUT_MS=150`、`OVERLAY_CONTROL_REPLY_CHUNK_SIZE=512` 和 `OVERLAY_CONTROL_MAX_REPLY_BYTES=8192`。`queryOverlayControlCommand()` 改为按命令类型选择回复等待时间：`STATUS` 仍短等待，自动视觉 `LOCATE` 使用更长等待；读取回复时在总超时内循环 `select/read`，直到读到换行或超过最大长度，不再把 `LOCATE` 当成单次 256 字节短读。 |
+| 根因边界 | 这次修复的是 MP157 Qt 等 overlay 回复过短导致的“自动检测启动后误报 overlay 回复超时”。如果 `/tmp/uvc-kms-overlay.log` 明确出现 `等待摄像头帧超时`，那是 `uvc_kms_overlay` 真的 2 秒未拿到 V4L2 帧，仍需继续查 USB 摄像头供电、线材、接口松动、设备占用、运动振动和开发板负载。 |
+| 测试改动 | `test_qt_kms_overlay_assets.sh` 新增静态契约：必须存在 `OVERLAY_CONTROL_LOCATE_REPLY_TIMEOUT_MS` 和 `overlayReplyTimeoutMs()`；`queryOverlayControlCommand()` 必须循环读取完整 overlay 行；禁止自动视觉 `LOCATE` 回到 `char buffer[256]` 单次短读；读取结束必须以换行作为完整回包条件。 |
+| 使用方式变化 | 首页自动检测操作不变。点击 `开始` 后，底部如果只是偶发等待 overlay 回复，现在应给 `LOCATE` 更宽的处理窗口，不应因为一帧采集/转换/定位略慢就立刻报“自动视觉定位失败：ERR overlay回复超时”。 |
+| 生效边界 | 本次只改 MP157 Qt 主程序和静态测试，不修改 F4 固件、不修改 MP157-F4 二进制协议、不修改 `uvc_kms_overlay` 识别算法。源码已改不等于板端生效；必须同步到虚拟机、交叉编译 `qt_camera_display`，替换板端 `/root/qt_camera_display/qt_camera_display` 并重启服务。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`；脚本确认 `LOCATE` 有独立长超时、overlay 回复循环读到换行。 | 若失败，先看第一条 `FAIL`；重点检查 `queryOverlayControlCommand()` 是否又退回 `150ms + 单次 read`。 |
+| 工作区格式检查 | Windows 仓库根目录 | `git diff --check -- 20_uvc_camera/qt_camera_display/main.cpp 20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh 20_uvc_camera/qt_camera_display/README.md` | 不应出现尾随空格、冲突标记或空白错误。 | 若失败，按输出文件和行号修复；CRLF warning 不代表逻辑失败。 |
+| 板端日志区分 | 开发板 SSH | `grep -n -E 'overlay回复超时|自动视觉定位失败|等待摄像头帧超时|frames=' /tmp/qt-kms-overlay-shell.log /tmp/uvc-kms-overlay.log \| tail -n 80` | 如果只剩少量 Qt `overlay回复超时`，优先查板端是否仍是旧二进制；如果 overlay 日志出现 `等待摄像头帧超时`，说明已经下沉到 UVC 取帧或硬件链路。 | 若两个日志都没有关键字，先确认 Qt 服务是否真的在运行，执行 `/root/qt_camera_display/run_qt_kms_overlay_display.sh status`。 |
+| 自动流程现场验证 | 开发板触摸屏 + F4 日志 | 部署新 `qt_camera_display` 后点击首页 `开始`，让传送带连续送料，观察底部自动视觉状态和 `/tmp/qt-kms-overlay-shell.log`。 | 自动检测启动后底部应持续刷新 `LOCATE` 坐标、`diag/cand_*` 或等待上料状态；不应一启动就频繁进入 `ERR overlay回复超时`。 | 若仍频繁超时，先确认板端二进制包含 `OVERLAY_CONTROL_LOCATE_REPLY_TIMEOUT_MS` 字符串；确认后再查 `/tmp/uvc-kms-overlay.log` 是否有 V4L2 取帧超时、USB 重连或 overlay 进程重启。 |
+
+## 2026-07-17 MP157-F4 心跳回显过滤修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场点击“刷新F4状态”后，底部显示 `收到非HEARTBEAT ACK/NACK回包：HEARTBEAT raw=A5 5A 01 02 ...`。该 raw 帧的 `CMD=0x02` 是 MP157 自己发送的 HEARTBEAT 请求帧，不是 F4 返回的 ACK；串口助手直接发心跳时 F4 能返回 `CMD=0x80 ACK`，说明 F4 命令号和 ACK payload 本身能对上。 |
+| 具体改动 | `main.cpp` 新增 `isMp157ToF4RequestCommand()`，在 `readF4BinaryReply()` 中跳过 `CMD < 0x80` 的 MP157 请求方向帧，避免串口回显或旧 RX 缓冲里的 HEARTBEAT 请求帧被当成 F4 回包；`Main.qml` 把刷新按钮提示从“已发送 STATUS”改成“已发送 HEARTBEAT，等待F4 ACK刷新在线状态”；静态测试增加回显过滤和提示文字检查。 |
+| 协议核对结论 | MP157 与 F4 的 `HEARTBEAT=0x02`、`ACK=0x80`、`NACK=0x81`、`STATUS_REPORT=0x82`、ACK 7 字节负载 `cycle_id/acked_seq/acked_cmd/status/state` 均一致。当前问题不是两端命令号不一致，而是 MP157 收包层没有过滤请求方向帧。 |
+| 生效边界 | 本次只修改 MP157 Qt/QML 和静态测试，不修改 F4 固件命令号。`Main.qml` 编进 Qt resource，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display` 后屏幕提示和回包过滤才会生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`；脚本确认 `readF4BinaryReply()` 会跳过 MP157 请求帧，并确认按钮提示使用 HEARTBEAT。 | 若失败，先按第一条 `FAIL` 定位；重点检查 `main.cpp` 的请求帧过滤和 `Main.qml` 的刷新提示。 |
+| 板端二进制标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep -E '跳过MP157请求帧/串口回显|已发送 HEARTBEAT'` | 能看到两个字符串，说明板端 Qt 主程序包含本次修复。 | 若无输出，说明板端仍是旧二进制；重新同步、交叉编译、替换主程序并重启 Qt 服务。 |
+| F4 心跳验证 | 开发板触摸屏 + F4 USART1 主链路 | 点击“刷新F4状态”。 | 若线路正常，底部应显示 `ACK HEARTBEAT cycle=... seq=... state=...`；如果串口链路仍有回显，MP157 会跳过 `HEARTBEAT raw=...` 后继续等待真正 ACK。 | 若仍提示未收到 ACK，先用串口助手确认 F4 USART1 收到 `A5 5A 01 02 ... 6B` 后能回 `CMD=0x80`，再查 MP157 `/dev/ttySTM2` 接线、共地、TX/RX 是否接反、F4 固件是否已重新编译下载。 |
+
+## 2026-07-10 ROI 左右轴微调改为位置模式记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/main.cpp`、`20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场已经确认 ROI 微调超时后 MP157 能进入下一步，但左右微调电机仍继续转。根因风险在于左右轴使用 `ACTUATOR_VEL_MOVE` 速度模式，真正停机依赖后续 STOP 链路；一旦 STOP 回调、状态或底层驱动器响应异常，速度模式可能残留。 |
+| 具体改动 | `Main.qml` 中传送带仍使用速度模式做前后实时闭环；摄像头左右轴改为每次发送 `ACTUATOR_POS_MOVE actuator=1`，步数来自参数页 `lateralFineTuneFixedSteps`，F4 到位或 MP157 本地位置等待结束后再重新 `LOCATE`；左右轴位置模式 DONE 后调用 `autoVisionRequestFineTuneLocate(true)`，保留本轮 10 秒总超时起点，不会每走一步重置超时。 |
+| 参数变化 | `main.cpp` 的 `StepperMotorSettings` 新增 `lateralFineTuneFixedSteps`，默认 `20 step`，保存到 JSON 字段 `lateral_fine_tune_fixed_steps`，QML 参数页“摄像头左右电机”新增“微调步数”输入，范围 `1~10000 step`。 |
+| F4 适配结论 | 当前 F4 源码已经有 `ACTUATOR_POS_MOVE actuator=1 -> CameraMotorService_RequestLateralPositionWithReport()` 分发链路，且左右轴地址仍由 `STEPPER_PARAM_SET` 配置为 `addr=3`；本次不需要新增 F4 代码。代码已写不等于 F4 已重新编译或板端已部署，如果现场 F4 不是当前版本，仍需用户重新编译下载 F4。 |
+| 使用方式变化 | 首页自动检测操作不变。进入 Z 轴下降后的 ROI 微调时，左右偏差每次只移动参数页设置的固定步数，走完自然停止；如果 10 秒内仍未居中，MP157 发送全轴 STOP 兜底并进入模型检测，不再让左右轴保持速度模式继续转。 |
+| 生效边界 | `Main.qml` 已编进 Qt resource，必须重新交叉编译 `qt_camera_display` 并替换板端 `/root/qt_camera_display/qt_camera_display`。只改源码或只复制 QML 不会让开发板生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`；脚本检查 `lateralFineTuneFixedSteps`、左右轴位置模式分支、DONE 后保留 10 秒总超时起点。 | 若失败，先按第一条 `FAIL` 定位；如果提示左右轴仍用速度模式，检查 `handleAutoVisionFineTuneLocateFinished()` 的 lateral 分支。 |
+| F4 源码链路检查 | Windows 本地 F4 工程 | `rg -n "BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL|CameraMotorService_RequestLateralPositionWithReport" E:\hal\bisai_f407_project\User\App` | 能看到 `actuator=1` 分发到 `CameraMotorService_RequestLateralPositionWithReport()`。 | 若缺失，说明 F4 工程不是当前版本，需要补齐位置模式分发后再编译下载。 |
+| 参数页调整 | 开发板触摸屏 | 进入 `参数设置` -> 步进电机 -> `摄像头左右电机` -> `微调步数`，输入例如 `20` 后保存配置。 | 底部提示左右轴 ROI 位置微调步数已更新；保存后 JSON 中出现 `lateral_fine_tune_fixed_steps`。 | 若看不到该行，说明板端 Qt 二进制仍是旧版本；重新交叉编译并替换主程序。 |
+| 现场 ROI 微调 | 开发板触摸屏 + F4 串口日志 | 点击首页 `开始`，让零件在 Z 轴下降后偏左或偏右。 | F4 收到 `ACTUATOR_POS_MOVE actuator=1 steps=<lateralFineTuneFixedSteps>`；左右轴每次走固定步数后停止，再由 MP157 重新识别；超时后进入模型检测。 | 若电机仍持续转，先确认 F4 收到的是 `ACTUATOR_POS_MOVE` 还是旧的 `ACTUATOR_VEL_MOVE`，再查板端哈希、F4 固件版本和电机驱动器响应。 |
+
+## 2026-07-10 ROI STOP 回调 Timer id TypeError 修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场反馈“超时后已经进入下一步，但微调电机仍继续转”。板端 `/tmp/qt-kms-overlay-shell.log` 出现 `qrc:/qml/Main.qml:8109: TypeError`、`qrc:/qml/Main.qml:8133: TypeError`、`qrc:/qml/Main.qml:8216: TypeError`。这些行位于 F4 执行器回调，原因是把 QML `Timer` 的 `id` 写成 `root.autoVisionRealtimeCommandGuardTimer.stop()`、`root.autoVisionRealtimeStopGuardTimer.stop()`、`root.autoForcedControlRetryTimer.restart()`。`id` 是 QML 词法作用域对象，不是 `root` 的属性；板端执行到这里会抛异常并打断后续 STOP 收口、兜底清理和重试逻辑。 |
+| 具体改动 | `Main.qml` 将执行器回调里的 `root.xxxTimer.stop()/restart()` 改成直接使用 `xxxTimer.stop()/restart()`，让速度命令 ACK、STOP ACK、首页暂停/停止强停回调都能继续执行完整状态收口。 |
+| 测试改动 | `test_qt_kms_overlay_assets.sh` 新增静态契约，禁止 `root.<任意Timer>.stop()/start()/restart()` 再进入 QML；该测试在旧写法上已先失败，修复后输出 `PASS: Qt KMS overlay assets contract`。 |
+| 使用方式变化 | 首页自动检测操作不变。ROI 实时微调超时后，MP157 不应再因为 QML TypeError 中断 F4 回调收口；如果 F4 已收到 STOP 但物理电机仍转，下一步应继续查 F4 到 Emm42 的停机帧、电机地址、总线接线和驱动器 STOP 响应。 |
+| 生效边界 | 本次修复仍是 MP157 Qt/QML 侧，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display`。如果板端日志仍出现 `Main.qml:8109/8133/8216 TypeError`，说明板端二进制不是本次版本。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并禁止 `root.xxxTimer.stop()/restart()`。 | 若失败，直接搜索 `root.<TimerId>.stop/start/restart` 并改成直接引用 Timer id。 |
+| 板端 QML 异常检查 | 开发板 SSH | `grep -n -E 'TypeError|ReferenceError|SyntaxError' /tmp/qt-kms-overlay-shell.log \| tail -n 40` | 自动流程运行后不再出现 `Main.qml:8109`、`Main.qml:8133`、`Main.qml:8216` 的 TypeError。 | 若仍出现，先确认板端 `sha256sum /root/qt_camera_display/qt_camera_display` 与虚拟机新构建产物一致。 |
+| ROI 超时收口验证 | 开发板触摸屏 + F4 USART2 | 点击首页 `开始`，让零件在 Z 轴下降后无法进入 ROI 中心直到超时。 | MP157 进入模型检测；F4 USART2 应出现对应 `[STOP][BELT]` 和 `[STOP][CAM]`；Qt 日志不再新增 TypeError。 | 如果 F4 STOP 日志出现但电机仍转，说明问题已下沉到 F4/Emm42 物理停机链路，继续查 `lat_addr/z_addr`、电机实际地址、USART6 接线和 Emm42 STOP 帧响应。 |
+
+## 2026-07-10 ROI 实时微调 STOP 收口互斥修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场 F4 USART2 持续输出 `[STOP][BELT]` 和 `[STOP][CAM]`，其中 `status=0`、`lat_status=0`、`z_status=0` 表示 F4 已经把 STOP 写到底层电机串口；`stack_hw≈199~212`、`heap_min=6192` 表示 F4 栈、堆资源没有耗尽。`epoch` 连续增长说明 MP157 在 ROI 实时微调收口阶段重复发送 STOP，而不是 F4 队列或栈不够。根因是 MP157 发出 STOP 后没有把实时微调收口变成原子状态，旧 LOCATE 结果和 `autoVisionTimer` 仍可能再次进入“已居中/已超时 -> 发送 STOP”分支。 |
+| 具体改动 | `Main.qml` 新增 `autoVisionRealtimeStopInFlight`，表示 STOP 已发出但还没完成回调；`autoVisionStopRealtimeFineTune()` 如果发现 STOP 正在收口就直接返回，禁止重复发 STOP；第一次进入 STOP 收口时立即关闭 `autoVisionRealtimeFineTuneActive`、停止 `autoVisionTimer`、释放 `autoVisionLocateBusy`，让遗留 LOCATE 回调在函数开头直接丢弃；`autoVisionFinalizeRealtimeFineTuneStop()` 在 STOP ACK 或兜底超时后统一清除互斥标志，并按 `focus/detect/resume` 推进流程。 |
+| 测试改动 | `test_qt_kms_overlay_assets.sh` 新增静态契约：必须存在 `autoVisionRealtimeStopInFlight`；STOP 收口函数必须检查互斥标志；STOP 收口开始必须关闭 `autoVisionRealtimeFineTuneActive`；STOP 收口开始必须停止 `autoVisionTimer`。这些契约用于防止后续改动重新引入“STOP 后继续 LOCATE 并重复 STOP”的问题。 |
+| 使用方式变化 | 首页自动检测操作不变。零件进入 ROI 中心后只允许触发一次 STOP 收口，然后进入约 3 秒对焦稳定；达到 10 秒超时后只允许触发一次全轴 STOP 收口，然后进入模型检测，不再让 MP157 持续刷 STOP 帧。 |
+| 生效边界 | 本次修复在 MP157 Qt/QML 侧；`Main.qml` 已编进 Qt resource，必须重新交叉编译 `qt_camera_display` 并替换板端 `/root/qt_camera_display/qt_camera_display` 才会在开发板生效。代码已写不等于板端已部署。F4 当前日志里的栈、堆、队列指标不支持“F4 栈不够”这个判断。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约测试 | Windows 仓库 `20_uvc_camera/qt_camera_display` | `C:\Program Files\Git\bin\bash.exe -lc 'cd /c/Users/caofengrui/Desktop/linux/20_uvc_camera/qt_camera_display && sh ./test_qt_kms_overlay_assets.sh'` | 输出 `PASS: Qt KMS overlay assets contract`，并覆盖 STOP 收口互斥、active 关闭、LOCATE Timer 停止。 | 若失败，先按脚本第一条 `FAIL` 定位；重点检查 `autoVisionStopRealtimeFineTune()` 是否仍会在 STOP 收口中重复下发 STOP。 |
+| 板端二进制更新 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep autoVisionRealtimeStopInFlight` | 有输出，说明板端运行的主程序包含本次 STOP 收口互斥状态。 | 若无输出，说明板端仍是旧二进制；重新在虚拟机交叉编译并替换 `/root/qt_camera_display/qt_camera_display`。 |
+| F4 串口观察 | F4 USART2 调试串口 | 点击首页 `开始`，让零件进入 Z 轴下降后的 ROI 实时微调，再让它居中或等待超时。 | 居中或超时后只出现有限几条 STOP 日志，随后 MP157 进入对焦稳定或模型检测；不再看到 `epoch` 长时间连续增长。 | 若仍连续刷 STOP，先确认板端二进制 marker，再查看 `/tmp/qt-kms-overlay-shell.log` 是否有 QML 异常导致新状态机未运行。 |
+| 自动流程推进 | 开发板触摸屏 | 零件从偏右位置进入 ROI，观察左右轴向右移动相机后回到中心。 | 进入中心后电机停止，底部状态进入 `对焦稳定`，随后执行双模型检测。 | 若电机已停但界面不推进，检查 `ACTUATOR_STOP_NOW` 回调是否进入实时闭环专用分支，或 STOP guard 是否在超时后触发本地收口。 |
+
+## 2026-07-10 ROI 强制 STOP 回调被旧 Z 阶段截获修复记录
+
+| 项目 | 内容 |
+|---|---|
+| 修改文件清单 | `20_uvc_camera/qt_camera_display/qml/Main.qml`、`20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh`、`20_uvc_camera/qt_camera_display/README.md` |
+| 修改原因 | 现场重新部署超时停机版本后，左右轴已经停止，但界面长期循环显示 `ACTUATOR_STOP 已写入串口，repeat=3，不等待ACK`，没有继续进入模型检测。根因是 Z 轴下降完成后进入 ROI 实时微调时，`autoVisionActuatorPhase` 仍残留 `z-motion-down-wait`；`onF4ActuatorCommandFinished` 又先处理通用位置阶段，导致后续 `ACTUATOR_VEL_MOVE` 和 `ACTUATOR_STOP_NOW` 回调被旧 Z 阶段提前截获并返回。 |
+| 具体改动 | `autoVisionRequestFineTuneLocate()` 在建立实时微调会话前显式清空 `autoVisionActuatorPhase`，表示旧 Z 轴位置阶段已经结束；`onF4ActuatorCommandFinished` 把实时闭环的 `ACTUATOR_VEL_MOVE/ACTUATOR_STOP_NOW` 专用处理移动到通用位置阶段之前，即使未来再次出现残留阶段，也优先释放速度命令、完成 STOP 收口并推进对焦或模型检测。 |
+| 测试改动 | 静态测试新增两条契约：进入实时微调前必须清空旧执行器阶段；实时速度/STOP 回调必须位于通用位置阶段分支之前。测试在旧实现上先失败，修复后输出 `PASS: Qt KMS overlay assets contract`。 |
+| 使用方式变化 | 首页操作和电机方向保持不变。零件偏右时左右轴仍向右移动相机；零件进入中心或达到 10 秒超时后，STOP 写入完成应立即退出微调，分别进入 3 秒对焦或自动模型检测，不再停留在 STOP 提示循环。 |
+| 生效边界 | QML 已编进 Qt 主程序，必须重新交叉编译并替换板端 `/root/qt_camera_display/qt_camera_display`。仅修改 Windows/虚拟机源码不等于板端已生效。 |
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态回归测试 | 虚拟机 `/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display` | `sh ./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract`；同时检查旧 Z 阶段清理和实时回调优先级。 | 若提示旧阶段未清空，检查 `autoVisionRequestFineTuneLocate()`；若提示回调顺序错误，检查 `onF4ActuatorCommandFinished` 中实时闭环分支是否仍位于位置阶段之后。 |
+| 编译产物检查 | 虚拟机同目录 | `./build_qt_camera_display.sh && file build-mp157/qt_camera_display` | 构建成功，产物显示 `ELF 32-bit LSB executable, ARM`。 | 若编译失败，先确认 ST Qt SDK 环境脚本和 QML 语法；不要把未通过编译的程序部署到板端。 |
+| 板端版本校验 | 开发板 SSH | `sha256sum /root/qt_camera_display/qt_camera_display` | 哈希与虚拟机 `build-mp157/qt_camera_display` 完全一致。 | 若不一致，重新上传为 `.new`，备份旧程序后原子替换并执行 `sync`。 |
+| 居中 STOP 推进 | 开发板触摸屏 | 点击首页 `开始`，让偏右零件进入 Z 轴下降后的实时微调并最终进入中心。 | 左右轴向右移动相机；进入中心后 STOP，随后进入约 3 秒对焦和双模型检测，不再停在 `ACTUATOR_STOP 已写入串口`。 | 若仍卡住，记录底部完整文字，并查看 `/tmp/qt-kms-overlay-shell.log` 是否出现 QML TypeError 或新的状态覆盖。 |
+| 10 秒超时推进 | 开发板触摸屏 | 让零件保持无法进入中心，持续观察实时微调。 | 约 10 秒发送全轴 STOP；STOP 写入完成后进入模型检测，不再继续运动，也不等待不存在的 ACK。 | 若电机已停但流程不前进，先确认板端哈希，再检查 `ACTUATOR_STOP_NOW` 是否进入实时闭环专用回调。 |
+
 ## 2026-07-09 ROI 微调结束全轴停机与回位接口修复记录
 
 | 项目 | 内容 |
@@ -490,7 +628,7 @@
 | 云服务器迁移 | 板端默认云服务器切到 `http://139.9.35.72`：`DEFAULT_CLOUD_HEALTH_URL` 用新 `/health`，`defect-cos-upload` 默认 `CLOUD_BASE_URL` 用新后端，`board-review-tunnel.sh` 默认 `CLOUD_HOST` 用新公网 IP；账号、Cookie、`cos-upload.env`、API 路径和云端本机 `127.0.0.1:18081` 回写端口不变。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端部署后执行 `curl -fsS --max-time 2 http://139.9.35.72/health`、`/root/qt_camera_display/defect-cos-upload --self-test-json-parser` 和 `/etc/init.d/S91board-review-tunnel status`。 |
 | 告警处理建议完整显示 | 告警维护页右下角处理建议仍保留短列表，新增 `查看全部` 按钮；点击后打开 `alarmAdviceDetailOverlay`，完整文本由 `alarmFullAdviceText()` 复用 `alarmSourceAdvice()` 生成，并交给 `alarmAdviceDetailFlickable` 滚动显示。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端点击 `告警维护` -> `查看全部`，确认能滚动读到相机、SD 卡、4G、云端、F4、保存/上传和模型检测排查项。 |
 | 告警设备健康 4G 状态 | 设备健康矩阵最后一格从参数 `配置` 改为 `4G`，直接显示 `deviceHealth.networkStatusText` 和 `deviceHealth.networkStatusColor`，与顶部网络状态同源，只有 `4g-ppp test` 通过才显示在线。 | 板端执行 `command -v 4g-ppp; 4g-ppp test; echo $?`，再点击告警页 `刷新状态`，确认 `4G` 格与命令退出码一致。 |
-| 参数详情完整显示 | 参数设置页的 `视觉检测策略` 和 `F4接入边界` 卡片新增 `查看详情`；视觉详情按云端上报契约说明 `record_no`、零件归一、双模型判定、`source/annotated` 图片、COS 登记和断网补传；F4 详情说明 `/dev/ttySTM1`、`115200`、心跳/CRC/帧序号、LDC1614、HX711、Emm42_V5.0、急停限位和 Qt 不接管运动控制的边界。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端点击 `参数设置` -> `视觉检测策略/查看详情` 和 `F4接入边界/查看详情`，确认弹层可滚动读完；确认存储卡片标题为 `相机、存储与上传`。 |
+| 参数详情完整显示 | 参数设置页的 `视觉检测策略` 和 `F4接入边界` 卡片新增 `查看详情`；视觉详情按云端上报契约说明 `record_no`、零件归一、双模型判定、`source/annotated` 图片、COS 登记和断网补传；F4 详情说明 `/dev/ttySTM2`、`57600`、心跳/CRC/帧序号、LDC1614、HX711、Emm42_V5.0、急停限位和 Qt 不接管运动控制的边界。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端点击 `参数设置` -> `视觉检测策略/查看详情` 和 `F4接入边界/查看详情`，确认弹层可滚动读完；确认存储卡片标题为 `相机、存储与上传`。 |
 | 参数详情按钮防重叠 | 板端拍屏发现 `查看详情` 按钮贴在卡片右下角会遮住最后一行状态；已把两个卡片摘要列表压为 4 行，并把底部状态文字放左侧、`查看详情` 按钮固定在右侧预留区域，避免按钮覆盖文本。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端打开 `参数设置`，确认 `视觉检测策略` 和 `F4接入边界` 两张卡片底部状态文本与 `查看详情` 按钮左右分栏，没有重叠。 |
 | 参数详情滚动归零 | 两个参数详情共用 `settingsDetailFlickable`，板端发现从一个详情滑到中间后再打开另一个详情会继承滚动位置；已在 `openSettingsDetail()` 每次打开详情后通过 `Qt.callLater()` 把 `settingsDetailFlickable.contentY` 归零。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端打开 `视觉检测策略/查看详情` 滑到中间并关闭，再打开 `F4接入边界/查看详情`，确认正文从顶部开始显示。 |
 | F4 二进制心跳、状态和故障回包 | F4 健康心跳从每 8 秒尝试发送改为 120 秒节流，减少 RS485 占用；参数设置页新增 `称重标定` 弹窗，快捷克重 100/500/1000/2000g，也支持通过内置数字键盘输入任意 1~5000g 整数；Qt 不再写 `CAL` 文本，当前发送二进制 `WEIGHT_CALIBRATE 0x30` 并按 `ACK/NACK/FAULT_REPORT` 显示结果。 | 本地执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端点击 `参数设置` -> `称重标定`，用 `清空`、数字键和 `退格` 输入非快捷值如 `750` 后点击 `发二进制`；F4 已去皮且最近一次 HX711 采样有效时，预期弹窗显示 `ACK WEIGHT_CALIBRATE ...`；若未去皮、克重越界或 HX711 异常，预期显示对应 `NACK ERR_STATE_NOT_ALLOWED/ERR_FIELD_RANGE/ERR_HARDWARE_FAULT`。 |
@@ -730,7 +868,7 @@
 | 4G PPP 管理命令 `4g-ppp` | 顶部网络真实状态 | Qt 周期调用 `4g-ppp test`；只有退出码为 0 才显示“在线”，失败、超时或命令不存在都不能显示在线。 |
 | SD 卡 `/mnt/sdcard` | 保存检测图片和安全卸载 | 检测流程只允许写入 `/mnt/sdcard/images`；安全卸载必须走 `sdcard-safe-remove`。 |
 | Unix socket `/tmp/uvc-kms-overlay-control.sock` | Qt UI 请求 overlay 保存当前检测帧 | 由 `uvc_kms_overlay` 创建，`run_qt_kms_overlay_display.sh status` 会显示路径；检测流程发送 `SAVE_DETECT /mnt/sdcard/images`。 |
-| F4 串口 `/dev/ttySTM2` | F4 控制器真实接入判断、称重标定、传送带和摄像头运动轴高层控制 | Qt 后台线程按 115200 8N1 raw 模式发送 `A5 5A ... 6B` 二进制帧；周期心跳发送 `HEARTBEAT`，人工刷新不节流；参数设置页称重标定弹窗发送二进制 `WEIGHT_CALIBRATE 0x30`，手动页传送带按钮发送 `BELT_MANUAL_CONTROL` 或 `QUERY_STATUS`，三轴手动弹窗中传送带/左右轴发送 `ACTUATOR_VEL_MOVE/ACTUATOR_STOP`，上下轴和自动 Z 轴流程发送 `ACTUATOR_POS_MOVE/ACTUATOR_STOP`；F407 再把传送带映射到 `UART4 PC10/PC11 addr=0x01`，把摄像头左右轴映射到 `USART6 PC6/PC7 addr=0x03`，把摄像头上下轴映射到 `USART6 PC6/PC7 addr=0x02`；正确只认 `ACK/STATUS_REPORT`，错误只认 `NACK/FAULT_REPORT`。 |
+| F4 串口 `/dev/ttySTM2` | F4 控制器真实接入判断、称重标定、传送带和摄像头运动轴高层控制 | Qt 后台线程按 57600 8N1 raw 模式发送 `A5 5A ... 6B` 二进制帧；周期心跳发送 `HEARTBEAT`，人工刷新不节流；参数设置页称重标定弹窗发送二进制 `WEIGHT_CALIBRATE 0x30`，手动页传送带按钮发送 `BELT_MANUAL_CONTROL` 或 `QUERY_STATUS`，三轴手动弹窗中传送带/左右轴发送 `ACTUATOR_VEL_MOVE/ACTUATOR_STOP`，上下轴和自动 Z 轴流程发送 `ACTUATOR_POS_MOVE/ACTUATOR_STOP`；F407 再把传送带映射到 `UART4 PC10/PC11 addr=0x01`，把摄像头左右轴映射到 `USART6 PC6/PC7 addr=0x03`，把摄像头上下轴映射到 `USART6 PC6/PC7 addr=0x02`；正确只认 `ACK/STATUS_REPORT`，错误只认 `NACK/FAULT_REPORT`。 |
 | 云端 health `http://139.9.35.72/health` | 云端连接状态 | Qt 异步执行 `curl -fsS --max-time 2`；请求成功才显示“已连接”，失败或超时不显示已连接。 |
 | 云端复核反向隧道 `127.0.0.1:18081 -> 127.0.0.1:18080` | 云端按钮回写板端本地历史 | 最终运行时由板端 `/etc/init.d/S91board-review-tunnel` 开机启动并守护，不依赖 Windows 或虚拟机；板端使用 `/root/.ssh/id_ed25519_yunfuwu_tunnel` 主动连接云端，云端只通过 systemd timer 周期检查 `127.0.0.1:18081` 是否可达。 |
 | 检测历史文件 `/mnt/sdcard/images/upload_history_YYYYMMDD.json` | Qt 历史记录页数据源 | 每次检测/上传完成后由 `UploadHistoryModel` 追加写入当天文件；启动时汇总读取多天 `upload_history_*.json`，并兼容旧 `/mnt/sdcard/images/upload_history.json`；记录包含 `source_path`、`annotated_images`、`classification_result`、`segmentation_result`、`record_id`、`record_no`、`upload_status` 和文件大小，同时保留旧 `jpg_path/png_path` 兼容字段。 |
@@ -806,7 +944,7 @@
 | overlay STATUS | 开发板 SSH | `printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock; sleep 3; printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock` | 输出类似 `OK STATUS has_frame=1 serial=123 visible=1 width=640 height=480`，第二次 `serial` 应大于第一次，且首页相机状态显示 `在线`。 | 若 `nc` 不支持 `-U`，只用屏幕状态和 `/tmp/uvc_kms_overlay.log` 验证；若 `has_frame=0`、`serial=0` 或 `serial` 不变化，先查 USB 摄像头、`/dev/video0` 和 overlay 日志。 |
 | USB 摄像头拔出检测 | 开发板屏幕和 SSH | 保持 Qt 首页运行，拔掉 USB 摄像头，再观察 6 秒；同时执行 `tail -n 80 /tmp/uvc_kms_overlay.log` | 顶部/健康矩阵相机状态变为离线类状态，Qt 主界面仍可切换页面和点击按钮，不应整屏卡死。 | 若界面卡住，检查 `main.cpp` 是否仍在主线程执行 socket/串口等待；若状态不变，确认部署了支持 `STATUS` 的新版 `uvc_kms_overlay`。 |
 | USB 摄像头重新插入恢复 | 开发板屏幕和 SSH | 插回 USB 摄像头，必要时执行 `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart-overlay; printf 'STATUS\n' | nc -U /tmp/uvc-kms-overlay-control.sock` | overlay 只重启视频进程，Qt PID 不变；`STATUS` 恢复 `has_frame=1 serial>0` 且后续 `serial` 持续变化后，相机状态回到 `在线`；如果当前页面是首页，QML 再发送 `VISIBLE 1` 让画面重新显示。 | 若 Qt PID 变化，说明误用了 `restart` 而不是 `restart-overlay`；若 overlay 起不来，查 USB 枚举、`/dev/video0`、DRM plane 占用和 `/tmp/uvc-kms-overlay.log`。 |
-| F4 串口握手状态 | 开发板屏幕和日志 | Qt 启动后等待健康检测，或在页面触发一次刷新状态；必要时查看 `/tmp/qt-kms-overlay-shell.log` 中 F4 心跳摘要 | Qt 通过 `/dev/ttySTM2` 发送二进制 `HEARTBEAT 0x02`，收到匹配 `ACK 0x80` 后顶部 F4 显示 `接入`，底部提示显示 `F4: F4 串口握手成功：ACK ...`；收到 `NACK/FAULT_REPORT`、串口失败或超时时显示 `F4: F4 待接入：...`。 | 若没有 `F4:` 提示或仍出现旧文本判断，确认板端运行的是新 Qt 二进制；若一直待接入，查 F407 是否烧录二进制协议固件、MP157 `/dev/ttySTM2` 与 F407 USART1 TX/RX 是否交叉、共地和 115200 波特率。 |
+| F4 串口握手状态 | 开发板屏幕和日志 | Qt 启动后等待健康检测，或在页面触发一次刷新状态；必要时查看 `/tmp/qt-kms-overlay-shell.log` 中 F4 心跳摘要 | Qt 通过 `/dev/ttySTM2`、`57600 8N1` 发送二进制 `HEARTBEAT 0x02`，收到匹配 `ACK 0x80` 后顶部 F4 显示 `接入`，底部提示显示 `F4: F4 串口握手成功：ACK ...`；收到 `NACK/FAULT_REPORT`、串口失败或超时时显示 `F4: F4 待接入：...`。 | 若没有 `F4:` 提示或仍出现旧文本判断，确认板端运行的是新 Qt 二进制；若一直待接入，查 F407 是否烧录二进制协议固件、MP157 `/dev/ttySTM2` 与 F407 USART1 TX/RX 是否交叉、共地和 57600 波特率。 |
 | F4 称重标定弹窗 | 开发板屏幕 | 点击左侧 `参数设置`，在 `F4接入边界` 卡片点击 `称重标定`，选择 `1000 g` 或用弹窗数字键盘按 `清空`、`7`、`5`、`0` 输入 `750`，再点击 `发二进制` | Qt 不发送 `CAL` 文本，只发送二进制 `WEIGHT_CALIBRATE 0x30`；F4 已去皮且最近一次 HX711 采样有效时，弹窗和底部提示应显示 `F4: 标定命令成功：ACK WEIGHT_CALIBRATE...`；未去皮、克重越界或 HX711 异常时显示结构化 `NACK`。 | 若弹窗仍显示 `正在发送 CAL` 或 `[OK][WEIGHT]`，说明板端还是旧 QML/旧二进制；若无回包，先按 F4 串口握手状态排查；若输入被拒绝，确认克重为 1~5000 的整数；若返回 `ERR_STATE_NOT_ALLOWED`，先用串口助手或 F4 初始化流程完成空载 TARE；若按输入框不弹键盘，直接使用弹窗内置数字键盘。 |
 | F4 称重标定 SSH 对照 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display | grep -E 'WEIGHT_CALIBRATE|标定克重必须是1~5000g整数|formatF4ToastText|发二进制'` | 板端二进制包含称重标定命令和 `F4:` 提示格式相关标记，证明 QML/C++ 已经重新编进程序。 | 该对照只证明部署版本正确，不直接向 F4 写 ASCII；若需要裸串口验证，应使用能发送二进制帧的专用工具，不能再用 `CAL 1000` 文本判断主链路。 |
 | F4 传送带手动控制 | 开发板屏幕 | 点击左侧 `手动控制`，点击 `进入手动`，再点 `巡航启动`、`查询状态`、`停止` | 命令日志依次记录 `BELT_MANUAL_SCAN`、`QUERY_STATUS`、`BELT_MANUAL_STOP` 语义名；底层向 F407 下发二进制 `BELT_MANUAL_CONTROL 0x41` 或 `QUERY_STATUS 0x40`；底部提示统一显示 `F4: F4回执：ACK ...`、`F4: F4回执：STATUS_REPORT ...` 或 `F4: F4命令失败：NACK/FAULT_REPORT...`。 | 若 UI 显示 F4 命令失败，先看底部 `F4:` 后面的 NACK 错误码；再确认 F407 已创建 `ConveyorMotorService_Task()`，并检查 `UART4 PC10/PC11` 到传送带 Emm42 地址 `0x01` 的接线、共地和电源。 |
