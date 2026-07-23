@@ -5403,7 +5403,7 @@ Rectangle {
             "",
             "[云端记录契约]",
             "1. 每次检测必须生成稳定 record_no，断网补传继续复用同一个 record_no，避免云端重复记录。",
-            "2. 零件类型只在波形垫圈、平垫圈、弹性垫圈之间归一；wave_washer_good/bad 只能归到同一个 wave_washer。",
+            "2. 当前四分类模型只输出平垫圈和弹性垫圈；历史记录中的波形垫圈编码仍保留兼容。",
             "3. POST /api/v1/records 顶层写 result、confidence_score、vision_context、decision_context 和 device_context。",
             "4. 图片不直接塞进主记录，先创建记录，再申请 COS 预签名地址，最后登记 source/annotated 文件元数据。",
             "5. source/annotated 上传成功后，历史详情才能完整展示原图、标注图、模型输出和云端记录号。",

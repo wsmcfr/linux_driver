@@ -919,6 +919,7 @@ Use this convention when the STM32MP157 Qt automatic flow asks `uvc_kms_overlay`
 | Overlay success reply | `OK LOCATE has_target=<0|1> frame_id=<n> width=<w> height=<h> center_x=<x> center_y=<y> bbox_x=<x> bbox_y=<y> bbox_w=<w> bbox_h=<h> confidence=<0..100> ring=<0|1> diag=<code> roi_y=<y> roi_h=<h> thr=<dark>,<body>,<bright> cand_box=<w>x<h> cand_area=<px> cand_density=<pct> cand_conf=<0..100> cand_ring=<0|1>` |
 | Overlay no-hard-gate marker | `#define AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET 0U` in `uvc_kms_overlay.c` |
 | Metal body expansion marker | `AUTO_LOCATE_MIN_BODY_LUMA_DELTA`, `AUTO_LOCATE_BODY_LUMA_DELTA_PERCENT`, and `auto_locate_body_threshold_from_delta()` |
+| Oversized candidate refine marker | `AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE` and `auto_locate_refine_oversized_ring_candidate()` in `uvc_kms_overlay.c` |
 | Diagnostic marker | `LOCATE_DIAG_*` and `auto_locate_record_reject_candidate()` in `uvc_kms_overlay.c` |
 | Candidate structure marker | `struct locate_result` includes `unsigned int has_ring_hole` |
 | Qt parser marker | `result.insert(QStringLiteral("has_ring"), tokenValue(reply, QStringLiteral("ring")).toInt())` |
@@ -935,6 +936,7 @@ Use this convention when the STM32MP157 Qt automatic flow asks `uvc_kms_overlay`
 | Source frame | `LOCATE` must analyze the raw `latest_frame.yuyv_map`, not the decorated Qt/KMS framebuffer. Display-only ROI graphics must not influence target selection. |
 | Search region | The horizontal search width remains aligned to the model ROI width; the vertical region should be the detected black conveyor band or a conservative center fallback, not the entire frame when belt detection fails. |
 | Candidate growth | `bright_threshold` starts a component and `body_threshold` expands it. Do not start components from `body_threshold` alone, or gray belt texture can become a candidate; do not expand only with `bright_threshold`, or shadowed washer arcs can be split and fail ring detection. |
+| Oversized candidate handling | A bbox larger than `AUTO_LOCATE_MAX_BBOX_SIDE` is not automatically "no part." It can be a real washer connected to a white support, highlight, or bright background. Before returning `LOCATE_DIAG_BBOX`, the overlay must try a local ring-hole refinement inside the oversized component, cap the refined bbox within QML's area budget, and recompute area/density/confidence from the refined window. If no four-side ring support is found, then reject with `diag=3`. |
 | Candidate class | For the current washer-like part set, ring evidence is still the strongest signal, but it must not be the only signal at every stage. A real washer can become `ring=0` when exposure, highlight, shadow, or blur hides the center hole. |
 | No-ring handling | `AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET` defaults to `0U`. The overlay may return a no-ring candidate only after stricter bbox, size, and confidence gates. QML defaults `autoVisionAllowNonRingFirstDetect` to `false`, so a no-ring candidate cannot establish the first target; after `autoVisionHasSeenTarget` is true, no-ring candidates may help hold or reacquire the same part. |
 | Reply compatibility | Existing fields keep their names and units. Adding `ring=<0|1>` is additive; Qt must parse missing or malformed `ring` as `0`, not crash. |
@@ -951,6 +953,7 @@ Use this convention when the STM32MP157 Qt automatic flow asks `uvc_kms_overlay`
 | Overlay no hard ring gate | `./test_qt_kms_overlay_assets.sh` finds `AUTO_LOCATE_REQUIRE_RING_HOLE_FOR_TARGET 0U` and rejects `require_ring_hole_for_target > 0U && !has_ring` | A real washer can disappear permanently when the center hole is hidden by lighting | Keep overlay no-ring fallback, while retaining stricter bbox, size, and confidence gates |
 | First-detect no-ring guard | Static test finds `autoVisionAllowNonRingFirstDetect: false`, `autoVisionFirstDetectRequiredFramesForCandidate`, `autoVisionFirstDetectNonRingConfirmRequired`, and `autoVisionFirstDetectMinNonRingConfidence` | If enabled by default, the stable black conveyor can satisfy multi-frame confirmation and become a false part | Keep first-detect no-ring disabled by default; use no-ring fallback only after the current cycle has seen a real target |
 | Body expansion contract | Static test finds `auto_locate_body_threshold_from_delta`, a `start_luma, bright_threshold` seed check, a `next_luma, body_threshold` neighbor expansion check, and ring detection using `body_threshold` | Real washers under uneven light can be split into several bright arcs and never produce `ring=1` | Restore high-brightness seed plus lower metal-body expansion; do not require ring as the only final signal |
+| Oversized bbox refinement | Static test finds `AUTO_LOCATE_OVERSIZE_REFINE_MAX_SIDE`, `auto_locate_refine_oversized_ring_candidate`, and a bbox-filter block that calls the helper before `LOCATE_DIAG_BBOX` | A visible washer can be rejected before ring detection with `diag=3 cand_box=300x261` because it touched a white support or highlight | Restore local ring refinement before the bbox reject path; do not solve this by simply raising the max bbox to the full ROI |
 | Locate diagnostic reply | Static test finds `diag=%u`, `roi_y=%u roi_h=%u`, `thr=%u,%u,%u`, `cand_box=%dx%d`, `LOCATE_DIAG_RING`, and `auto_locate_record_reject_candidate` | A moving washer can fail in the field with no evidence of which gate rejected it | Restore additive diagnostic fields and candidate rejection tracking |
 | QML bbox max | Static test finds `property int autoVisionExpectedPartMaxBboxArea: 45000` | Overlay can return a valid `173x173 ring=1` washer while QML turns it back into `VISION_LOST` | Restore the max area budget or replace it with a ring-aware QML filter backed by board evidence |
 | Reply parser | Static test finds the `ring` parser in `main.cpp` and `ring=` display in QML | The overlay may return ring evidence but the UI cannot show or validate it | Parse `ring` into `has_ring` and display it in the auto vision status |
@@ -970,7 +973,15 @@ Good: A bright washer highlight starts the component, then adjacent dimmer silve
 ```
 
 ```text
+Good: An oversized `cand_box=300x261` first attempts local ring refinement and returns a <=210x210 washer-local bbox only if the dark center has metal support on all four sides.
+```
+
+```text
 Base: A partial washer entering from the top may return `ring=0`; before the cycle has seen a real target, QML keeps waiting instead of entering tracking from that no-ring candidate.
+```
+
+```text
+Bad: Raising `AUTO_LOCATE_MAX_BBOX_SIDE` to the full 300px ROI and returning the whole connected support/background blob as the target.
 ```
 
 ```text
@@ -1025,6 +1036,7 @@ if (!autoVisionAllowNonRingFirstDetect) {
 - Run `git diff --check` after editing C++, C, QML, shell, Markdown, or spec files.
 - Cross-build `uvc_kms_overlay` in `cfr-vm` and confirm the output is an ARM ELF before board deployment.
 - Cross-build `qt_camera_display` after QML or C++ parser changes, because `Main.qml` is embedded through Qt resources.
+- For `diag=3` field failures, verify that the oversized-bbox path tries local ring refinement before rejection and keeps the refined bbox within QML's max-area budget.
 - On the board, verify an empty conveyor does not repeatedly show `TRACKING`, verify first detection proceeds from `ring=1`, and verify already-seen targets can survive short no-ring drops without sending `VISION_LOST reason=1`.
 - When board `nc -U` is available, run `printf 'LOCATE\n' | nc -U /tmp/uvc-kms-overlay-control.sock`; otherwise use the home-page bottom status and overlay logs.
 
@@ -1214,6 +1226,105 @@ The final `detectCurrentFrameFinished` signal already contains every field, so i
 
 ```text
 Emit `detectClassificationReady` after the first model returns and update part/class/confidence immediately; emit `detectModelsReady` after the last local model returns and update `total_time_ms`; reserve `detectCurrentFrameFinished` for final upload status and busy-state reset.
+```
+
+---
+
+## Scenario: MP157 Dynamic Classification Model Replacement Contract
+
+### 1. Scope / Trigger
+
+- Trigger: replacing the MobileNetV3-Small classification ONNX or labels used by `20_uvc_camera/qt_camera_display/defect_classify.cpp`.
+- Trigger: changing the number or order of classifier labels, quantizing a new classifier, or deploying model files to STM32MP157.
+- This contract does not authorize replacing the UNet segmentation model. A classifier-only replacement must prove that the board UNet SHA256 remains unchanged.
+- The current six-class UNet is a temporary compatibility model. When the separately trained reduced-class UNet is ready, evaluate, quantize, and deploy it as a separate task; do not infer that classifier class removal has already changed segmentation outputs.
+
+### 2. Signatures
+
+| Boundary | Signature |
+|---|---|
+| Classifier executable | `/root/qt_camera_display/defect-classify --image <jpg> [--model <onnx>] [--labels <json>]` |
+| Stable board model | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx` |
+| Stable board labels | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json` |
+| ONNX output inspection | `session.GetOutputTypeInfo(0)` and `GetTensorTypeAndShapeInfo().GetShape()` |
+| Runtime element inspection | `outputs.front().GetTensorTypeAndShapeInfo().GetElementCount()` |
+| Static regression | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` |
+| Current four-class source | `/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx` |
+| Immutable segmentation model | `/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Class count source | Do not define a fixed `MODEL_CLASS_COUNT`. Read the positive final dimension from a rank-2 ONNX output shaped `[batch, classes]`. |
+| Labels mapping | Parse every `idx_to_class` entry, reject negative/duplicate indexes, and require continuous indexes `0..N-1` with no empty values. |
+| Boundary equality | Before inference, require `labels.size() == model_class_count`. After inference with batch size one, require `GetElementCount() == model_class_count`. |
+| Quality groups | Every classification label must contain a distinct `good` or `bad` token so probability aggregation cannot silently treat an unknown label as good. |
+| Quantization gate | Evaluate FP32 and INT8 on the same complete validation split. Do not deploy when INT8 exact accuracy drops by more than one percentage point or a class has no evaluated samples. |
+| Stable destination | New classifier artifacts may replace the contents of the stable board filenames; Qt launch paths and settings do not need a filename migration. |
+| Selective deployment | A classifier-only update replaces the classifier model, labels, `defect-classify`, and a relinked Qt binary when required. It must not copy or overwrite the UNet model. |
+| Completion proof | Model generation is not board deployment. Require VM/board SHA256 equality, service restart completion, four representative board inferences, and pre/post UNet SHA256 equality. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| ONNX output shape | Rank 2 and final dimension is positive | Model is not the supported single-output classifier contract | Reject the model before reading logits |
+| Labels continuity | Indexes are exactly `0..N-1` | Missing, duplicate, negative, or ambiguous class mapping | Exit nonzero with a labels error |
+| Model/labels equality | Example: `model=4`, `labels=4` | Only one artifact was replaced, or labels came from another training run | Exit nonzero; redeploy the matching pair |
+| Runtime element count | Batch-one output contains exactly `N` floats | Unexpected output shape or runtime contract drift | Exit nonzero before softmax |
+| Quantized accuracy | INT8 loss is at most 1 percentage point versus FP32 | Quantized node scope damages model accuracy | Reduce quantized nodes and repeat calibration/evaluation |
+| Board hash | Board classifier/labels hashes equal staged VM files | Old or partial deployment is still active | Stop service, upload `.new`, verify, atomically move, `sync`, restart |
+| UNet hash | Pre-deployment hash equals post-deployment hash | Classifier update accidentally changed segmentation | Restore the backed-up UNet immediately and audit the copy command |
+| Qt self-test with empty ROI | Fails before models with `current ROI has no part` diagnostics | Physical target is absent; not a classifier failure | Put a supported part in the green ROI; do not bypass the safety gate |
+
+### 5. Good / Base / Bad Cases
+
+```cpp
+// Good: derive the count from the ONNX output and validate the labels boundary.
+const Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
+const auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+const std::vector<int64_t> output_shape = output_tensor_info.GetShape();
+const size_t model_class_count = static_cast<size_t>(output_shape.back());
+if (labels.size() != model_class_count) {
+    throw std::runtime_error("classification model/labels class count mismatch");
+}
+```
+
+```text
+Base: keep old cloud display/upload mappings for historical records, even when the current classifier no longer emits those old classes.
+```
+
+```text
+Bad: change `MODEL_CLASS_COUNT = 6` to `MODEL_CLASS_COUNT = 4` and assume future model replacements will remember to edit C++ again.
+```
+
+```text
+Bad: run the full deployment script for a classifier-only update when it also copies the UNet model, then claim segmentation was unchanged without comparing hashes.
+```
+
+### 6. Tests Required
+
+- Run the FP32 and INT8 classifiers on the same complete validation directory and record exact accuracy, class counts, file sizes, and hashes.
+- Run `sh ./test_qt_kms_overlay_assets.sh`; it must reject a fixed six-class constant and require output-shape/element-count validation markers.
+- Cross-build `defect-classify` with the deployed ONNX Runtime ARM headers. ONNX Runtime 1.17 returns `ConstTensorTypeAndShapeInfo` from a const `TypeInfo`; use `auto` rather than forcing an owned wrapper type.
+- On the board, run one known image for every current class and assert the `class=` token and `status=GOOD|BAD` agree with the label suffix.
+- On the board, deliberately pass a known mismatched old labels file and assert nonzero exit plus `model=<N> labels=<M>` in the error.
+- Record the UNet SHA256 before deployment and assert the same value after service restart.
+- Run Qt `--detect-self-test` with a supported physical part inside the ROI. If no part is present, record the ROI-gate failure separately from model execution evidence.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+Copy a four-class ONNX over the old model, leave six-class labels and a fixed loop bound in place, then debug the resulting out-of-bounds probabilities on the board.
+```
+
+#### Correct
+
+```text
+Quantize and evaluate the matching ONNX/labels pair, derive the output class count at runtime, reject any mismatch before softmax, deploy through `.new` files, and prove the unchanged UNet hash after restart.
 ```
 
 ---
@@ -2882,6 +2993,106 @@ Lateral fine tune moved the camera for this part, then Z-up immediately starts t
 
 ```text
 After Z-up, if the current cycle accumulated a successful lateral offset, send the reverse lateral position move first; if the offset is zero, skip the return and start the arm flow directly.
+```
+
+## Scenario: ROI Realtime Fine Tune Stop Safety Contract
+
+### 1. Scope / Trigger
+
+- Trigger: changing `20_uvc_camera/qt_camera_display/qml/Main.qml`, `test_qt_kms_overlay_assets.sh`, `main.cpp`, `docs/stm32mp157-f407-binary-protocol.md`, or F407 `binary_protocol_service.c` around ROI realtime fine tuning, dropped LOCATE frames, actuator velocity moves, timeout handling, or automatic model-detect handoff.
+- Field bug learned: showing "ROI realtime fine tune timeout" on the MP157 screen is not enough. The timeout branch must actually send a stop frame that F4 accepts even when local state and F4 cycle state have drifted.
+
+### 2. Signatures
+
+| Boundary | Signature / Marker |
+|---|---|
+| MP157 realtime stop helper | `autoVisionStopRealtimeFineTune(reasonText, nextStage, forceAllActuators)` |
+| MP157 dropped-frame branch | `handleAutoVisionFineTuneLocateFinished()` invalid LOCATE result branch |
+| MP157 timeout property | `property int autoVisionRealtimeTuneTimeoutMs: 10000` |
+| MP157 all-actuator stop | `deviceHealth.sendF4ActuatorStopNow(255, 0)` |
+| F4 stop command | `ACTUATOR_STOP 0x51` payload `cycle_id, actuator, flags` |
+| F4 all-actuator value | `BINARY_PROTOCOL_ACTUATOR_ALL == 0xFF` |
+| F4 safety log marker | `ACTUATOR_STOP ignores cycle mismatch for safety` |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Dropped LOCATE frames | A dropped or invalid LOCATE frame during realtime fine tune counts toward `autoVisionRealtimeTuneTimeoutMs`; do not reset the realtime fine-tune start timestamp on dropped frames. |
+| Dropped-frame motion safety | If a dropped frame occurs while `autoVisionRealtimeFineTuneAxis` and `autoVisionRealtimeFineTuneSpeedRpm` show an active velocity move, MP157 must stop the current actuator before waiting for the next LOCATE result. |
+| Timeout handoff | When elapsed realtime fine-tune time reaches 10000 ms, MP157 must stop micro-adjustment and enter automatic model detection via the `detect` stage. It must not stay in fine tune, focus settle, or manual review. |
+| All-axis timeout stop | Timeout-to-detect branches must call `autoVisionStopRealtimeFineTune(..., "detect", true)` so QML sends `ACTUATOR_STOP_NOW actuator=255`. This handles stale local axis state and unknown physical motor state. |
+| Resume after non-timeout drop | A single dropped frame before timeout should use `nextStage="resume"` after stopping the current actuator, preserving the same realtime fine-tune session and elapsed timer. |
+| F4 cycle mismatch safety | F4 `ACTUATOR_STOP` must validate payload length, `flags`, and `actuator`, but it must not reject a valid stop solely because `cycle_id` mismatches. It should log the mismatch and still stop the requested actuator(s). |
+
+### 4. Validation & Error Matrix
+
+| Check | Good Result | Failure Meaning | Required Action |
+|---|---|---|---|
+| Static QML test | `./test_qt_kms_overlay_assets.sh` finds dropped-frame elapsed timeout checks, dropped-frame current-axis stop, `"detect"` timeout handoff, and `forceAllActuators` support | A future edit can reintroduce blind motion during dropped frames or timeout | Restore the dropped-frame stop block and timeout all-axis stop call |
+| F4 source check | `rg "BINARY_PROTOCOL_ACTUATOR_ALL|ignores cycle mismatch for safety" E:\hal\bisai_f407_project\User\App\binary_protocol_service.c` finds both markers | MP157 may send all-axis STOP but F4 can still reject it due cycle mismatch | Restore F4 safety-stop behavior and rebuild/download F4 |
+| Board binary marker | `sha256sum /root/qt_camera_display/qt_camera_display` equals the freshly built VM binary; `strings` finds `forceAllActuators` | Board is still running old QML embedded in an old binary | Rebuild Qt, replace `/root/qt_camera_display/qt_camera_display`, restart service |
+| Field dropped-frame test | Occluding the target during realtime fine tune stops current motion and keeps elapsed time increasing | MP157 still lets velocity mode continue without visual feedback | Inspect `autoVisionStopRealtimeFineTune(..., "resume")` and F4 STOP logs |
+| Field timeout test | Around 10 seconds after realtime fine tune starts, F4 receives all-axis STOP and MP157 enters model detection | Timeout is only a status message, not a control action | Check MP157 STOP_NOW write path, F4 cycle mismatch behavior, and board binary freshness |
+
+### 5. Good / Base / Bad Cases
+
+```qml
+// Good: dropped frames count toward total timeout and stop active motion before resuming.
+if (elapsedMs >= autoVisionRealtimeTuneTimeoutMs) {
+    autoVisionStopRealtimeFineTune("ROI realtime timeout during dropped frame", "detect", true)
+    return
+}
+if (autoVisionRealtimeFineTuneAxis !== "" && autoVisionRealtimeFineTuneSpeedRpm > 0) {
+    autoVisionStopRealtimeFineTune("ROI dropped frame, stop current actuator", "resume")
+    return
+}
+```
+
+```c
+/* Good: ACTUATOR_STOP remains a safety command even when cycle IDs drift. */
+if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
+{
+    my_printf(&huart1, "[WARN][PROTO] ACTUATOR_STOP ignores cycle mismatch for safety...\r\n");
+}
+/* Continue stopping requested actuator(s). */
+```
+
+```text
+Bad: the QML timeout text says "enter model detection", but the STOP target is only the remembered axis and F4 rejects the stop because the cycle ID no longer matches.
+```
+
+### 6. Tests Required
+
+- Run `cd 20_uvc_camera/qt_camera_display && ./test_qt_kms_overlay_assets.sh` after changing realtime fine-tune QML, timeout handling, dropped-frame handling, or F4 stop contracts.
+- Run `git diff --check` in the Windows repository and in `E:/hal/bisai_f407_project` after editing MP157 or F4 files.
+- For QML changes, cross-build `qt_camera_display`, verify the produced binary is ARM 32-bit, deploy it to the board, and verify the board hash matches the VM build hash.
+- For F4 `ACTUATOR_STOP` changes, compile and download the F4 firmware manually, then confirm F4 logs show all-axis STOP and the cycle-mismatch safety warning only when a mismatch is intentionally forced.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```text
+Dropped LOCATE frame -> keep current ACTUATOR_VEL_MOVE running -> wait for target to reappear.
+```
+
+#### Correct
+
+```text
+Dropped LOCATE frame -> elapsed time still counts -> stop current actuator -> resume LOCATE polling without resetting the 10 second timer.
+```
+
+#### Wrong
+
+```text
+ACTUATOR_STOP with a stale cycle_id returns CYCLE_MISMATCH before stopping the motor.
+```
+
+#### Correct
+
+```text
+ACTUATOR_STOP validates flags and actuator, logs stale cycle_id, then stops the requested actuator(s) because stop is a safety command.
 ```
 
 ## Common Mistakes

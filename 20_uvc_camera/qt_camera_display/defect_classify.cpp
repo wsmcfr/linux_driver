@@ -42,7 +42,7 @@
 static const char *DEFAULT_MODEL_PATH =
     "/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx";
 
-/* 默认标签路径：必须和 ONNX 同前缀，保证 6 类输出顺序不靠猜。 */
+/* 默认标签路径：必须和 ONNX 同前缀，保证类别数量和输出顺序不靠硬编码猜测。 */
 static const char *DEFAULT_LABELS_PATH =
     "/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json";
 
@@ -54,9 +54,6 @@ static const int MODEL_INPUT_WIDTH = 224;
 
 /* 模型输入高度：export_classify_onnx.py 固定导出 224x224。 */
 static const int MODEL_INPUT_HEIGHT = 224;
-
-/* 当前模型类别数：gasket/splitwasher/washer 各 good/bad，共 6 类。 */
-static const int MODEL_CLASS_COUNT = 6;
 
 /* 默认 bad 总概率阈值；实际运行时可由 Qt 参数页通过 --bad-threshold 覆盖。 */
 static const float DEFAULT_BAD_THRESHOLD = 0.5f;
@@ -502,7 +499,7 @@ static std::string trim_json_string(std::string text)
  *   labels_path 是 *_labels.json 文件路径。
  *
  * 返回值：
- *   返回长度为 6 的类别名数组，索引必须对应 ONNX 输出。
+ *   返回按 idx_to_class 索引连续排列的类别名数组；数组长度必须在会话创建后与 ONNX 输出维度核对。
  */
 static std::vector<std::string> load_labels(const std::string &labels_path)
 {
@@ -520,7 +517,8 @@ static std::vector<std::string> load_labels(const std::string &labels_path)
         throw std::runtime_error("标签文件缺少 idx_to_class: " + labels_path);
     }
 
-    std::vector<std::string> labels(MODEL_CLASS_COUNT);
+    /* labels 按 JSON 中的最大索引动态扩展，使推理程序兼容经过契约校验的不同类别数量模型。 */
+    std::vector<std::string> labels;
     size_t pos = 0;
 
     while (pos < object.size()) {
@@ -541,15 +539,37 @@ static std::vector<std::string> load_labels(const std::string &labels_path)
         const int index = parse_int(object.substr(key_start + 1, key_end - key_start - 1).c_str(), "label index");
         const std::string value = trim_json_string(object.substr(value_start, value_end - value_start + 1));
 
-        if (index >= 0 && index < MODEL_CLASS_COUNT) {
-            labels[static_cast<size_t>(index)] = value;
+        /* 负索引没有对应的 ONNX 输出位置，必须直接拒绝，不能静默忽略错误标签。 */
+        if (index < 0) {
+            throw std::runtime_error("标签索引不能为负数: " + labels_path);
         }
+
+        const size_t label_index = static_cast<size_t>(index);
+        if (labels.size() <= label_index) {
+            labels.resize(label_index + 1U);
+        }
+
+        /* 同一索引出现两次会让类别顺序产生歧义，因此在加载阶段立即报错。 */
+        if (!labels[label_index].empty()) {
+            throw std::runtime_error("标签文件包含重复索引 " + std::to_string(index) + ": " + labels_path);
+        }
+
+        if (value.empty()) {
+            throw std::runtime_error("标签名称不能为空: " + labels_path);
+        }
+
+        labels[label_index] = value;
 
         pos = value_end + 1;
     }
 
-    for (int i = 0; i < MODEL_CLASS_COUNT; i++) {
-        if (labels[static_cast<size_t>(i)].empty()) {
+    if (labels.empty()) {
+        throw std::runtime_error("标签文件 idx_to_class 不能为空: " + labels_path);
+    }
+
+    /* 索引必须从 0 连续到 N-1；空洞说明 labels 无法与 ONNX 输出列一一对应。 */
+    for (size_t i = 0; i < labels.size(); i++) {
+        if (labels[i].empty()) {
             throw std::runtime_error("标签文件类别数量或索引不完整: " + labels_path);
         }
     }
@@ -628,6 +648,14 @@ int main(int argc, char **argv)
     try {
         const ProgramOptions options = parse_args(argc, argv);
         const std::vector<std::string> labels = load_labels(options.labels_path);
+
+        /* 每个标签必须明确属于 good 或 bad，避免未知后缀被错误汇总为良品。 */
+        for (size_t i = 0; i < labels.size(); i++) {
+            if (!class_name_is_group(labels[i], "good") && !class_name_is_group(labels[i], "bad")) {
+                throw std::runtime_error("标签缺少 good/bad 质量分组: " + labels[i]);
+            }
+        }
+
         const ImageBuffer image = read_jpeg_rgb(options.image_path);
         std::vector<float> input_tensor = preprocess_image(image, options.roi_size);
 
@@ -638,6 +666,28 @@ int main(int argc, char **argv)
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
         Ort::Session session(env, options.model_path.c_str(), session_options);
+
+        /* 当前命令行程序只支持单输出分类模型，多输出图无法确定哪一个张量是分类 logits。 */
+        if (session.GetOutputCount() != 1U) {
+            throw std::runtime_error("分类模型必须且只能包含一个输出张量");
+        }
+
+        /* 从 ONNX 输出张量读取真实类别数量，避免模型由 6 类换成 4 类后发生越界读取。 */
+        const Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
+        const auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+        const std::vector<int64_t> output_shape = output_tensor_info.GetShape();
+        if (output_shape.size() != 2U || output_shape.back() <= 0) {
+            throw std::runtime_error("分类模型输出形状必须为 [batch, classes]，且 classes 必须为正数");
+        }
+
+        const size_t model_class_count = static_cast<size_t>(output_shape.back());
+        if (labels.size() != model_class_count) {
+            throw std::runtime_error(
+                "分类模型输出类别数与 labels 不一致: model="
+                + std::to_string(model_class_count)
+                + " labels=" + std::to_string(labels.size()));
+        }
+
         Ort::AllocatorWithDefaultOptions allocator;
         Ort::AllocatedStringPtr input_name = session.GetInputNameAllocated(0, allocator);
         Ort::AllocatedStringPtr output_name = session.GetOutputNameAllocated(0, allocator);
@@ -662,24 +712,39 @@ int main(int argc, char **argv)
             1);
         const auto infer_end = std::chrono::steady_clock::now();
 
+        if (outputs.size() != 1U || !outputs.front().IsTensor()) {
+            throw std::runtime_error("ONNX Runtime 未返回唯一的分类输出张量");
+        }
+
+        const size_t output_element_count = outputs.front().GetTensorTypeAndShapeInfo().GetElementCount();
+        if (output_element_count != model_class_count) {
+            throw std::runtime_error(
+                "单张图片输出元素数量与类别数不一致: elements="
+                + std::to_string(output_element_count)
+                + " classes=" + std::to_string(model_class_count));
+        }
+
         float *logits = outputs.front().GetTensorMutableData<float>();
-        std::vector<float> probs = softmax(logits, MODEL_CLASS_COUNT);
+        std::vector<float> probs = softmax(logits, model_class_count);
 
         float bad_total = 0.0f;
         float good_total = 0.0f;
-        int best_bad_index = -1;
+        size_t best_bad_index = 0U;
+        bool has_bad_index = false;
         float best_bad_prob = -std::numeric_limits<float>::infinity();
-        int argmax_index = 0;
+        size_t argmax_index = 0U;
 
-        for (int i = 0; i < MODEL_CLASS_COUNT; i++) {
-            const std::string &name = labels[static_cast<size_t>(i)];
-            const float prob = probs[static_cast<size_t>(i)];
+        /* 遍历模型实际输出的全部类别，分别累计 bad/good 概率并寻找最终类别。 */
+        for (size_t i = 0; i < model_class_count; i++) {
+            const std::string &name = labels[i];
+            const float prob = probs[i];
 
             if (class_name_is_group(name, "bad")) {
                 bad_total += prob;
                 if (prob > best_bad_prob) {
                     best_bad_prob = prob;
                     best_bad_index = i;
+                    has_bad_index = true;
                 }
             }
 
@@ -687,18 +752,18 @@ int main(int argc, char **argv)
                 good_total += prob;
             }
 
-            if (prob > probs[static_cast<size_t>(argmax_index)]) {
+            if (prob > probs[argmax_index]) {
                 argmax_index = i;
             }
         }
 
-        int pred_index = argmax_index;
-        if (best_bad_index >= 0 && bad_total >= options.bad_threshold) {
+        size_t pred_index = argmax_index;
+        if (has_bad_index && bad_total >= options.bad_threshold) {
             pred_index = best_bad_index;
         }
 
-        const bool is_bad = class_name_is_group(labels[static_cast<size_t>(pred_index)], "bad");
-        const float confidence = probs[static_cast<size_t>(pred_index)];
+        const bool is_bad = class_name_is_group(labels[pred_index], "bad");
+        const float confidence = probs[pred_index];
         const double time_ms = std::chrono::duration<double, std::milli>(infer_end - infer_start).count();
 
         std::cout.setf(std::ios::fixed);
@@ -706,7 +771,7 @@ int main(int argc, char **argv)
         std::cout
             << "RESULT"
             << " status=" << (is_bad ? "BAD" : "GOOD")
-            << " class=" << labels[static_cast<size_t>(pred_index)]
+            << " class=" << labels[pred_index]
             << " confidence=" << confidence
             << " bad_total=" << bad_total
             << " good_total=" << good_total

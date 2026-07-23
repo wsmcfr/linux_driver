@@ -1860,15 +1860,25 @@ require_grep "onnxruntime_cxx_api.h" "defect_classify.cpp"
 require_grep "onnxruntime_cxx_api.h" "defect_segment.cpp"
 require_grep "defect_classifier_static_mixed_int8.onnx" "defect_classify.cpp"
 require_grep "defect_unet_test_decoder_head_int8.onnx" "defect_segment.cpp"
+require_grep "当前四分类模型只输出平垫圈和弹性垫圈" "qml/Main.qml"
+require_grep "GetOutputTypeInfo" "defect_classify.cpp"
+require_grep "model_class_count" "defect_classify.cpp"
+require_grep 'labels\.size\(\)[[:space:]]*!=[[:space:]]*model_class_count' "defect_classify.cpp"
+require_grep "GetElementCount" "defect_classify.cpp"
 require_grep "RESULT_SEG" "defect_segment.cpp"
 require_grep "overlay_path" "defect_segment.cpp"
 require_grep "mask_path" "defect_segment.cpp"
 require_grep "defect_classifier_static_mixed_int8.onnx" "deploy_qt_camera_display.sh"
 require_grep "defect_classifier_static_mixed_int8_labels.json" "deploy_qt_camera_display.sh"
+require_grep "checkpoints_classify_4classes" "deploy_qt_camera_display.sh"
 require_grep "defect_unet_test_decoder_head_int8.onnx" "deploy_qt_camera_display.sh"
 require_grep "defect-classify" "deploy_qt_camera_display.sh"
 require_grep "defect-segment" "deploy_qt_camera_display.sh"
 require_grep "libonnxruntime.so" "deploy_qt_camera_display.sh"
+
+if grep -Eq 'MODEL_CLASS_COUNT[[:space:]]*=[[:space:]]*6' "$SCRIPT_DIR/defect_classify.cpp"; then
+    fail "defect-classify 不能继续把分类类别数写死为 6，必须从 ONNX 输出维度读取并与 labels 数量核对"
+fi
 
 if grep -Eq '"保存图片"|requestSaveCurrentFrameToSdCard\(\)|"save-image"' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "qml/Main.qml 首页不应再暴露独立保存图片按钮；检测按钮要替代保存并生成历史记录"

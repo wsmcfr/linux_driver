@@ -53,11 +53,11 @@ COS_UPLOAD_SRC="$SCRIPT_DIR/defect-cos-upload"
 # BOARD_REVIEW_TUNNEL_SRC 是板端反向隧道守护脚本，负责独立维持云端回写板端的 ssh -R。
 BOARD_REVIEW_TUNNEL_SRC="$SCRIPT_DIR/board-review-tunnel.sh"
 
-# DEFECT_MODEL_SRC 是待部署的 INT8 ONNX 模型路径，可通过环境变量覆盖。
-DEFECT_MODEL_SRC="${DEFECT_MODEL_SRC:-/mnt/d/model_picture/checkpoints_classify/defect_classifier_static_mixed_int8.onnx}"
+# DEFECT_MODEL_SRC 是新四分类 INT8 ONNX 模型路径；板端目标文件名保持不变，便于原子替换和回滚。
+DEFECT_MODEL_SRC="${DEFECT_MODEL_SRC:-/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx}"
 
-# DEFECT_LABELS_SRC 是待部署的类别映射路径，可通过环境变量覆盖。
-DEFECT_LABELS_SRC="${DEFECT_LABELS_SRC:-/mnt/d/model_picture/checkpoints_classify/defect_classifier_static_mixed_int8_labels.json}"
+# DEFECT_LABELS_SRC 是四分类类别映射路径，索引顺序必须和 ONNX 的四列输出完全一致。
+DEFECT_LABELS_SRC="${DEFECT_LABELS_SRC:-/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8_labels.json}"
 
 # DEFECT_UNET_MODEL_SRC 是待部署的 UNet INT8 分割模型路径，可通过环境变量覆盖。
 DEFECT_UNET_MODEL_SRC="${DEFECT_UNET_MODEL_SRC:-/mnt/d/model_picture/checkpoints_unet_test/defect_unet_test_decoder_head_int8.onnx}"
