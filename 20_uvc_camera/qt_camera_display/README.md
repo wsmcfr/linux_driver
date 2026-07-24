@@ -715,7 +715,7 @@
 | 构建 MobileNet 分类程序 | `cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display && ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./build_defect_classify.sh` | 生成 `build-mp157/defect-classify`。 |
 | 构建 UNet 分割程序 | `cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display && ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./build_defect_segment.sh` | 生成 `build-mp157/defect-segment`。 |
 | 静态契约检查 | `./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract`。 |
-| 部署到 NFS rootfs | `sudo DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8_labels.json DEFECT_UNET_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs` | 板端 `/root/qt_camera_display/` 获得 Qt 程序、overlay 工具、`fb_boot_splash`、`boot_splash.rgb565`、`defect-classify`、`defect-segment`、四分类 ONNX、两类 UNet、labels、ONNX Runtime 库和运行脚本，`/etc/init.d/` 获得 `S05display-quiet` 和 `S90uvc-camera`。只替换一个模型时不要执行整套部署，使用对应模型章节的精准替换命令。 |
+| 部署到 NFS rootfs | `sudo DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json DEFECT_UNET_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs` | 板端 `/root/qt_camera_display/` 获得 Qt 程序、overlay 工具、`fb_boot_splash`、`boot_splash.rgb565`、`defect-classify`、`defect-segment`、四分类 ONNX、两类 UNet、labels、ONNX Runtime 库和运行脚本，`/etc/init.d/` 获得 `S05display-quiet` 和 `S90uvc-camera`。只替换一个模型时不要执行整套部署，使用对应模型章节的精准替换命令。 |
 | 部署默认上传账号 | `CLOUD_ACCOUNT='<账号>' CLOUD_PASSWORD='<密码>' sudo -E ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs` | 额外生成 `/home/cfr/linux/nfs/rootfs/root/qt_camera_display/cos-upload.env`，权限为 `600`；检测按钮后续可不再手工传账号密码。 |
 | 安装 Qt runtime | `./install_qt_runtime_from_sdk.sh /home/cfr/linux/nfs/rootfs` | rootfs 获得 Qt5 库、QML 模块、eglfs/wayland 插件和 Vivante 库。 |
 | 板端启动正式路线 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart` | Qt UI 与 overlay 视频同时运行。 |
@@ -1312,6 +1312,115 @@ ssh -i "$key" -o IdentitiesOnly=yes "$target" '
 `sync` 后重启服务。源码或模型已经生成不等于板端已经生效，必须以板端 SHA256、进程状态和真实
 单图输出为准。
 
+## 2026-07-24 四分类 v2 模型量化与精准替换
+
+本轮使用 `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_4classes_v2.onnx`
+重新生成四分类混合静态 INT8 模型。模型输入输出、预处理方式、四类标签顺序和板端稳定文件名均未改变，
+因此不重新编译或替换 Qt、`defect-classify`、`defect-segment`、`uvc_kms_overlay`，也不替换两类 UNet。
+现有检测前 `LOCATE ring=1` 门禁继续保持；四类板端验收直接调用 `defect-classify`，避免把 ROI 定位失败
+误判成分类模型加载失败。
+
+### 本次修改文件与原因
+
+| 修改路径 | 修改原因 | 影响边界 |
+|---|---|---|
+| `20_uvc_camera/qt_camera_display/deploy_qt_camera_display.sh` | 默认分类模型和 labels 源切换到 `checkpoints_classify_4classes_v2` | 完整部署时不再回退到 v1；板端目标文件名不变 |
+| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 静态检查精确要求 v2 模型和 labels 源路径 | 防止后续部署脚本重新指向 v1 |
+| `20_uvc_camera/qt_camera_display/README.md` | 记录 v2 量化、精准部署、回滚和实测证据 | 明确本轮只允许替换分类模型与 labels |
+| `.trellis/spec/frontend/component-guidelines.md` | 更新当前分类模型来源和同 ABI 精准替换契约 | 后续模型替换必须继续验证哈希、精度和不变项 |
+| `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx` | 使用完整 187 张验证集执行 `static_mixed` 量化 | 不提交到代码仓库；部署内容写入稳定板端分类模型名 |
+| `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8_labels.json` | 保存本轮四类索引顺序 | 内容与 v1 labels 相同，仍需与模型作为一对校验和部署 |
+
+### v2 量化结果
+
+| 项目 | FP32 | 混合静态 INT8 |
+|---|---:|---:|
+| 文件大小 | 6,102,223 字节 | 2,059,394 字节 |
+| SHA256 | `D877681BB68C2F2220E8835164D28EF3D549C60087CC4FE60F290FFF2334146D` | `1637C31846CC4EFB589A06EAF65A8DB0969BB29C9259C458863C274DDCA934A3` |
+| 输入/输出 | `tensor(float) [N,3,224,224]` / `tensor(float) [N,4]` | `tensor(float) [N,3,224,224]` / `tensor(float) [N,4]` |
+| 187 张 argmax 准确率 | 100.00% | 100.00% |
+| 板端 `0.85` 阈值准确率 | 100.00% | 100.00% |
+
+验证集类别数量依次为 `splitwasher_bad=40`、`splitwasher_good=40`、`washer_bad=51`、
+`washer_good=56`。FP32/INT8 预测一致率为 `100.00%`，最大概率绝对差为 `0.007114`，
+平均概率绝对差为 `0.000378`。labels 文件大小为 263 字节，SHA256 为
+`D280A40EC1A9B9588DC8079F5A9B07E3A847C1D350B4DA82A486031738701A55`。
+
+在 Windows `D:\model_picture` 执行的量化命令为：
+
+```powershell
+& 'D:\model_picture\defect-unet\python.exe' quantize_classify_int8.py `
+  --preset static_mixed `
+  --onnx_input '.\checkpoints_classify_4classes_v2\defect_classifier_4classes_v2.onnx' `
+  --onnx_output '.\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx' `
+  --calib_dir '.\datasets_classify\val' `
+  --num_calib 187
+```
+
+### v2 精准部署与回滚
+
+本轮不能运行整套部署脚本覆盖运行目录。先在板端记录 Qt、overlay、三个 helper、分类模型、labels 和
+UNet 的 SHA256；再创建时间戳备份，只把以下两个文件上传为 `.new`，校验后原子改名并执行 `sync`：
+
+```bash
+key=/home/cfr/.ssh/id_ed25519_github
+target=root@192.168.1.250
+model_dir=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2
+
+ssh -i "$key" -o IdentitiesOnly=yes "$target" '
+  set -e
+  stamp=$(date +%Y%m%d_%H%M%S)
+  backup=/root/qt_camera_display/backups/classifier_v2_${stamp}
+  mkdir -p "$backup"
+  cp -p /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx "$backup"/
+  cp -p /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json "$backup"/
+  printf "%s\n" "$backup"
+'
+
+scp -i "$key" -o IdentitiesOnly=yes "$model_dir/defect_classifier_static_mixed_int8.onnx" \
+  "$target:/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx.new"
+scp -i "$key" -o IdentitiesOnly=yes "$model_dir/defect_classifier_static_mixed_int8_labels.json" \
+  "$target:/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json.new"
+
+ssh -i "$key" -o IdentitiesOnly=yes "$target" '
+  set -e
+  chmod 0644 /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx.new
+  chmod 0644 /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json.new
+  mv -f /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx.new \
+    /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx
+  mv -f /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json.new \
+    /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json
+  sync
+  /root/qt_camera_display/run_qt_kms_overlay_display.sh restart
+  /root/qt_camera_display/run_qt_kms_overlay_display.sh status
+'
+```
+
+回滚时从上述时间戳目录恢复两个分类文件，重新设置 `0644`、执行 `sync`，再重启服务。不能恢复或覆盖
+Qt、helper、overlay 或 UNet；如果任一不变项哈希发生变化，应立即停止验收并查明错误复制命令。
+
+### v2 验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 量化回归测试 | Windows `D:\model_picture` | `& 'D:\model_picture\defect-unet\python.exe' -m unittest tests.test_quantize_classify -v` | 8 项测试全部通过 | 查 Python 环境、ONNX Runtime 和量化脚本变更 |
+| 核对 v2 模型 | Windows/VM | `Get-FileHash -Algorithm SHA256 D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx`；VM 执行 `sha256sum /home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx` | 两端均为 `1637C318...CA934A3` | 重新同步模型，不能继续部署损坏文件 |
+| 四类直接推理 | 开发板 SSH | 依次执行 `cd /root/qt_camera_display && LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH ./defect-classify --image /tmp/classifier-v2-tests/<class>.jpg` | 四张图分别输出对应 `class=`，且 `_good/_bad` 与 `status=GOOD/BAD` 一致 | 查测试图、板端模型/labels 哈希和 ONNX Runtime 日志；不要修改 `ring=1` 门禁 |
+| 服务状态 | 开发板 SSH | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart && /root/qt_camera_display/run_qt_kms_overlay_display.sh status` | Qt PID 与 overlay PID 均存在，日志没有输出维度或 labels 数量错误 | 恢复时间戳备份，查看 `/tmp/qt-kms-overlay-shell.log` |
+| 不变项复核 | 开发板 SSH | 部署前后对 Qt、overlay、`defect-classify`、`defect-segment` 和 UNet 执行 `sha256sum` | 五个不变项哈希逐项相同；分类模型变为 `1637C318...CA934A3`；labels 仍为 `D280A40E...38701A55` | 任一不变项变化立即停止，按备份恢复并审计传输路径 |
+
+本轮 2026-07-24 实际部署与验证结果：
+
+| 实测项目 | 结果 |
+|---|---|
+| 板端备份 | 旧 v1 分类模型和 labels 已保存到 `/root/qt_camera_display/backups/classifier_v2_20260724083049`；旧模型哈希为 `DCDE6C5C...E54F5F82` |
+| v2 分类模型 | 板端 SHA256 为 `1637C31846CC4EFB589A06EAF65A8DB0969BB29C9259C458863C274DDCA934A3`，与 Windows/VM 量化产物一致 |
+| 四类直接推理 | `splitwasher_bad` 输出 `BAD/0.9989`，`splitwasher_good` 输出 `GOOD/1.0000`，`washer_bad` 输出 `BAD/1.0000`，`washer_good` 输出 `GOOD/0.9998` |
+| 不变项 | Qt、overlay、`defect-classify`、`defect-segment` 和两类 UNet 的部署前后 SHA256 完全一致；labels 内容哈希仍为 `D280A40E...38701A55` |
+| 摄像头恢复 | 第一次服务启动时摄像头正在 USB 重枚举，日志显示 `/dev/video0` 不存在；重新接入后 `/dev/video0`、`/dev/video1` 恢复，Qt PID 为 `4686`、overlay PID 为 `4999` |
+| 视频帧 | `/tmp/uvc-kms-overlay-control.sock` 已创建，`/tmp/uvc-kms-overlay.log` 帧计数从 `frames=60` 持续增长到 `frames=720`，确认摄像头数据通路恢复 |
+| 已知运行库提示 | `defect-classify` 仍会输出既有的 `libstdc++.so.6: no version information available` 警告，但四次推理均退出 `0` 并产生正确 `RESULT`；本轮没有替换运行库 |
+
 ## 检测按钮与双模型部署
 
 当前首页 `检测` 按钮不在 Qt 进程内直接链接 ONNX Runtime，而是串行调用两个独立推理程序。
@@ -1341,7 +1450,7 @@ ssh -i "$key" -o IdentitiesOnly=yes "$target" '
 | overlay 命令 | `SAVE_DETECT /mnt/sdcard/images` | 保存 source JPG，要求 SD 卡挂载，后续写入历史记录并触发 COS 上传 |
 | 分类推理程序 | `/root/qt_camera_display/defect-classify` | 独立 C++ 程序，依赖 ONNX Runtime ARM 动态库和 libjpeg |
 | 分割推理程序 | `/root/qt_camera_display/defect-segment` | 独立 C++ 程序，依赖 ONNX Runtime ARM 动态库、libjpeg 和 libpng |
-| 分类模型 | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx` | 来自 `D:\model_picture\checkpoints_classify_4classes\defect_classifier_static_mixed_int8.onnx`，当前为四分类模型 |
+| 分类模型 | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx` | 来自 `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx`，当前为四分类 v2 模型 |
 | UNet 模型 | `/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` | 文件名为兼容 Qt 配置而保持不变，实际内容来自 `D:\model_picture\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx`，输出契约为 `tensor(float) [1,2,224,224]`，对应背景/缺陷两类 |
 | 默认标签 | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json` | 类别顺序必须与 ONNX 输出一致 |
 | 默认 ROI | 中心 `300x300` | 与当前训练/PC 摄像头测试命令 `--roi_size 300` 保持一致 |
@@ -1396,8 +1505,8 @@ ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxrunti
 
 ```bash
 cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display
-DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx \
-DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8_labels.json \
+DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx \
+DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json \
 DEFECT_UNET_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx \
 ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm \
 ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs

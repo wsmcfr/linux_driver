@@ -1249,7 +1249,8 @@ Emit `detectClassificationReady` after the first model returns and update part/c
 | ONNX output inspection | `session.GetOutputTypeInfo(0)` and `GetTensorTypeAndShapeInfo().GetShape()` |
 | Runtime element inspection | `outputs.front().GetTensorTypeAndShapeInfo().GetElementCount()` |
 | Static regression | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` |
-| Current four-class source | `/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx` |
+| Current four-class source | `/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx` |
+| Current four-class labels | `/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json` |
 | Immutable segmentation model | `/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` |
 
 ### 3. Contracts
@@ -1263,7 +1264,9 @@ Emit `detectClassificationReady` after the first model returns and update part/c
 | Quantization gate | Evaluate FP32 and INT8 on the same complete validation split. Do not deploy when INT8 exact accuracy drops by more than one percentage point or a class has no evaluated samples. |
 | Stable destination | New classifier artifacts may replace the contents of the stable board filenames; Qt launch paths and settings do not need a filename migration. |
 | Selective deployment | A classifier-only update replaces the classifier model, labels, `defect-classify`, and a relinked Qt binary when required. It must not copy or overwrite the UNet model. |
+| Same-ABI model-only update | When input/output types and shapes, preprocessing, label order, helper CLI, and Qt invocation are unchanged, replace only the classifier ONNX and matching labels. Do not rebuild or overwrite Qt, helpers, overlay, or UNet merely because model weights changed. |
 | Completion proof | Model generation is not board deployment. Require VM/board SHA256 equality, service restart completion, four representative board inferences, and pre/post UNet SHA256 equality. |
+| Current v2 evidence | The v2 FP32/INT8 pair was evaluated on all 187 validation images (`40/40/51/56` per class): both reached 100% argmax and 0.85-threshold accuracy, prediction agreement was 100%, maximum probability delta was 0.007114, and mean probability delta was 0.000378. |
 
 ### 4. Validation & Error Matrix
 
@@ -2495,7 +2498,7 @@ Use this convention when the user mentions the defect inspection model, defect d
 | Classification INT8 quantization | `D:\model_picture\defect-unet\python.exe quantize_classify_int8.py` |
 | Classification inference script | `D:\model_picture\defect-unet\python.exe infer_classify.py --model <model.onnx> --image <image>` |
 | Classification unit tests | `D:\model_picture\defect-unet\python.exe -m unittest tests.test_infer_classify tests.test_infer_camera_onnx -v` |
-| Current four-class classification INT8 ONNX | `D:\model_picture\checkpoints_classify_4classes\defect_classifier_static_mixed_int8.onnx` |
+| Current four-class classification INT8 ONNX | `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx` |
 | Current two-class segmentation FP32 ONNX | `D:\model_picture\checkpoints_unet_2parts\scratch_unet.onnx` |
 | Current two-class segmentation INT8 ONNX | `D:\model_picture\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx` |
 | Segmentation quantization | `D:\model_picture\defect-unet\python.exe quantize_segment_int8.py --preset decoder_head --onnx_input .\checkpoints_unet_2parts\scratch_unet.onnx --onnx_output .\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx --calib_dir .\datasets_unet_2parts\val\images --num_calib 60` |
@@ -2507,7 +2510,7 @@ Use this convention when the user mentions the defect inspection model, defect d
 | Default project meaning | In this STM32MP157 workspace, “检测缺陷模型” means the Windows model-training project at `D:\model_picture` unless the user explicitly names another path. |
 | Current recommended board path | Use the four-class MobileNetV3-Small mixed INT8 classifier together with the two-class mixed INT8 UNet. The Qt detection transaction runs each model once for a saved ROI instead of running either model on every camera frame. |
 | Classification label order | The deployed classifier labels are `splitwasher_bad`, `splitwasher_good`, `washer_bad`, and `washer_good`; `defect_classify.cpp` must read all labels and require their count to match the ONNX output dimension. |
-| Classification model state | The four-class classification model is trained, quantized, and deployed for flat washers and split washers. The removed black waveform part must not reappear in current result labels. |
+| Classification model state | The current v2 four-class classifier is `static_mixed` INT8 with SHA256 `1637c31846cc4efb589a06eaf65a8db0969bb29c9259c458863c274ddca934a3`. It retains the approved flat-washer/split-washer label order; the removed black waveform part must not reappear in current result labels. |
 | Segmentation model state | The current real-part UNet uses `background=0` and `defect=1`, input `[1,3,224,224]`, and output `[1,2,224,224]`. Its mixed INT8 artifact is 6,434,978 bytes; its 61-image test metrics are mIoU 79.23%, defect IoU 58.91%, and defect F1 74.14%. |
 | Dynamic segmentation output | `defect_segment.cpp` must derive class count and mask dimensions from the only ONNX output tensor, require `tensor(float)` with shape `[1,C,224,224]`, use the derived values for argmax/palette/overlay, and emit the derived count in `RESULT_SEG classes=`. Never replace fixed six classes with fixed two classes. |
 | Board runtime policy | Classification and segmentation coexist inside one explicit detection transaction, but neither model runs continuously on camera frames. This keeps the Cortex-A7 workload bounded and gives every history record one classification result plus one segmentation result. |

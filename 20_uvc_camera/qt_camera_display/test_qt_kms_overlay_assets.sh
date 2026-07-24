@@ -1881,7 +1881,9 @@ require_grep 'class_id[[:space:]]*<[[:space:]]*class_count' "defect_segment.cpp"
 require_grep 'build_palette\(model_class_count\)' "defect_segment.cpp"
 require_grep "defect_classifier_static_mixed_int8.onnx" "deploy_qt_camera_display.sh"
 require_grep "defect_classifier_static_mixed_int8_labels.json" "deploy_qt_camera_display.sh"
-require_grep "checkpoints_classify_4classes" "deploy_qt_camera_display.sh"
+# 默认分类模型源必须指向本轮 v2 目录，避免完整部署时把板端回退到 v1 模型内容。
+require_grep "checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx" "deploy_qt_camera_display.sh"
+require_grep "checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json" "deploy_qt_camera_display.sh"
 require_grep "defect_unet_test_decoder_head_int8.onnx" "deploy_qt_camera_display.sh"
 # 默认源路径必须指向本轮生成的两类分割模型，板端目标文件名仍由部署脚本保持兼容。
 require_grep "checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx" "deploy_qt_camera_display.sh"
