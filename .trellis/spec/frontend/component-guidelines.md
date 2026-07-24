@@ -1080,7 +1080,7 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 | QML all-models handler | `onDetectModelsReady: updateDetectClassificationFields(resultText); updateDetectFusedFields(resultText); updateDetectModelTimeFields(resultText)` |
 | Model-fusion function | `fusedResultFromModelResults(const QString &classificationResult, const QString &segmentationResult) -> FusedDetectResult` |
 | Fused-to-cloud mapping | `cloudResultFromFusedResult(const FusedDetectResult &fusedResult) -> good|bad|review` |
-| Fused-to-history mapping | `historyTextFromFusedResult(const FusedDetectResult &fusedResult) -> 良品|待复核` |
+| Fused-to-history mapping | `historyTextFromFusedResult(const FusedDetectResult &fusedResult) -> 良品|坏品|待复核` |
 | Upload environment field | `CLOUD_RESULT=good|bad|review` |
 | Upload result validator | `validate_cloud_result "$CLOUD_RESULT"` |
 | Upload success helper | `isUploadStatusSuccess(QString uploadStatus)` in `main.cpp` |
@@ -1094,14 +1094,14 @@ Use this convention when the STM32MP157 Qt defect screen runs the model detectio
 
 | Area | Contract |
 |---|---|
-| Result source of truth | `records.result` must come from the fused classifier + UNet result for the same detection transaction. Map classifier `BAD` or UNet `NG/defect_pixels>0` to cloud `bad`; map `good` only when the classifier is `GOOD` and UNet reports no defect; map incomplete or unknown model evidence to `review`. Never default a model-backed detection to `good`. |
+| Result source of truth | `records.result` must come from the fused classifier + UNet result for the same detection transaction. Map confident classifier `BAD` or UNet `STRONG` to cloud `bad`; map UNet `WEAK` or low/incomplete classifier confidence to `review`; map `good` only when the classifier is confidently `GOOD` and UNet evidence is `CLEAR`. Raw `defect_pixels>0` alone is not a bad result because filtered reflective noise can remain `CLEAR`. Never default missing model evidence to `good`. |
 | Upload default | `defect-cos-upload` may use `review` as the conservative default for manual diagnostics without a model result. It must not use `good` as a fallback default, because that turns missing data into a false pass. |
 | Result validation | The upload helper must reject any `CLOUD_RESULT` outside `good`, `bad`, and `review` before create-record. Invalid values should fail locally and not create a misleading cloud record. |
 | Placeholder cleanup | When editing the detection/upload/history/QML chain, search the touched files for fixed payload values such as hard-coded `good`, `待接入`, demo IDs, fixed part names, fixed result text, and old confidence scaling. Replace them with model-derived or explicitly conservative values. |
 | Part display | The home page part name must be derived from the model class or backend part field for the current record. For class names such as `washer_bad` or `gasket_good`, strip only the quality suffix and display the remaining part token. Do not keep a fixed part label. |
 | Confidence display | The home page confidence must be rendered as a 0-100 percentage. Do not divide confidence by `1000` or show a permille-style value unless the upstream model contract explicitly changes. |
 | Progressive result display | The home page must show each model stage as soon as that stage has a complete result. After the first classifier returns `RESULT`, QML must immediately refresh part name, class name, classifier tendency, confidence, and good/bad totals, but the main pass/fail banner must stay in a waiting/review style until fusion finishes. It must not wait for segmentation, COS upload, or history append to show classifier details. |
-| Final fused display | After the last local model returns, QML must apply `fused_status/fused_reason` over the first classifier status. If the classifier says `GOOD` but UNet reports `NG` or a positive `defect_pixels`, the home page must show a bad/review-style final state, not a good state. |
+| Final fused display | After the last local model returns, QML must apply `fused_status/fused_reason` over the first classifier status. Classifier `GOOD + STRONG` must display `BAD`; classifier `GOOD + WEAK` must display `REVIEW`; classifier `GOOD + CLEAR` may display `GOOD` only when confidence is sufficient. |
 | Progressive time display | `total_time_ms` must appear when the last model in the local model chain finishes. For the current classifier + UNet chain, emit `detectModelsReady` after UNet returns and before COS upload starts. Do not wait for `upload_status=OK/FAIL` to show the model elapsed time. |
 | Final completion boundary | `detectCurrentFrameFinished` means the whole detect transaction finished, including upload attempt and history append eligibility. It should restore busy state and show final upload status, but it must not be the first moment when model result fields become visible. |
 | Total detection time | `total_time_ms` is measured from classifier start through segmentation completion. It must include both model runtimes and exclude COS upload time unless the field name is changed to an upload-inclusive metric. |
@@ -1163,7 +1163,7 @@ onDetectModelsReady: {
 ```
 
 ```text
-Bad: the classifier reports GOOD, UNet reports `segment_status=NG`, but the upload helper creates `"result":"good"` because the Qt controller only used the first model.
+Bad: the classifier reports GOOD and UNet evidence is `STRONG`, but the upload helper creates `"result":"good"` because the Qt controller only used the first model. A `WEAK` conflict must similarly remain `review`, not `good`.
 ```
 
 ```text
@@ -1186,7 +1186,7 @@ Bad: source and annotated files were already uploaded and registered, but the fi
 - Search touched files for old fixed payload/display markers: `CLOUD_RESULT`, hard-coded `good`, fixed part names, fixed IDs, placeholder text such as `待接入`, and confidence `/1000`.
 - Cross-build `qt_camera_display` in `cfr-vm` and confirm the ARM binary contains the expected detection markers such as `fusedResultFromModelResults`, `cloudResultFromFusedResult`, `CLOUD_RESULT`, `fused_status`, `total_time_ms`, `detectClassificationReady`, and `detectModelsReady`.
 - On the board, run `--detect-self-test` and assert the result line includes `classification_result`, `segmentation_result`, nonzero `total_time_ms`, and `upload_status=OK` when network credentials are available.
-- For at least one BAD detection acceptance test and one classifier-GOOD/UNet-NG conflict case, query the returned cloud detail and assert both `result` and `effective_result` are `bad`. Do not accept the feature based only on upload stdout.
+- For at least one classifier-GOOD/UNet-STRONG conflict case, query the returned cloud detail and assert both `result` and `effective_result` are `bad`; for one classifier-GOOD/UNet-WEAK case, assert the result remains `review`. Do not accept the feature based only on upload stdout.
 - On the LCD, verify the home page shows the model-derived part name, 0-100 percent confidence, and total two-model detection time without overlapping controls.
 - On the LCD, verify timing explicitly: part/class/classifier tendency/confidence appear after the first classifier finishes while the main banner waits for fusion; `total_time_ms` and final good/bad/review appear after the final local model finishes; upload completion only changes final status/history.
 
@@ -1249,8 +1249,7 @@ Emit `detectClassificationReady` after the first model returns and update part/c
 | ONNX output inspection | `session.GetOutputTypeInfo(0)` and `GetTensorTypeAndShapeInfo().GetShape()` |
 | Runtime element inspection | `outputs.front().GetTensorTypeAndShapeInfo().GetElementCount()` |
 | Static regression | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` |
-| Current four-class source | `/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx` |
-| Current four-class labels | `/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json` |
+| Current four-class source | `/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx` |
 | Immutable segmentation model | `/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` |
 
 ### 3. Contracts
@@ -1264,9 +1263,7 @@ Emit `detectClassificationReady` after the first model returns and update part/c
 | Quantization gate | Evaluate FP32 and INT8 on the same complete validation split. Do not deploy when INT8 exact accuracy drops by more than one percentage point or a class has no evaluated samples. |
 | Stable destination | New classifier artifacts may replace the contents of the stable board filenames; Qt launch paths and settings do not need a filename migration. |
 | Selective deployment | A classifier-only update replaces the classifier model, labels, `defect-classify`, and a relinked Qt binary when required. It must not copy or overwrite the UNet model. |
-| Same-ABI model-only update | When input/output types and shapes, preprocessing, label order, helper CLI, and Qt invocation are unchanged, replace only the classifier ONNX and matching labels. Do not rebuild or overwrite Qt, helpers, overlay, or UNet merely because model weights changed. |
 | Completion proof | Model generation is not board deployment. Require VM/board SHA256 equality, service restart completion, four representative board inferences, and pre/post UNet SHA256 equality. |
-| Current v2 evidence | The v2 FP32/INT8 pair was evaluated on all 187 validation images (`40/40/51/56` per class): both reached 100% argmax and 0.85-threshold accuracy, prediction agreement was 100%, maximum probability delta was 0.007114, and mean probability delta was 0.000378. |
 
 ### 4. Validation & Error Matrix
 
@@ -2498,25 +2495,21 @@ Use this convention when the user mentions the defect inspection model, defect d
 | Classification INT8 quantization | `D:\model_picture\defect-unet\python.exe quantize_classify_int8.py` |
 | Classification inference script | `D:\model_picture\defect-unet\python.exe infer_classify.py --model <model.onnx> --image <image>` |
 | Classification unit tests | `D:\model_picture\defect-unet\python.exe -m unittest tests.test_infer_classify tests.test_infer_camera_onnx -v` |
-| Current four-class classification INT8 ONNX | `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx` |
-| Current two-class segmentation FP32 ONNX | `D:\model_picture\checkpoints_unet_2parts\scratch_unet.onnx` |
-| Current two-class segmentation INT8 ONNX | `D:\model_picture\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx` |
-| Segmentation quantization | `D:\model_picture\defect-unet\python.exe quantize_segment_int8.py --preset decoder_head --onnx_input .\checkpoints_unet_2parts\scratch_unet.onnx --onnx_output .\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx --calib_dir .\datasets_unet_2parts\val\images --num_calib 60` |
+| Current MobileNetV2 segmentation ONNX | `D:\model_picture\checkpoints\defect_unet.onnx` |
+| Current MobileNetV3 segmentation ONNX | `D:\model_picture\checkpoints_mobilenetv3\defect_unet_mobilenetv3.onnx` |
 
 ### 3. Contracts
 
 | Area | Contract |
 |---|---|
 | Default project meaning | In this STM32MP157 workspace, “检测缺陷模型” means the Windows model-training project at `D:\model_picture` unless the user explicitly names another path. |
-| Current recommended board path | Use the four-class MobileNetV3-Small mixed INT8 classifier together with the two-class mixed INT8 UNet. The Qt detection transaction runs each model once for a saved ROI instead of running either model on every camera frame. |
-| Classification label order | The deployed classifier labels are `splitwasher_bad`, `splitwasher_good`, `washer_bad`, and `washer_good`; `defect_classify.cpp` must read all labels and require their count to match the ONNX output dimension. |
-| Classification model state | The current v2 four-class classifier is `static_mixed` INT8 with SHA256 `1637c31846cc4efb589a06eaf65a8db0969bb29c9259c458863c274ddca934a3`. It retains the approved flat-washer/split-washer label order; the removed black waveform part must not reappear in current result labels. |
-| Segmentation model state | The current real-part UNet uses `background=0` and `defect=1`, input `[1,3,224,224]`, and output `[1,2,224,224]`. Its mixed INT8 artifact is 6,434,978 bytes; its 61-image test metrics are mIoU 79.23%, defect IoU 58.91%, and defect F1 74.14%. |
-| Dynamic segmentation output | `defect_segment.cpp` must derive class count and mask dimensions from the only ONNX output tensor, require `tensor(float)` with shape `[1,C,224,224]`, use the derived values for argmax/palette/overlay, and emit the derived count in `RESULT_SEG classes=`. Never replace fixed six classes with fixed two classes. |
-| Board runtime policy | Classification and segmentation coexist inside one explicit detection transaction, but neither model runs continuously on camera frames. This keeps the Cortex-A7 workload bounded and gives every history record one classification result plus one segmentation result. |
+| Current recommended board path | Use MobileNetV3-Small INT8 good/bad classification as the main MP157 runtime path. It answers whether the ROI is defective and should be fast enough for a CPU-only board after measurement. |
+| Classification label order | The current ImageFolder-compatible label order is `bad=0`, `good=1`; inference code must read this through `CLASS_NAMES`, `BAD_CLASS_INDEX`, `GOOD_CLASS_INDEX`, `is_bad_prediction()`, `get_class_probability()`, and `result_name()` rather than hand-writing class-number meanings in scattered branches. |
+| Classification model state | `datasets_classify` currently has the required directory shape, but the real good/bad image data and trained classification ONNX still need to be produced before claiming a board-ready classifier exists. |
+| Segmentation model state | Existing UNet segmentation ONNX files are flow-validation assets from `datasets_severstal`, not final real-part models. The MobileNetV3-small UNet ONNX is about 13.70 MB; the MobileNetV2 UNet ONNX is about 25.27 MB. |
+| Board runtime policy | Classification and segmentation may coexist on disk and inside the Qt/inspection workflow, but they should not both run for every frame on STM32MP157. Run classification as the main path, then trigger segmentation only for low-frequency visualization, uncertain samples, saved evidence, or manual review. |
 | Documentation policy | When model status changes, update both `D:\model_picture\模型目录评估与MP157部署建议.md` and the STM32MP157 project documents that describe deployment strategy. |
-| Legacy Severstal boundary | Legacy `datasets_severstal` models remain flow-validation assets only. The current board segmentation source must be the real-part `checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx` artifact. |
-| Known conveyor-reflection limit | The current two-class model may label reflective regions on the black conveyor as defects. Quantization does not fix FP32 false positives; this deployment preserves the existing runtime `segmentMinPixels` setting and does not add post-processing. The direct board acceptance command uses 80 pixels explicitly and must not be confused with changing the persisted Qt setting. |
+| Severstal boundary | Do not present Severstal-trained segmentation output as proof that the final washer/stamping-part inspection model works; it proves only the code path, export path, and visualization path. |
 
 ### 4. Validation & Error Matrix
 
@@ -2524,23 +2517,20 @@ Use this convention when the user mentions the defect inspection model, defect d
 |---|---|---|
 | `git -C D:\model_picture status --short --branch` | Shows the current model-project branch and local modifications before editing | Edits may overwrite unreviewed training or inference changes |
 | `Get-ChildItem D:\model_picture\datasets_classify -Recurse` | Shows non-empty `train/val/good/bad` image sets before classification training | Training would create an empty or meaningless classifier |
-| Classification contract test | Static/runtime checks prove ONNX output count equals the four labels and GOOD/BAD grouping follows label suffixes | A model replacement can silently reverse or omit a product class |
-| Segmentation metadata check | ONNX Runtime reports input `tensor(float) [1,3,224,224]` and output `tensor(float) [1,2,224,224]` | The helper can interpret the output buffer with the wrong element width, read past a tensor boundary, or produce a meaningless mask |
-| Quantization comparison | FP32 mIoU 79.39% versus INT8 mIoU 79.23%; defect IoU 59.22% versus 58.91% | A broader quantization preset caused unacceptable segmentation drift |
-| Board segmentation smoke test | Direct helper output contains `RESULT_SEG`, `classes=2`, and nonempty raw/overlay/mask files | Model/helper versions are mismatched or output files did not complete |
+| Classification mapping tests | `tests.test_infer_classify` passes and proves `bad=0`, `good=1` behavior | The classifier may report defective parts as good or reverse the UI color |
+| Segmentation ONNX size check | MobileNetV3 UNet is preferred over MobileNetV2 UNet if segmentation is needed on MP157 | A larger segmentation model may make the UI feel stuck on Cortex-A7 |
 | Board benchmark | Measures capture, preprocess, inference, postprocess, and Qt overlay time separately | “Can run” is not enough to prove it will meet the inspection beat |
 | Result acceptance | GOOD/BAD/UNCERTAIN output is checked against real part photos, not only synthetic or Severstal data | The system may look functional but fail on the target hardware object |
 
 ### 5. Good / Base / Bad Cases
 
 ```text
-Good: Capture one centered ROI, run the four-class INT8 classifier once, run the two-class INT8 UNet once,
-then fuse both results and save the raw/overlay/mask evidence under the same history transaction.
+Good: Use MobileNetV3-Small INT8 classification for the normal every-part decision.
+If the classifier is uncertain or the operator asks for evidence, run the lighter segmentation model once and display/save the mask overlay.
 ```
 
 ```text
-Base: Keep the stable board filename `defect_unet_test_decoder_head_int8.onnx`, but verify its SHA256 matches the current
-`scratch_unet_decoder_head_int8.onnx` content and require `RESULT_SEG classes=2`.
+Base: Keep the existing MobileNetV3 UNet ONNX as a visualization and pipeline-validation asset while collecting real good/bad classification data.
 ```
 
 ```text
@@ -2549,11 +2539,10 @@ Bad: Run classification and segmentation on every camera frame on MP157, then ju
 
 ### 6. Tests Required
 
-- Before changing classification inference logic, run the model project's focused classifier tests and the Qt module static contract test.
-- Before replacing segmentation output handling, make the static contract test fail on fixed `MODEL_CLASS_COUNT=6`, then implement `tensor(float) [1,C,H,W]` validation and rerun it.
-- Before board deployment, evaluate FP32 and INT8 on the same `datasets_unet_2parts/test` split and verify the INT8 output remains `[1,2,224,224]`.
-- On the board, wait for the synchronous helper process to exit, require each reported raw/overlay/mask path to exist and be nonempty, then run `sync`; fixed sleep is not completion proof.
-- Record classification-side hashes before a segmentation-only deployment and prove they are unchanged afterward.
+- Before changing classification inference logic, run `D:\model_picture\defect-unet\python.exe -m unittest tests.test_infer_classify tests.test_infer_camera_onnx -v`.
+- Before claiming a classification model is trained, confirm `datasets_classify\train\good`, `datasets_classify\train\bad`, `datasets_classify\val\good`, and `datasets_classify\val\bad` contain real target-part images.
+- Before board deployment, export ONNX, quantize to INT8 when possible, copy the chosen model into the NFS rootfs or application model directory, then benchmark on STM32MP157 with the same input size and preprocessing used by the Qt/inspection app.
+- Before enabling segmentation in the live workflow, measure segmentation inference time separately from camera capture and Qt rendering, and decide whether it is manual/low-frequency only.
 - Update the model status document and this workspace's STM32MP157 deployment notes whenever the trained model, class order, dataset source, model size, or runtime policy changes.
 
 ### 7. Wrong vs Correct
@@ -2573,14 +2562,13 @@ ImageFolder currently maps bad=0 and good=1. Use BAD_CLASS_INDEX or is_bad_predi
 #### Wrong
 
 ```text
-The new ONNX exists, so copying only the model is enough even though `defect_segment.cpp` still assumes six output channels.
+The 13.70 MB segmentation ONNX exists, so the final MP157 defect model is ready.
 ```
 
 #### Correct
 
 ```text
-Validate the real-part FP32 and INT8 metrics, update `defect_segment.cpp` to derive `[1,C,H,W]` dynamically, cross-build the ARM helper,
-back up the old helper/model, atomically replace both, and accept the deployment only after board-side `classes=2`, file, hash, and service checks pass.
+The segmentation ONNX proves export/inference/overlay flow only. For the MP157 production decision, first collect real target-part data, train the MobileNetV3-Small good/bad classifier, quantize it, and benchmark it on the board.
 ```
 
 ---
@@ -3106,6 +3094,83 @@ ACTUATOR_STOP with a stale cycle_id returns CYCLE_MISMATCH before stopping the m
 ```text
 ACTUATOR_STOP validates flags and actuator, logs stale cycle_id, then stops the requested actuator(s) because stop is a safety command.
 ```
+
+## Scenario: MP157 Balanced UNet Evidence And Board Threshold Contract
+
+### 1. Scope / Trigger
+
+- Trigger: changing `defect_segment.cpp`, `defect_segment_evidence.h`, `main.cpp`, `qml/Main.qml`, detection history/cloud fields, or board settings around UNet defect pixels.
+- Problem learned: treating any nonzero UNet mask pixel as `NG -> BAD` makes reflective good parts fail too often.
+- Goal: isolated noise is ignored, ambiguous evidence is reviewed, and only continuous obvious defects can independently force `BAD`.
+
+### 2. Signatures
+
+| Boundary | Required signature |
+|---|---|
+| Board JSON schema | `schema_version=2`, `segment_min_component_pixels`, `segment_review_pixels`, `segment_bad_pixels`, `segment_strong_component_pixels` |
+| UNet CLI | `--min-component-pixels`, `--review-defect-pixels`, `--bad-defect-pixels`, `--strong-component-pixels` |
+| UNet result | `RESULT_SEG status=OK|NG evidence=CLEAR|WEAK|STRONG raw_defect_pixels=<n> filtered_defect_pixels=<n> largest_component_pixels=<n> component_count=<n> retained_component_count=<n>` |
+| UNet output metadata | `GetOutputTypeInfo(0)` -> unique float32 `[1,C,224,224]`, with `2 <= C <= 256`; `RESULT_SEG classes=<C>` |
+| Board UI | `settingsUnetPopupVisible`, `settingsUnetParameterColumn`, `openUnetSettingsPopup()` |
+| Shared algorithm | `analyze_segment_evidence(mask, width, height, settings)` in `defect_segment_evidence.h` |
+| Host regression | `test_defect_segment_evidence.cpp` prints `PASS: defect segment evidence` |
+
+### 3. Contracts
+
+| Area | Contract |
+|---|---|
+| Default values | Use `20/80/300/120 px` for minimum component, review total, bad total, and strong component respectively until target-part data justifies a new calibrated set. |
+| Connectivity | Use 8-neighbor connected components so diagonal scratches remain one physical defect. |
+| Noise filtering | Components smaller than `minComponentPixels` do not contribute to `filteredDefectPixels`. Preserve raw statistics for diagnostics. |
+| Evidence rule | `filtered < review -> CLEAR`; `filtered >= bad && largest >= strongComponent -> STRONG`; every other valid case is `WEAK`. Total area alone must not produce `STRONG`. |
+| Fusion order | `STRONG` independently forces `BAD`; low classifier confidence with `CLEAR/WEAK` is `REVIEW`; confident classifier `BAD` is `BAD`; classifier `GOOD + WEAK` is `REVIEW`; only confident classifier `GOOD + CLEAR` is `GOOD`. |
+| Validation owner | C++ normalizes board settings once before storage/use. Require `1 <= minComponent <= review <= bad <= 50000` and `minComponent <= strongComponent <= bad`. The CLI validates the same ordering. |
+| Legacy migration | Schema 1 `segment_min_pixels` has incompatible semantics and must not be guessed into the four thresholds. Load the new defaults during schema migration. |
+| Result boundary | Qt must reject missing/invalid evidence or statistics; reject `CLEAR+NG`, `WEAK+OK`, or `STRONG+OK`; require the helper's four echoed thresholds to equal the current settings snapshot; and recompute evidence from filtered/largest statistics through the shared function before fusion. It must not silently convert missing numeric fields to zero. |
+| Model shape boundary | `defect-segment` must read the real class count from ONNX output metadata. It must not hard-code `MODEL_CLASS_COUNT` or `[1,6,224,224]`; the current board model is `[1,2,224,224]`, while the same post-processing remains compatible with a valid legacy six-class output. |
+| Persistence | QML changes update the next in-memory detection snapshot. Only an explicit save atomically writes `/mnt/sdcard/config/defect_ui_config.json`. |
+| Fixed-screen UI | Keep the 190px strategy card compact. Put the four thresholds and overlay alpha in a dedicated fixed-size popup; do not clip required controls inside the card. |
+| Protocol boundary | F4 still receives only final `good/bad/review`; UNet pixel thresholds remain MP157 board parameters and do not change the MP157-F4 frame contract. |
+| Cloud/history diagnostics | Preserve evidence, raw/filtered pixels, largest component, component counts, and the four thresholds in local/cloud context so a false reject can be reproduced. |
+
+### 4. Validation & Error Matrix
+
+| Check | Good result | Failure meaning | Required action |
+|---|---|---|---|
+| Isolated reflective dots | All components are below 20px, evidence is `CLEAR` | Noise still directly rejects good parts | Verify component filtering and deployed threshold JSON |
+| Medium defect | Filtered area is at least 80px but not strong, evidence is `WEAK` | Borderline samples are automatically passed or rejected | Restore three-level evidence mapping |
+| Continuous defect | Filtered area is at least 300px and largest component at least 120px, evidence is `STRONG` | Explicit defects can be downgraded | Verify both strong conditions and fusion priority |
+| Fragmented 324px defect | Four disconnected 81px components produce `WEAK`, not `STRONG` | Total area alone still forces a bad result | Require the largest-component condition |
+| Old helper binary | `RESULT_SEG` without evidence/statistics is rejected | New Qt is accepting an incompatible old helper | Deploy matching `defect-segment` and Qt binaries |
+| Current two-class model | `RESULT_SEG ... classes=2 ...` and three non-empty result images | Helper reports output smaller than `[1,6,224,224]` | Rebuild and deploy the dynamic-output helper; threshold tuning cannot fix a shape-contract failure |
+| Settings round trip | Save, reload, and next detection use identical four values | QML, JSON, or thread snapshot drifted | Check property names, schema 2 keys, and process arguments |
+
+### 5. Tests Required
+
+- Compile and run `test_defect_segment_evidence.cpp` after changing the algorithm or defaults.
+- Run `./test_qt_kms_overlay_assets.sh` after changing settings QML, CLI parameters, output fields, README, or cloud/history mapping.
+- Cross-build both `defect-segment` and `qt_camera_display`; verify ARM binaries and marker strings before board deployment.
+- The static contract must require `GetOutputTypeInfo`, `output_shape`, `model_class_count`, and `classes=`, and reject `MODEL_CLASS_COUNT` or a hard-coded `[1,6,224,224]` in `defect_segment.cpp`.
+- On the board, run one known reflective good sample, one ambiguous sample, and one obvious continuous defect. Record the complete `RESULT_SEG` line and resulting `fused_result`.
+- Save settings, read `/mnt/sdcard/config/defect_ui_config.json`, restart Qt, and confirm the same values are displayed and passed to the next helper process.
+
+### 6. Wrong vs Correct
+
+#### Wrong
+
+```text
+defect_pixels > 0 -> NG -> BAD
+```
+
+#### Correct
+
+```text
+small isolated regions -> CLEAR
+ambiguous retained regions -> WEAK/REVIEW
+large continuous region -> STRONG/BAD
+```
+
+---
 
 ## Common Mistakes
 

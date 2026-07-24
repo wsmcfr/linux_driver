@@ -1908,6 +1908,10 @@ require_grep "evidence=" "defect_segment.cpp"
 require_grep "filtered_defect_pixels" "defect_segment.cpp"
 require_grep "largest_component_pixels" "defect_segment.cpp"
 require_grep "retained_component_count" "defect_segment.cpp"
+require_grep "GetOutputTypeInfo" "defect_segment.cpp"
+require_grep "output_shape" "defect_segment.cpp"
+require_grep "model_class_count" "defect_segment.cpp"
+require_grep "classes=" "defect_segment.cpp"
 require_grep "kDefaultMinComponentPixels" "defect_segment_evidence.h"
 require_grep "kDefaultReviewPixels" "defect_segment_evidence.h"
 require_grep "kDefaultBadPixels" "defect_segment_evidence.h"
@@ -1925,6 +1929,10 @@ require_grep "libonnxruntime.so" "deploy_qt_camera_display.sh"
 
 if grep -Eq 'MODEL_CLASS_COUNT[[:space:]]*=[[:space:]]*6' "$SCRIPT_DIR/defect_classify.cpp"; then
     fail "defect-classify 不能继续把分类类别数写死为 6，必须从 ONNX 输出维度读取并与 labels 数量核对"
+fi
+
+if grep -Eq 'MODEL_CLASS_COUNT|\[1,6,224,224\]' "$SCRIPT_DIR/defect_segment.cpp"; then
+    fail "defect-segment 不能把 UNet 输出写死为六类，必须兼容当前 [1,2,224,224] 两类模型"
 fi
 
 if grep -Eq '"保存图片"|requestSaveCurrentFrameToSdCard\(\)|"save-image"' "$SCRIPT_DIR/qml/Main.qml"; then

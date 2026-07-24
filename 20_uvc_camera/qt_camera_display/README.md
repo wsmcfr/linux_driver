@@ -19,12 +19,23 @@
 
 ## 2026-07-24 UNet 平衡判定与板端四阈值参数
 
+### 分割模型输出维度回归修复
+
+板端当前 UNet 是两分类模型，输出张量为 `[1,2,224,224]`。四阈值版本曾把后处理类别数重新写死为 6，导致模型虽然加载和推理成功，后处理仍以 `[1,6,224,224]` 检查元素数量并报“分割模型检测失败”。本次恢复从 ONNX 元数据动态读取 `[batch, classes, height, width]`，两类和旧六类输出都走同一套 argmax、连通域证据、彩色 mask 与 overlay 流程；四个板端阈值及 `CLEAR/WEAK/STRONG` 综合规则不变。
+
+| 修改路径 | 本次回归修复原因 |
+|---|---|
+| `20_uvc_camera/qt_camera_display/defect_segment.cpp` | 删除固定 `MODEL_CLASS_COUNT=6`，校验唯一 float32 NCHW 输出，并把真实类别数和输出宽高传给后处理及 `RESULT_SEG classes=`。 |
+| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 增加动态输出形状静态契约，禁止 `[1,6,224,224]` 和 `MODEL_CLASS_COUNT` 再次回流。 |
+| `20_uvc_camera/qt_camera_display/README.md` | 记录故障含义、修改原因、板端部署与复测方法。 |
+| `.trellis/spec/frontend/component-guidelines.md` | 固化动态 UNet 输出与四阈值证据必须同时保留的契约。 |
+
 ### 修改文件与原因
 
 | 修改路径 | 修改原因 |
 |---|---|
 | `20_uvc_camera/qt_camera_display/defect_segment_evidence.h` | 新增不依赖 Qt/ONNX Runtime 的 8 邻域连通域统计和 `CLEAR/WEAK/STRONG` 证据算法，生产程序与主机测试共用，避免判定逻辑漂移。 |
-| `20_uvc_camera/qt_camera_display/defect_segment.cpp` | 用四个可调阈值替换旧单像素阈值，输出原始/过滤后像素、最大连通域和连通域数量。 |
+| `20_uvc_camera/qt_camera_display/defect_segment.cpp` | 用四个可调阈值替换旧单像素阈值，输出原始/过滤后像素、最大连通域和连通域数量；从 ONNX 输出元数据动态读取类别数，兼容当前 `[1,2,224,224]` 两类模型。 |
 | `20_uvc_camera/qt_camera_display/main.cpp` | 保存 schema 2 板端 JSON、向 `defect-segment` 传四参数、校验 `RESULT_SEG` 完整性，并按平衡策略融合分类和 UNet。 |
 | `20_uvc_camera/qt_camera_display/qml/Main.qml` | 在“视觉检测策略”增加 `UNet参数` 弹层，现场可用加减按钮调整四阈值和 overlay 透明度。 |
 | `20_uvc_camera/qt_camera_display/test_defect_segment_evidence.cpp` | 覆盖小噪点、待复核、明确坏品、分散大面积仍待复核和 8 邻域边界。 |
@@ -70,9 +81,10 @@ filtered >= 300 且 largest_component >= 120        -> STRONG
 |---|---|---|---|---|
 | 主机连通域算法 | Windows PowerShell 仓库根目录 | `g++ -std=c++14 -Wall -Wextra -pedantic -static-libstdc++ -static-libgcc -I 20_uvc_camera/qt_camera_display 20_uvc_camera/qt_camera_display/test_defect_segment_evidence.cpp -o .codex_tmp/test_defect_segment_evidence.exe; ./.codex_tmp/test_defect_segment_evidence.exe` | 输出 `PASS: defect segment evidence`。 | 先查编译器是否为 MinGW g++；若进程异常，确认使用了两个静态运行库参数，避免误加载其它目录的 `libstdc++-6.dll`。 |
 | 静态接口契约 | Windows Git Bash 或虚拟机模块目录 | `sh ./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract`。 | 按第一条 `FAIL:` 检查 QML 属性、CLI 参数、JSON 字段或 README 是否未同步。 |
-| 手动 UNet 四阈值推理 | 开发板 SSH | `cd /root/qt_camera_display && LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH ./defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images --min-component-pixels 20 --review-defect-pixels 80 --bad-defect-pixels 300 --strong-component-pixels 120` | `RESULT_SEG` 包含 `evidence=CLEAR|WEAK|STRONG`、六项统计和三个结果图路径。 | 查 `/tmp/test.jpg`、UNet ONNX、`libonnxruntime.so`；若提示阈值顺序非法，恢复默认四值。 |
+| 手动 UNet 四阈值推理 | 开发板 SSH | `cd /root/qt_camera_display && LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH ./defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images --min-component-pixels 20 --review-defect-pixels 80 --bad-defect-pixels 300 --strong-component-pixels 120` | 当前模型输出一行 `RESULT_SEG ... classes=2 evidence=CLEAR\|WEAK\|STRONG ...`，并包含六项统计和三个结果图路径。 | 若出现“输出元素数量小于 [1,6,224,224]”，板端仍是旧 helper；若提示输出类型/形状非法，再核对实际 ONNX 文件。 |
+| UNet 结果图落盘 | 开发板 SSH | `for file in $(ls -t /mnt/sdcard/images/segment_*_raw.jpg /mnt/sdcard/images/segment_*_overlay.jpg /mnt/sdcard/images/segment_*_mask.png 2>/dev/null \| head -n 3); do test -s "$file" && echo "$file $(wc -c < "$file") bytes"; done; sync` | raw、overlay、mask 三个最新文件大小均大于 0；`defect-segment` 已正常退出后文件大小保持稳定。 | 先看完整 `RESULT_SEG`；若没有结果行，检查模型路径、动态输出 shape 日志、SD 卡挂载和剩余空间。 |
 | JSON 写入与读回 | 开发板屏幕和 SSH | 屏幕调整参数并点击 `保存到板端 JSON`，SSH 执行 `sed -n '1,100p' /mnt/sdcard/config/defect_ui_config.json` | `schema_version=2`，四个 `segment_*` 字段与屏幕一致，重启 Qt 后仍保持。 | 先执行 `mount | grep /mnt/sdcard` 和 `df -h /mnt/sdcard`；若未挂载，程序会拒绝保存，不能把配置误写到 rootfs。 |
-| 结果文件真实落盘 | 开发板 SSH | `result=$(ls -t /mnt/sdcard/images/segment_* 2>/dev/null | head -n 1); test -n "$result" && stat -c '%n %s %y' "$result"; sync` | 最新结果文件存在且大小大于 0；模型进程已退出后 `stat` 大小保持稳定。 | 查 `RESULT_SEG raw_path/overlay_path/mask_path`、SD 卡剩余空间和写权限；不可只等待固定秒数后认定完成。 |
+| 结果文件真实落盘 | 开发板 SSH | `result=$(ls -t /mnt/sdcard/images/segment_* 2>/dev/null | head -n 1); test -s "$result" && echo "$result $(wc -c < "$result") bytes"; sync` | 最新结果文件存在且大小大于 0；模型进程已退出后再次执行命令，文件字节数保持稳定。 | 查 `RESULT_SEG raw_path/overlay_path/mask_path`、SD 卡剩余空间和写权限；不可只等待固定秒数后认定完成。 |
 | 板端二进制标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display | grep -E 'settingsUnetPopupVisible|segment_min_component_pixels|strong-component-pixels|segment_evidence'` | 四类 marker 均能找到。 | marker 缺失说明只改了源码或只复制了 QML，必须重新交叉编译并替换主程序。 |
 
 > 本次文档和 Windows 源码修改不等于开发板已经生效；必须完成虚拟机同步、ARM 交叉编译、板端替换和 LCD 实测。
