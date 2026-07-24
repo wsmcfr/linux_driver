@@ -1868,16 +1868,39 @@ require_grep "GetElementCount" "defect_classify.cpp"
 require_grep "RESULT_SEG" "defect_segment.cpp"
 require_grep "overlay_path" "defect_segment.cpp"
 require_grep "mask_path" "defect_segment.cpp"
+# 新分割模型只有背景和缺陷两个通道，板端程序必须读取 ONNX 输出形状，不能继续依赖旧六类常量。
+require_grep "GetOutputTypeInfo" "defect_segment.cpp"
+require_grep "GetElementType" "defect_segment.cpp"
+require_grep "ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT" "defect_segment.cpp"
+require_grep "model_class_count" "defect_segment.cpp"
+require_grep "model_output_height" "defect_segment.cpp"
+require_grep "model_output_width" "defect_segment.cpp"
+# 后处理的元素数、argmax 和调色板都必须使用动态类别数，避免仅输出字段动态而计算仍写死六类。
+require_grep 'class_count[[:space:]]*\*[[:space:]]*output_pixels' "defect_segment.cpp"
+require_grep 'class_id[[:space:]]*<[[:space:]]*class_count' "defect_segment.cpp"
+require_grep 'build_palette\(model_class_count\)' "defect_segment.cpp"
 require_grep "defect_classifier_static_mixed_int8.onnx" "deploy_qt_camera_display.sh"
 require_grep "defect_classifier_static_mixed_int8_labels.json" "deploy_qt_camera_display.sh"
 require_grep "checkpoints_classify_4classes" "deploy_qt_camera_display.sh"
 require_grep "defect_unet_test_decoder_head_int8.onnx" "deploy_qt_camera_display.sh"
+# 默认源路径必须指向本轮生成的两类分割模型，板端目标文件名仍由部署脚本保持兼容。
+require_grep "checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx" "deploy_qt_camera_display.sh"
 require_grep "defect-classify" "deploy_qt_camera_display.sh"
 require_grep "defect-segment" "deploy_qt_camera_display.sh"
 require_grep "libonnxruntime.so" "deploy_qt_camera_display.sh"
 
 if grep -Eq 'MODEL_CLASS_COUNT[[:space:]]*=[[:space:]]*6' "$SCRIPT_DIR/defect_classify.cpp"; then
     fail "defect-classify 不能继续把分类类别数写死为 6，必须从 ONNX 输出维度读取并与 labels 数量核对"
+fi
+
+# 固定六类会让 [1,2,224,224] 输出被按六个平面越界读取，因此必须在部署新模型前彻底移除。
+if grep -Eq 'MODEL_CLASS_COUNT[[:space:]]*=[[:space:]]*6' "$SCRIPT_DIR/defect_segment.cpp"; then
+    fail "defect-segment 不能继续把分割类别数写死为 6，必须从 ONNX 输出维度读取"
+fi
+
+# 即使移除了旧常量，也不能在 argmax 循环中重新写入字面量 6。
+if grep -Eq 'class_id[[:space:]]*<[[:space:]]*6([UuLl]*)' "$SCRIPT_DIR/defect_segment.cpp"; then
+    fail "defect-segment 的 argmax 循环不能写死 6 类，必须使用 class_count"
 fi
 
 if grep -Eq '"保存图片"|requestSaveCurrentFrameToSdCard\(\)|"save-image"' "$SCRIPT_DIR/qml/Main.qml"; then

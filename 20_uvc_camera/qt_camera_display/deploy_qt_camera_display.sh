@@ -59,8 +59,8 @@ DEFECT_MODEL_SRC="${DEFECT_MODEL_SRC:-/home/cfr/linux/model_picture/checkpoints_
 # DEFECT_LABELS_SRC 是四分类类别映射路径，索引顺序必须和 ONNX 的四列输出完全一致。
 DEFECT_LABELS_SRC="${DEFECT_LABELS_SRC:-/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8_labels.json}"
 
-# DEFECT_UNET_MODEL_SRC 是待部署的 UNet INT8 分割模型路径，可通过环境变量覆盖。
-DEFECT_UNET_MODEL_SRC="${DEFECT_UNET_MODEL_SRC:-/mnt/d/model_picture/checkpoints_unet_test/defect_unet_test_decoder_head_int8.onnx}"
+# DEFECT_UNET_MODEL_SRC 是两类 UNet 混合 INT8 分割模型源路径；板端仍使用稳定旧文件名兼容 Qt 配置。
+DEFECT_UNET_MODEL_SRC="${DEFECT_UNET_MODEL_SRC:-/home/cfr/linux/model_picture/checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx}"
 
 # ORT_ROOT 是可选 ONNX Runtime ARM SDK 根目录；存在 libonnxruntime.so 时部署到板端 lib 目录。
 ORT_ROOT="${ORT_ROOT:-$SCRIPT_DIR/onnxruntime-arm}"
@@ -252,7 +252,7 @@ fi
 
 if [ ! -f "$DEFECT_UNET_MODEL_SRC" ]; then
     echo "错误：找不到 UNet INT8 ONNX 模型：$DEFECT_UNET_MODEL_SRC" >&2
-    echo "可设置 DEFECT_UNET_MODEL_SRC=/path/to/defect_unet_test_decoder_head_int8.onnx 后重跑部署。" >&2
+    echo "可设置 DEFECT_UNET_MODEL_SRC=/path/to/scratch_unet_decoder_head_int8.onnx 后重跑部署。" >&2
     exit 1
 fi
 

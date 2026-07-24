@@ -2495,21 +2495,25 @@ Use this convention when the user mentions the defect inspection model, defect d
 | Classification INT8 quantization | `D:\model_picture\defect-unet\python.exe quantize_classify_int8.py` |
 | Classification inference script | `D:\model_picture\defect-unet\python.exe infer_classify.py --model <model.onnx> --image <image>` |
 | Classification unit tests | `D:\model_picture\defect-unet\python.exe -m unittest tests.test_infer_classify tests.test_infer_camera_onnx -v` |
-| Current MobileNetV2 segmentation ONNX | `D:\model_picture\checkpoints\defect_unet.onnx` |
-| Current MobileNetV3 segmentation ONNX | `D:\model_picture\checkpoints_mobilenetv3\defect_unet_mobilenetv3.onnx` |
+| Current four-class classification INT8 ONNX | `D:\model_picture\checkpoints_classify_4classes\defect_classifier_static_mixed_int8.onnx` |
+| Current two-class segmentation FP32 ONNX | `D:\model_picture\checkpoints_unet_2parts\scratch_unet.onnx` |
+| Current two-class segmentation INT8 ONNX | `D:\model_picture\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx` |
+| Segmentation quantization | `D:\model_picture\defect-unet\python.exe quantize_segment_int8.py --preset decoder_head --onnx_input .\checkpoints_unet_2parts\scratch_unet.onnx --onnx_output .\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx --calib_dir .\datasets_unet_2parts\val\images --num_calib 60` |
 
 ### 3. Contracts
 
 | Area | Contract |
 |---|---|
 | Default project meaning | In this STM32MP157 workspace, “检测缺陷模型” means the Windows model-training project at `D:\model_picture` unless the user explicitly names another path. |
-| Current recommended board path | Use MobileNetV3-Small INT8 good/bad classification as the main MP157 runtime path. It answers whether the ROI is defective and should be fast enough for a CPU-only board after measurement. |
-| Classification label order | The current ImageFolder-compatible label order is `bad=0`, `good=1`; inference code must read this through `CLASS_NAMES`, `BAD_CLASS_INDEX`, `GOOD_CLASS_INDEX`, `is_bad_prediction()`, `get_class_probability()`, and `result_name()` rather than hand-writing class-number meanings in scattered branches. |
-| Classification model state | `datasets_classify` currently has the required directory shape, but the real good/bad image data and trained classification ONNX still need to be produced before claiming a board-ready classifier exists. |
-| Segmentation model state | Existing UNet segmentation ONNX files are flow-validation assets from `datasets_severstal`, not final real-part models. The MobileNetV3-small UNet ONNX is about 13.70 MB; the MobileNetV2 UNet ONNX is about 25.27 MB. |
-| Board runtime policy | Classification and segmentation may coexist on disk and inside the Qt/inspection workflow, but they should not both run for every frame on STM32MP157. Run classification as the main path, then trigger segmentation only for low-frequency visualization, uncertain samples, saved evidence, or manual review. |
+| Current recommended board path | Use the four-class MobileNetV3-Small mixed INT8 classifier together with the two-class mixed INT8 UNet. The Qt detection transaction runs each model once for a saved ROI instead of running either model on every camera frame. |
+| Classification label order | The deployed classifier labels are `splitwasher_bad`, `splitwasher_good`, `washer_bad`, and `washer_good`; `defect_classify.cpp` must read all labels and require their count to match the ONNX output dimension. |
+| Classification model state | The four-class classification model is trained, quantized, and deployed for flat washers and split washers. The removed black waveform part must not reappear in current result labels. |
+| Segmentation model state | The current real-part UNet uses `background=0` and `defect=1`, input `[1,3,224,224]`, and output `[1,2,224,224]`. Its mixed INT8 artifact is 6,434,978 bytes; its 61-image test metrics are mIoU 79.23%, defect IoU 58.91%, and defect F1 74.14%. |
+| Dynamic segmentation output | `defect_segment.cpp` must derive class count and mask dimensions from the only ONNX output tensor, require `tensor(float)` with shape `[1,C,224,224]`, use the derived values for argmax/palette/overlay, and emit the derived count in `RESULT_SEG classes=`. Never replace fixed six classes with fixed two classes. |
+| Board runtime policy | Classification and segmentation coexist inside one explicit detection transaction, but neither model runs continuously on camera frames. This keeps the Cortex-A7 workload bounded and gives every history record one classification result plus one segmentation result. |
 | Documentation policy | When model status changes, update both `D:\model_picture\模型目录评估与MP157部署建议.md` and the STM32MP157 project documents that describe deployment strategy. |
-| Severstal boundary | Do not present Severstal-trained segmentation output as proof that the final washer/stamping-part inspection model works; it proves only the code path, export path, and visualization path. |
+| Legacy Severstal boundary | Legacy `datasets_severstal` models remain flow-validation assets only. The current board segmentation source must be the real-part `checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx` artifact. |
+| Known conveyor-reflection limit | The current two-class model may label reflective regions on the black conveyor as defects. Quantization does not fix FP32 false positives; this deployment preserves the existing runtime `segmentMinPixels` setting and does not add post-processing. The direct board acceptance command uses 80 pixels explicitly and must not be confused with changing the persisted Qt setting. |
 
 ### 4. Validation & Error Matrix
 
@@ -2517,20 +2521,23 @@ Use this convention when the user mentions the defect inspection model, defect d
 |---|---|---|
 | `git -C D:\model_picture status --short --branch` | Shows the current model-project branch and local modifications before editing | Edits may overwrite unreviewed training or inference changes |
 | `Get-ChildItem D:\model_picture\datasets_classify -Recurse` | Shows non-empty `train/val/good/bad` image sets before classification training | Training would create an empty or meaningless classifier |
-| Classification mapping tests | `tests.test_infer_classify` passes and proves `bad=0`, `good=1` behavior | The classifier may report defective parts as good or reverse the UI color |
-| Segmentation ONNX size check | MobileNetV3 UNet is preferred over MobileNetV2 UNet if segmentation is needed on MP157 | A larger segmentation model may make the UI feel stuck on Cortex-A7 |
+| Classification contract test | Static/runtime checks prove ONNX output count equals the four labels and GOOD/BAD grouping follows label suffixes | A model replacement can silently reverse or omit a product class |
+| Segmentation metadata check | ONNX Runtime reports input `tensor(float) [1,3,224,224]` and output `tensor(float) [1,2,224,224]` | The helper can interpret the output buffer with the wrong element width, read past a tensor boundary, or produce a meaningless mask |
+| Quantization comparison | FP32 mIoU 79.39% versus INT8 mIoU 79.23%; defect IoU 59.22% versus 58.91% | A broader quantization preset caused unacceptable segmentation drift |
+| Board segmentation smoke test | Direct helper output contains `RESULT_SEG`, `classes=2`, and nonempty raw/overlay/mask files | Model/helper versions are mismatched or output files did not complete |
 | Board benchmark | Measures capture, preprocess, inference, postprocess, and Qt overlay time separately | “Can run” is not enough to prove it will meet the inspection beat |
 | Result acceptance | GOOD/BAD/UNCERTAIN output is checked against real part photos, not only synthetic or Severstal data | The system may look functional but fail on the target hardware object |
 
 ### 5. Good / Base / Bad Cases
 
 ```text
-Good: Use MobileNetV3-Small INT8 classification for the normal every-part decision.
-If the classifier is uncertain or the operator asks for evidence, run the lighter segmentation model once and display/save the mask overlay.
+Good: Capture one centered ROI, run the four-class INT8 classifier once, run the two-class INT8 UNet once,
+then fuse both results and save the raw/overlay/mask evidence under the same history transaction.
 ```
 
 ```text
-Base: Keep the existing MobileNetV3 UNet ONNX as a visualization and pipeline-validation asset while collecting real good/bad classification data.
+Base: Keep the stable board filename `defect_unet_test_decoder_head_int8.onnx`, but verify its SHA256 matches the current
+`scratch_unet_decoder_head_int8.onnx` content and require `RESULT_SEG classes=2`.
 ```
 
 ```text
@@ -2539,10 +2546,11 @@ Bad: Run classification and segmentation on every camera frame on MP157, then ju
 
 ### 6. Tests Required
 
-- Before changing classification inference logic, run `D:\model_picture\defect-unet\python.exe -m unittest tests.test_infer_classify tests.test_infer_camera_onnx -v`.
-- Before claiming a classification model is trained, confirm `datasets_classify\train\good`, `datasets_classify\train\bad`, `datasets_classify\val\good`, and `datasets_classify\val\bad` contain real target-part images.
-- Before board deployment, export ONNX, quantize to INT8 when possible, copy the chosen model into the NFS rootfs or application model directory, then benchmark on STM32MP157 with the same input size and preprocessing used by the Qt/inspection app.
-- Before enabling segmentation in the live workflow, measure segmentation inference time separately from camera capture and Qt rendering, and decide whether it is manual/low-frequency only.
+- Before changing classification inference logic, run the model project's focused classifier tests and the Qt module static contract test.
+- Before replacing segmentation output handling, make the static contract test fail on fixed `MODEL_CLASS_COUNT=6`, then implement `tensor(float) [1,C,H,W]` validation and rerun it.
+- Before board deployment, evaluate FP32 and INT8 on the same `datasets_unet_2parts/test` split and verify the INT8 output remains `[1,2,224,224]`.
+- On the board, wait for the synchronous helper process to exit, require each reported raw/overlay/mask path to exist and be nonempty, then run `sync`; fixed sleep is not completion proof.
+- Record classification-side hashes before a segmentation-only deployment and prove they are unchanged afterward.
 - Update the model status document and this workspace's STM32MP157 deployment notes whenever the trained model, class order, dataset source, model size, or runtime policy changes.
 
 ### 7. Wrong vs Correct
@@ -2562,13 +2570,14 @@ ImageFolder currently maps bad=0 and good=1. Use BAD_CLASS_INDEX or is_bad_predi
 #### Wrong
 
 ```text
-The 13.70 MB segmentation ONNX exists, so the final MP157 defect model is ready.
+The new ONNX exists, so copying only the model is enough even though `defect_segment.cpp` still assumes six output channels.
 ```
 
 #### Correct
 
 ```text
-The segmentation ONNX proves export/inference/overlay flow only. For the MP157 production decision, first collect real target-part data, train the MobileNetV3-Small good/bad classifier, quantize it, and benchmark it on the board.
+Validate the real-part FP32 and INT8 metrics, update `defect_segment.cpp` to derive `[1,C,H,W]` dynamically, cross-build the ARM helper,
+back up the old helper/model, atomically replace both, and accept the deployment only after board-side `classes=2`, file, hash, and service checks pass.
 ```
 
 ---

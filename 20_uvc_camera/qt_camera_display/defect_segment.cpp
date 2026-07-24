@@ -59,9 +59,6 @@ static const int MODEL_INPUT_WIDTH = 224;
 /* UNet 输入高度：当前模型固定导出为 224x224。 */
 static const int MODEL_INPUT_HEIGHT = 224;
 
-/* UNet 输出类别数：当前模型输出 [1,6,224,224]，0 是背景，1~5 是缺陷类别。 */
-static const int MODEL_CLASS_COUNT = 6;
-
 /* 默认叠加透明度：与 PC 端脚本 alpha=0.45 保持一致。 */
 static const float DEFAULT_OVERLAY_ALPHA = 0.45f;
 
@@ -516,12 +513,15 @@ static std::vector<float> preprocess_image(const ImageBuffer &roi)
  * 关键说明：
  *   PC 端脚本使用 BGR 表；这里全程序使用 RGB，因此颜色视觉效果保持一致但通道顺序已经换成 RGB。
  *
+ * 参数：
+ *   class_count 是从 ONNX 输出形状读取的实际类别数。
+ *
  * 返回值：
- *   返回 MODEL_CLASS_COUNT * 3 长度的 RGB 颜色表。
+ *   返回 class_count * 3 长度的 RGB 颜色表。
  */
-static std::vector<uint8_t> build_palette()
+static std::vector<uint8_t> build_palette(size_t class_count)
 {
-    const uint8_t fixed_palette[MODEL_CLASS_COUNT][3] = {
+    const uint8_t fixed_palette[][3] = {
         {0, 0, 0},       /* 0 背景：黑色。 */
         {255, 0, 0},     /* 1 缺陷类：红色。 */
         {255, 165, 0},   /* 2 缺陷类：橙色。 */
@@ -529,11 +529,17 @@ static std::vector<uint8_t> build_palette()
         {255, 0, 255},   /* 4 缺陷类：紫色。 */
         {255, 255, 0},   /* 5 缺陷类：黄色。 */
     };
-    std::vector<uint8_t> palette(static_cast<size_t>(MODEL_CLASS_COUNT) * 3U);
+    const size_t fixed_color_count = sizeof(fixed_palette) / sizeof(fixed_palette[0]); /* fixed_color_count 保存内置颜色数量。 */
+    std::vector<uint8_t> palette(class_count * 3U); /* palette 按模型真实类别数分配，避免两类模型访问旧六类边界。 */
 
-    for (int class_id = 0; class_id < MODEL_CLASS_COUNT; class_id++) {
+    for (size_t class_id = 0; class_id < class_count; class_id++) {
+        /* 超过内置颜色数量时循环使用五种缺陷色，但类别 0 始终保持黑色背景。 */
+        const size_t color_index = class_id < fixed_color_count
+            ? class_id
+            : 1U + ((class_id - 1U) % (fixed_color_count - 1U));
         for (int channel = 0; channel < 3; channel++) {
-            palette[static_cast<size_t>(class_id) * 3U + channel] = fixed_palette[class_id][channel];
+            palette[class_id * 3U + static_cast<size_t>(channel)] =
+                fixed_palette[color_index][channel];
         }
     }
 
@@ -548,6 +554,7 @@ static std::vector<uint8_t> build_palette()
  *   mask 是类别 ID 数组，尺寸 mask_w * mask_h。
  *   mask_w/mask_h 是 mask 尺寸。
  *   palette 是 RGB 颜色表。
+ *   class_count 是模型实际类别数，用于校验类别下标不越界。
  *
  * 返回值：
  *   返回 RGB 彩色 mask 图片。
@@ -555,7 +562,8 @@ static std::vector<uint8_t> build_palette()
 static ImageBuffer mask_to_color(const std::vector<uint8_t> &mask,
                                  int mask_w,
                                  int mask_h,
-                                 const std::vector<uint8_t> &palette)
+                                 const std::vector<uint8_t> &palette,
+                                 size_t class_count)
 {
     ImageBuffer color; /* color 保存彩色 mask 输出图。 */
     color.width = mask_w;
@@ -565,7 +573,7 @@ static ImageBuffer mask_to_color(const std::vector<uint8_t> &mask,
     for (int y = 0; y < mask_h; y++) {
         for (int x = 0; x < mask_w; x++) {
             const size_t mask_index = static_cast<size_t>(y) * mask_w + x; /* mask_index 是当前像素类别下标。 */
-            const uint8_t class_id = std::min<uint8_t>(mask[mask_index], MODEL_CLASS_COUNT - 1); /* class_id 防止异常类别越界。 */
+            const size_t class_id = std::min<size_t>(mask[mask_index], class_count - 1U); /* class_id 防止异常类别越界。 */
 
             for (int channel = 0; channel < 3; channel++) {
                 color.rgb[mask_index * 3U + static_cast<size_t>(channel)] =
@@ -616,7 +624,9 @@ static std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t> &mask
  * 参数：
  *   roi 是中心 ROI 原图。
  *   mask 是 224x224 类别 mask。
+ *   mask_w/mask_h 是模型输出 mask 的实际宽高。
  *   palette 是 RGB 颜色表。
+ *   class_count 是模型实际类别数。
  *   alpha 是缺陷颜色叠加强度。
  *
  * 返回值：
@@ -624,17 +634,20 @@ static std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t> &mask
  */
 static ImageBuffer overlay_mask(const ImageBuffer &roi,
                                 const std::vector<uint8_t> &mask,
+                                int mask_w,
+                                int mask_h,
                                 const std::vector<uint8_t> &palette,
+                                size_t class_count,
                                 float alpha)
 {
     ImageBuffer output = roi; /* output 从原图开始，只改非背景缺陷区域。 */
     const std::vector<uint8_t> resized_mask =
-        resize_mask_nearest(mask, MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, roi.width, roi.height);
+        resize_mask_nearest(mask, mask_w, mask_h, roi.width, roi.height);
 
     for (int y = 0; y < roi.height; y++) {
         for (int x = 0; x < roi.width; x++) {
             const size_t pixel_index = static_cast<size_t>(y) * roi.width + x; /* pixel_index 是当前 ROI 像素下标。 */
-            const uint8_t class_id = std::min<uint8_t>(resized_mask[pixel_index], MODEL_CLASS_COUNT - 1);
+            const size_t class_id = std::min<size_t>(resized_mask[pixel_index], class_count - 1U); /* class_id 使用动态类别上限。 */
 
             if (class_id == 0U) {
                 continue;
@@ -982,38 +995,48 @@ static void write_rgb_as_png(const ImageBuffer &image, const std::string &path)
  * 参数：
  *   logits 是输出张量首地址。
  *   count 是输出张量元素数量。
+ *   class_count 是模型输出类别数。
+ *   output_width/output_height 是模型输出 mask 的宽高。
  *
  * 返回值：
  *   返回 224x224 类别 mask。
  */
-static std::vector<uint8_t> logits_to_mask(const float *logits, size_t count)
+static std::vector<uint8_t> logits_to_mask(const float *logits,
+                                           size_t count,
+                                           size_t class_count,
+                                           int output_width,
+                                           int output_height)
 {
-    const size_t expected = static_cast<size_t>(MODEL_CLASS_COUNT) * MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT;
-    if (count < expected) {
-        throw std::runtime_error("UNet 输出元素数量小于 [1,6,224,224]");
+    const size_t output_pixels = static_cast<size_t>(output_width) * static_cast<size_t>(output_height); /* output_pixels 保存单通道像素数。 */
+    const size_t expected = class_count * output_pixels; /* expected 保存单批次 NCHW 输出应有的精确元素数。 */
+    if (count != expected) {
+        throw std::runtime_error(
+            "UNet 输出元素数量与模型元数据不一致: elements="
+            + std::to_string(count)
+            + " expected=" + std::to_string(expected));
     }
 
-    std::vector<uint8_t> mask(static_cast<size_t>(MODEL_INPUT_WIDTH) * MODEL_INPUT_HEIGHT, 0U);
+    std::vector<uint8_t> mask(output_pixels, 0U); /* mask 保存每个输出像素的 argmax 类别。 */
 
-    for (int y = 0; y < MODEL_INPUT_HEIGHT; y++) {
-        for (int x = 0; x < MODEL_INPUT_WIDTH; x++) {
+    for (int y = 0; y < output_height; y++) {
+        for (int x = 0; x < output_width; x++) {
             int best_class = 0;                                            /* best_class 保存当前像素最大 logits 类别。 */
             float best_value = -std::numeric_limits<float>::infinity();    /* best_value 保存当前最大 logits。 */
 
-            for (int class_id = 0; class_id < MODEL_CLASS_COUNT; class_id++) {
+            for (size_t class_id = 0; class_id < class_count; class_id++) {
                 const size_t offset =
-                    static_cast<size_t>(class_id) * MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT
-                    + static_cast<size_t>(y) * MODEL_INPUT_WIDTH
+                    class_id * output_pixels
+                    + static_cast<size_t>(y) * static_cast<size_t>(output_width)
                     + static_cast<size_t>(x);
                 const float value = logits[offset];
 
                 if (value > best_value) {
                     best_value = value;
-                    best_class = class_id;
+                    best_class = static_cast<int>(class_id);
                 }
             }
 
-            mask[static_cast<size_t>(y) * MODEL_INPUT_WIDTH + static_cast<size_t>(x)] =
+            mask[static_cast<size_t>(y) * static_cast<size_t>(output_width) + static_cast<size_t>(x)] =
                 static_cast<uint8_t>(best_class);
         }
     }
@@ -1078,6 +1101,33 @@ int main(int argc, char **argv)
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
         Ort::Session session(env, options.model_path.c_str(), session_options); /* session 加载 UNet INT8 模型。 */
+
+        /* 当前辅助程序只支持一个 NCHW 分割输出，多输出模型无法确定哪一个张量是像素 logits。 */
+        if (session.GetOutputCount() != 1U) {
+            throw std::runtime_error("UNet 模型必须且只能包含一个输出张量");
+        }
+
+        /* 从模型元数据读取真实输出形状，确保两类新模型和旧六类模型都不会发生越界读取。 */
+        const Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
+        const auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+        /* 后处理会把输出缓冲区解释为 float，因此必须先拒绝其他元素类型，避免错误指针解释导致越界或错误结果。 */
+        if (output_tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            throw std::runtime_error("UNet 输出元素类型必须为 float32");
+        }
+        const std::vector<int64_t> output_shape = output_tensor_info.GetShape();
+        if (output_shape.size() != 4U) {
+            throw std::runtime_error("UNet 输出形状必须为 [batch, classes, height, width]");
+        }
+        if (output_shape[0] != 1 || output_shape[1] <= 1 || output_shape[1] > 256) {
+            throw std::runtime_error("UNet 输出 batch 必须为 1，classes 必须在 2 到 256 之间");
+        }
+        if (output_shape[2] != MODEL_INPUT_HEIGHT || output_shape[3] != MODEL_INPUT_WIDTH) {
+            throw std::runtime_error("UNet 输出高宽必须与 224x224 输入一致");
+        }
+
+        const size_t model_class_count = static_cast<size_t>(output_shape[1]); /* model_class_count 保存模型实际输出通道数。 */
+        const int model_output_height = static_cast<int>(output_shape[2]);     /* model_output_height 保存输出 mask 高度。 */
+        const int model_output_width = static_cast<int>(output_shape[3]);      /* model_output_width 保存输出 mask 宽度。 */
         Ort::AllocatorWithDefaultOptions allocator;                            /* allocator 用于读取输入输出节点名。 */
         Ort::AllocatedStringPtr input_name = session.GetInputNameAllocated(0, allocator);
         Ort::AllocatedStringPtr output_name = session.GetOutputNameAllocated(0, allocator);
@@ -1102,14 +1152,35 @@ int main(int argc, char **argv)
             1);
         const auto infer_end = std::chrono::steady_clock::now();
 
-        float *logits = outputs.front().GetTensorMutableData<float>();       /* logits 指向模型输出 [1,6,224,224]。 */
-        const size_t logits_count = tensor_element_count(outputs.front());    /* logits_count 保存输出元素总数。 */
-        const std::vector<uint8_t> mask = logits_to_mask(logits, logits_count);
+        if (outputs.size() != 1U || !outputs.front().IsTensor()) {
+            throw std::runtime_error("ONNX Runtime 未返回唯一的 UNet 输出张量");
+        }
+
+        float *logits = outputs.front().GetTensorMutableData<float>();        /* logits 指向模型实际 NCHW 输出。 */
+        const size_t logits_count = tensor_element_count(outputs.front());     /* logits_count 保存输出元素总数。 */
+        const std::vector<uint8_t> mask = logits_to_mask(
+            logits,
+            logits_count,
+            model_class_count,
+            model_output_width,
+            model_output_height);
         const int defect_pixels = count_defect_pixels(mask);
         const bool is_ng = defect_pixels >= options.min_defect_pixels && defect_pixels > 0;
-        const std::vector<uint8_t> palette = build_palette();
-        const ImageBuffer color_mask = mask_to_color(mask, MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, palette);
-        const ImageBuffer overlay = overlay_mask(roi, mask, palette, options.alpha);
+        const std::vector<uint8_t> palette = build_palette(model_class_count);
+        const ImageBuffer color_mask = mask_to_color(
+            mask,
+            model_output_width,
+            model_output_height,
+            palette,
+            model_class_count);
+        const ImageBuffer overlay = overlay_mask(
+            roi,
+            mask,
+            model_output_width,
+            model_output_height,
+            palette,
+            model_class_count,
+            options.alpha);
         const std::string stem = current_timestamp_stem();
         const std::string raw_path = join_path(options.output_dir, stem + "_raw.jpg");
         const std::string overlay_path = join_path(options.output_dir, stem + "_overlay.jpg");
@@ -1128,7 +1199,7 @@ int main(int argc, char **argv)
             << " status=" << (is_ng ? "NG" : "OK")
             << " defect_pixels=" << defect_pixels
             << " min_defect_pixels=" << options.min_defect_pixels
-            << " classes=" << MODEL_CLASS_COUNT
+            << " classes=" << model_class_count
             << " time_ms=" << time_ms
             << " raw_path=" << raw_path
             << " overlay_path=" << overlay_path
