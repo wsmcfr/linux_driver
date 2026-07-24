@@ -19,6 +19,8 @@
 
 #include <onnxruntime_cxx_api.h> /* ONNX Runtime C++ API 提供 Session、Tensor 和 CPU 推理能力。 */
 
+#include "defect_segment_evidence.h" /* 共用 8 邻域连通域统计和 CLEAR/WEAK/STRONG 证据判定。 */
+
 #include <jpeglib.h>             /* libjpeg 用于读取当前帧 JPG，也用于写出 raw/overlay JPG 结果图。 */
 #include <png.h>                 /* libpng 用于写出彩色 mask PNG，方便历史页和云端直接预览。 */
 #include <setjmp.h>              /* setjmp/longjmp 用于把 libjpeg/libpng 的错误回调转为可控失败。 */
@@ -59,11 +61,11 @@ static const int MODEL_INPUT_WIDTH = 224;
 /* UNet 输入高度：当前模型固定导出为 224x224。 */
 static const int MODEL_INPUT_HEIGHT = 224;
 
+/* UNet 输出类别数：当前模型输出 [1,6,224,224]，0 是背景，1~5 是缺陷类别。 */
+static const int MODEL_CLASS_COUNT = 6;
+
 /* 默认叠加透明度：与 PC 端脚本 alpha=0.45 保持一致。 */
 static const float DEFAULT_OVERLAY_ALPHA = 0.45f;
-
-/* 默认 UNet 判 NG 的最小缺陷像素数；1 表示只要出现非背景缺陷像素就判 NG。 */
-static const int DEFAULT_MIN_DEFECT_PIXELS = 1;
 
 /* ImageNet RGB 均值：训练、PC 推理和板端推理必须一致。 */
 static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f};
@@ -95,7 +97,10 @@ struct ImageBuffer {
  *   output_dir 是 raw/overlay/mask 三张结果图输出目录。
  *   roi_size 是中心裁剪边长，0 表示不裁剪整图缩放。
  *   alpha 是 overlay 中缺陷颜色的叠加强度。
- *   min_defect_pixels 是判定 NG 所需的最小缺陷像素数。
+ *   min_component_pixels 是过滤孤立小连通域所需的最小面积。
+ *   review_defect_pixels 是进入 WEAK 待复核区的过滤后总像素下限。
+ *   bad_defect_pixels 是进入 STRONG 的过滤后总像素下限。
+ *   strong_component_pixels 是进入 STRONG 的最大连通域面积下限。
  */
 struct ProgramOptions {
     std::string image_path;                         /* 待分割输入图片路径，必须由 --image 提供。 */
@@ -103,7 +108,10 @@ struct ProgramOptions {
     std::string output_dir = DEFAULT_OUTPUT_DIR;    /* 输出目录，默认写入 SD 卡历史图片目录。 */
     int roi_size = DEFAULT_ROI_SIZE;                /* ROI 边长，默认 300。 */
     float alpha = DEFAULT_OVERLAY_ALPHA;            /* 叠加透明度，默认 0.45。 */
-    int min_defect_pixels = DEFAULT_MIN_DEFECT_PIXELS; /* 最小缺陷像素阈值，默认 1。 */
+    int min_component_pixels = defect_segment_evidence::kDefaultMinComponentPixels; /* 小连通域过滤阈值。 */
+    int review_defect_pixels = defect_segment_evidence::kDefaultReviewPixels;        /* 待复核总像素阈值。 */
+    int bad_defect_pixels = defect_segment_evidence::kDefaultBadPixels;              /* 明确坏品总像素阈值。 */
+    int strong_component_pixels = defect_segment_evidence::kDefaultStrongComponentPixels; /* 强缺陷最大连通域阈值。 */
 };
 
 /*
@@ -137,8 +145,14 @@ struct PngErrorManager {
 static void print_usage(const char *program)
 {
     std::cout
-        << "用法: " << program << " --image <jpg> [--model <onnx>] [--output-dir <dir>] [--roi 300] [--alpha 0.45] [--min-defect-pixels 1]\n"
-        << "输出: RESULT_SEG status=OK|NG defect_pixels=<n> time_ms=<ms> raw_path=<jpg> overlay_path=<jpg> mask_path=<png>\n";
+        << "用法: " << program
+        << " --image <jpg> [--model <onnx>] [--output-dir <dir>] [--roi 300] [--alpha 0.45]"
+        << " [--min-component-pixels 20] [--review-defect-pixels 80]"
+        << " [--bad-defect-pixels 300] [--strong-component-pixels 120]\n"
+        << "输出: RESULT_SEG status=OK|NG evidence=CLEAR|WEAK|STRONG"
+        << " raw_defect_pixels=<n> filtered_defect_pixels=<n> largest_component_pixels=<n>"
+        << " component_count=<n> retained_component_count=<n> time_ms=<ms>"
+        << " raw_path=<jpg> overlay_path=<jpg> mask_path=<png>\n";
 }
 
 /*
@@ -163,6 +177,32 @@ static int parse_int(const char *text, const char *name)
 
     if (value < 0 || value > 4096) {
         throw std::runtime_error(std::string("参数超出范围: ") + name);
+    }
+
+    return static_cast<int>(value);
+}
+
+/*
+ * parse_pixel_count 的作用：
+ *   解析板端 UNet 像素阈值，并允许覆盖完整 224x224 mask 的像素数量范围。
+ *
+ * 参数：
+ *   text 是待解析的十进制字符串。
+ *   name 是参数名，用于输出明确错误。
+ *
+ * 返回值：
+ *   返回 1~50000 范围内的像素阈值。
+ */
+static int parse_pixel_count(const char *text, const char *name)
+{
+    char *end = nullptr;                       /* end 保存 strtol 停止解析的位置。 */
+    const long value = std::strtol(text, &end, 10); /* value 保存解析出的长整数。 */
+
+    if (text == nullptr || *text == '\0' || end == text || *end != '\0') {
+        throw std::runtime_error(std::string("参数不是整数: ") + name);
+    }
+    if (value < 1 || value > 50000) {
+        throw std::runtime_error(std::string("像素阈值必须在 1~50000: ") + name);
     }
 
     return static_cast<int>(value);
@@ -200,7 +240,7 @@ static float parse_float(const char *text, const char *name)
  *   解析命令行参数并返回 ProgramOptions。
  *
  * 主要流程：
- *   1. 支持 --image、--model、--output-dir、--roi、--alpha、--min-defect-pixels 和 --help。
+ *   1. 支持图片、模型、输出目录、ROI、透明度和四个连通域证据阈值。
  *   2. 对缺少参数值、未知参数和缺少 --image 做明确报错。
  *
  * 参数：
@@ -261,11 +301,35 @@ static ProgramOptions parse_args(int argc, char **argv)
             continue;
         }
 
-        if (std::strcmp(arg, "--min-defect-pixels") == 0) {
+        if (std::strcmp(arg, "--min-component-pixels") == 0) {
             if (++i >= argc) {
-                throw std::runtime_error("--min-defect-pixels 缺少数值");
+                throw std::runtime_error("--min-component-pixels 缺少数值");
             }
-            options.min_defect_pixels = parse_int(argv[i], "--min-defect-pixels");
+            options.min_component_pixels = parse_pixel_count(argv[i], "--min-component-pixels");
+            continue;
+        }
+
+        if (std::strcmp(arg, "--review-defect-pixels") == 0) {
+            if (++i >= argc) {
+                throw std::runtime_error("--review-defect-pixels 缺少数值");
+            }
+            options.review_defect_pixels = parse_pixel_count(argv[i], "--review-defect-pixels");
+            continue;
+        }
+
+        if (std::strcmp(arg, "--bad-defect-pixels") == 0) {
+            if (++i >= argc) {
+                throw std::runtime_error("--bad-defect-pixels 缺少数值");
+            }
+            options.bad_defect_pixels = parse_pixel_count(argv[i], "--bad-defect-pixels");
+            continue;
+        }
+
+        if (std::strcmp(arg, "--strong-component-pixels") == 0) {
+            if (++i >= argc) {
+                throw std::runtime_error("--strong-component-pixels 缺少数值");
+            }
+            options.strong_component_pixels = parse_pixel_count(argv[i], "--strong-component-pixels");
             continue;
         }
 
@@ -275,6 +339,14 @@ static ProgramOptions parse_args(int argc, char **argv)
     if (options.image_path.empty()) {
         throw std::runtime_error("必须指定 --image <jpg>");
     }
+
+    const defect_segment_evidence::SegmentEvidenceSettings evidenceSettings{
+        options.min_component_pixels,
+        options.review_defect_pixels,
+        options.bad_defect_pixels,
+        options.strong_component_pixels
+    }; /* evidenceSettings 复用生产算法校验入口，保证 CLI 和 mask 判定接受同一组参数。 */
+    defect_segment_evidence::validate_segment_evidence_settings(evidenceSettings);
 
     return options;
 }
@@ -513,15 +585,12 @@ static std::vector<float> preprocess_image(const ImageBuffer &roi)
  * 关键说明：
  *   PC 端脚本使用 BGR 表；这里全程序使用 RGB，因此颜色视觉效果保持一致但通道顺序已经换成 RGB。
  *
- * 参数：
- *   class_count 是从 ONNX 输出形状读取的实际类别数。
- *
  * 返回值：
- *   返回 class_count * 3 长度的 RGB 颜色表。
+ *   返回 MODEL_CLASS_COUNT * 3 长度的 RGB 颜色表。
  */
-static std::vector<uint8_t> build_palette(size_t class_count)
+static std::vector<uint8_t> build_palette()
 {
-    const uint8_t fixed_palette[][3] = {
+    const uint8_t fixed_palette[MODEL_CLASS_COUNT][3] = {
         {0, 0, 0},       /* 0 背景：黑色。 */
         {255, 0, 0},     /* 1 缺陷类：红色。 */
         {255, 165, 0},   /* 2 缺陷类：橙色。 */
@@ -529,17 +598,11 @@ static std::vector<uint8_t> build_palette(size_t class_count)
         {255, 0, 255},   /* 4 缺陷类：紫色。 */
         {255, 255, 0},   /* 5 缺陷类：黄色。 */
     };
-    const size_t fixed_color_count = sizeof(fixed_palette) / sizeof(fixed_palette[0]); /* fixed_color_count 保存内置颜色数量。 */
-    std::vector<uint8_t> palette(class_count * 3U); /* palette 按模型真实类别数分配，避免两类模型访问旧六类边界。 */
+    std::vector<uint8_t> palette(static_cast<size_t>(MODEL_CLASS_COUNT) * 3U);
 
-    for (size_t class_id = 0; class_id < class_count; class_id++) {
-        /* 超过内置颜色数量时循环使用五种缺陷色，但类别 0 始终保持黑色背景。 */
-        const size_t color_index = class_id < fixed_color_count
-            ? class_id
-            : 1U + ((class_id - 1U) % (fixed_color_count - 1U));
+    for (int class_id = 0; class_id < MODEL_CLASS_COUNT; class_id++) {
         for (int channel = 0; channel < 3; channel++) {
-            palette[class_id * 3U + static_cast<size_t>(channel)] =
-                fixed_palette[color_index][channel];
+            palette[static_cast<size_t>(class_id) * 3U + channel] = fixed_palette[class_id][channel];
         }
     }
 
@@ -554,7 +617,6 @@ static std::vector<uint8_t> build_palette(size_t class_count)
  *   mask 是类别 ID 数组，尺寸 mask_w * mask_h。
  *   mask_w/mask_h 是 mask 尺寸。
  *   palette 是 RGB 颜色表。
- *   class_count 是模型实际类别数，用于校验类别下标不越界。
  *
  * 返回值：
  *   返回 RGB 彩色 mask 图片。
@@ -562,8 +624,7 @@ static std::vector<uint8_t> build_palette(size_t class_count)
 static ImageBuffer mask_to_color(const std::vector<uint8_t> &mask,
                                  int mask_w,
                                  int mask_h,
-                                 const std::vector<uint8_t> &palette,
-                                 size_t class_count)
+                                 const std::vector<uint8_t> &palette)
 {
     ImageBuffer color; /* color 保存彩色 mask 输出图。 */
     color.width = mask_w;
@@ -573,7 +634,7 @@ static ImageBuffer mask_to_color(const std::vector<uint8_t> &mask,
     for (int y = 0; y < mask_h; y++) {
         for (int x = 0; x < mask_w; x++) {
             const size_t mask_index = static_cast<size_t>(y) * mask_w + x; /* mask_index 是当前像素类别下标。 */
-            const size_t class_id = std::min<size_t>(mask[mask_index], class_count - 1U); /* class_id 防止异常类别越界。 */
+            const uint8_t class_id = std::min<uint8_t>(mask[mask_index], MODEL_CLASS_COUNT - 1); /* class_id 防止异常类别越界。 */
 
             for (int channel = 0; channel < 3; channel++) {
                 color.rgb[mask_index * 3U + static_cast<size_t>(channel)] =
@@ -624,9 +685,7 @@ static std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t> &mask
  * 参数：
  *   roi 是中心 ROI 原图。
  *   mask 是 224x224 类别 mask。
- *   mask_w/mask_h 是模型输出 mask 的实际宽高。
  *   palette 是 RGB 颜色表。
- *   class_count 是模型实际类别数。
  *   alpha 是缺陷颜色叠加强度。
  *
  * 返回值：
@@ -634,20 +693,17 @@ static std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t> &mask
  */
 static ImageBuffer overlay_mask(const ImageBuffer &roi,
                                 const std::vector<uint8_t> &mask,
-                                int mask_w,
-                                int mask_h,
                                 const std::vector<uint8_t> &palette,
-                                size_t class_count,
                                 float alpha)
 {
     ImageBuffer output = roi; /* output 从原图开始，只改非背景缺陷区域。 */
     const std::vector<uint8_t> resized_mask =
-        resize_mask_nearest(mask, mask_w, mask_h, roi.width, roi.height);
+        resize_mask_nearest(mask, MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, roi.width, roi.height);
 
     for (int y = 0; y < roi.height; y++) {
         for (int x = 0; x < roi.width; x++) {
             const size_t pixel_index = static_cast<size_t>(y) * roi.width + x; /* pixel_index 是当前 ROI 像素下标。 */
-            const size_t class_id = std::min<size_t>(resized_mask[pixel_index], class_count - 1U); /* class_id 使用动态类别上限。 */
+            const uint8_t class_id = std::min<uint8_t>(resized_mask[pixel_index], MODEL_CLASS_COUNT - 1);
 
             if (class_id == 0U) {
                 continue;
@@ -665,29 +721,6 @@ static ImageBuffer overlay_mask(const ImageBuffer &roi,
     }
 
     return output;
-}
-
-/*
- * count_defect_pixels 的作用：
- *   统计 mask 中非背景像素数量。
- *
- * 参数：
- *   mask 是模型输出的单通道类别 mask。
- *
- * 返回值：
- *   返回 class_id != 0 的像素总数。
- */
-static int count_defect_pixels(const std::vector<uint8_t> &mask)
-{
-    int count = 0; /* count 保存累计缺陷像素数。 */
-
-    for (uint8_t value : mask) {
-        if (value != 0U) {
-            count++;
-        }
-    }
-
-    return count;
 }
 
 /*
@@ -995,48 +1028,38 @@ static void write_rgb_as_png(const ImageBuffer &image, const std::string &path)
  * 参数：
  *   logits 是输出张量首地址。
  *   count 是输出张量元素数量。
- *   class_count 是模型输出类别数。
- *   output_width/output_height 是模型输出 mask 的宽高。
  *
  * 返回值：
  *   返回 224x224 类别 mask。
  */
-static std::vector<uint8_t> logits_to_mask(const float *logits,
-                                           size_t count,
-                                           size_t class_count,
-                                           int output_width,
-                                           int output_height)
+static std::vector<uint8_t> logits_to_mask(const float *logits, size_t count)
 {
-    const size_t output_pixels = static_cast<size_t>(output_width) * static_cast<size_t>(output_height); /* output_pixels 保存单通道像素数。 */
-    const size_t expected = class_count * output_pixels; /* expected 保存单批次 NCHW 输出应有的精确元素数。 */
-    if (count != expected) {
-        throw std::runtime_error(
-            "UNet 输出元素数量与模型元数据不一致: elements="
-            + std::to_string(count)
-            + " expected=" + std::to_string(expected));
+    const size_t expected = static_cast<size_t>(MODEL_CLASS_COUNT) * MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT;
+    if (count < expected) {
+        throw std::runtime_error("UNet 输出元素数量小于 [1,6,224,224]");
     }
 
-    std::vector<uint8_t> mask(output_pixels, 0U); /* mask 保存每个输出像素的 argmax 类别。 */
+    std::vector<uint8_t> mask(static_cast<size_t>(MODEL_INPUT_WIDTH) * MODEL_INPUT_HEIGHT, 0U);
 
-    for (int y = 0; y < output_height; y++) {
-        for (int x = 0; x < output_width; x++) {
+    for (int y = 0; y < MODEL_INPUT_HEIGHT; y++) {
+        for (int x = 0; x < MODEL_INPUT_WIDTH; x++) {
             int best_class = 0;                                            /* best_class 保存当前像素最大 logits 类别。 */
             float best_value = -std::numeric_limits<float>::infinity();    /* best_value 保存当前最大 logits。 */
 
-            for (size_t class_id = 0; class_id < class_count; class_id++) {
+            for (int class_id = 0; class_id < MODEL_CLASS_COUNT; class_id++) {
                 const size_t offset =
-                    class_id * output_pixels
-                    + static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                    static_cast<size_t>(class_id) * MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT
+                    + static_cast<size_t>(y) * MODEL_INPUT_WIDTH
                     + static_cast<size_t>(x);
                 const float value = logits[offset];
 
                 if (value > best_value) {
                     best_value = value;
-                    best_class = static_cast<int>(class_id);
+                    best_class = class_id;
                 }
             }
 
-            mask[static_cast<size_t>(y) * static_cast<size_t>(output_width) + static_cast<size_t>(x)] =
+            mask[static_cast<size_t>(y) * MODEL_INPUT_WIDTH + static_cast<size_t>(x)] =
                 static_cast<uint8_t>(best_class);
         }
     }
@@ -1101,33 +1124,6 @@ int main(int argc, char **argv)
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
         Ort::Session session(env, options.model_path.c_str(), session_options); /* session 加载 UNet INT8 模型。 */
-
-        /* 当前辅助程序只支持一个 NCHW 分割输出，多输出模型无法确定哪一个张量是像素 logits。 */
-        if (session.GetOutputCount() != 1U) {
-            throw std::runtime_error("UNet 模型必须且只能包含一个输出张量");
-        }
-
-        /* 从模型元数据读取真实输出形状，确保两类新模型和旧六类模型都不会发生越界读取。 */
-        const Ort::TypeInfo output_type_info = session.GetOutputTypeInfo(0);
-        const auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
-        /* 后处理会把输出缓冲区解释为 float，因此必须先拒绝其他元素类型，避免错误指针解释导致越界或错误结果。 */
-        if (output_tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-            throw std::runtime_error("UNet 输出元素类型必须为 float32");
-        }
-        const std::vector<int64_t> output_shape = output_tensor_info.GetShape();
-        if (output_shape.size() != 4U) {
-            throw std::runtime_error("UNet 输出形状必须为 [batch, classes, height, width]");
-        }
-        if (output_shape[0] != 1 || output_shape[1] <= 1 || output_shape[1] > 256) {
-            throw std::runtime_error("UNet 输出 batch 必须为 1，classes 必须在 2 到 256 之间");
-        }
-        if (output_shape[2] != MODEL_INPUT_HEIGHT || output_shape[3] != MODEL_INPUT_WIDTH) {
-            throw std::runtime_error("UNet 输出高宽必须与 224x224 输入一致");
-        }
-
-        const size_t model_class_count = static_cast<size_t>(output_shape[1]); /* model_class_count 保存模型实际输出通道数。 */
-        const int model_output_height = static_cast<int>(output_shape[2]);     /* model_output_height 保存输出 mask 高度。 */
-        const int model_output_width = static_cast<int>(output_shape[3]);      /* model_output_width 保存输出 mask 宽度。 */
         Ort::AllocatorWithDefaultOptions allocator;                            /* allocator 用于读取输入输出节点名。 */
         Ort::AllocatedStringPtr input_name = session.GetInputNameAllocated(0, allocator);
         Ort::AllocatedStringPtr output_name = session.GetOutputNameAllocated(0, allocator);
@@ -1152,35 +1148,25 @@ int main(int argc, char **argv)
             1);
         const auto infer_end = std::chrono::steady_clock::now();
 
-        if (outputs.size() != 1U || !outputs.front().IsTensor()) {
-            throw std::runtime_error("ONNX Runtime 未返回唯一的 UNet 输出张量");
-        }
-
-        float *logits = outputs.front().GetTensorMutableData<float>();        /* logits 指向模型实际 NCHW 输出。 */
-        const size_t logits_count = tensor_element_count(outputs.front());     /* logits_count 保存输出元素总数。 */
-        const std::vector<uint8_t> mask = logits_to_mask(
-            logits,
-            logits_count,
-            model_class_count,
-            model_output_width,
-            model_output_height);
-        const int defect_pixels = count_defect_pixels(mask);
-        const bool is_ng = defect_pixels >= options.min_defect_pixels && defect_pixels > 0;
-        const std::vector<uint8_t> palette = build_palette(model_class_count);
-        const ImageBuffer color_mask = mask_to_color(
-            mask,
-            model_output_width,
-            model_output_height,
-            palette,
-            model_class_count);
-        const ImageBuffer overlay = overlay_mask(
-            roi,
-            mask,
-            model_output_width,
-            model_output_height,
-            palette,
-            model_class_count,
-            options.alpha);
+        float *logits = outputs.front().GetTensorMutableData<float>();       /* logits 指向模型输出 [1,6,224,224]。 */
+        const size_t logits_count = tensor_element_count(outputs.front());    /* logits_count 保存输出元素总数。 */
+        const std::vector<uint8_t> mask = logits_to_mask(logits, logits_count);
+        const defect_segment_evidence::SegmentEvidenceSettings evidenceSettings{
+            options.min_component_pixels,
+            options.review_defect_pixels,
+            options.bad_defect_pixels,
+            options.strong_component_pixels
+        }; /* evidenceSettings 是本次进程启动时固定的板端阈值快照。 */
+        const defect_segment_evidence::SegmentEvidenceStats evidence =
+            defect_segment_evidence::analyze_segment_evidence(
+                mask,
+                MODEL_INPUT_WIDTH,
+                MODEL_INPUT_HEIGHT,
+                evidenceSettings); /* evidence 保存 8 邻域过滤后的完整诊断和三级结论。 */
+        const bool is_ng = evidence.level != defect_segment_evidence::SegmentEvidenceLevel::Clear;
+        const std::vector<uint8_t> palette = build_palette();
+        const ImageBuffer color_mask = mask_to_color(mask, MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, palette);
+        const ImageBuffer overlay = overlay_mask(roi, mask, palette, options.alpha);
         const std::string stem = current_timestamp_stem();
         const std::string raw_path = join_path(options.output_dir, stem + "_raw.jpg");
         const std::string overlay_path = join_path(options.output_dir, stem + "_overlay.jpg");
@@ -1197,9 +1183,18 @@ int main(int argc, char **argv)
         std::cout
             << "RESULT_SEG"
             << " status=" << (is_ng ? "NG" : "OK")
-            << " defect_pixels=" << defect_pixels
-            << " min_defect_pixels=" << options.min_defect_pixels
-            << " classes=" << model_class_count
+            << " evidence=" << defect_segment_evidence::segment_evidence_level_name(evidence.level)
+            << " defect_pixels=" << evidence.rawDefectPixels
+            << " raw_defect_pixels=" << evidence.rawDefectPixels
+            << " filtered_defect_pixels=" << evidence.filteredDefectPixels
+            << " largest_component_pixels=" << evidence.largestComponentPixels
+            << " component_count=" << evidence.componentCount
+            << " retained_component_count=" << evidence.retainedComponentCount
+            << " min_component_pixels=" << options.min_component_pixels
+            << " review_defect_pixels=" << options.review_defect_pixels
+            << " bad_defect_pixels=" << options.bad_defect_pixels
+            << " strong_component_pixels=" << options.strong_component_pixels
+            << " classes=" << MODEL_CLASS_COUNT
             << " time_ms=" << time_ms
             << " raw_path=" << raw_path
             << " overlay_path=" << overlay_path

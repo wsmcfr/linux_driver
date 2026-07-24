@@ -33,7 +33,8 @@
  *   QML 加载失败返回 EXIT_FAILURE；正常进入 Qt 事件循环后返回 app.exec()。
  */
 
-#include "v4l2_video_item.h"  /* V4L2VideoItem 提供不依赖 QtMultimedia 的 UVC 预览控件。 */
+#include "v4l2_video_item.h"          /* V4L2VideoItem 提供不依赖 QtMultimedia 的 UVC 预览控件。 */
+#include "defect_segment_evidence.h" /* 共用 UNet 证据默认阈值，保证 Qt 配置与推理程序一致。 */
 
 #include <QAbstractListModel>   /* QAbstractListModel 用于把上传历史记录以模型形式暴露给 QML ListView。 */
 #include <QByteArray>           /* QByteArray 用于保存串口二进制协议帧、F4 文本回包和上传脚本输出。 */
@@ -571,7 +572,10 @@ static QVariantList stepperMotorSettingsToVariantList(const QVector<StepperMotor
  *   modelThreshold 是分类模型 bad_total 判坏阈值，传给 defect-classify 的 --bad-threshold。
  *   reviewThreshold 是综合判定的复核阈值，分类置信度低于该值时进入 REVIEW。
  *   roiSize 是分类和 UNet 使用的中心 ROI 边长，传给两个模型程序的 --roi。
- *   segmentMinPixels 是 UNet 判 NG 的最小缺陷像素数，传给 defect-segment 的 --min-defect-pixels。
+ *   segmentMinComponentPixels 是 UNet 过滤孤立小连通域的面积阈值。
+ *   segmentReviewPixels 是 UNet 从 CLEAR 进入 WEAK 待复核区的过滤后总像素阈值。
+ *   segmentBadPixels 是 UNet 进入 STRONG 的过滤后总像素阈值。
+ *   segmentStrongComponentPixels 是 UNet 进入 STRONG 的最大连通域面积阈值。
  *   overlayAlpha 是 UNet 叠加图透明度，传给 defect-segment 的 --alpha。
  *   autoUploadEnabled 为 false 时检测仍写本地历史，但跳过 COS 上传并返回 upload_status=SKIP。
  *   f4ArmResultTimeoutMs 是 MP157 等待 F4 主动 WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE 的最大窗口，单位 ms。
@@ -583,7 +587,10 @@ struct DetectSettingsSnapshot
     double modelThreshold = 0.85;
     double reviewThreshold = 0.65;
     int roiSize = 300;
-    int segmentMinPixels = 1;
+    int segmentMinComponentPixels = defect_segment_evidence::kDefaultMinComponentPixels;
+    int segmentReviewPixels = defect_segment_evidence::kDefaultReviewPixels;
+    int segmentBadPixels = defect_segment_evidence::kDefaultBadPixels;
+    int segmentStrongComponentPixels = defect_segment_evidence::kDefaultStrongComponentPixels;
     double overlayAlpha = 0.45;
     bool autoUploadEnabled = true;
     int f4ArmResultTimeoutMs = F4_ARM_ACTIVE_FRAME_TIMEOUT_DEFAULT_MS;
@@ -688,7 +695,7 @@ static quint32 clampedUInt32FromText(const QString &text, bool *ok)
  *   settings 是要转换的检测配置快照。
  *
  * 返回值：
- *   返回包含 partType/modelThreshold/reviewThreshold/roiSize/segmentMinPixels/overlayAlpha/autoUploadEnabled/f4ArmResultTimeoutMs 的 map。
+ *   返回包含分类、ROI、UNet 四阈值、透明度、上传和机械臂等待配置的 map。
  */
 static QVariantMap detectSettingsToVariantMap(const DetectSettingsSnapshot &settings)
 {
@@ -698,7 +705,10 @@ static QVariantMap detectSettingsToVariantMap(const DetectSettingsSnapshot &sett
     map.insert(QStringLiteral("modelThreshold"), settings.modelThreshold);
     map.insert(QStringLiteral("reviewThreshold"), settings.reviewThreshold);
     map.insert(QStringLiteral("roiSize"), settings.roiSize);
-    map.insert(QStringLiteral("segmentMinPixels"), settings.segmentMinPixels);
+    map.insert(QStringLiteral("segmentMinComponentPixels"), settings.segmentMinComponentPixels);
+    map.insert(QStringLiteral("segmentReviewPixels"), settings.segmentReviewPixels);
+    map.insert(QStringLiteral("segmentBadPixels"), settings.segmentBadPixels);
+    map.insert(QStringLiteral("segmentStrongComponentPixels"), settings.segmentStrongComponentPixels);
     map.insert(QStringLiteral("overlayAlpha"), settings.overlayAlpha);
     map.insert(QStringLiteral("autoUploadEnabled"), settings.autoUploadEnabled);
     map.insert(QStringLiteral("f4ArmResultTimeoutMs"), settings.f4ArmResultTimeoutMs);
@@ -3817,7 +3827,10 @@ class DetectSettingsController : public QObject
     Q_PROPERTY(double modelThreshold READ modelThreshold WRITE setModelThreshold NOTIFY settingsChanged)
     Q_PROPERTY(double reviewThreshold READ reviewThreshold WRITE setReviewThreshold NOTIFY settingsChanged)
     Q_PROPERTY(int roiSize READ roiSize WRITE setRoiSize NOTIFY settingsChanged)
-    Q_PROPERTY(int segmentMinPixels READ segmentMinPixels WRITE setSegmentMinPixels NOTIFY settingsChanged)
+    Q_PROPERTY(int segmentMinComponentPixels READ segmentMinComponentPixels WRITE setSegmentMinComponentPixels NOTIFY settingsChanged)
+    Q_PROPERTY(int segmentReviewPixels READ segmentReviewPixels WRITE setSegmentReviewPixels NOTIFY settingsChanged)
+    Q_PROPERTY(int segmentBadPixels READ segmentBadPixels WRITE setSegmentBadPixels NOTIFY settingsChanged)
+    Q_PROPERTY(int segmentStrongComponentPixels READ segmentStrongComponentPixels WRITE setSegmentStrongComponentPixels NOTIFY settingsChanged)
     Q_PROPERTY(double overlayAlpha READ overlayAlpha WRITE setOverlayAlpha NOTIFY settingsChanged)
     Q_PROPERTY(bool autoUploadEnabled READ autoUploadEnabled WRITE setAutoUploadEnabled NOTIFY settingsChanged)
     Q_PROPERTY(int f4ArmResultTimeoutMs READ f4ArmResultTimeoutMs WRITE setF4ArmResultTimeoutMs NOTIFY settingsChanged)
@@ -3913,12 +3926,39 @@ public:
     }
 
     /*
-     * segmentMinPixels 的作用：
-     *   返回 UNet 判定 NG 所需的最小缺陷像素数。
+     * segmentMinComponentPixels 的作用：
+     *   返回 UNet 保留单个缺陷连通域所需的最小面积。
      */
-    int segmentMinPixels() const
+    int segmentMinComponentPixels() const
     {
-        return m_settings.segmentMinPixels;
+        return m_settings.segmentMinComponentPixels;
+    }
+
+    /*
+     * segmentReviewPixels 的作用：
+     *   返回过滤后缺陷面积进入 WEAK 待复核区的下限。
+     */
+    int segmentReviewPixels() const
+    {
+        return m_settings.segmentReviewPixels;
+    }
+
+    /*
+     * segmentBadPixels 的作用：
+     *   返回过滤后缺陷总面积进入 STRONG 的下限。
+     */
+    int segmentBadPixels() const
+    {
+        return m_settings.segmentBadPixels;
+    }
+
+    /*
+     * segmentStrongComponentPixels 的作用：
+     *   返回最大连续缺陷区域进入 STRONG 的面积下限。
+     */
+    int segmentStrongComponentPixels() const
+    {
+        return m_settings.segmentStrongComponentPixels;
     }
 
     /*
@@ -4044,18 +4084,51 @@ public:
     }
 
     /*
-     * setSegmentMinPixels 的作用：
-     *   设置 UNet 判 NG 所需的最小缺陷像素数。
-     *
-     * 参数：
-     *   value 是像素数量，0 表示只要有缺陷类像素就判 NG。
+     * setSegmentMinComponentPixels 的作用：
+     *   设置 UNet 小连通域过滤阈值，并由 normalizedSettings() 联动修正其它阈值顺序。
      */
-    void setSegmentMinPixels(int value)
+    void setSegmentMinComponentPixels(int value)
     {
         DetectSettingsSnapshot next = m_settings;
 
-        next.segmentMinPixels = clampedInt(value, 0, 50000);
-        applySettings(next, QStringLiteral("真实检测配置：UNet像素阈值已调整"));
+        next.segmentMinComponentPixels = value;
+        applySettings(next, QStringLiteral("真实检测配置：UNet噪点过滤阈值已调整"));
+    }
+
+    /*
+     * setSegmentReviewPixels 的作用：
+     *   设置过滤后缺陷面积进入 WEAK 待复核区的下限。
+     */
+    void setSegmentReviewPixels(int value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.segmentReviewPixels = value;
+        applySettings(next, QStringLiteral("真实检测配置：UNet复核像素阈值已调整"));
+    }
+
+    /*
+     * setSegmentBadPixels 的作用：
+     *   设置过滤后缺陷总面积进入 STRONG 明确缺陷区的下限。
+     */
+    void setSegmentBadPixels(int value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.segmentBadPixels = value;
+        applySettings(next, QStringLiteral("真实检测配置：UNet坏品像素阈值已调整"));
+    }
+
+    /*
+     * setSegmentStrongComponentPixels 的作用：
+     *   设置最大连续缺陷区域进入 STRONG 明确缺陷区的下限。
+     */
+    void setSegmentStrongComponentPixels(int value)
+    {
+        DetectSettingsSnapshot next = m_settings;
+
+        next.segmentStrongComponentPixels = value;
+        applySettings(next, QStringLiteral("真实检测配置：UNet强连通域阈值已调整"));
     }
 
     /*
@@ -4256,6 +4329,7 @@ public:
 
         DetectSettingsSnapshot next = m_settings;
         const QJsonObject object = doc.object();
+        const int schemaVersion = object.value(QStringLiteral("schema_version")).toInt(1);
 
         next.partType = object.value(QStringLiteral("part_type")).toString(
             object.value(QStringLiteral("partType")).toString(next.partType));
@@ -4265,8 +4339,23 @@ public:
             object.value(QStringLiteral("reviewThreshold")).toDouble(next.reviewThreshold));
         next.roiSize = object.value(QStringLiteral("roi_size")).toInt(
             object.value(QStringLiteral("roiSize")).toInt(next.roiSize));
-        next.segmentMinPixels = object.value(QStringLiteral("segment_min_pixels")).toInt(
-            object.value(QStringLiteral("segmentMinPixels")).toInt(next.segmentMinPixels));
+        if (schemaVersion >= 2) {
+            next.segmentMinComponentPixels = object.value(QStringLiteral("segment_min_component_pixels")).toInt(
+                object.value(QStringLiteral("segmentMinComponentPixels")).toInt(next.segmentMinComponentPixels));
+            next.segmentReviewPixels = object.value(QStringLiteral("segment_review_pixels")).toInt(
+                object.value(QStringLiteral("segmentReviewPixels")).toInt(next.segmentReviewPixels));
+            next.segmentBadPixels = object.value(QStringLiteral("segment_bad_pixels")).toInt(
+                object.value(QStringLiteral("segmentBadPixels")).toInt(next.segmentBadPixels));
+            next.segmentStrongComponentPixels = object.value(QStringLiteral("segment_strong_component_pixels")).toInt(
+                object.value(QStringLiteral("segmentStrongComponentPixels")).toInt(next.segmentStrongComponentPixels));
+        } else {
+            /* schema 1 的 segment_min_pixels 只有单阈值语义，不能安全映射到三级证据，统一迁移到新默认值。 */
+            const DetectSettingsSnapshot defaults;
+            next.segmentMinComponentPixels = defaults.segmentMinComponentPixels;
+            next.segmentReviewPixels = defaults.segmentReviewPixels;
+            next.segmentBadPixels = defaults.segmentBadPixels;
+            next.segmentStrongComponentPixels = defaults.segmentStrongComponentPixels;
+        }
         next.overlayAlpha = object.value(QStringLiteral("overlay_alpha")).toDouble(
             object.value(QStringLiteral("overlayAlpha")).toDouble(next.overlayAlpha));
         next.autoUploadEnabled = object.value(QStringLiteral("auto_upload_enabled")).toBool(
@@ -4338,12 +4427,15 @@ public:
             return result;
         }
 
-        object.insert(QStringLiteral("schema_version"), 1);
+        object.insert(QStringLiteral("schema_version"), 2);
         object.insert(QStringLiteral("part_type"), m_settings.partType);
         object.insert(QStringLiteral("model_threshold"), m_settings.modelThreshold);
         object.insert(QStringLiteral("review_threshold"), m_settings.reviewThreshold);
         object.insert(QStringLiteral("roi_size"), m_settings.roiSize);
-        object.insert(QStringLiteral("segment_min_pixels"), m_settings.segmentMinPixels);
+        object.insert(QStringLiteral("segment_min_component_pixels"), m_settings.segmentMinComponentPixels);
+        object.insert(QStringLiteral("segment_review_pixels"), m_settings.segmentReviewPixels);
+        object.insert(QStringLiteral("segment_bad_pixels"), m_settings.segmentBadPixels);
+        object.insert(QStringLiteral("segment_strong_component_pixels"), m_settings.segmentStrongComponentPixels);
         object.insert(QStringLiteral("overlay_alpha"), m_settings.overlayAlpha);
         object.insert(QStringLiteral("auto_upload_enabled"), m_settings.autoUploadEnabled);
         object.insert(QStringLiteral("f4_arm_result_timeout_ms"), m_settings.f4ArmResultTimeoutMs);
@@ -4574,7 +4666,16 @@ private:
         next.modelThreshold = clampedDouble(next.modelThreshold, 0.50, 0.99);
         next.reviewThreshold = clampedDouble(next.reviewThreshold, 0.30, next.modelThreshold);
         next.roiSize = clampedInt(next.roiSize, 160, 640);
-        next.segmentMinPixels = clampedInt(next.segmentMinPixels, 0, 50000);
+        next.segmentMinComponentPixels = clampedInt(next.segmentMinComponentPixels, 1, 50000);
+        next.segmentReviewPixels = clampedInt(next.segmentReviewPixels,
+                                              next.segmentMinComponentPixels,
+                                              50000);
+        next.segmentBadPixels = clampedInt(next.segmentBadPixels,
+                                           next.segmentReviewPixels,
+                                           50000);
+        next.segmentStrongComponentPixels = clampedInt(next.segmentStrongComponentPixels,
+                                                       next.segmentMinComponentPixels,
+                                                       next.segmentBadPixels);
         next.overlayAlpha = clampedDouble(next.overlayAlpha, 0.0, 1.0);
         next.f4ArmResultTimeoutMs = clampedInt(next.f4ArmResultTimeoutMs,
                                                F4_ARM_ACTIVE_FRAME_TIMEOUT_MIN_MS,
@@ -4594,7 +4695,10 @@ private:
             && qFuzzyCompare(left.modelThreshold + 1.0, right.modelThreshold + 1.0)
             && qFuzzyCompare(left.reviewThreshold + 1.0, right.reviewThreshold + 1.0)
             && left.roiSize == right.roiSize
-            && left.segmentMinPixels == right.segmentMinPixels
+            && left.segmentMinComponentPixels == right.segmentMinComponentPixels
+            && left.segmentReviewPixels == right.segmentReviewPixels
+            && left.segmentBadPixels == right.segmentBadPixels
+            && left.segmentStrongComponentPixels == right.segmentStrongComponentPixels
             && qFuzzyCompare(left.overlayAlpha + 1.0, right.overlayAlpha + 1.0)
             && left.autoUploadEnabled == right.autoUploadEnabled
             && left.f4ArmResultTimeoutMs == right.f4ArmResultTimeoutMs
@@ -4670,7 +4774,8 @@ class CameraStorageController : public QObject
      *   historyText 是本地历史列表展示的中文主结果，良品表示两个模型均未发现缺陷。
      *   uiStatus 是 QML 首页结果卡片使用的状态，取值 GOOD/BAD/REVIEW。
      *   reason 是不带空格的中文短原因，会追加到 RESULT 行供 QML 和日志读取。
-     *   classifyBad/segmentBad 保存两个模型各自是否发现缺陷，便于工作流文案说明冲突来源。
+     *   segmentEvidence 保存 CLEAR/WEAK/STRONG 原始证据等级。
+     *   classifyBad/segmentBad/segmentReview 保存分类坏品、UNet 强缺陷和 UNet 弱缺陷状态。
      */
     struct FusedDetectResult
     {
@@ -4678,8 +4783,10 @@ class CameraStorageController : public QObject
         QString historyText;
         QString uiStatus;
         QString reason;
+        QString segmentEvidence;
         bool classifyBad = false;
         bool segmentBad = false;
+        bool segmentReview = false;
     };
 
 public:
@@ -6450,6 +6557,16 @@ private:
             + parseTokenValue(segmentationResult, QStringLiteral("status"))
             + QStringLiteral(" defect_pixels=")
             + parseTokenValue(segmentationResult, QStringLiteral("defect_pixels"))
+            + QStringLiteral(" segment_evidence=")
+            + parseTokenValue(segmentationResult, QStringLiteral("evidence"))
+            + QStringLiteral(" filtered_defect_pixels=")
+            + parseTokenValue(segmentationResult, QStringLiteral("filtered_defect_pixels"))
+            + QStringLiteral(" largest_component_pixels=")
+            + parseTokenValue(segmentationResult, QStringLiteral("largest_component_pixels"))
+            + QStringLiteral(" component_count=")
+            + parseTokenValue(segmentationResult, QStringLiteral("component_count"))
+            + QStringLiteral(" retained_component_count=")
+            + parseTokenValue(segmentationResult, QStringLiteral("retained_component_count"))
             + QStringLiteral(" segment_time_ms=")
             + parseTokenValue(segmentationResult, QStringLiteral("time_ms"))
             + QStringLiteral(" total_time_ms=")
@@ -6504,9 +6621,17 @@ private:
         QJsonObject unet;
         unet.insert(QStringLiteral("model_name"), QStringLiteral("UNet"));
         unet.insert(QStringLiteral("status"), parseTokenValue(bundle.segmentationResult, QStringLiteral("status")));
+        unet.insert(QStringLiteral("evidence"), parseTokenValue(bundle.segmentationResult, QStringLiteral("evidence")));
         unet.insert(QStringLiteral("threshold"), 0.5);
-        unet.insert(QStringLiteral("min_defect_pixels"), bundle.settings.segmentMinPixels);
+        unet.insert(QStringLiteral("min_component_pixels"), bundle.settings.segmentMinComponentPixels);
+        unet.insert(QStringLiteral("review_defect_pixels"), bundle.settings.segmentReviewPixels);
+        unet.insert(QStringLiteral("bad_defect_pixels"), bundle.settings.segmentBadPixels);
+        unet.insert(QStringLiteral("strong_component_pixels"), bundle.settings.segmentStrongComponentPixels);
         unet.insert(QStringLiteral("defect_pixels"), parseTokenValue(bundle.segmentationResult, QStringLiteral("defect_pixels")).toInt());
+        unet.insert(QStringLiteral("filtered_defect_pixels"), parseTokenValue(bundle.segmentationResult, QStringLiteral("filtered_defect_pixels")).toInt());
+        unet.insert(QStringLiteral("largest_component_pixels"), parseTokenValue(bundle.segmentationResult, QStringLiteral("largest_component_pixels")).toInt());
+        unet.insert(QStringLiteral("component_count"), parseTokenValue(bundle.segmentationResult, QStringLiteral("component_count")).toInt());
+        unet.insert(QStringLiteral("retained_component_count"), parseTokenValue(bundle.segmentationResult, QStringLiteral("retained_component_count")).toInt());
         unet.insert(QStringLiteral("time_ms"), parseTokenValue(bundle.segmentationResult, QStringLiteral("time_ms")).toInt());
         unet.insert(QStringLiteral("raw_path"), parseTokenValue(bundle.segmentationResult, QStringLiteral("raw_path")));
         unet.insert(QStringLiteral("overlay_path"), parseTokenValue(bundle.segmentationResult, QStringLiteral("overlay_path")));
@@ -6532,7 +6657,7 @@ private:
      *
      * 主要流程：
      *   1. 复用 fusedResultFromModelResults() 保证 UI、历史和云端最终结果一致。
-     *   2. 记录分类阈值、复核阈值、UNet 最小缺陷像素和模型耗时。
+     *   2. 记录分类阈值、复核阈值、UNet 四个证据阈值和模型耗时。
      *   3. 明确本次上传发生在 F4 称重/电感完成之后，便于云端追溯自动流程时序。
      *
      * 参数：
@@ -6552,7 +6677,7 @@ private:
 
         QJsonObject context;
         context.insert(QStringLiteral("pipeline"), QStringLiteral("UNet + MobileNetV3-Small"));
-        context.insert(QStringLiteral("decision_rule"), QStringLiteral("bad if classification or UNet reaches defect threshold; review if confidence or sensor context is incomplete"));
+        context.insert(QStringLiteral("decision_rule"), QStringLiteral("strong UNet or confident bad classification => bad; weak UNet or incomplete confidence => review; confident good plus clear UNet => good"));
         context.insert(QStringLiteral("result"), cloudResultFromFusedResult(fusedResult));
         context.insert(QStringLiteral("ui_status"), uiStatusFromFusedResult(fusedResult));
         context.insert(QStringLiteral("need_ai_review"), cloudResultFromFusedResult(fusedResult) == QStringLiteral("review"));
@@ -6560,7 +6685,10 @@ private:
         context.insert(QStringLiteral("classification_threshold"), bundle.settings.modelThreshold);
         context.insert(QStringLiteral("classification_review_threshold"), bundle.settings.reviewThreshold);
         context.insert(QStringLiteral("unet_threshold"), 0.5);
-        context.insert(QStringLiteral("unet_min_defect_pixels"), bundle.settings.segmentMinPixels);
+        context.insert(QStringLiteral("unet_min_component_pixels"), bundle.settings.segmentMinComponentPixels);
+        context.insert(QStringLiteral("unet_review_pixels"), bundle.settings.segmentReviewPixels);
+        context.insert(QStringLiteral("unet_bad_pixels"), bundle.settings.segmentBadPixels);
+        context.insert(QStringLiteral("unet_strong_component_pixels"), bundle.settings.segmentStrongComponentPixels);
         context.insert(QStringLiteral("classification_ms"), classifyMs);
         context.insert(QStringLiteral("unet_ms"), segmentMs);
         context.insert(QStringLiteral("cycle_ms"), classifyMs + segmentMs);
@@ -6569,39 +6697,14 @@ private:
     }
 
     /*
-     * segmentationHasDefect 的作用：
-     *   判断 defect-segment 的 RESULT_SEG 行是否输出了非背景缺陷像素。
-     *
-     * 参数：
-     *   segmentationResult 是 defect-segment 输出的一行 RESULT_SEG。
-     *
-     * 返回值：
-     *   defect_pixels 大于 0 或 status=NG 时返回 true；否则返回 false。
-     */
-    bool segmentationHasDefect(const QString &segmentationResult,
-                               const DetectSettingsSnapshot &settings) const
-    {
-        const QString status = parseTokenValue(segmentationResult, QStringLiteral("status"));
-        const QString defectPixelsText = parseTokenValue(segmentationResult, QStringLiteral("defect_pixels"));
-        bool ok = false;
-        const int defectPixels = defectPixelsText.toInt(&ok);
-
-        if (status == QStringLiteral("NG")) {
-            return true;
-        }
-
-        return ok && defectPixels >= settings.segmentMinPixels && defectPixels > 0;
-    }
-
-    /*
      * fusedResultFromModelResults 的作用：
      *   综合分类模型和 UNet 分割模型的详细输出，生成唯一最终判定。
      *
      * 主要流程：
      *   1. 先读取分类 RESULT 的 status/confidence，只有 GOOD/BAD 属于可信输入。
-     *   2. 再读取 UNet RESULT_SEG 的 status 和 defect_pixels，按 segmentMinPixels 判断缺陷是否有效。
-     *   3. 任一模型结果缺失或分类置信度低于复核阈值时最终判为 review，避免低可信样本默认 good。
-     *   4. 任一模型发现缺陷时最终判为 bad，禁止把 UNet 检出缺陷的样本放进良品流。
+     *   2. 再读取 UNet RESULT_SEG 的 status/evidence，并校验 CLEAR/WEAK/STRONG 与 OK/NG 一致。
+     *   3. STRONG 明确缺陷优先判 bad，避免被分类低置信度门控降级。
+     *   4. WEAK 可疑缺陷进入 review；只有可信分类 GOOD 且 UNet CLEAR 才判 good。
      *
      * 参数：
      *   classificationResult 是 defect-classify 输出的一行 RESULT。
@@ -6619,8 +6722,16 @@ private:
         const QString classifyStatus = parseTokenValue(classificationResult, QStringLiteral("status"));
         const QString confidenceText = parseTokenValue(classificationResult, QStringLiteral("confidence"));
         const QString segmentStatus = parseTokenValue(segmentationResult, QStringLiteral("status"));
+        const QString segmentEvidence = parseTokenValue(segmentationResult, QStringLiteral("evidence")).toUpper();
         const bool classifyKnown = classifyStatus == QStringLiteral("GOOD") || classifyStatus == QStringLiteral("BAD");
-        const bool segmentKnown = segmentStatus == QStringLiteral("OK") || segmentStatus == QStringLiteral("NG");
+        const bool segmentEvidenceKnown = segmentEvidence == QStringLiteral("CLEAR")
+            || segmentEvidence == QStringLiteral("WEAK")
+            || segmentEvidence == QStringLiteral("STRONG");
+        const bool segmentStatusConsistent = (segmentEvidence == QStringLiteral("CLEAR")
+                                              && segmentStatus == QStringLiteral("OK"))
+            || ((segmentEvidence == QStringLiteral("WEAK") || segmentEvidence == QStringLiteral("STRONG"))
+                && segmentStatus == QStringLiteral("NG"));
+        const bool segmentKnown = segmentEvidenceKnown && segmentStatusConsistent;
         bool confidenceOk = false;
         const double confidence = confidenceText.toDouble(&confidenceOk);
 
@@ -6628,37 +6739,41 @@ private:
         result.historyText = QStringLiteral("待复核");
         result.uiStatus = QStringLiteral("REVIEW");
         result.reason = QStringLiteral("模型结果待复核");
+        result.segmentEvidence = segmentEvidence;
         result.classifyBad = classifyStatus == QStringLiteral("BAD");
-        result.segmentBad = segmentationHasDefect(segmentationResult, settings);
+        result.segmentBad = segmentEvidence == QStringLiteral("STRONG");
+        result.segmentReview = segmentEvidence == QStringLiteral("WEAK");
 
         if (!classifyKnown || !segmentKnown) {
             result.reason = QStringLiteral("模型结果不完整");
             return result;
         }
 
-        if (!confidenceOk || confidence < settings.reviewThreshold) {
-            result.reason = QStringLiteral("分类置信度低于复核阈值");
+        if (result.segmentBad) {
+            result.cloudResult = QStringLiteral("bad");
+            result.historyText = QStringLiteral("坏品");
+            result.uiStatus = QStringLiteral("BAD");
+            result.reason = result.classifyBad
+                ? QStringLiteral("分类判坏且UNet强缺陷")
+                : QStringLiteral("UNet发现连续明确缺陷");
             return result;
         }
 
-        if (result.classifyBad && result.segmentBad) {
-            result.cloudResult = QStringLiteral("bad");
-            result.uiStatus = QStringLiteral("BAD");
-            result.reason = QStringLiteral("分类和UNet均发现缺陷");
+        if (!confidenceOk || confidence < settings.reviewThreshold) {
+            result.reason = QStringLiteral("分类置信度低且UNet无强缺陷");
             return result;
         }
 
         if (result.classifyBad) {
             result.cloudResult = QStringLiteral("bad");
+            result.historyText = QStringLiteral("坏品");
             result.uiStatus = QStringLiteral("BAD");
             result.reason = QStringLiteral("分类模型判定坏品");
             return result;
         }
 
-        if (result.segmentBad) {
-            result.cloudResult = QStringLiteral("bad");
-            result.uiStatus = QStringLiteral("BAD");
-            result.reason = QStringLiteral("UNet发现疑似缺陷");
+        if (result.segmentReview) {
+            result.reason = QStringLiteral("UNet存在可疑缺陷需复核");
             return result;
         }
 
@@ -6692,7 +6807,7 @@ private:
      *   fusedResult 是 fusedResultFromModelResults() 的返回值。
      *
      * 返回值：
-     *   返回“良品”或“待复核”；当前坏品也先进入待复核，避免未接自动分拣前直接下最终人工结论。
+     *   返回“良品”“坏品”或“待复核”，与首页、F4 最终分拣和云端结果保持一致。
      */
     QString historyTextFromFusedResult(const FusedDetectResult &fusedResult) const
     {
@@ -6837,6 +6952,13 @@ private:
                                         bundle.segmentationResult,
                                         bundle.settings);
         const QString cloudResult = cloudResultFromFusedResult(fusedResult);
+        const QString unetWorkflowText = fusedResult.segmentEvidence == QStringLiteral("STRONG")
+            ? QStringLiteral("明确连续缺陷")
+            : (fusedResult.segmentEvidence == QStringLiteral("WEAK")
+               ? QStringLiteral("存在可疑缺陷")
+               : (fusedResult.segmentEvidence == QStringLiteral("CLEAR")
+                  ? QStringLiteral("小噪点已过滤")
+                  : QStringLiteral("证据未知"))); /* unetWorkflowText 保留三级证据含义，避免 WEAK 被写成“未见缺陷”。 */
 
         entry.uploadTime = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
         entry.resultText = historyTextFromFusedResult(fusedResult);
@@ -6844,7 +6966,7 @@ private:
         entry.workflowText = QStringLiteral("综合%1；分类%2；UNet%3；%4")
             .arg(fusedResult.reason)
             .arg(fusedResult.classifyBad ? QStringLiteral("BAD") : QStringLiteral("GOOD"))
-            .arg(fusedResult.segmentBad ? QStringLiteral("发现缺陷") : QStringLiteral("未见缺陷"))
+            .arg(unetWorkflowText)
             .arg(isUploadStatusSuccess(bundle.uploadResult)
                  ? QStringLiteral("云端已归档")
                  : QStringLiteral("本地已保存"));
@@ -7228,7 +7350,10 @@ private:
                 << "roi" << settings.roiSize
                 << "badThreshold" << settings.modelThreshold
                 << "reviewThreshold" << settings.reviewThreshold
-                << "segmentMinPixels" << settings.segmentMinPixels
+                << "segmentMinComponentPixels" << settings.segmentMinComponentPixels
+                << "segmentReviewPixels" << settings.segmentReviewPixels
+                << "segmentBadPixels" << settings.segmentBadPixels
+                << "segmentStrongComponentPixels" << settings.segmentStrongComponentPixels
                 << "overlayAlpha" << settings.overlayAlpha
                 << "autoUpload" << settings.autoUploadEnabled
                 << "uploadMode" << "LOCAL_READY";
@@ -7418,13 +7543,14 @@ private:
      *
      * 主要流程：
      *   1. 校验程序、UNet 模型、输入图片和输出目录是否存在或可用。
-     *   2. 传入 --image/--model/--output-dir/--roi/--alpha/--min-defect-pixels，使用参数页真实配置。
-     *   3. 等待进程结束，成功时解析 RESULT_SEG 中的 raw_path/overlay_path/mask_path。
-     *   4. 把 raw/overlay/mask 三张图都放入 annotatedPaths，后续统一作为 --annotated 上传。
+     *   2. 传入图片、模型、输出目录、ROI、透明度和四个 UNet 证据阈值，使用参数页真实配置。
+     *   3. 等待进程结束，严格校验证据等级、统计字段和 OK/NG 状态的一致性。
+     *   4. 解析 RESULT_SEG 中的 raw_path/overlay_path/mask_path，并确认文件已经真实落盘。
+     *   5. 把 raw/overlay/mask 三张图都放入 annotatedPaths，后续统一作为 --annotated 上传。
      *
      * 参数：
      *   segmentBin/modelPath/imagePath/outputDir 分别是推理程序、模型、输入图和输出目录。
-     *   settings 保存本次检测使用的 ROI、overlay 透明度和 UNet 像素阈值。
+     *   settings 保存本次检测使用的 ROI、overlay 透明度和 UNet 四个证据阈值。
      *   bundle 用于保存分割结果图路径和标签。
      *
      * 返回值：
@@ -7445,6 +7571,18 @@ private:
         QString rawPath;
         QString overlayPath;
         QString maskPath;
+        QString evidenceText;
+        QString segmentStatus;
+        bool defectPixelsOk = false;
+        bool rawPixelsOk = false;
+        bool filteredPixelsOk = false;
+        bool largestComponentOk = false;
+        bool componentCountOk = false;
+        bool retainedComponentCountOk = false;
+        bool minComponentPixelsOk = false;
+        bool reviewPixelsOk = false;
+        bool badPixelsOk = false;
+        bool strongComponentPixelsOk = false;
 
         if (bundle == nullptr) {
             return QStringLiteral("检测失败：UNet 结果缓存为空");
@@ -7477,7 +7615,14 @@ private:
                              << QStringLiteral("--output-dir") << outputDir
                              << QStringLiteral("--roi") << QString::number(settings.roiSize)
                              << QStringLiteral("--alpha") << QString::number(settings.overlayAlpha, 'f', 2)
-                             << QStringLiteral("--min-defect-pixels") << QString::number(settings.segmentMinPixels));
+                             << QStringLiteral("--min-component-pixels")
+                             << QString::number(settings.segmentMinComponentPixels)
+                             << QStringLiteral("--review-defect-pixels")
+                             << QString::number(settings.segmentReviewPixels)
+                             << QStringLiteral("--bad-defect-pixels")
+                             << QString::number(settings.segmentBadPixels)
+                             << QStringLiteral("--strong-component-pixels")
+                             << QString::number(settings.segmentStrongComponentPixels));
         process.start();
 
         if (!process.waitForStarted(3000)) {
@@ -7516,6 +7661,88 @@ private:
         usefulLine = firstUsefulLine(stdoutText);
         if (!usefulLine.startsWith(QStringLiteral("RESULT_SEG "))) {
             return QStringLiteral("检测失败：UNet 输出缺少 RESULT_SEG：") + usefulLine.left(120);
+        }
+
+        evidenceText = parseTokenValue(usefulLine, QStringLiteral("evidence")).toUpper();
+        segmentStatus = parseTokenValue(usefulLine, QStringLiteral("status")).toUpper();
+        const int defectPixels = parseTokenValue(usefulLine,
+                                                  QStringLiteral("defect_pixels")).toInt(&defectPixelsOk);
+        const int rawDefectPixels = parseTokenValue(usefulLine,
+                                                     QStringLiteral("raw_defect_pixels")).toInt(&rawPixelsOk);
+        const int filteredDefectPixels = parseTokenValue(usefulLine,
+                                                          QStringLiteral("filtered_defect_pixels")).toInt(&filteredPixelsOk);
+        const int largestComponentPixels = parseTokenValue(usefulLine,
+                                                             QStringLiteral("largest_component_pixels")).toInt(&largestComponentOk);
+        const int componentCount = parseTokenValue(usefulLine,
+                                                    QStringLiteral("component_count")).toInt(&componentCountOk);
+        const int retainedComponentCount = parseTokenValue(usefulLine,
+                                                            QStringLiteral("retained_component_count")).toInt(&retainedComponentCountOk);
+        const int echoedMinComponentPixels = parseTokenValue(usefulLine,
+                                                              QStringLiteral("min_component_pixels")).toInt(&minComponentPixelsOk);
+        const int echoedReviewPixels = parseTokenValue(usefulLine,
+                                                        QStringLiteral("review_defect_pixels")).toInt(&reviewPixelsOk);
+        const int echoedBadPixels = parseTokenValue(usefulLine,
+                                                     QStringLiteral("bad_defect_pixels")).toInt(&badPixelsOk);
+        const int echoedStrongComponentPixels = parseTokenValue(usefulLine,
+                                                                 QStringLiteral("strong_component_pixels")).toInt(&strongComponentPixelsOk);
+        const bool evidenceKnown = evidenceText == QStringLiteral("CLEAR")
+            || evidenceText == QStringLiteral("WEAK")
+            || evidenceText == QStringLiteral("STRONG");
+        const bool statusConsistent = (evidenceText == QStringLiteral("CLEAR")
+                                       && segmentStatus == QStringLiteral("OK"))
+            || ((evidenceText == QStringLiteral("WEAK") || evidenceText == QStringLiteral("STRONG"))
+                && segmentStatus == QStringLiteral("NG"));
+
+        /*
+         * 这里不接受缺字段被 QString::toInt() 静默转成 0：旧版推理程序没有三级证据时必须明确失败，
+         * 防止 Qt 把“不完整结果”误当 CLEAR 良品继续送往最终分拣。
+         */
+        if (!evidenceKnown || !statusConsistent) {
+            return QStringLiteral("检测失败：UNet evidence/status 不合法或不一致：")
+                + evidenceText + QLatin1Char('/') + segmentStatus;
+        }
+        if (!defectPixelsOk || !rawPixelsOk || !filteredPixelsOk || !largestComponentOk
+                || !componentCountOk || !retainedComponentCountOk) {
+            return QStringLiteral("检测失败：UNet 输出缺少合法的连通域统计字段");
+        }
+        if (defectPixels < 0
+                || rawDefectPixels < 0
+                || defectPixels != rawDefectPixels
+                || filteredDefectPixels < 0
+                || filteredDefectPixels > rawDefectPixels
+                || largestComponentPixels < 0
+                || largestComponentPixels > rawDefectPixels
+                || componentCount < 0
+                || retainedComponentCount < 0
+                || retainedComponentCount > componentCount) {
+            return QStringLiteral("检测失败：UNet 连通域统计字段关系不合法");
+        }
+
+        /* helper 必须回显本轮实际使用的四阈值；不匹配说明 Qt 与 defect-segment 版本或参数已经漂移。 */
+        if (!minComponentPixelsOk || !reviewPixelsOk || !badPixelsOk || !strongComponentPixelsOk
+                || echoedMinComponentPixels != settings.segmentMinComponentPixels
+                || echoedReviewPixels != settings.segmentReviewPixels
+                || echoedBadPixels != settings.segmentBadPixels
+                || echoedStrongComponentPixels != settings.segmentStrongComponentPixels) {
+            return QStringLiteral("检测失败：UNet 回显阈值与本轮板端参数不一致");
+        }
+
+        const defect_segment_evidence::SegmentEvidenceSettings evidenceSettings{
+            settings.segmentMinComponentPixels,
+            settings.segmentReviewPixels,
+            settings.segmentBadPixels,
+            settings.segmentStrongComponentPixels
+        }; /* evidenceSettings 把 Qt 快照转换为共用算法输入，确保二次校验和 helper 使用同一公式。 */
+        const defect_segment_evidence::SegmentEvidenceLevel expectedLevel =
+            defect_segment_evidence::segment_evidence_level_from_stats(
+                filteredDefectPixels,
+                largestComponentPixels,
+                evidenceSettings);
+        const QString expectedEvidence = QString::fromLatin1(
+            defect_segment_evidence::segment_evidence_level_name(expectedLevel));
+        if (evidenceText != expectedEvidence) {
+            return QStringLiteral("检测失败：UNet 证据等级与连通域统计不一致，期望")
+                + expectedEvidence + QStringLiteral("，实际") + evidenceText;
         }
 
         rawPath = parseTokenValue(usefulLine, QStringLiteral("raw_path"));
@@ -13840,7 +14067,10 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("model_threshold=0.650 (65.0%)\n")
         + QStringLiteral("review_threshold=0.820 (82.0%)\n")
         + QStringLiteral("roi_size=352\n")
-        + QStringLiteral("segment_min_pixels=120\n")
+        + QStringLiteral("segment_min_component_pixels=20\n")
+        + QStringLiteral("segment_review_pixels=80\n")
+        + QStringLiteral("segment_bad_pixels=300\n")
+        + QStringLiteral("segment_strong_component_pixels=120\n")
         + QStringLiteral("overlay_alpha=0.45\n")
         + QStringLiteral("auto_upload_enabled=true\n")
         + QStringLiteral("f4_arm_result_timeout_ms=75000\n")
@@ -13870,7 +14100,7 @@ static int run_settings_log_self_test(int argc, char *argv[])
         + QStringLiteral("stepper_motor[2].direction=1 (正向)\n")
         + QStringLiteral("stepper_motor[2].z_motion_timeout_ms=10000\n")
         + QStringLiteral("classify_args=--roi 352 --bad-threshold 0.650\n")
-        + QStringLiteral("segment_args=--roi 352 --alpha 0.45 --min-defect-pixels 120\n");
+        + QStringLiteral("segment_args=--roi 352 --alpha 0.45 --min-component-pixels 20 --review-defect-pixels 80 --bad-defect-pixels 300 --strong-component-pixels 120\n");
 
     /* saveSummary 模拟参数页点击“保存配置”后写入的日志段。 */
     const QString saveSummary =

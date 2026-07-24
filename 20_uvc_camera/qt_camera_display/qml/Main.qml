@@ -493,8 +493,17 @@ Rectangle {
     /* settingsRoiSize 保存分类和 UNet 共用的中心 ROI 边长，真实值来自 detectSettings.roiSize。 */
     property int settingsRoiSize: detectSettings.roiSize
 
-    /* settingsSegmentMinPixels 保存 UNet 判 NG 的最小缺陷像素数，真实值来自 detectSettings.segmentMinPixels。 */
-    property int settingsSegmentMinPixels: detectSettings.segmentMinPixels
+    /* settingsSegmentMinComponentPixels 保存 UNet 小连通域过滤阈值，真实值来自板端 JSON 配置。 */
+    property int settingsSegmentMinComponentPixels: detectSettings.segmentMinComponentPixels
+
+    /* settingsSegmentReviewPixels 保存过滤后缺陷面积进入 WEAK 待复核区的下限。 */
+    property int settingsSegmentReviewPixels: detectSettings.segmentReviewPixels
+
+    /* settingsSegmentBadPixels 保存过滤后缺陷总面积进入 STRONG 的总面积下限。 */
+    property int settingsSegmentBadPixels: detectSettings.segmentBadPixels
+
+    /* settingsSegmentStrongComponentPixels 保存 STRONG 判定要求的最大连续缺陷面积下限。 */
+    property int settingsSegmentStrongComponentPixels: detectSettings.segmentStrongComponentPixels
 
     /* settingsOverlayAlpha 保存 UNet overlay 结果图透明度，真实值来自 detectSettings.overlayAlpha。 */
     property real settingsOverlayAlpha: detectSettings.overlayAlpha
@@ -516,6 +525,9 @@ Rectangle {
 
     /* settingsDetailText 保存当前参数详情浮层正文，内容来自云端上传契约和当前板端接入边界。 */
     property string settingsDetailText: ""
+
+    /* settingsUnetPopupVisible 表示 UNet 三级证据参数弹层是否打开，完整表单不占用固定高度小卡片。 */
+    property bool settingsUnetPopupVisible: false
 
     /* stepperMotorSettings 保存 C++ DetectSettingsController 暴露的三台步进电机参数，用于三页弹窗显示。 */
     property var stepperMotorSettings: detectSettings.stepperMotorSettings
@@ -4492,7 +4504,10 @@ Rectangle {
                 + "  模型" + settingsThresholdText(settingsDecisionThreshold)
                 + "  复核" + settingsThresholdText(settingsReviewThreshold)
                 + "  ROI" + settingsRoiSize
-                + "  UNet>" + settingsSegmentMinPixels + "px"
+                + "  UNet " + settingsSegmentMinComponentPixels
+                + "/" + settingsSegmentReviewPixels
+                + "/" + settingsSegmentBadPixels
+                + "/" + settingsSegmentStrongComponentPixels + "px"
                 + "  电机ID" + stepperMotorCompactSummary()
                 + "  带" + conveyorScanSpeedRpm() + "/" + conveyorTrackSpeedRpm() + "rpm"
                 + "  臂等" + settingsF4ArmResultTimeoutText()
@@ -4505,7 +4520,7 @@ Rectangle {
      *
      * 主要流程：
      *   1. 记录本次动作名称、时间、JSON 路径和 C++ 保存结果。
-     *   2. 逐项写出零件、模型阈值、复核阈值、ROI、UNet 像素阈值、overlay 透明度和上传策略。
+     *   2. 逐项写出零件、分类阈值、ROI、UNet 四个证据阈值、overlay 透明度和上传策略。
      *   3. 写出下一次检测会使用的命令行参数，方便日志查看页直接确认真实生效范围。
      *
      * 参数：
@@ -4526,13 +4541,21 @@ Rectangle {
             "model_threshold=" + (settingsDecisionThreshold / 1000.0).toFixed(3) + " (" + settingsThresholdText(settingsDecisionThreshold) + ")",
             "review_threshold=" + (settingsReviewThreshold / 1000.0).toFixed(3) + " (" + settingsThresholdText(settingsReviewThreshold) + ")",
             "roi_size=" + settingsRoiSize,
-            "segment_min_pixels=" + settingsSegmentMinPixels,
+            "segment_min_component_pixels=" + settingsSegmentMinComponentPixels,
+            "segment_review_pixels=" + settingsSegmentReviewPixels,
+            "segment_bad_pixels=" + settingsSegmentBadPixels,
+            "segment_strong_component_pixels=" + settingsSegmentStrongComponentPixels,
             "overlay_alpha=" + settingsOverlayAlpha.toFixed(2),
             "auto_upload_enabled=" + (settingsUploadEnabled ? "true" : "false"),
             "f4_arm_result_timeout_ms=" + settingsF4ArmResultTimeoutMs,
             stepperMotorLogText(),
             "classify_args=--roi " + settingsRoiSize + " --bad-threshold " + (settingsDecisionThreshold / 1000.0).toFixed(3),
-            "segment_args=--roi " + settingsRoiSize + " --alpha " + settingsOverlayAlpha.toFixed(2) + " --min-defect-pixels " + settingsSegmentMinPixels,
+            "segment_args=--roi " + settingsRoiSize
+                    + " --alpha " + settingsOverlayAlpha.toFixed(2)
+                    + " --min-component-pixels " + settingsSegmentMinComponentPixels
+                    + " --review-defect-pixels " + settingsSegmentReviewPixels
+                    + " --bad-defect-pixels " + settingsSegmentBadPixels
+                    + " --strong-component-pixels " + settingsSegmentStrongComponentPixels,
             "summary=" + settingsSummaryText()
         ]
         return lines.join("\n")
@@ -5395,11 +5418,15 @@ Rectangle {
             "1. MP157 通过 KMS overlay 保存当前原始帧，原图作为 source 图片留档。",
             "2. MobileNetV3-Small INT8 先输出零件类别、GOOD/BAD 初判和 top1 置信度。",
             "3. UNet INT8 再输出缺陷 mask、overlay 和 raw 结果图，这些结果图作为 annotated 图片登记。",
-            "4. 综合规则保持保守：分类判坏或 UNet 检出缺陷像素时，最终结果不能直接判为良品。",
-            "5. 低于复核阈值的样本进入人工复核，不在本页伪装成自动分拣参数。",
+            "4. 综合规则使用平衡策略：UNet 小噪点为 CLEAR，中等缺陷为 WEAK 待复核，连续明显缺陷为 STRONG 坏品。",
+            "5. 分类 GOOD + UNet WEAK 进入待复核；只有分类可信 GOOD + UNet CLEAR 才是良品。",
             "6. 当前 ROI=" + settingsRoiSize + "px，会传给 defect-classify 和 defect-segment 的 --roi。",
-            "7. 当前 UNet 像素阈值=" + settingsSegmentMinPixels + "px，会传给 defect-segment 的 --min-defect-pixels。",
-            "8. 当前 overlay 透明度=" + settingsOverlayAlpha.toFixed(2) + "，会传给 defect-segment 的 --alpha。",
+            "7. 当前 UNet 阈值：过滤=" + settingsSegmentMinComponentPixels
+                    + "px、复核=" + settingsSegmentReviewPixels
+                    + "px、坏品=" + settingsSegmentBadPixels
+                    + "px、强连通域=" + settingsSegmentStrongComponentPixels + "px。",
+            "8. 四项阈值会分别传给 defect-segment 的 --min-component-pixels、--review-defect-pixels、--bad-defect-pixels 和 --strong-component-pixels。",
+            "9. 当前 overlay 透明度=" + settingsOverlayAlpha.toFixed(2) + "，会传给 defect-segment 的 --alpha。",
             "",
             "[云端记录契约]",
             "1. 每次检测必须生成稳定 record_no，断网补传继续复用同一个 record_no，避免云端重复记录。",
@@ -5411,7 +5438,7 @@ Rectangle {
             "[当前参数边界]",
             "1. 本页配置会保存到 " + settingsConfigPath + "，下一次启动自动读取。",
             "2. 模型阈值会传给 defect-classify --bad-threshold；复核阈值由 Qt 综合判定阶段使用。",
-            "3. ROI、UNet像素阈值和overlay透明度会传给 defect-segment，对本地结果图和 NG 判定真实生效。",
+            "3. ROI、UNet四个证据阈值和overlay透明度会传给 defect-segment，对 CLEAR/WEAK/STRONG 和结果图真实生效。",
             "4. 自动上传关闭时仍保存 source/annotated 和本地历史，但最终返回 upload_status=SKIP。",
             "5. 真正模型版本以板端部署的 ONNX Runtime、UNet 和 MobileNetV3-Small 模型文件为准。"
         ]
@@ -5480,6 +5507,18 @@ Rectangle {
         Qt.callLater(function() {
             settingsDetailFlickable.contentY = 0
         })
+    }
+
+    /*
+     * openUnetSettingsPopup 的作用：
+     *   打开板端 UNet 证据阈值弹层，让现场不改代码即可调整噪点过滤、复核线和坏品线。
+     *
+     * 返回值：
+     *   无返回值；弹层直接绑定 DetectSettingsController，调整后会立即进入下一次检测的内存快照。
+     */
+    function openUnetSettingsPopup() {
+        settingsUnetPopupVisible = true
+        settingsLastActionText = "UNet平衡策略参数：调整后点击页面底部保存配置写入JSON"
     }
 
     /*
@@ -5653,9 +5692,23 @@ Rectangle {
         } else if (key === "roi") {
             detectSettings.roiSize = Math.max(160, Math.min(640, settingsRoiSize + delta))
             settingsLastActionText = "真实检测配置：ROI " + settingsRoiSize + "px"
-        } else if (key === "segment") {
-            detectSettings.segmentMinPixels = Math.max(0, Math.min(50000, settingsSegmentMinPixels + delta))
-            settingsLastActionText = "真实检测配置：UNet像素阈值 " + settingsSegmentMinPixels + "px"
+        } else if (key === "segment-min-component") {
+            detectSettings.segmentMinComponentPixels = Math.max(1,
+                    Math.min(settingsSegmentReviewPixels, settingsSegmentMinComponentPixels + delta))
+            settingsLastActionText = "真实检测配置：UNet小区域过滤 " + settingsSegmentMinComponentPixels + "px"
+        } else if (key === "segment-review") {
+            detectSettings.segmentReviewPixels = Math.max(settingsSegmentMinComponentPixels,
+                    Math.min(settingsSegmentBadPixels, settingsSegmentReviewPixels + delta))
+            settingsLastActionText = "真实检测配置：UNet待复核阈值 " + settingsSegmentReviewPixels + "px"
+        } else if (key === "segment-bad") {
+            detectSettings.segmentBadPixels = Math.max(settingsSegmentReviewPixels,
+                    Math.min(50000, settingsSegmentBadPixels + delta))
+            settingsLastActionText = "真实检测配置：UNet明确坏品阈值 " + settingsSegmentBadPixels + "px"
+        } else if (key === "segment-strong-component") {
+            detectSettings.segmentStrongComponentPixels = Math.max(settingsSegmentMinComponentPixels,
+                    Math.min(settingsSegmentBadPixels, settingsSegmentStrongComponentPixels + delta))
+            settingsLastActionText = "真实检测配置：UNet强连通域阈值 "
+                    + settingsSegmentStrongComponentPixels + "px"
         } else if (key === "alpha") {
             detectSettings.overlayAlpha = Math.max(0.0, Math.min(1.0, settingsOverlayAlpha + delta))
             settingsLastActionText = "真实检测配置：overlay透明度 " + settingsOverlayAlpha.toFixed(2)
@@ -6304,6 +6357,7 @@ Rectangle {
         activePage = pageName
         alarmAdviceDetailVisible = false
         settingsDetailVisible = false
+        settingsUnetPopupVisible = false
         stepperMotorPopupVisible = false
         manualMotorPopup = false
         calibrationPopupVisible = false
@@ -7094,9 +7148,9 @@ Rectangle {
      *   把 UNet 分割结果转换成左侧检测图的查看提示。
      *
      * 主要流程：
-     *   1. 从 segmentationResult 中读取 status 和 defect_pixels。
-     *   2. defect_pixels 大于 0 或 status=NG 时，提示红色区域代表疑似缺陷。
-     *   3. 没有缺陷像素时，提示当前检测图未标出明显缺陷区域。
+     *   1. 从 segmentationResult 中读取 evidence、原始像素和过滤后像素。
+     *   2. CLEAR 明确提示红色小区域已按噪点过滤，避免操作员误以为仍是坏品。
+     *   3. WEAK 提示人工复核，STRONG 提示连续明确缺陷；旧记录再回退到 status/像素规则。
      *
      * 参数：
      *   record 是当前历史记录，里面可能包含 segmentationResult。
@@ -7107,15 +7161,31 @@ Rectangle {
     function historyDefectHintText(record) {
         var segmentText = record && record.segmentationResult ? record.segmentationResult : ""
         var statusText = resultTokenValue(segmentText, "status")
+        var evidenceText = resultTokenValue(segmentText, "evidence")
         var defectPixelsText = resultTokenValue(segmentText, "defect_pixels")
+        var filteredPixelsText = resultTokenValue(segmentText, "filtered_defect_pixels")
         var defectPixels = Number(defectPixelsText)
+        var filteredPixels = Number(filteredPixelsText)
 
         if (segmentText.length <= 0) {
             return "暂无缺陷区域数据，左侧图片仅作为本地留档。"
         }
 
+        if (evidenceText === "CLEAR") {
+            return "UNet 证据为 CLEAR；红色小区域已按噪点/反光过滤，过滤后 "
+                    + (isNaN(filteredPixels) ? "0" : filteredPixels) + "px。"
+        }
+        if (evidenceText === "WEAK") {
+            return "UNet 证据为 WEAK；检测图中的可疑区域需要人工复核，过滤后 "
+                    + (isNaN(filteredPixels) ? "--" : filteredPixels) + "px。"
+        }
+        if (evidenceText === "STRONG") {
+            return "UNet 证据为 STRONG；检测图中存在达到面积和连续性条件的明确缺陷。"
+        }
+
+        /* 兼容 schema 1 历史记录：旧 RESULT_SEG 没有 evidence，只能继续按 status/原始像素提示。 */
         if (statusText === "NG" || (!isNaN(defectPixels) && defectPixels > 0)) {
-            return "检测图中的红色区域是系统标出的疑似缺陷位置，建议重点查看。"
+            return "旧版 UNet 记录标出了疑似缺陷区域，未保存三级证据，建议人工复核。"
         }
 
         return "检测图未标出明显缺陷区域，可结合原图做最终确认。"
@@ -11720,7 +11790,7 @@ Rectangle {
                     model: [
                         {"name": "分类阈值", "value": root.settingsThresholdText(root.settingsDecisionThreshold), "color": root.accentGreen},
                         {"name": "复核阈值", "value": root.settingsThresholdText(root.settingsReviewThreshold), "color": root.accentAmber},
-                        {"name": "UNet像素", "value": root.settingsSegmentMinPixels + "px", "color": "#9fdcff"},
+                        {"name": "UNet证据", "value": root.settingsSegmentMinComponentPixels + "/" + root.settingsSegmentReviewPixels + "/" + root.settingsSegmentBadPixels, "color": "#9fdcff"},
                         {"name": "叠加透明", "value": root.settingsOverlayAlpha.toFixed(2), "color": "#eef3f4"}
                     ]
 
@@ -11815,14 +11885,13 @@ Rectangle {
 
                 Repeater {
                     model: [
-                        {"text": "UNet-", "key": "segment", "delta": -10, "color": "#5aa7ff"},
-                        {"text": "UNet+", "key": "segment", "delta": 10, "color": "#5aa7ff"},
-                        {"text": "透明-", "key": "alpha", "delta": -0.05, "color": root.accentGreen},
-                        {"text": "透明+", "key": "alpha", "delta": 0.05, "color": root.accentGreen}
+                        {"text": "UNet参数", "action": "unet", "delta": 0, "color": "#5aa7ff"},
+                        {"text": "透明-", "action": "alpha", "delta": -0.05, "color": root.accentGreen},
+                        {"text": "透明+", "action": "alpha", "delta": 0.05, "color": root.accentGreen}
                     ]
 
                     Rectangle {
-                        width: (settingsVisionStepperRow.width - 18) / 4
+                        width: (settingsVisionStepperRow.width - 12) / 3
                         height: 28
                         radius: 6
                         color: settingsVisionStepMouse.pressed ? "#2d3338" : "#22272b"
@@ -11842,7 +11911,11 @@ Rectangle {
                             anchors.fill: parent
 
                             onClicked: {
-                                root.changeSettingValue(modelData.key, modelData.delta)
+                                if (modelData.action === "unet") {
+                                    root.openUnetSettingsPopup()
+                                } else {
+                                    root.changeSettingValue(modelData.action, modelData.delta)
+                                }
                             }
                         }
                     }
@@ -12392,6 +12465,285 @@ Rectangle {
                     lineHeight: 1.26
                     wrapMode: Text.Wrap
                 }
+            }
+        }
+    }
+
+    /*
+     * settingsUnetPopup 的作用：
+     *   在 1024x600 固定屏上集中调整 UNet 三级证据阈值和结果图透明度。
+     *   四个阈值直接绑定 DetectSettingsController，改动立即影响下一次检测，保存按钮再原子写入 SD 卡 JSON。
+     */
+    Rectangle {
+        id: settingsUnetPopup
+        anchors.fill: parent
+        z: 893
+        visible: root.settingsUnetPopupVisible
+        color: "#b0000000"
+
+        MouseArea {
+            anchors.fill: parent
+
+            onClicked: {
+                root.settingsUnetPopupVisible = false
+            }
+        }
+
+        Rectangle {
+            width: 620
+            height: 520
+            anchors.centerIn: parent
+            radius: 8
+            color: "#20262a"
+            border.color: "#5aa7ff"
+            border.width: 1
+            clip: true
+
+            /* 内层 MouseArea 截获点击，避免操作参数时触发外层遮罩关闭。 */
+            MouseArea {
+                anchors.fill: parent
+            }
+
+            Text {
+                x: 18
+                y: 14
+                width: parent.width - 126
+                text: "UNet 平衡判定参数"
+                color: "#f1f4f5"
+                font.pixelSize: 19
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                x: parent.width - 90
+                y: 12
+                width: 72
+                height: 30
+                radius: 6
+                color: closeUnetSettingsMouse.pressed ? "#3a1b1f" : "#2a2020"
+                border.color: root.accentRed
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "关闭"
+                    color: "#ffecef"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: closeUnetSettingsMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.settingsUnetPopupVisible = false
+                    }
+                }
+            }
+
+            Text {
+                x: 18
+                y: 52
+                width: parent.width - 36
+                height: 38
+                text: "CLEAR：过滤后小于复核线；WEAK：中等缺陷待复核；STRONG：总面积和最大连续区域同时过线。"
+                color: "#aeb8bd"
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+
+            Column {
+                id: settingsUnetParameterColumn
+                x: 18
+                y: 96
+                width: parent.width - 36
+                spacing: 8
+
+                Repeater {
+                    model: [
+                        {"label": "小区域过滤", "key": "segment-min-component", "value": root.settingsSegmentMinComponentPixels + " px", "step": 5, "note": "小于此面积忽略"},
+                        {"label": "待复核阈值", "key": "segment-review", "value": root.settingsSegmentReviewPixels + " px", "step": 10, "note": "达到后为 WEAK"},
+                        {"label": "明确坏品阈值", "key": "segment-bad", "value": root.settingsSegmentBadPixels + " px", "step": 20, "note": "STRONG 总面积条件"},
+                        {"label": "强连通域阈值", "key": "segment-strong-component", "value": root.settingsSegmentStrongComponentPixels + " px", "step": 10, "note": "STRONG 连续性条件"},
+                        {"label": "叠加图透明度", "key": "alpha", "value": root.settingsOverlayAlpha.toFixed(2), "step": 0.05, "note": "只影响结果图显示"}
+                    ]
+
+                    Rectangle {
+                        width: settingsUnetParameterColumn.width
+                        height: 54
+                        radius: 6
+                        color: "#171b1e"
+                        border.color: "#344149"
+                        border.width: 1
+
+                        Text {
+                            x: 12
+                            y: 8
+                            width: 142
+                            text: modelData.label
+                            color: "#e4eaed"
+                            font.pixelSize: 13
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            x: 12
+                            y: 29
+                            width: 142
+                            text: modelData.note
+                            color: "#7f898f"
+                            font.pixelSize: 10
+                            elide: Text.ElideRight
+                        }
+
+                        Rectangle {
+                            x: 162
+                            y: 9
+                            width: 72
+                            height: 36
+                            radius: 6
+                            color: unetMinusMouse.pressed ? "#30363b" : "#22272b"
+                            border.color: "#5aa7ff"
+                            border.width: 1
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "-"
+                                color: "#ffffff"
+                                font.pixelSize: 19
+                                font.bold: true
+                            }
+
+                            MouseArea {
+                                id: unetMinusMouse
+                                anchors.fill: parent
+
+                                onClicked: {
+                                    root.changeSettingValue(modelData.key, -modelData.step)
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            x: 242
+                            y: 9
+                            width: 108
+                            height: 36
+                            radius: 6
+                            color: "#20262a"
+                            border.color: "#46535b"
+                            border.width: 1
+
+                            Text {
+                                anchors.fill: parent
+                                text: modelData.value
+                                color: modelData.key === "alpha" ? root.accentGreen : "#9fdcff"
+                                font.pixelSize: 14
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        Rectangle {
+                            x: 358
+                            y: 9
+                            width: 72
+                            height: 36
+                            radius: 6
+                            color: unetPlusMouse.pressed ? "#30413a" : "#1f332b"
+                            border.color: root.accentGreen
+                            border.width: 1
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "+"
+                                color: "#ffffff"
+                                font.pixelSize: 19
+                                font.bold: true
+                            }
+
+                            MouseArea {
+                                id: unetPlusMouse
+                                anchors.fill: parent
+
+                                onClicked: {
+                                    root.changeSettingValue(modelData.key, modelData.step)
+                                }
+                            }
+                        }
+
+                        Text {
+                            x: 442
+                            y: 9
+                            width: parent.width - 454
+                            height: 36
+                            text: modelData.key === "segment-bad"
+                                  ? "需同时满足强连通域"
+                                  : (modelData.key === "segment-review"
+                                     ? "低于该值保持 CLEAR"
+                                     : "步长 " + modelData.step)
+                            color: "#aeb8bd"
+                            font.pixelSize: 11
+                            verticalAlignment: Text.AlignVCenter
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                }
+            }
+
+            Text {
+                x: 18
+                y: 418
+                width: 360
+                height: 44
+                text: "当前顺序约束：过滤 <= 复核 <= 坏品；强连通域位于过滤和坏品之间。"
+                color: root.accentAmber
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
+
+            Rectangle {
+                x: parent.width - 174
+                y: 420
+                width: 156
+                height: 38
+                radius: 7
+                color: saveUnetSettingsMouse.pressed ? "#30413a" : "#1f332b"
+                border.color: root.accentGreen
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "保存到板端 JSON"
+                    color: "#eafff2"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    id: saveUnetSettingsMouse
+                    anchors.fill: parent
+
+                    onClicked: {
+                        root.settingsApplyAction("save")
+                    }
+                }
+            }
+
+            Text {
+                x: 18
+                y: 472
+                width: parent.width - 36
+                height: 30
+                text: root.settingsLastActionText
+                color: "#9aa5ab"
+                font.pixelSize: 11
+                elide: Text.ElideRight
             }
         }
     }

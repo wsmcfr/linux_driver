@@ -9,13 +9,73 @@
 | 视频显示 | 安全预览使用 V4L2 YUYV 帧上传到 OpenGL ES 纹理；正式路线使用 KMS overlay plane 显示视频 |
 | GPU 路径 | `galcore` + OpenGL ES + `eglfs` 或 `wayland-egl` |
 | 目标分辨率 | 1024x600 |
-| 当前检测逻辑 | 点击 `检测` 或自动流程进入模型前，先通过 overlay `LOCATE` 确认当前帧 `has_target=1` 且 `ring=1`，空 ROI、空皮带和没有中心孔结构的黑色传送带候选不允许进入模型；通过门禁后先运行 MobileNetV3-Small 分类，再运行 UNet 分割；分类完成后首页立即显示零件类型、短类别、分类初判和置信度，但主状态保持“等待综合判定”；UNet 完成后按两个模型综合生成最终判定并显示双模型总耗时；首页窄栏只显示“分类良/分类坏/综合良品/综合坏品”等短结果，完整模型依据保留在历史详情；只要分类模型判坏或 UNet 检出缺陷像素，最终就不能判为良品；COS 上传完成后再把本次原始图片、UNet raw/overlay/mask 结果图、两个模型输出、综合判定和云端上传状态合并成一条历史记录。 |
+| 当前检测逻辑 | 点击 `检测` 或自动流程进入模型前，先通过 overlay `LOCATE` 确认当前帧 `has_target=1` 且 `ring=1`，空 ROI、空皮带和没有中心孔结构的黑色传送带候选不允许进入模型；通过门禁后先运行 MobileNetV3-Small 分类，再运行 UNet 分割；分类完成后首页立即显示零件类型、短类别、分类初判和置信度，但主状态保持“等待综合判定”；UNet 完成后先过滤孤立小连通域，再输出 `CLEAR/WEAK/STRONG` 三级证据：小噪点不阻止良品，中等缺陷进入待复核，连续明确缺陷直接判坏；COS 上传完成后再把本次原始图片、UNet raw/overlay/mask 结果图、两个模型输出、综合判定和云端上传状态合并成一条历史记录。 |
 | SD 卡按钮 | 右侧面板只保留 `检测` 和 `安全卸载`；独立 `保存图片` 按钮已取消，图片保存由双模型检测流程自动完成。 |
 | 板端 SSH | 从虚拟机执行 `ssh -i /home/cfr/.ssh/id_ed25519_github -o IdentitiesOnly=yes root@192.168.1.250` |
 
 > 记录：当前版本已经打通 Qt 界面和 UVC 摄像头显示，但它是“安全预览路径”，不是最终零拷贝视频路径。
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
+
+## 2026-07-24 UNet 平衡判定与板端四阈值参数
+
+### 修改文件与原因
+
+| 修改路径 | 修改原因 |
+|---|---|
+| `20_uvc_camera/qt_camera_display/defect_segment_evidence.h` | 新增不依赖 Qt/ONNX Runtime 的 8 邻域连通域统计和 `CLEAR/WEAK/STRONG` 证据算法，生产程序与主机测试共用，避免判定逻辑漂移。 |
+| `20_uvc_camera/qt_camera_display/defect_segment.cpp` | 用四个可调阈值替换旧单像素阈值，输出原始/过滤后像素、最大连通域和连通域数量。 |
+| `20_uvc_camera/qt_camera_display/main.cpp` | 保存 schema 2 板端 JSON、向 `defect-segment` 传四参数、校验 `RESULT_SEG` 完整性，并按平衡策略融合分类和 UNet。 |
+| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 在“视觉检测策略”增加 `UNet参数` 弹层，现场可用加减按钮调整四阈值和 overlay 透明度。 |
+| `20_uvc_camera/qt_camera_display/test_defect_segment_evidence.cpp` | 覆盖小噪点、待复核、明确坏品、分散大面积仍待复核和 8 邻域边界。 |
+| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 固化新 QML 入口、JSON 字段和四个 CLI 参数，拒绝主流程继续传旧 `--min-defect-pixels`。 |
+| `20_uvc_camera/qt_camera_display/README.md` | 记录修改、编译部署、调参方法、验证指令、文件落盘等待和失败排查。 |
+| `.trellis/spec/frontend/component-guidelines.md` | 写入可执行的三级证据与板端参数契约，防止后续恢复成“有一个像素就判坏”。 |
+| `docs/stm32mp157-f407-auto-detect-debug-roadmap.md` | 同步自动流程模型阶段的当前完成项和硬件联调缺口。 |
+
+### 默认阈值与综合规则
+
+| 参数 | JSON 字段 | CLI 参数 | 默认值 | 含义 |
+|---|---|---|---:|---|
+| 小连通域过滤 | `segment_min_component_pixels` | `--min-component-pixels` | `20 px` | 单个缺陷区域小于该值时按小噪点/反光过滤。 |
+| 待复核总面积 | `segment_review_pixels` | `--review-defect-pixels` | `80 px` | 过滤后总面积达到该值进入 `WEAK`。 |
+| 明确坏品总面积 | `segment_bad_pixels` | `--bad-defect-pixels` | `300 px` | `STRONG` 的总面积条件。 |
+| 强缺陷最大连通域 | `segment_strong_component_pixels` | `--strong-component-pixels` | `120 px` | `STRONG` 的连续性条件，必须与坏品总面积条件同时满足。 |
+
+```text
+filtered < 80                                      -> CLEAR
+filtered >= 300 且 largest_component >= 120        -> STRONG
+其余                                                -> WEAK
+```
+
+| 分类结果 | UNet 证据 | 最终结果 |
+|---|---|---|
+| 任意可信分类 | `STRONG` | `BAD`，明确连续缺陷优先。 |
+| `GOOD` | `WEAK` | `REVIEW`，避免反光/边界样本直接判坏。 |
+| `GOOD` 且置信度达标 | `CLEAR` | `GOOD`。 |
+| `BAD` 且置信度达标 | `CLEAR/WEAK` | `BAD`。 |
+| 分类置信度不足 | `CLEAR/WEAK` | `REVIEW`。 |
+
+### 板端使用与保存
+
+1. 打开 `参数设置 -> 视觉检测策略 -> UNet参数`。
+2. 先调“小区域过滤”，再调“待复核阈值”，最后调“明确坏品阈值/强连通域阈值”；界面和 C++ 会保持 `过滤 <= 复核 <= 坏品`，且强连通域位于过滤线和坏品线之间。
+3. 加减按钮先修改运行内存，下一次检测立即使用；点击 `保存到板端 JSON` 后才持久化到 `/mnt/sdcard/config/defect_ui_config.json`。
+4. 保存使用 `QSaveFile` 原子提交。确认屏幕提示“保存成功”或进程正常返回，再读取 JSON；不能用固定 `sleep` 代替完成判断。
+5. 检测图片以模型进程正常退出且 `RESULT_SEG` 返回三条非空路径为完成条件；随后用 `ls -lh`/`stat` 确认大小稳定。需要卸载 SD 卡时再执行 `sync` 和 `sdcard-safe-remove`。
+
+### 本次验证方式
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 主机连通域算法 | Windows PowerShell 仓库根目录 | `g++ -std=c++14 -Wall -Wextra -pedantic -static-libstdc++ -static-libgcc -I 20_uvc_camera/qt_camera_display 20_uvc_camera/qt_camera_display/test_defect_segment_evidence.cpp -o .codex_tmp/test_defect_segment_evidence.exe; ./.codex_tmp/test_defect_segment_evidence.exe` | 输出 `PASS: defect segment evidence`。 | 先查编译器是否为 MinGW g++；若进程异常，确认使用了两个静态运行库参数，避免误加载其它目录的 `libstdc++-6.dll`。 |
+| 静态接口契约 | Windows Git Bash 或虚拟机模块目录 | `sh ./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract`。 | 按第一条 `FAIL:` 检查 QML 属性、CLI 参数、JSON 字段或 README 是否未同步。 |
+| 手动 UNet 四阈值推理 | 开发板 SSH | `cd /root/qt_camera_display && LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH ./defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images --min-component-pixels 20 --review-defect-pixels 80 --bad-defect-pixels 300 --strong-component-pixels 120` | `RESULT_SEG` 包含 `evidence=CLEAR|WEAK|STRONG`、六项统计和三个结果图路径。 | 查 `/tmp/test.jpg`、UNet ONNX、`libonnxruntime.so`；若提示阈值顺序非法，恢复默认四值。 |
+| JSON 写入与读回 | 开发板屏幕和 SSH | 屏幕调整参数并点击 `保存到板端 JSON`，SSH 执行 `sed -n '1,100p' /mnt/sdcard/config/defect_ui_config.json` | `schema_version=2`，四个 `segment_*` 字段与屏幕一致，重启 Qt 后仍保持。 | 先执行 `mount | grep /mnt/sdcard` 和 `df -h /mnt/sdcard`；若未挂载，程序会拒绝保存，不能把配置误写到 rootfs。 |
+| 结果文件真实落盘 | 开发板 SSH | `result=$(ls -t /mnt/sdcard/images/segment_* 2>/dev/null | head -n 1); test -n "$result" && stat -c '%n %s %y' "$result"; sync` | 最新结果文件存在且大小大于 0；模型进程已退出后 `stat` 大小保持稳定。 | 查 `RESULT_SEG raw_path/overlay_path/mask_path`、SD 卡剩余空间和写权限；不可只等待固定秒数后认定完成。 |
+| 板端二进制标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display | grep -E 'settingsUnetPopupVisible|segment_min_component_pixels|strong-component-pixels|segment_evidence'` | 四类 marker 均能找到。 | marker 缺失说明只改了源码或只复制了 QML，必须重新交叉编译并替换主程序。 |
+
+> 本次文档和 Windows 源码修改不等于开发板已经生效；必须完成虚拟机同步、ARM 交叉编译、板端替换和 LCD 实测。
 
 ## 2026-07-17 MP157-F4 主链路波特率改为 57600 记录
 
@@ -642,7 +702,7 @@
 | 首页/历史短文案预算 | 首页窄结果栏使用 `compactHomeClassText()` 和 `compactHomeModelText()`，避免完整类别名和综合原因在 182px 面板中显示不全。 | 板端点击 `检测`，确认分类完成后能看到短零件类型和短类别；历史详情固定面板不出现文字越界。 |
 | 统计分布防溢出 | 统计页 `分布概览` 从单列五条改为左右两列，左列显示检测结果分布，右列显示上传链路分布，防止“上传失败”条超出面板边框。 | 虚拟机执行 `"C:/Program Files/Git/bin/bash.exe" ./test_qt_kms_overlay_assets.sh`；板端点击 `统计分析`，确认五项分布都完整显示在面板内。 |
 | 波形垫圈命名修正 | 旧训练标签 `gasket/gasket_good/gasket_bad` 在板端显示和上传时都按“波形垫圈 / 垫圈类”处理；`washer` 是“平垫圈”，不是同一个零件。 | 运行 `sh defect-cos-upload --self-test-json-parser`；云端零件页确认 `gasket` 不显示成“垫片”，`washer` 不被合并到 `gasket`。 |
-| 参数设置页真实配置 | 参数页 `零件与模型判定` 只在波形垫圈、平垫圈、弹性垫圈之间循环；模型阈值、复核阈值、ROI、UNet 像素阈值、overlay 透明度和自动上传开关通过 `detectSettings` 绑定到 C++，保存到 `/mnt/sdcard/config/defect_ui_config.json`；`保存配置` 和 `导出摘要` 追加当天 `qt_settings_YYYYMMDD.log`。 | 虚拟机或本地执行 `sh ./test_qt_kms_overlay_assets.sh`；板端打开 `参数设置`，确认界面显示 `真实检测配置` 和 JSON 路径，点击 `保存配置` 后 SSH 查看 JSON，下一次检测命令包含 `--bad-threshold` 和 `--min-defect-pixels`；进入 `日志查看` 刷新并点开 `qt_settings_YYYYMMDD.log`，确认能看到 `config_path`、阈值、ROI、`segment_args` 和上传策略。 |
+| 参数设置页真实配置 | 参数页 `零件与模型判定` 只在波形垫圈、平垫圈、弹性垫圈之间循环；模型阈值、复核阈值、ROI、UNet 四个证据阈值、overlay 透明度和自动上传开关通过 `detectSettings` 绑定到 C++，保存到 `/mnt/sdcard/config/defect_ui_config.json`；`保存配置` 和 `导出摘要` 追加当天 `qt_settings_YYYYMMDD.log`。 | 虚拟机或本地执行 `sh ./test_qt_kms_overlay_assets.sh`；板端打开 `参数设置 -> 视觉检测策略 -> UNet参数`，点击保存后 SSH 查看 JSON，下一次检测命令包含 `--bad-threshold`、`--min-component-pixels`、`--review-defect-pixels`、`--bad-defect-pixels` 和 `--strong-component-pixels`；进入 `日志查看` 刷新并打开当天参数日志确认 `segment_args`。 |
 | 每日记录文件 | 检测历史、自动告警日志和告警诊断快照统一按自然日归档；检测历史写入 `/mnt/sdcard/images/upload_history_YYYYMMDD.json`，告警日志追加到 `/mnt/sdcard/logs/qt_alarm_YYYYMMDD.log`，诊断快照追加到 `/mnt/sdcard/logs/qt_alarm_snapshot_YYYYMMDD.txt`；第二天自动新建当天文件。 | 虚拟机执行 `./test_qt_kms_overlay_assets.sh`；板端执行 `--detect-self-test`、`--alarm-snapshot-self-test`、`--alarm-log-self-test` 后用 `date +%Y%m%d` 组装路径，再执行 `test -s`、`tail`、`grep` 验证当天文件非空并含检测/告警字段。 |
 | 正式反向隧道 | 新增板端 `board-review-tunnel.sh` 和 `S91board-review-tunnel`，部署后由板端主动连接云服务器并守护 `ssh -R`；新增云端检查脚本和 timer。 | 板端执行 `/etc/init.d/S91board-review-tunnel status`；云端执行 `systemctl status yunduan-board-review-tunnel-check.timer`、`ss -ltnp | grep 127.0.0.1:18081`、`curl -i --max-time 5 http://127.0.0.1:18081/api/v1/review-result`。 |
 | 最终运行边界 | 最终现场只需要板端和云服务器常驻；Windows/虚拟机只用于开发部署，不参与正式隧道。 | 杀掉临时 Windows/VM `ssh -R` 后，确认板端 monitor 仍能维持云端 `127.0.0.1:18081`。 |
@@ -715,7 +775,7 @@
 | 构建 MobileNet 分类程序 | `cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display && ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./build_defect_classify.sh` | 生成 `build-mp157/defect-classify`。 |
 | 构建 UNet 分割程序 | `cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display && ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./build_defect_segment.sh` | 生成 `build-mp157/defect-segment`。 |
 | 静态契约检查 | `./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract`。 |
-| 部署到 NFS rootfs | `sudo DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json DEFECT_UNET_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs` | 板端 `/root/qt_camera_display/` 获得 Qt 程序、overlay 工具、`fb_boot_splash`、`boot_splash.rgb565`、`defect-classify`、`defect-segment`、四分类 ONNX、两类 UNet、labels、ONNX Runtime 库和运行脚本，`/etc/init.d/` 获得 `S05display-quiet` 和 `S90uvc-camera`。只替换一个模型时不要执行整套部署，使用对应模型章节的精准替换命令。 |
+| 部署到 NFS rootfs | `sudo DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8_labels.json DEFECT_UNET_MODEL_SRC=/tmp/defect_unet_test_decoder_head_int8.onnx ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs` | 板端 `/root/qt_camera_display/` 获得 Qt 程序、overlay 工具、`fb_boot_splash`、`boot_splash.rgb565`、`defect-classify`、`defect-segment`、四分类 ONNX、原 UNet 模型、labels、ONNX Runtime 库和运行脚本，`/etc/init.d/` 获得 `S05display-quiet` 和 `S90uvc-camera`。只替换分类模型时不要执行整套部署，使用“四分类模型量化与替换”章节的精准替换命令。 |
 | 部署默认上传账号 | `CLOUD_ACCOUNT='<账号>' CLOUD_PASSWORD='<密码>' sudo -E ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs` | 额外生成 `/home/cfr/linux/nfs/rootfs/root/qt_camera_display/cos-upload.env`，权限为 `600`；检测按钮后续可不再手工传账号密码。 |
 | 安装 Qt runtime | `./install_qt_runtime_from_sdk.sh /home/cfr/linux/nfs/rootfs` | rootfs 获得 Qt5 库、QML 模块、eglfs/wayland 插件和 Vivante 库。 |
 | 板端启动正式路线 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart` | Qt UI 与 overlay 视频同时运行。 |
@@ -815,7 +875,7 @@
 | 2026-07-02 | 恢复顶部位置并删除未接运动轴显示 | 顶部状态栏保留 `位置`，但内容改为开机单次高德 IP 省份定位结果，例如 `河南省`；Qt 后续健康刷新不再周期调用定位脚本；手动页、参数页和告警健康矩阵删除相机运动轴待接提示，不再显示 `待F4协议/等待CAM协议` 这类占位状态；后续接入前只在文档待办中记录 F407 协议要求。 |
 | 2026-05-16 | 新增参数设置界面 | 左侧 `参数设置` 导航正式可点击；当时版本用于整理页面入口和参数摘要，后续已在 2026-07-01 改为真实检测配置链路；当前状态以本表 2026-07-01 的 `参数设置页接入真实检测配置` 记录为准，运动参数仍不由 Qt 直接下发。 |
 | 2026-05-20 | 参数设置页真实零件收敛 | `settingsSupportedPartTypes` 只保留波形垫圈、平垫圈、弹性垫圈；参数页删除旧演示零件名和容易误导的运动/分拣可调项，保留模型阈值、复核阈值、相机、SD 卡和 COS 策略。 |
-| 2026-07-01 | 参数设置页接入真实检测配置 | 新增 `DetectSettingsController` 读取/保存 `/mnt/sdcard/config/defect_ui_config.json`；参数页通过 `detectSettings` 调整模型阈值、复核阈值、ROI、UNet 最小缺陷像素、overlay 透明度和自动上传；分类命令新增 `--bad-threshold`，分割命令新增 `--min-defect-pixels`；自动上传关闭时检测结果返回 `upload_status=SKIP` 并保留本地历史。 |
+| 2026-07-01 | 参数设置页接入真实检测配置（历史版本） | 新增 `DetectSettingsController` 读取/保存 `/mnt/sdcard/config/defect_ui_config.json`；当时 UNet 使用旧单阈值 `--min-defect-pixels`。2026-07-24 已升级为 schema 2 四阈值三级证据，旧字段不再直接参与生产判定。 |
 | 2026-07-02 | 参数设置日志与未接硬件项清理 | `保存配置` 和 `导出摘要` 调用 `CameraStorageController::recordSettingsSummaryToSdCard()` 追加 `/mnt/sdcard/logs/qt_settings_YYYYMMDD.log`；日志查看页刷新后可打开全文；参数页和手动页删除现场未接入的硬件控制入口，只保留相机、存储、上传、检测辅助和 F4 边界说明。 |
 | 2026-07-03 | 参数页新增步进电机参数弹窗 | `F4接入边界` 卡片新增 `步进参数` 小入口；弹窗按三页分别配置传送带电机、摄像头左右电机、摄像头上下电机的 ID 地址、最小步长、常规速度和方向；常规速度通过内置数字键盘支持 `0~5000 rpm` 任意整数。C++ 将配置保存到 `stepper_motors` JSON 数组，参数日志也记录每台电机字段；`保存并下发` 会通过 `sendF4StepperSettings()` 发送 `STEPPER_PARAM_SET 0x42`，并用 `f4StepperSettingsFinished` 显示 `ACK/NACK`。F4 回 ACK 只代表运行内存接收，不代表 F4 已烧录或 Emm42 EEPROM 已保存。 |
 | 2026-07-05 | 步进参数同步和双速度生效 | 传送带参数拆成 `normal_speed_rpm` 对中/短步速度和 `scan_speed_rpm` 上料扫描速度；`STEPPER_PARAM_SET 0x42` 改为 31 字节负载、单条 9 字节记录；参数页普通 `保存配置` 和开机启动后都会开机自动下发三台电机参数到 F4。自动流程不再固定限制到 40rpm，传送带扫描、传送带微调、左右轴微调、上下轴升降都读取参数页速度。 |
@@ -909,7 +969,7 @@
 | 触摸按钮 | 用户在开发板屏幕上点击 `开始/暂停/继续/停止`，确认状态栏文字变化。 |
 | SD 卡按钮 | 2026-05-03 人工点击 `保存图片` 未通过验收；2026-05-04 定位到 Qt 侧 procfs 挂载判断误判 `/mnt/sdcard 未挂载`，已改为 POSIX 解析 `/proc/mounts`；板端 `--storage-self-test` 已生成 `/mnt/sdcard/images/uvc_20260504_113814_000263.ppm`，屏幕按钮触发 Qt 主进程日志并生成 `uvc_20260504_113846_000592.ppm`、`uvc_20260504_113946_001192.ppm`，文件头 `P6` 且大小稳定。 |
 | JPG/PNG + COS 上传 | 2026-05-08 板端验证通过。`record_id=9` 证明只上传本次 `source/annotated` 两张图；随后修复时间二次换算后，`record_id=10` 返回 `captured_at=2026-05-08T13:12:51`、`uploaded_at=2026-05-08T13:13:16`，详情文件数仍为 2。 |
-| 双模型检测 + COS 上传 | 2026-05-18 板端 `./qt_camera_display --detect-self-test` 验证通过。输出 `RESULT status=GOOD class=gasket_good ... segment_status=OK defect_pixels=0 ... upload_status=OK`；本地历史新增 `record_id=48 / MP157-20260518-145002`，包含 `source_path`、3 张 `annotated_images`、`classification_result` 和 `segmentation_result`；云端详情同一条记录包含 1 张 `source` 和 3 张 `annotated` 文件，其中 JPEG 为 `image/jpeg`，mask PNG 为 `image/png`。后续坏品验证必须确认 `RESULT status=BAD` 或 `segment_status=NG/defect_pixels>0` 时输出含 `fused_result=bad`，云端记录 `result` 也为 `bad`，不能再显示成良品。 |
+| 双模型检测 + COS 上传 | 2026-05-18 板端 `./qt_camera_display --detect-self-test` 验证通过。输出 `RESULT status=GOOD class=gasket_good ... segment_status=OK defect_pixels=0 ... upload_status=OK`；本地历史新增 `record_id=48 / MP157-20260518-145002`，包含 `source_path`、3 张 `annotated_images`、`classification_result` 和 `segmentation_result`；云端详情同一条记录包含 1 张 `source` 和 3 张 `annotated` 文件，其中 JPEG 为 `image/jpeg`，mask PNG 为 `image/png`。2026-07-24 后续验收按三级证据执行：`WEAK -> fused_result=review`，`STRONG -> fused_result=bad`；原始 `defect_pixels>0` 但过滤后为 `CLEAR` 时仍可结合可信分类判良品。 |
 
 ## 待修问题记录
 
@@ -956,7 +1016,7 @@
 | 高画质压力测试 | 开发板 | `CAMERA_WIDTH=640 CAMERA_HEIGHT=480 CAMERA_FPS=15 /root/qt_camera_display/run_qt_camera_display.sh` | 能显示更高画质，同时 CPU 升高。 | 若 CPU 过高，这是安全路径预期瓶颈，不要误判为内核崩溃。 |
 | 自动流程四键幂等验证 | 开发板屏幕 + F4 串口日志 | 依次点击 `开始`、`暂停`、`继续`、`停止`；再在自动流程未完成时点击 `停止` 后马上点击 `开始`。 | 四个按钮始终可点击；空闲时点 `暂停` 只提示当前无运行流程；运行中点 `停止` 立即硬停执行器并同步 F4；停止后马上点 `开始` 会显示正在清理旧流程，STOP ACK 和必要回位完成后自动下发新的 `START_CYCLE`，不需要反复手动点。 | 若按钮变灰或点击无反馈，确认板端二进制包含 `autoStartAfterStopRequested/requestAutoRestartAfterStop/completeAutoStopAndMaybeRestart`；若 STOP 后 START 仍被 F4 拒绝，查 `/dev/ttySTM2` 是否被其它程序占用、F4 是否支持 `STOP_CYCLE cycle_id=0` 强制清理，以及 F4 调试口中的 active cycle 状态。 |
 | 检测前置检查 | 开发板 | `mount | grep ' /mnt/sdcard '; df -h /mnt/sdcard; /root/qt_camera_display/run_qt_kms_overlay_display.sh status; ls -lh /root/qt_camera_display/defect-classify /root/qt_camera_display/defect-segment /root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` | `/mnt/sdcard` 已挂载，overlay PID 存在，状态输出包含 `/tmp/uvc-kms-overlay-control.sock`，两个推理程序和 UNet 模型存在。 | 若未挂载，执行 `/etc/init.d/S85sdcard-mount status`；若 socket 不存在，查 `/tmp/uvc-kms-overlay.log`；若模型缺失，重新部署 `DEFECT_UNET_MODEL_SRC`。 |
-| 双模型 SSH 自检 | 开发板 SSH | `cd /root/qt_camera_display && ./qt_camera_display --detect-self-test` | 输出以 `RESULT ` 开头，包含 `status=GOOD|BAD`、`fused_status=GOOD|BAD|REVIEW`、`fused_result=good|bad|review`、`total_time_ms=<ms>`、`segment_status=OK|NG`、`source_path=/mnt/sdcard/images/uvc_*.jpg` 和 `upload_status=OK|FAIL|SKIP`；当自动上传关闭时仍生成本地历史但不调用 COS；当 `status=BAD` 或 `segment_status=NG/defect_pixels>=min_defect_pixels` 时云端记录应为 `bad`。 | 若保存失败，查 `/mnt/sdcard`、overlay socket 和 `SAVE_DETECT`；若分类失败，查 `defect-classify --bad-threshold`、分类模型和 labels；若 UNet 失败，查 `defect-segment --min-defect-pixels`、UNet 模型和 ONNX Runtime；若上传结果变成良品，查 Qt 是否传入综合后的 `CLOUD_RESULT`、脚本是否部署新版。 |
+| 双模型 SSH 自检 | 开发板 SSH | `cd /root/qt_camera_display && ./qt_camera_display --detect-self-test` | 输出以 `RESULT ` 开头，包含 `status=GOOD|BAD`、`segment_evidence=CLEAR|WEAK|STRONG`、`fused_status=GOOD|BAD|REVIEW`、`fused_result=good|bad|review`、`total_time_ms=<ms>`、`source_path=/mnt/sdcard/images/uvc_*.jpg` 和 `upload_status=OK|FAIL|SKIP`；`STRONG` 直接坏品、`WEAK` 待复核、`CLEAR` 再结合分类结果。 | 若保存失败，查 `/mnt/sdcard`、overlay socket 和 `SAVE_DETECT`；若分类失败，查 `defect-classify --bad-threshold`、分类模型和 labels；若 UNet 失败，手动执行四阈值 `defect-segment` 命令并检查 ONNX Runtime；若综合结果不符，查 `segment_evidence/fused_reason` 和板端 JSON。 |
 | 检测图片内容检查 | 开发板 SSH | `src=$(ls -t /mnt/sdcard/images/uvc_*.jpg | head -n 1); raw=$(ls -t /mnt/sdcard/images/segment_*_raw.jpg | head -n 1); overlay=$(ls -t /mnt/sdcard/images/segment_*_overlay.jpg | head -n 1); mask=$(ls -t /mnt/sdcard/images/segment_*_mask.png | head -n 1); ls -lh "$src" "$raw" "$overlay" "$mask"; head -c 2 "$src" | hexdump -C; head -c 2 "$raw" | hexdump -C; head -c 2 "$overlay" | hexdump -C; head -c 8 "$mask" | hexdump -C` | source/raw/overlay 是 JPEG SOI `ff d8`，mask 是 PNG 签名 `89 50 4e 47 0d 0a 1a 0a`，四个文件都非空。 | 若文件头不正确，说明编码失败或取错文件；若文件不存在，先查 `RESULT_SEG` 中的 `raw_path/overlay_path/mask_path`。 |
 | 检测历史文件检查 | 开发板 SSH | `day=$(date +%Y%m%d); hist=/mnt/sdcard/images/upload_history_${day}.json; test -s "$hist"; tail -n 120 "$hist"` | 当天 JSON 最新记录包含 `source_path`、3 项 `annotated_images`、`classification_result`、`segmentation_result`、`upload_status`、`record_id` 和 `record_no`。 | 若文件不存在，先确认点击 `检测` 或 `--detect-self-test` 是否走到 Qt 主进程；再查 `/tmp/qt-kms-overlay-shell.log`、`upload history save failed` 和 SD 卡日期是否正确。 |
 | 上传成功状态回归 | 开发板屏幕、SSH 和云端页面 | 屏幕点击 `检测`；SSH 执行 `day=$(date +%Y%m%d); tail -n 160 /mnt/sdcard/images/upload_history_${day}.json; grep -n 'verify_status\\|upload_status=OK\\|record_id' /tmp/qt-kms-overlay-shell.log /tmp/defect-cos-record-detail.json 2>/dev/null || true`；云端打开最新检测记录 | 如果云端已经出现本次记录和图片，本地历史详情应显示 `上传成功`，JSON 中 `upload_status` 不应是 `上传失败`；脚本允许 stdout 出现 `verify_status=warning`，但仍必须带 `upload_status=OK`、`record_id` 和 `record_no`。 | 若云端有记录但本地仍显示失败，确认板端二进制和 `/root/qt_camera_display/defect-cos-upload` 是否都是新版；再查 `isUploadStatusSuccess()`、`cloudStatusSummary()` 和脚本 stdout 是否被旧启动包覆盖。 |
@@ -966,11 +1026,11 @@
 | 历史失败完整重发验证 | 开发板屏幕和 SSH | 准备一条 `upload_status` 含 `上传失败` 且带 `weight_context_json/ldc_context_json/f4_flow_context_json/decision_context_json/vision_context_json` 的历史记录，屏幕进入该记录详情点击 `重新发送`，再执行 `day=$(date +%Y%m%d); tail -n 160 /mnt/sdcard/images/upload_history_${day}.json` | 点击后按钮短暂显示 `发送中`；成功时同一条 JSON 记录移动到数组最后，`upload_time` 变为本次重发完成时间，并写入本次重发日期文件，出现新的 `record_id`、`record_no` 和 `上传成功` 状态，界面详情同步刷新到这条最新记录；重发请求继续携带历史中保存的重量、电感、F4 流程、判定和视觉上下文；失败时该条记录保留原时间、原位置、失败状态和完整上下文并允许再次重发。 | 若按钮不显示，确认每日 JSON 中 `upload_status` 含 `失败`；若上下文字段为空，说明第一次自动检测未在上传前完成 `updateRecordInspectionContexts()` 写回；若成功但界面不刷新，查 `retryUploadFinished` 和 `updateRecordUploadResult`；若时间仍是旧值，查 `refreshedUploadTime` 和 `m_entries.move(row, lastRow)`；若上传失败，查 4G、云端 health、账号配置、`/tmp/defect-cos-record*.json` 和脚本 stderr。 |
 | 统计页触摸验证 | 开发板屏幕 | 点击左侧 `统计分析`，观察 KPI、最近检测趋势、分布概览、云端与文件状态、最近记录表；在最近记录卡片内上下滑动，再点击任一记录行 | 统计页打开后实时视频 plane 隐藏；总记录应等于所有 `upload_history_*.json` 汇总记录数；良品/待复核、上传成功率、图片数量和文件大小有值；`分布概览` 左列显示良品/坏品/待复核，右列显示上传成功/上传失败，五条都在面板边框内；最近记录表能在卡片内竖向滑动查看更多记录；点击最近记录行进入对应历史详情页。 | 若统计页无数据，先查 `/mnt/sdcard/images/upload_history_*.json` 是否存在且非空；若分布概览仍越界，检查 `statsDistributionLeftColumn`、`statsDistributionRightColumn` 和 `statsDistributionBarDelegate`；若不能滑动，检查 `statsRecentListView` 是否仍是 `ListView`；若点击无反应，检查 `openHistoryDetailFromStats` 和 `showHistoryDetail`；若视频仍覆盖统计页，查 `setOverlayVisible(pageName === "home")` 和 overlay `VISIBLE` 命令。 |
 | 参数页真实零件验证 | 开发板屏幕 | 点击左侧 `参数设置`，连续点击零件 `切换` 至少 4 次 | 零件显示只在波形垫圈、平垫圈、弹性垫圈之间循环，不再出现旧演示名或泛化垫片名。 | 若出现其它名称，先查 `Main.qml` 的 `settingsSupportedPartTypes`、`settingsNextPartType()` 和 `settingsApplyAction("part-next")`。 |
-| 参数页真实配置验证 | 开发板屏幕和 SSH | 屏幕点击 `参数设置`，调整模型阈值、ROI、UNet 像素阈值和自动上传，点击 `保存配置`；SSH 执行 `cat /mnt/sdcard/config/defect_ui_config.json` | JSON 包含 `model_threshold`、`review_threshold`、`roi_size`、`segment_min_pixels`、`overlay_alpha`、`auto_upload_enabled`；下一次检测使用这些值，分类命令包含 `--bad-threshold`，分割命令包含 `--min-defect-pixels`；自动上传关闭时结果为 `upload_status=SKIP`。 | 若 JSON 不存在，先查 `/mnt/sdcard` 是否挂载和可写；若界面值与 JSON 不一致，查 `DetectSettingsController::saveSettingsToDisk()` 和 QML `detectSettings` 绑定；若检测仍用旧值，查 `CameraStorageController::setDetectSettingsController()` 和后台线程快照复制。 |
+| 参数页真实配置验证 | 开发板屏幕和 SSH | 屏幕点击 `参数设置 -> 视觉检测策略 -> UNet参数`，调整四阈值后点击 `保存到板端 JSON`；SSH 执行 `cat /mnt/sdcard/config/defect_ui_config.json` | JSON 包含 `schema_version: 2`、`segment_min_component_pixels`、`segment_review_pixels`、`segment_bad_pixels`、`segment_strong_component_pixels`；下一次检测向 `defect-segment` 传同值。 | 若 JSON 不存在，先查 `/mnt/sdcard` 是否挂载和可写；若界面值与 JSON 不一致，查 `DetectSettingsController::saveSettingsToDisk()` 和 QML 四属性绑定；若检测仍用旧值，查后台线程参数快照和板端二进制 marker。 |
 | 步进电机速度任意值 | 开发板屏幕和 SSH | 屏幕点击 `参数设置` -> `步进参数`，选择任一电机，点击常规速度行的 `输入`，分别输入 `0`、`137`、`5000` 并点 `应用速度`、`保存并下发`；SSH 执行 `cat /mnt/sdcard/config/defect_ui_config.json | grep -A8 'normal_speed_rpm'` | JSON 的 `stepper_motors[].normal_speed_rpm` 能保存 `0~5000 rpm` 任意整数，参数日志也出现对应 `normal_speed_rpm` 行；F4 若已烧录新固件，应返回 `ACK acked_cmd=0x42 status=0`，表示运行内存参数已接收。 | 若输入 5001 被接受，说明 QML 或 C++ 限幅失效；若 0 被拒绝，检查 `applyStepperSpeedInput()` 和 `clampedInt(source.normalSpeedRpm, 0, 5000)`；若 JSON 没变，确认点了弹窗的 `保存并下发`，并检查 `/mnt/sdcard` 挂载；若 JSON 已变但 F4 无 ACK，确认 `/dev/ttySTM2`、F4 固件和二进制协议 `0x42` 是否已生效。 |
 | 步进电机最小步长按钮 | 开发板屏幕和 SSH | 屏幕点击 `参数设置` -> `步进参数`，选择任一电机，连续点击 `步长+50`、`步长-50`，再点 `保存并下发`；SSH 执行 `cat /mnt/sdcard/config/defect_ui_config.json | grep -A8 'min_step'` | 弹窗里的最小步长每次点击变化 `50 step`；保存后 JSON 的 `stepper_motors[].min_step` 与界面一致，低于 1 或高于 10000 时由 C++ 限幅保护。 | 若仍每次只变化 1 step 或 100 step，确认板端二进制包含 `步长+50` 和 `changeStepperMotorValue("minStep", 50)`；若 JSON 没变，确认点了 `保存并下发` 且 `/mnt/sdcard` 可写。 |
 | 传送带双速度和开机同步 | 开发板屏幕、F4 USART1 调试口、SSH | 屏幕点击 `参数设置` -> `步进参数`，传送带页把 `对中速度` 设为 `137rpm`，把 `上料速度` 设为 `60rpm`，点击 `保存并下发`；重启 Qt 后等待约 2 秒；F4 调试口发送 `BELTINFO`；SSH 执行 `cat /mnt/sdcard/config/defect_ui_config.json | grep -A10 'scan_speed_rpm'` | JSON 包含 `normal_speed_rpm` 和 `scan_speed_rpm`；界面提示 `F4已接收步进参数`；F4 日志或 `BELTINFO` 显示 `track=137 rpm, scan=60 rpm`；开机后即使没有手动打开弹窗，也会开机自动下发三台电机参数。 | 若 `BELTINFO` 仍是旧速度，说明 F4 未烧录新固件、Qt 未部署新二进制或 `/dev/ttySTM2` 被其它程序占用；若只有 JSON 变而 F4 不变，查 `syncStepperSettingsToF4()`、`stepperStartupSyncTimer` 和 F4 `STEPPER_PARAM_SET` 31 字节解析。 |
-| 参数日志查看验证 | 开发板屏幕和 SSH | 屏幕点击 `参数设置` -> `保存配置`，再点击 `导出摘要`，进入 `日志查看` 点击 `刷新` 并打开 `qt_settings_YYYYMMDD.log`；SSH 执行 `/root/qt_camera_display/qt_camera_display --settings-log-self-test; day=$(date +%Y%m%d); log=/mnt/sdcard/logs/qt_settings_${day}.log; test -s "$log"; tail -n 80 "$log"` | 屏幕和 SSH 都能看到参数日志；内容包含 `action=保存配置`、`action=导出摘要`、`config_path=/mnt/sdcard/config/defect_ui_config.json`、`model_threshold`、`review_threshold`、`roi_size`、`segment_min_pixels`、`overlay_alpha`、`auto_upload_enabled`、`classify_args` 和 `segment_args`；自检输出还应包含 `log_model_contains=qt_settings_YYYYMMDD.log`，证明日志查看模型能扫描到该文件。 | 若日志查看页没有文件，先确认点击后底部提示或自检输出是否为 `参数日志已保存`，再查 `/mnt/sdcard/logs` 是否存在、`recordSettingsSummaryToSdCard()` 返回值、`refreshLogFileList()` 是否执行；若 SSH 有文件但界面没有，查 `LogFileModel::refresh()` 扫描 `.log` 文件和是否运行旧二进制。 |
+| 参数日志查看验证 | 开发板屏幕和 SSH | 屏幕点击 `参数设置` -> `保存配置`，再点击 `导出摘要`，进入 `日志查看` 点击 `刷新` 并打开 `qt_settings_YYYYMMDD.log`；SSH 执行 `/root/qt_camera_display/qt_camera_display --settings-log-self-test; day=$(date +%Y%m%d); log=/mnt/sdcard/logs/qt_settings_${day}.log; test -s "$log"; tail -n 80 "$log"` | 屏幕和 SSH 都能看到参数日志；内容包含 `action=保存配置`、`action=导出摘要`、四个 `segment_*` 字段、`overlay_alpha`、`classify_args` 和完整四参数 `segment_args`；自检输出还应包含 `log_model_contains=qt_settings_YYYYMMDD.log`。 | 若日志查看页没有文件，先确认底部提示或自检输出是否为 `参数日志已保存`，再查 `/mnt/sdcard/logs`、`recordSettingsSummaryToSdCard()` 和 `refreshLogFileList()`；若字段仍是旧单阈值，说明板端运行旧二进制。 |
 | 参数页布局验证 | 开发板屏幕 | 点击左侧 `参数设置`，依次观察顶部摘要、三张参数卡、下方存储卡和参数摘要卡；点击 `+/-`、`切换`、`应用检测`、`保存配置`、`恢复默认` | 所有文字都在卡片边框内，长路径和摘要只省略不换行溢出；参数按钮不挤出卡片，底部提示条不遮挡其它区域。 | 若仍有文字越界，先查 `Main.qml` 中对应卡片是否缺少 `clip: true`、`elide: Text.ElideRight/ElideMiddle`，再按板端实际字体继续缩短文案或减少同屏字段。 |
 | 告警页布局验证 | 开发板屏幕 | 点击左侧 `告警维护`，观察当前告警、设备健康矩阵、告警历史、处理建议；点击 `确认`、`清故障`、`刷新状态`、`保存诊断` | 当前告警按钮在告警卡片右侧纵向排列，不挤占发生时间和处理状态；设备健康 3x3 网格包含 `4G` 状态格，告警历史每一行和处理建议都不越过卡片边界；长诊断路径和状态文字只省略显示。 | 若当前告警按钮仍压住文字，检查 `alarmCurrentPanel` 是否为左信息右按钮布局；若历史行仍超出，优先检查 `alarmHistoryListView` delegate 的列宽总和与 `spacing`；若设备健康覆盖刷新按钮，检查 `alarmHealthGrid` 单元高度、行距和刷新按钮 `y`；若仍显示 `配置`，说明板端 QML 资源或二进制未更新。 |
 | 告警建议查看全部 | 开发板屏幕 | 点击左侧 `告警维护`，再点击处理建议面板右下角 `查看全部`；在弹层内上下滑动，最后点击 `关闭` 或遮罩区域 | 弹层标题为 `处理建议完整说明`，内容包含当前告警码、设备健康摘要，以及相机/KMS、SD 卡、4G 网络、云端上传、云端 health、F4 串口、保存链路和模型检测排查步骤；长文本能滚动到末尾，关闭后回到告警维护页。 | 若按钮不出现，检查 `alarmAdviceDetailVisible`、`alarmAdviceDetailOverlay` 和 `查看全部` 是否打进 QML；若不能滑动，检查 `alarmAdviceDetailFlickable` 的 `contentHeight` 和 `clip`；若内容缺项，检查 `alarmFullAdviceText()` 是否仍复用 `alarmSourceAdvice()`。 |
@@ -1312,115 +1372,6 @@ ssh -i "$key" -o IdentitiesOnly=yes "$target" '
 `sync` 后重启服务。源码或模型已经生成不等于板端已经生效，必须以板端 SHA256、进程状态和真实
 单图输出为准。
 
-## 2026-07-24 四分类 v2 模型量化与精准替换
-
-本轮使用 `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_4classes_v2.onnx`
-重新生成四分类混合静态 INT8 模型。模型输入输出、预处理方式、四类标签顺序和板端稳定文件名均未改变，
-因此不重新编译或替换 Qt、`defect-classify`、`defect-segment`、`uvc_kms_overlay`，也不替换两类 UNet。
-现有检测前 `LOCATE ring=1` 门禁继续保持；四类板端验收直接调用 `defect-classify`，避免把 ROI 定位失败
-误判成分类模型加载失败。
-
-### 本次修改文件与原因
-
-| 修改路径 | 修改原因 | 影响边界 |
-|---|---|---|
-| `20_uvc_camera/qt_camera_display/deploy_qt_camera_display.sh` | 默认分类模型和 labels 源切换到 `checkpoints_classify_4classes_v2` | 完整部署时不再回退到 v1；板端目标文件名不变 |
-| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 静态检查精确要求 v2 模型和 labels 源路径 | 防止后续部署脚本重新指向 v1 |
-| `20_uvc_camera/qt_camera_display/README.md` | 记录 v2 量化、精准部署、回滚和实测证据 | 明确本轮只允许替换分类模型与 labels |
-| `.trellis/spec/frontend/component-guidelines.md` | 更新当前分类模型来源和同 ABI 精准替换契约 | 后续模型替换必须继续验证哈希、精度和不变项 |
-| `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx` | 使用完整 187 张验证集执行 `static_mixed` 量化 | 不提交到代码仓库；部署内容写入稳定板端分类模型名 |
-| `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8_labels.json` | 保存本轮四类索引顺序 | 内容与 v1 labels 相同，仍需与模型作为一对校验和部署 |
-
-### v2 量化结果
-
-| 项目 | FP32 | 混合静态 INT8 |
-|---|---:|---:|
-| 文件大小 | 6,102,223 字节 | 2,059,394 字节 |
-| SHA256 | `D877681BB68C2F2220E8835164D28EF3D549C60087CC4FE60F290FFF2334146D` | `1637C31846CC4EFB589A06EAF65A8DB0969BB29C9259C458863C274DDCA934A3` |
-| 输入/输出 | `tensor(float) [N,3,224,224]` / `tensor(float) [N,4]` | `tensor(float) [N,3,224,224]` / `tensor(float) [N,4]` |
-| 187 张 argmax 准确率 | 100.00% | 100.00% |
-| 板端 `0.85` 阈值准确率 | 100.00% | 100.00% |
-
-验证集类别数量依次为 `splitwasher_bad=40`、`splitwasher_good=40`、`washer_bad=51`、
-`washer_good=56`。FP32/INT8 预测一致率为 `100.00%`，最大概率绝对差为 `0.007114`，
-平均概率绝对差为 `0.000378`。labels 文件大小为 263 字节，SHA256 为
-`D280A40EC1A9B9588DC8079F5A9B07E3A847C1D350B4DA82A486031738701A55`。
-
-在 Windows `D:\model_picture` 执行的量化命令为：
-
-```powershell
-& 'D:\model_picture\defect-unet\python.exe' quantize_classify_int8.py `
-  --preset static_mixed `
-  --onnx_input '.\checkpoints_classify_4classes_v2\defect_classifier_4classes_v2.onnx' `
-  --onnx_output '.\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx' `
-  --calib_dir '.\datasets_classify\val' `
-  --num_calib 187
-```
-
-### v2 精准部署与回滚
-
-本轮不能运行整套部署脚本覆盖运行目录。先在板端记录 Qt、overlay、三个 helper、分类模型、labels 和
-UNet 的 SHA256；再创建时间戳备份，只把以下两个文件上传为 `.new`，校验后原子改名并执行 `sync`：
-
-```bash
-key=/home/cfr/.ssh/id_ed25519_github
-target=root@192.168.1.250
-model_dir=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2
-
-ssh -i "$key" -o IdentitiesOnly=yes "$target" '
-  set -e
-  stamp=$(date +%Y%m%d_%H%M%S)
-  backup=/root/qt_camera_display/backups/classifier_v2_${stamp}
-  mkdir -p "$backup"
-  cp -p /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx "$backup"/
-  cp -p /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json "$backup"/
-  printf "%s\n" "$backup"
-'
-
-scp -i "$key" -o IdentitiesOnly=yes "$model_dir/defect_classifier_static_mixed_int8.onnx" \
-  "$target:/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx.new"
-scp -i "$key" -o IdentitiesOnly=yes "$model_dir/defect_classifier_static_mixed_int8_labels.json" \
-  "$target:/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json.new"
-
-ssh -i "$key" -o IdentitiesOnly=yes "$target" '
-  set -e
-  chmod 0644 /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx.new
-  chmod 0644 /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json.new
-  mv -f /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx.new \
-    /root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx
-  mv -f /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json.new \
-    /root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json
-  sync
-  /root/qt_camera_display/run_qt_kms_overlay_display.sh restart
-  /root/qt_camera_display/run_qt_kms_overlay_display.sh status
-'
-```
-
-回滚时从上述时间戳目录恢复两个分类文件，重新设置 `0644`、执行 `sync`，再重启服务。不能恢复或覆盖
-Qt、helper、overlay 或 UNet；如果任一不变项哈希发生变化，应立即停止验收并查明错误复制命令。
-
-### v2 验证方式
-
-| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
-|---|---|---|---|---|
-| 量化回归测试 | Windows `D:\model_picture` | `& 'D:\model_picture\defect-unet\python.exe' -m unittest tests.test_quantize_classify -v` | 8 项测试全部通过 | 查 Python 环境、ONNX Runtime 和量化脚本变更 |
-| 核对 v2 模型 | Windows/VM | `Get-FileHash -Algorithm SHA256 D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx`；VM 执行 `sha256sum /home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx` | 两端均为 `1637C318...CA934A3` | 重新同步模型，不能继续部署损坏文件 |
-| 四类直接推理 | 开发板 SSH | 依次执行 `cd /root/qt_camera_display && LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH ./defect-classify --image /tmp/classifier-v2-tests/<class>.jpg` | 四张图分别输出对应 `class=`，且 `_good/_bad` 与 `status=GOOD/BAD` 一致 | 查测试图、板端模型/labels 哈希和 ONNX Runtime 日志；不要修改 `ring=1` 门禁 |
-| 服务状态 | 开发板 SSH | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart && /root/qt_camera_display/run_qt_kms_overlay_display.sh status` | Qt PID 与 overlay PID 均存在，日志没有输出维度或 labels 数量错误 | 恢复时间戳备份，查看 `/tmp/qt-kms-overlay-shell.log` |
-| 不变项复核 | 开发板 SSH | 部署前后对 Qt、overlay、`defect-classify`、`defect-segment` 和 UNet 执行 `sha256sum` | 五个不变项哈希逐项相同；分类模型变为 `1637C318...CA934A3`；labels 仍为 `D280A40E...38701A55` | 任一不变项变化立即停止，按备份恢复并审计传输路径 |
-
-本轮 2026-07-24 实际部署与验证结果：
-
-| 实测项目 | 结果 |
-|---|---|
-| 板端备份 | 旧 v1 分类模型和 labels 已保存到 `/root/qt_camera_display/backups/classifier_v2_20260724083049`；旧模型哈希为 `DCDE6C5C...E54F5F82` |
-| v2 分类模型 | 板端 SHA256 为 `1637C31846CC4EFB589A06EAF65A8DB0969BB29C9259C458863C274DDCA934A3`，与 Windows/VM 量化产物一致 |
-| 四类直接推理 | `splitwasher_bad` 输出 `BAD/0.9989`，`splitwasher_good` 输出 `GOOD/1.0000`，`washer_bad` 输出 `BAD/1.0000`，`washer_good` 输出 `GOOD/0.9998` |
-| 不变项 | Qt、overlay、`defect-classify`、`defect-segment` 和两类 UNet 的部署前后 SHA256 完全一致；labels 内容哈希仍为 `D280A40E...38701A55` |
-| 摄像头恢复 | 第一次服务启动时摄像头正在 USB 重枚举，日志显示 `/dev/video0` 不存在；重新接入后 `/dev/video0`、`/dev/video1` 恢复，Qt PID 为 `4686`、overlay PID 为 `4999` |
-| 视频帧 | `/tmp/uvc-kms-overlay-control.sock` 已创建，`/tmp/uvc-kms-overlay.log` 帧计数从 `frames=60` 持续增长到 `frames=720`，确认摄像头数据通路恢复 |
-| 已知运行库提示 | `defect-classify` 仍会输出既有的 `libstdc++.so.6: no version information available` 警告，但四次推理均退出 `0` 并产生正确 `RESULT`；本轮没有替换运行库 |
-
 ## 检测按钮与双模型部署
 
 当前首页 `检测` 按钮不在 Qt 进程内直接链接 ONNX Runtime，而是串行调用两个独立推理程序。
@@ -1438,10 +1389,10 @@ Qt、helper、overlay 或 UNet；如果任一不变项哈希发生变化，应�
 | `uvc_kms_overlay.c` | 支持 `SAVE_DETECT /mnt/sdcard/images` 控制命令，保存单张检测 source JPG；同时在 YUYV 转换行内绘制中心 `300x300` ROI 观察框，避免整帧后补画导致闪烁 |
 | `defect_classify.cpp` | 独立 ONNX Runtime + libjpeg 推理程序，执行 300x300 中心 ROI、224x224 resize、ImageNet 标准化，并从 ONNX 输出维度动态读取类别数后与 labels 核对 |
 | `build_defect_classify.sh` | 新增 `defect-classify` 交叉编译脚本，依赖 ARMv7 ONNX Runtime SDK |
-| `defect_segment.cpp` | 独立 ONNX Runtime + libjpeg/libpng 分割程序；从 `[1,C,H,W]` 输出形状动态读取类别数和 mask 尺寸，输出 `RESULT_SEG` 并生成 raw JPG、overlay JPG、mask PNG |
+| `defect_segment.cpp` | 新增独立 ONNX Runtime + libjpeg/libpng 分割程序，输出 `RESULT_SEG`，并生成 raw JPG、overlay JPG、mask PNG |
 | `build_defect_segment.sh` | 新增 `defect-segment` 交叉编译脚本，依赖 ARMv7 ONNX Runtime SDK、libjpeg 和 libpng |
-| `deploy_qt_camera_display.sh` | 部署 `defect-classify`、`defect-segment`、分类 ONNX、UNet ONNX、labels JSON 和 `libonnxruntime.so*` 到 NFS rootfs；默认 UNet 源改为两类混合 INT8 模型 |
-| `test_qt_kms_overlay_assets.sh` | 检查检测按钮、双模型入口、模型部署、动态分割输出契约、`SAVE_DETECT`、annotated 上传和 ROI 观察框 |
+| `deploy_qt_camera_display.sh` | 部署 `defect-classify`、`defect-segment`、分类 ONNX、UNet ONNX、labels JSON 和 `libonnxruntime.so*` 到 NFS rootfs |
+| `test_qt_kms_overlay_assets.sh` | 增加检测按钮、双模型入口、模型部署、`SAVE_DETECT`、annotated 上传和 ROI 观察框静态契约检查 |
 | `.gitignore` | 排除 `build-mp157/`、本地模型目录和 `onnxruntime-arm/` SDK，避免提交大文件或第三方二进制 |
 
 | 项目 | 路径/行为 | 说明 |
@@ -1450,8 +1401,8 @@ Qt、helper、overlay 或 UNet；如果任一不变项哈希发生变化，应�
 | overlay 命令 | `SAVE_DETECT /mnt/sdcard/images` | 保存 source JPG，要求 SD 卡挂载，后续写入历史记录并触发 COS 上传 |
 | 分类推理程序 | `/root/qt_camera_display/defect-classify` | 独立 C++ 程序，依赖 ONNX Runtime ARM 动态库和 libjpeg |
 | 分割推理程序 | `/root/qt_camera_display/defect-segment` | 独立 C++ 程序，依赖 ONNX Runtime ARM 动态库、libjpeg 和 libpng |
-| 分类模型 | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx` | 来自 `D:\model_picture\checkpoints_classify_4classes_v2\defect_classifier_static_mixed_int8.onnx`，当前为四分类 v2 模型 |
-| UNet 模型 | `/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` | 文件名为兼容 Qt 配置而保持不变，实际内容来自 `D:\model_picture\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx`，输出契约为 `tensor(float) [1,2,224,224]`，对应背景/缺陷两类 |
+| 分类模型 | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8.onnx` | 来自 `D:\model_picture\checkpoints_classify_4classes\defect_classifier_static_mixed_int8.onnx`，当前为四分类模型 |
+| UNet 模型 | `/root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx` | 来自 `D:\model_picture\checkpoints_unet_test\defect_unet_test_decoder_head_int8.onnx` |
 | 默认标签 | `/root/qt_camera_display/models/defect_classifier_static_mixed_int8_labels.json` | 类别顺序必须与 ONNX 输出一致 |
 | 默认 ROI | 中心 `300x300` | 与当前训练/PC 摄像头测试命令 `--roi_size 300` 保持一致 |
 | 屏幕 ROI 观察框 | KMS overlay 绿色框 | 640x480 采集画面下坐标约为 `x=170,y=90,w=300,h=300`；仅用于观察零件是否进中心 ROI |
@@ -1505,9 +1456,9 @@ ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxrunti
 
 ```bash
 cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display
-DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8.onnx \
-DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes_v2/defect_classifier_static_mixed_int8_labels.json \
-DEFECT_UNET_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_unet_2parts/scratch_unet_decoder_head_int8.onnx \
+DEFECT_MODEL_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8.onnx \
+DEFECT_LABELS_SRC=/home/cfr/linux/model_picture/checkpoints_classify_4classes/defect_classifier_static_mixed_int8_labels.json \
+DEFECT_UNET_MODEL_SRC=/tmp/defect_unet_test_decoder_head_int8.onnx \
 ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxruntime-arm \
 ./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs
 ```
@@ -1523,9 +1474,8 @@ ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxrunti
 | 确认推理程序存在 | 开发板 SSH | `ls -lh /root/qt_camera_display/defect-classify /root/qt_camera_display/defect-segment` | 两个文件存在且可执行 | 先运行两个 build 脚本再部署 |
 | 确认 ONNX Runtime 动态库 | 开发板 SSH | `ls -lh /root/qt_camera_display/lib/libonnxruntime.so` | 文件存在 | 检查 `ORT_ROOT/lib/libonnxruntime.so` |
 | 单图手动推理 | 开发板 SSH | `LD_LIBRARY_PATH=/root/qt_camera_display/lib:$LD_LIBRARY_PATH /root/qt_camera_display/defect-classify --image /tmp/test.jpg` | 输出 `RESULT status=GOOD|BAD ...` | 确认 `/tmp/test.jpg` 是 JPG，模型和 labels 路径存在 |
-| 单图 UNet 推理 | 开发板 SSH | `LD_LIBRARY_PATH=/root/qt_camera_display/lib:$LD_LIBRARY_PATH /root/qt_camera_display/defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images --min-defect-pixels 80` | 进程退出码为 0，输出 `RESULT_SEG status=OK|NG ... classes=2 ... raw_path=... overlay_path=... mask_path=...` | 确认 `/tmp/test.jpg` 是 JPG，UNet 模型输出为 `tensor(float) [1,2,224,224]`，ONNX Runtime 动态库存在；输出类型错误时 helper 会明确退出，不能按 `float *` 强行解释缓冲区 |
-| 确认结果图真正落盘 | 开发板 SSH | `latest=$(ls -t /mnt/sdcard/images/segment_*_mask.png 2>/dev/null \| head -n 1) && test -n "$latest" && test -s "$latest" && stat -c '%n %s bytes' "$latest" && sync` | 必须先等待同步推理进程退出；随后最新 mask 存在且大小非 0，`stat` 输出实际字节数，`sync` 成功返回 | 若文件为空或不存在，先查 `RESULT_SEG` 的 `mask_path`、SD 卡挂载和剩余空间；不能用固定 `sleep` 代替进程退出和文件检查 |
-| SSH 双模型检测 | 开发板 SSH | `cd /root/qt_camera_display && ./qt_camera_display --detect-self-test` | 输出 `RESULT status=GOOD|BAD ... fused_status=GOOD|BAD|REVIEW fused_result=good/bad/review segment_status=OK|NG ... upload_status=OK|FAIL`，并追加当天 `/mnt/sdcard/images/upload_history_YYYYMMDD.json` | 查 `/tmp/uvc-kms-overlay-control.sock`、overlay 是否启动、两个模型运行库是否缺失、COS 账号和网络；若分类 `GOOD` 但 UNet `NG` 仍上传 `good`，优先确认 Qt 二进制是否包含 `fusedResultFromModelResults`。 |
+| 单图 UNet 推理 | 开发板 SSH | `LD_LIBRARY_PATH=/root/qt_camera_display/lib:$LD_LIBRARY_PATH /root/qt_camera_display/defect-segment --image /tmp/test.jpg --output-dir /mnt/sdcard/images` | 输出 `RESULT_SEG status=OK|NG ... raw_path=... overlay_path=... mask_path=...` | 确认 `/tmp/test.jpg` 是 JPG，UNet 模型和输出目录存在 |
+| SSH 双模型检测 | 开发板 SSH | `cd /root/qt_camera_display && ./qt_camera_display --detect-self-test` | 输出 `RESULT status=GOOD|BAD ... segment_evidence=CLEAR|WEAK|STRONG fused_status=GOOD|BAD|REVIEW fused_result=good/bad/review ... upload_status=OK|FAIL`，并追加当天 `/mnt/sdcard/images/upload_history_YYYYMMDD.json`；分类 `GOOD + WEAK` 为 `review`，分类 `GOOD + STRONG` 为 `bad`。 | 查 `/tmp/uvc-kms-overlay-control.sock`、overlay 是否启动、两个模型运行库是否缺失、COS 账号和网络；若 `WEAK/STRONG` 仍上传 `good`，优先确认 Qt 二进制包含 `fusedResultFromModelResults`、`segment_evidence` 和四阈值 marker。 |
 | 首页按钮检测 | 触摸屏/开发板 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh start` 后点击“检测” | 分类模型完成后右侧面板先显示模型零件名、分类初判、类别和百分制置信度，并显示 `等待综合判定`；UNet 完成后再显示综合判定和双模型总耗时；上传完成后历史页新增一条包含 4 张图片的检测记录。 | 查 `/tmp/uvc-kms-overlay-control.sock`、overlay 是否启动、模型运行库是否缺失；若结果仍等上传后才显示，确认 Qt 二进制包含 `detectClassificationReady`、`detectModelsReady` 和 `fused_status`。 |
 | overlay `LOCATE` 当前帧定位 | 开发板 SSH | `test -S /tmp/uvc-kms-overlay-control.sock && command -v nc >/dev/null && printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock` | 有 `nc -U` 时返回 `OK LOCATE has_target=0/1 frame_id=... width=640 height=480 center_x=... center_y=... bbox_w=... confidence=...`；空黑色传送带和固定反光点不应稳定返回 `has_target=1`；放入铝色零件并让它进入传送带中部后，`has_target` 应稳定变为 `1`，`center_y` 随零件从上方进入而增大。当前板端 BusyBox 没有 `nc` applet 时，改看首页自动视觉提示和 `/tmp/uvc-kms-overlay.log` 的持续 `frames=` 计数。 | 若 socket 命令返回 `ERR` 或无回复，先查 `/root/qt_camera_display/run_qt_kms_overlay_display.sh status`、`/tmp/uvc-kms-overlay.log`、`/dev/video0` 是否被占用；若无零件仍误报，保存现场原图后继续收紧 `AUTO_LOCATE_MIN_PART_BBOX_AREA/AUTO_LOCATE_MIN_NON_RING_CONFIDENCE`；若放入零件一直 `has_target=0`，先确认零件在绿色 300x300 ROI 内、光照不把铝件压暗，再看 `confidence/bbox_w/bbox_h` 是否低于门槛。 |
 | 板端二进制功能标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep -E 'runF4ActuatorPositionMoveAndWaitDone|estimateActuatorPositionMoveFallbackMs|sendF4ActuatorPositionMoveWithTimeout|zMotionTimeoutMs|fallbackMaxWaitMs|BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE|autoVisionHandleActuatorMoveDone|actuator-move-done|estimated-done|mp157-local-estimated-done|wait_ms=|z-motion-down-wait|z-motion-up-wait|autoVisionLateralReturnOffsetSteps|lateral-return|相机回到皮带基准|sendF4ActuatorStopNow|ACTUATOR_STOP_NOW|ACTUATOR_STOP 抢占|autoStartAfterStopRequested|requestAutoRestartAfterStop|completeAutoStopAndMaybeRestart|旧流程已停止，正在开始下一轮|等待约3秒让摄像头对焦稳定'` | 能看到自动视觉、F4 执行器完成事件、MP157 按帧内速度/步数和参数页超时本地兜底、Z 轴保护等待、左右轴必要回中、对焦等待、强制 STOP、STOP 抢占和四键排队重启 marker，证明 QML/C++ 已重新编进当前板端 Qt 二进制。 | 若 marker 不存在，说明只改了源码或只拷了 QML，未重新交叉编译并替换 `/root/qt_camera_display/qt_camera_display`。 |
@@ -1534,46 +1484,6 @@ ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxrunti
 | 检测结果图生成 | 开发板 SSH | `ls -lh /mnt/sdcard/images/uvc_*.jpg /mnt/sdcard/images/segment_* | tail` | 点击检测后出现 source JPG 和 UNet raw/overlay/mask | 若无文件，查 `SAVE_DETECT` socket 命令、`RESULT_SEG` 输出和 overlay 日志 |
 | ROI 框观察 | 开发板屏幕 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart` | 实时视频中心出现绿色 `300x300` ROI 框，零件进入框内后再点“检测”；框线不应肉眼可见闪烁 | 若没有框或仍明显闪烁，确认已部署新的 `/root/qt_camera_display/uvc_kms_overlay` 并查看 `/tmp/uvc-kms-overlay.log` |
 | 检测图不带框 | 开发板 SSH | `ls -t /mnt/sdcard/images/uvc_*.jpg | head -n 1` 后拉取图片观察 | source JPG 是当前摄像头画面，不包含绿色 ROI 边框 | 若 JPG 带框，说明 overlay 没有使用原始 YUYV 生成图片或运行的仍是旧二进制 |
-
-### 2026-07-24 两类 UNet 量化与替换记录
-
-本轮将平垫圈、弹性垫圈数据训练出的两类 UNet 替换旧六类分割模型。模型只区分背景和缺陷区域；分类侧四类模型、labels、`defect-classify` 和 Qt 主程序不参与替换。
-
-| 模型 | SHA256 | 大小 | mIoU | 缺陷 IoU | 缺陷 F1 |
-|---|---|---:|---:|---:|---:|
-| FP32 `scratch_unet.onnx` | `68259f699fe857727b562805c46afee5e886773c077d884b69224c85e48d91e5` | 14,366,801 字节 | 79.39% | 59.22% | 74.39% |
-| 混合 INT8 `scratch_unet_decoder_head_int8.onnx` | `9b32af650292fab7ad70e8abd2cc156f98cec7d181d3e1a85decdc94bca3225e` | 6,434,978 字节 | 79.23% | 58.91% | 74.14% |
-
-量化只处理 decoder/head，encoder 保持 FP32；校准集为 `datasets_unet_2parts/val/images` 的 60 张图片，测试集为 `datasets_unet_2parts/test` 的 61 张图片。INT8 相对 FP32 的 mIoU 下降 0.16 个百分点，缺陷 IoU 下降 0.31 个百分点；两模型逐像素预测一致率为 99.952756%，缺陷 mask 互相之间的 IoU 为 95.211445%。
-
-在 Windows 模型目录执行：
-
-```powershell
-Set-Location -LiteralPath 'D:\model_picture'
-& 'D:\model_picture\defect-unet\python.exe' quantize_segment_int8.py --preset decoder_head --onnx_input .\checkpoints_unet_2parts\scratch_unet.onnx --onnx_output .\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx --calib_dir .\datasets_unet_2parts\val\images --num_calib 60
-& 'D:\model_picture\defect-unet\python.exe' eval_segment_onnx.py --model .\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx --data_dir .\datasets_unet_2parts\test --num_classes 2 --provider CPUExecutionProvider
-& 'D:\model_picture\defect-unet\python.exe' compare_segment_onnx.py --data_dir .\datasets_unet_2parts\test --fp32_model .\checkpoints_unet_2parts\scratch_unet.onnx --int8_model .\checkpoints_unet_2parts\scratch_unet_decoder_head_int8.onnx --output_dir .\segment_compare_outputs_unet_2parts --num_classes 2
-```
-
-已知限制：用户已确认本轮先不处理黑色传送带反光误检。量化不会修复 FP32 模型已有的误检；Qt 仍把参数页当前 `segmentMinPixels` 值传给 `--min-defect-pixels`，本轮没有修改该运行时配置。板端手动验收显式使用 `--min-defect-pixels 80`，未增加亮度过滤、零件轮廓过滤或孔洞过滤。
-
-只替换分割模型和辅助程序时，在板端先备份再原子替换：
-
-```bash
-stamp=$(date +%Y%m%d_%H%M%S)
-backup=/root/qt_camera_display/backup_unet2_$stamp
-mkdir -p "$backup"
-cp -a /root/qt_camera_display/defect-segment "$backup/"
-cp -a /root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx "$backup/"
-
-chmod 755 /root/qt_camera_display/defect-segment.new
-chmod 644 /root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx.new
-mv -f /root/qt_camera_display/defect-segment.new /root/qt_camera_display/defect-segment
-mv -f /root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx.new /root/qt_camera_display/models/defect_unet_test_decoder_head_int8.onnx
-sync
-```
-
-若单图推理、`classes=2` 契约或服务重启验证失败，从上述 `backup_unet2_<时间>` 目录恢复两个文件，重新执行 `chmod`、`sync` 和服务重启。源码、模型或 NFS rootfs 已更新不等于板端已生效，最终以板端 SHA256、单图输出和服务日志为准。
 
 ## 编译
 
