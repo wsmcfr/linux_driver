@@ -17,6 +17,77 @@
 > 默认采集参数为 `320x240@10fps`，板端 5 秒平均 CPU 实测约 `5.9%`，画质明显不足。
 > `640x480@15fps` 安全路径实测约 `42.0%`，接近旧 CPU framebuffer 预览，所以后续必须继续做稳定的零拷贝/硬件视频显示链路。
 
+## 2026-07-25 模型检测前补光舵机状态机
+
+自动视觉链路现在按以下顺序运行：
+
+```text
+ROI 对齐与对焦
+-> MP157 下发 FILL_LIGHT_CONTROL action=1
+-> F4 PB6/TIM4_CH1 输出 PWM 2 秒并转到 270 度
+-> MP157 收到 ACK 和 EVENT_REPORT 0x16
+-> 非阻塞等待 5000 ms
+-> 双模型检测
+-> MP157 下发 action=0
+-> F4 回到 0 度并停止 PWM
+-> MP157 收到关灯完成事件后回升 Z 轴
+```
+
+### 修改文件与原因
+
+| 修改路径 | 修改原因 |
+|---|---|
+| `20_uvc_camera/qt_camera_display/main.cpp` | 新增 `FILL_LIGHT_CONTROL 0x23` 编码、严格 ACK/`related_seq`/`EVENT_REPORT 0x16` 等待、完成信号和补光故障诊断。 |
+| `20_uvc_camera/qt_camera_display/qml/Main.qml` | 新增 opening/settling/detecting/closing 状态、独立 5000 ms Timer、检测后统一关灯和暂停/停止安全收口。 |
+| `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 增加补光命令、真实完成事件、5 秒门禁、检测完成关灯和旧 cycle 拒绝等静态契约。 |
+| `docs/stm32mp157-f407-binary-protocol.md` | 记录 `0x23` 负载、`0x16` 完成事件及跨层时序。 |
+| `docs/stm32mp157-f407-auto-detect-debug-roadmap.md` | 更新自动检测总流程、已完成项和板端/F4 实机缺口。 |
+
+### 状态与失败处理
+
+| 场景 | MP157 行为 |
+|---|---|
+| 开灯正常 | 只有收到相同 `cycle_id`、原命令 `related_seq`、action=1、angle=270 的完成事件后才启动 5 秒计时。 |
+| 5 秒到期 | 先把阶段改为 `detecting`，再调用一次 `handleDetectAction()`，避免重复启动模型线程。 |
+| 检测成功或失败 | 都调用 `autoVisionFinishDetectionAndCloseFillLight()`，关灯完成前不清除 `autoVisionDetectFromZFlow`，因此不会提前回升 Z 轴或启动机械臂。 |
+| 暂停或停止 | 立即取消 5 秒计时，先强停三轴，再在 `STOP_CYCLE` 清除 F4 active cycle 之前发送绝对关灯命令。 |
+| 开灯完成事件晚到 | 若用户已暂停/停止，只发关灯，不再启动 5 秒计时和模型检测。 |
+| 关灯失败 | 最多非阻塞重试 20 次；超限后保留 Z 轴待回升状态并提示检查 F4 串口和 PB6 舵机。 |
+
+### 编译与部署
+
+在虚拟机中执行：
+
+```bash
+cd /home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display
+sh ./test_qt_kms_overlay_assets.sh
+./build_qt_camera_display.sh
+./deploy_qt_camera_display.sh /home/cfr/linux/nfs/rootfs
+```
+
+若完整部署因模型源路径缺失而停止，但板端 `/root/qt_camera_display` 已有模型和资源，可只替换重新编译的主程序；`Main.qml` 已编进 Qt resource，不能只复制 QML 文件。替换后执行：
+
+```bash
+/root/qt_camera_display/run_qt_kms_overlay_display.sh restart
+/root/qt_camera_display/run_qt_kms_overlay_display.sh status
+tail -n 120 /tmp/qt-kms-overlay-shell.log
+```
+
+### 验证方式
+
+| 测试目标 | 执行位置 | 命令/操作 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 静态契约 | Windows Git Bash 或虚拟机模块目录 | `sh ./test_qt_kms_overlay_assets.sh` | 输出 `PASS: Qt KMS overlay assets contract`。 | 查 `sendF4FillLightControl`、`onF4FillLightCommandFinished`、5 秒 Timer 和检测完成关灯函数。 |
+| 交叉编译 | 虚拟机模块目录 | `./build_qt_camera_display.sh` | 生成 `build-mp157/qt_camera_display`，`file` 显示 ARM 32-bit。 | 确认脚本已加载 ST Qt SDK，查看首个 C++/QML resource 错误。 |
+| 板端功能标记 | STM32MP157 开发板 | `strings /root/qt_camera_display/qt_camera_display | grep -E 'FILL_LIGHT_CONTROL|FILL_LIGHT_MOVE_DONE|补光灯已稳定5秒|autoVisionFillLightSettleMs'` | 四类标记均可见，证明 C++ 和 QML 已进入当前二进制。 | 标记缺失说明只改源码或只复制 QML，需重新交叉编译并替换主程序。 |
+| 正常自动检测 | 板端屏幕 + F4 日志 | 首页按开始，让零件完成 ROI 对齐 | 底部依次显示开灯、270 度完成、等待 5 秒、模型检测、关灯、0 度完成、Z 轴回升。 | 查 `/dev/ttySTM2`、F4 是否烧录新固件、cycle/related_seq/action、PB6 波形和日志。 |
+| 5 秒门禁 | 板端日志录像或时间戳 | 记录开灯 `event=0x16` 与模型检测开始时间 | 两者相隔不少于约 5 秒，且只启动一次模型检测。 | 查 `autoVisionFillLightSettleTimer` 是否被旧流程绕过，是否收到重复事件。 |
+| 检测失败关灯 | 暂时制造模型文件缺失或检测命令失败 | 运行一轮并观察失败出口 | 即使显示检测失败，也发送 action=0；关灯完成后才处理 Z 轴。 | 查 `onDetectCurrentFrameFinished` 是否调用统一关灯函数。 |
+| 暂停/停止收口 | 开灯等待 5 秒期间点击暂停或停止 | 观察底部和 F4 日志 | 5 秒 Timer 被取消，不启动模型；F4 在 PAUSE/STOP_CYCLE 前收到 action=0 并完成关灯。 | 查 `autoForcedActuatorStopDone`、关灯重试和 F4 active cycle 是否过早清零。 |
+| 数据路径与落盘 | 开发板 | `day=$(date +%Y%m%d); ls -lh /mnt/sdcard/images/*; tail -n 80 /mnt/sdcard/images/upload_history_${day}.json` | 正常检测仍生成 source/annotated 文件和历史记录，补光状态机不改变图片落盘契约。 | 查 SD 卡挂载、overlay socket、模型程序和检测完成回调。 |
+
+当前 Windows 源码和静态测试完成不等于 MP157 板端已经生效；必须经过虚拟机交叉编译、部署并重启服务。F4 源码完成也不等于已经 Keil 编译或下载，F4 固件和 PB6 波形由用户验证。
+
 ## 2026-07-24 UNet 平衡判定与板端四阈值参数
 
 ### 分割模型输出维度回归修复
@@ -794,7 +865,7 @@ filtered >= 300 且 largest_component >= 120        -> STRONG
 | 只重启 overlay | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart-overlay` | 只重启 `uvc_kms_overlay` 并保持隐藏，Qt 主界面不退出；用于 USB 摄像头拔插后的手动恢复或健康检测自动恢复，画面显示恢复由 QML 在首页时发送 `VISIBLE 1`。 |
 | 板端查看状态 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh status` | 显示 Qt PID、overlay PID、fallback PID、plane、控制 socket 和日志路径。 |
 | overlay 内存定位自检 | `printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock` | overlay 不保存图片、不跑模型，直接返回 `OK LOCATE has_target=0/1 frame_id=... width=640 height=480 center_x=... center_y=... bbox_x=... confidence=...`；用于确认自动视觉坐标来源真实可用。 |
-| 首页自动居中和 Z 轴下探流程 | 开发板屏幕点击首页 `开始` | F4 ACK `START_CYCLE` 后传送带扫描，MP157 每 100ms 请求 `LOCATE`，识别到目标后发送 `VISION_POS`；零件从画面上方进入后，`center_y` 向 `height/2` 靠近；连续 3 帧进入 ±24px 后发送 `BELT_STOP_CENTERED`；ACK 后发送 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN steps=zDownFixedSteps`，下降 ACK 后先显示 `执行器ACK只表示F4已接收命令`，并按步数/速度等待上下轴物理下降完成；随后复查 ROI，必要时用传送带和左右轴短步微调；微调提示中的 `steps` 应随 `errorX/errorY` 超出死区的像素量放大，不再长期固定为 `minStep`；ROI 复查通过后再等待约 3 秒让摄像头对焦稳定，然后自动进入模型检测；检测完成后发送 `ACTUATOR_POS_MOVE actuator=2 direction=UP steps=zUpFixedSteps` 回升。若本轮左右轴动过，Z 回升完成后会显示 `相机回到皮带基准` 并发送反向 `ACTUATOR_POS_MOVE actuator=1`；若左右轴没动过，则不会多发回中动作。左右回中完成后再通知 F4/ESP32S3 抓取零件。目标已经出现后若短暂返回 `has_target=0`，界面显示 `目标短暂丢失/连续丢失但保持停机`，不会再发 `VISION_LOST reason=1` 让 F4 继续扫描。 |
+| 首页自动居中和 Z 轴下探流程 | 开发板屏幕点击首页 `开始` | F4 ACK `START_CYCLE` 后传送带扫描，MP157 每 100ms 请求 `LOCATE`，识别到目标后发送 `VISION_POS`；连续 3 帧进入 ±24px 后发送 `BELT_STOP_CENTERED`；ACK 后发送 Z 轴 DOWN，真实到位后复查 ROI 并按 X/Y 误差微调；ROI 通过后等待约 3 秒对焦，再发送 `FILL_LIGHT_CONTROL action=1`。收到开灯 `event=0x16 angle=270` 后等待 5 秒才检测；检测完成发送 action=0，收到 `angle=0` 关灯完成后才发送 Z 轴 UP。若本轮左右轴动过，Z 回升完成后追加反向回中；左右回中完成后再通知 F4/ESP32S3 抓取零件。目标已经出现后若短暂返回 `has_target=0`，界面保持停机并尝试重捕获。 |
 | 早期静态首帧观察 | 开发板 SSH | `/root/qt_camera_display/fb_boot_splash -f /dev/fb0; echo $?` | 命令返回 `0`，LCD 立即显示由 HTML 渲染资源生成的 AI 竞赛品牌静态首帧，中文标题、白色 Logo 面板、光晕和底部技术铭牌应与 `boot_splash.png` 基本一致；不依赖 Qt、GPU、摄像头或 overlay。 |
 | 开机动画观察 | 开发板重启或执行 `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart` 后观察 LCD | 先看到 `fb_boot_splash` 的 AI 竞赛品牌静态首帧，然后切换为 QML `工业缺陷检测系统`、`STM32MP157 Vision Inspection Terminal`、相机扫描窗口、`加载相机/初始化检测模型/连接运动控制/挂载存储/进入检测界面` 和进度条，随后淡出进入首页并恢复摄像头画面；摄像头画面不应抢在 Qt 启动画面前出现，画面中不出现 Ubuntu 企鹅图标。 |
 | SSH 双模型检测自检 | `ssh -i /home/cfr/.ssh/id_ed25519_github -o IdentitiesOnly=yes root@192.168.1.250 'cd /root/qt_camera_display && ./qt_camera_display --detect-self-test'` | 不启动 QML，直接复用点击 `检测` 的链路：保存 source JPG、运行 MobileNetV3-Small、运行 UNet、上传 source 和全部 annotated 图、追加历史记录；成功输出以 `RESULT ` 开头。 |
@@ -1491,7 +1562,7 @@ ORT_ROOT=/home/cfr/linux/Linux_Drivers/20_uvc_camera/qt_camera_display/onnxrunti
 | 首页按钮检测 | 触摸屏/开发板 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh start` 后点击“检测” | 分类模型完成后右侧面板先显示模型零件名、分类初判、类别和百分制置信度，并显示 `等待综合判定`；UNet 完成后再显示综合判定和双模型总耗时；上传完成后历史页新增一条包含 4 张图片的检测记录。 | 查 `/tmp/uvc-kms-overlay-control.sock`、overlay 是否启动、模型运行库是否缺失；若结果仍等上传后才显示，确认 Qt 二进制包含 `detectClassificationReady`、`detectModelsReady` 和 `fused_status`。 |
 | overlay `LOCATE` 当前帧定位 | 开发板 SSH | `test -S /tmp/uvc-kms-overlay-control.sock && command -v nc >/dev/null && printf 'LOCATE\n' \| nc -U /tmp/uvc-kms-overlay-control.sock` | 有 `nc -U` 时返回 `OK LOCATE has_target=0/1 frame_id=... width=640 height=480 center_x=... center_y=... bbox_w=... confidence=...`；空黑色传送带和固定反光点不应稳定返回 `has_target=1`；放入铝色零件并让它进入传送带中部后，`has_target` 应稳定变为 `1`，`center_y` 随零件从上方进入而增大。当前板端 BusyBox 没有 `nc` applet 时，改看首页自动视觉提示和 `/tmp/uvc-kms-overlay.log` 的持续 `frames=` 计数。 | 若 socket 命令返回 `ERR` 或无回复，先查 `/root/qt_camera_display/run_qt_kms_overlay_display.sh status`、`/tmp/uvc-kms-overlay.log`、`/dev/video0` 是否被占用；若无零件仍误报，保存现场原图后继续收紧 `AUTO_LOCATE_MIN_PART_BBOX_AREA/AUTO_LOCATE_MIN_NON_RING_CONFIDENCE`；若放入零件一直 `has_target=0`，先确认零件在绿色 300x300 ROI 内、光照不把铝件压暗，再看 `confidence/bbox_w/bbox_h` 是否低于门槛。 |
 | 板端二进制功能标记 | 开发板 SSH | `strings /root/qt_camera_display/qt_camera_display \| grep -E 'runF4ActuatorPositionMoveAndWaitDone|estimateActuatorPositionMoveFallbackMs|sendF4ActuatorPositionMoveWithTimeout|zMotionTimeoutMs|fallbackMaxWaitMs|BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE|autoVisionHandleActuatorMoveDone|actuator-move-done|estimated-done|mp157-local-estimated-done|wait_ms=|z-motion-down-wait|z-motion-up-wait|autoVisionLateralReturnOffsetSteps|lateral-return|相机回到皮带基准|sendF4ActuatorStopNow|ACTUATOR_STOP_NOW|ACTUATOR_STOP 抢占|autoStartAfterStopRequested|requestAutoRestartAfterStop|completeAutoStopAndMaybeRestart|旧流程已停止，正在开始下一轮|等待约3秒让摄像头对焦稳定'` | 能看到自动视觉、F4 执行器完成事件、MP157 按帧内速度/步数和参数页超时本地兜底、Z 轴保护等待、左右轴必要回中、对焦等待、强制 STOP、STOP 抢占和四键排队重启 marker，证明 QML/C++ 已重新编进当前板端 Qt 二进制。 | 若 marker 不存在，说明只改了源码或只拷了 QML，未重新交叉编译并替换 `/root/qt_camera_display/qt_camera_display`。 |
-| 首页自动视觉居中和 Z 轴对焦等待 | 开发板屏幕 + F4 串口日志 | 点击首页 `开始`，把零件从画面上方放上传送带进入 ROI | 底部提示先出现 `自动流程ACK`，随后出现 `自动视觉：x=... y=... target=... error=... stable=...`，右侧偏差显示真实 `errorY`；F4 收到 `VISION_POS` 后误差逐步变小；连续居中后 Qt 发送 `BELT_STOP_CENTERED`，传送带停止；随后 Qt 发送 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN`。F4 ACK 后优先返回同一 `related_seq` 的 `EVENT_REPORT actuator-move-done`；若 detail 为 `status=0(reached-ack)` 表示收到张大头主动到位回包，若为 `status=5(estimated-done)` 表示 F4 估算运动完成；若 F4 事件没有及时回来，Qt 会显示 `mp157-local-estimated-done`，并带 `speed_rpm=... steps=... wait_ms=...`，说明 MP157 已按本次命令帧内速度和步数完成兜底并进入 ROI 复查。ROI 不居中时先用传送带和左右轴短步微调，微调提示中的 `steps` 应大于或等于 `minStep`，并随 `errorX/errorY` 超出死区的像素量放大，且提示会显示本次 `direction`；左右轴 `errorX>0` 表示零件在画面右侧，Qt 应发送 `direction=1` 让相机右移、画面左移回中心。ROI 到中心后再显示 `等待约3秒让摄像头对焦稳定`，3 秒后才触发双模型检测；模型检测后 Qt 发送 Z 轴 `direction=UP`，Z 回升完成后若本轮左右轴动过，会显示 `本轮左右轴曾微调，相机回到皮带基准` 并追加反向 `ACTUATOR_POS_MOVE actuator=1`；左右轴没动过时不发这条回中动作。Z 回升和必要的左右回中都完成后，才通知 F4/ESP32S3 机械臂抓取。目标出现后如黑色波形零件漏检，界面应显示 `目标短暂丢失` 或 `连续丢失但保持停机`，F4 不应收到新的 `VISION_LOST reason=1` 扫描命令。 | 若频繁看到 `mp157-local-estimated-done`，说明 MP157 没卡住但 F4 完成事件链仍要查：确认 F4 pending 任务是否还在、USART6/UART4 RX 是否能收到主动回包、估算完成分支是否运行、`related_seq` 是否匹配，再查张大头 Response、共地、电机地址和 F4 日志；若 `steps` 已明显放大但误差仍完全不变，优先查 F4 是否收到 `ACTUATOR_POS_MOVE actuator=0/1`、传送带/左右轴地址是否为 `0x01/0x03`、电机是否使能、方向接线和共地；若底部提示的 `direction` 与现场画面仍越调越远，优先改参数页该轴 `direction` 映射或 F4 运行时方向映射，不能继续盲目加步数；若左右回中后绿色 ROI 仍不能和黑色传送带两边大致对齐，先检查左右轴回中 `steps` 是否等于本轮累计偏移、F4 是否返回完成事件，再做视觉皮带边缘闭环校正。 |
+| 首页自动视觉、补光和 Z 轴收口 | 开发板屏幕 + F4 串口日志 + PB6 示波器 | 点击首页 `开始`，把零件从画面上方放上传送带进入 ROI | 居中后 Qt 发送 Z 轴 DOWN，真实到位后复查和微调 ROI；对焦约 3 秒后发送 `FILL_LIGHT_CONTROL action=1`，F4 回 ACK 和 `event=0x16 angle=270`，PB6 输出约 2 秒 50 Hz PWM后停止；Qt 再等待约 5 秒，只启动一次双模型。模型完成后发送 action=0，收到 `event=0x16 angle=0` 后才回升 Z 轴和执行必要的左右回中，最后通知机械臂。 | 若 5 秒内提前检测，查 `autoVisionFillLightSettleTimer`；若 ACK 后卡住，查 `event=0x16` 的 cycle/related_seq/action/angle；若关灯后不回升，查 `autoVisionContinueAfterFillLightOff()`；若 PB6 无波形，查 F4 新固件、TIM4 时钟、AF2、外部舵机供电和共地。 |
 | 手动左右轴/上下轴停止键 | 开发板屏幕 + F4 串口日志 | 手动控制页打开三轴弹窗，切到 `摄像头左右电机` 或 `摄像头上下电机`，点 `左移/右移` 或 `下降/上升` 后马上点 `停止` | Qt 底部先显示运动命令，再显示 `F4强制停止帧已写入`；如果普通运动线程尚未写帧或仍在等位置完成，后续日志可能出现 `ACTUATOR_STOP 抢占`，表示旧运动命令已被取消；F4 侧应收到 `ACTUATOR_STOP actuator=1/2`，摄像头电机服务日志出现 `Stop applied`，左右轴地址为 `0x03`，上下轴地址为 `0x02`。 | 若 Qt 没有 `ACTUATOR_STOP_NOW` 或 `ACTUATOR_STOP 抢占` marker，说明板端仍是旧二进制；若 F4 没有 `Stop applied`，查 `/dev/ttySTM2`、F4 协议是否烧录、USART6 接线、左右轴地址 `0x03`、上下轴地址 `0x02`；若日志显示 stop 到了但电机不停，查张大头驱动器停止帧 `[03/02 FE 98 00 6B]`、电源和共地。 |
 | 检测结果图生成 | 开发板 SSH | `ls -lh /mnt/sdcard/images/uvc_*.jpg /mnt/sdcard/images/segment_* | tail` | 点击检测后出现 source JPG 和 UNet raw/overlay/mask | 若无文件，查 `SAVE_DETECT` socket 命令、`RESULT_SEG` 输出和 overlay 日志 |
 | ROI 框观察 | 开发板屏幕 | `/root/qt_camera_display/run_qt_kms_overlay_display.sh restart` | 实时视频中心出现绿色 `300x300` ROI 框，零件进入框内后再点“检测”；框线不应肉眼可见闪烁 | 若没有框或仍明显闪烁，确认已部署新的 `/root/qt_camera_display/uvc_kms_overlay` 并查看 `/tmp/uvc-kms-overlay.log` |

@@ -238,6 +238,12 @@ static const quint8 BINARY_PROTOCOL_CMD_VISION_LOST = 0x21U;
 /* 居中停止命令：MP157 判断零件已稳定进入中心 ROI 后要求 F4 停传送带并保持。 */
 static const quint8 BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED = 0x22U;
 
+/* 补光灯控制命令：F4 把 action=1 映射到 270 度开灯，action=0 映射到 0 度关灯。 */
+static const quint8 BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL = 0x23U;
+
+/* 补光灯控制负载长度：cycle_id2 + action1 + flags1，和 F4 固定 4 字节定义保持一致。 */
+static const int BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_SIZE = 4;
+
 /* 二进制心跳命令：MP157 周期确认 F4 在线，成功只看 ACK，不再解析 STATUS 文本。 */
 static const quint8 BINARY_PROTOCOL_CMD_HEARTBEAT = 0x02U;
 
@@ -300,6 +306,15 @@ static const quint8 BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE = 0x14U;
 
 /* 执行器位置运动超时事件：Response 未配置、RX 接线异常、地址错误或堵转时由 F4 发送。 */
 static const quint8 BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT = 0x15U;
+
+/* 补光舵机动作完成事件：F4 输出目标 PWM 2 秒并停止通道后发送。 */
+static const quint8 BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE = 0x16U;
+
+/* 补光舵机事件来源：必须与 F4 的 BINARY_PROTOCOL_FAULT_SOURCE_FILL_LIGHT=7 保持一致。 */
+static const quint8 BINARY_PROTOCOL_EVENT_SOURCE_FILL_LIGHT = 7U;
+
+/* 补光舵机完成事件等待上限，单位毫秒；覆盖 F4 的 2 秒动作和串口调度余量。 */
+static const int F4_FILL_LIGHT_MOVE_DONE_TIMEOUT_MS = 7000;
 
 /* 执行器位置运动完成状态：0 表示 F4 收到张大头 Emm42 主动到位回包 `[addr FD 9F 6B]`。 */
 static const quint16 F4_ACTUATOR_MOVE_STATUS_REACHED_ACK = 0x0000U;
@@ -8579,6 +8594,53 @@ public:
     }
 
     /*
+     * sendF4FillLightControl 的作用：
+     *   让 QML 在模型检测前后请求 F4 控制补光舵机机械打开或关闭补光灯。
+     *
+     * 主要流程：
+     *   1. 要求当前存在运行中或暂停中的非零自动检测 cycle；
+     *   2. 按 `cycle_id:u16, action:u8, flags:u8` 编码固定 4 字节负载；
+     *   3. 启动独立后台线程，先等待匹配 ACK，再严格等待 EVENT_REPORT 0x16；
+     *   4. 通过独立信号返回 action 和 cycle_id，避免与步进执行器状态机混淆。
+     *
+     * 参数：
+     *   turnOn 为 true 时请求舵机到 270 度开灯，为 false 时请求回 0 度关灯。
+     *
+     * 返回值：
+     *   true 表示后台串口任务已启动；false 表示没有活动 cycle、串口忙或线程创建失败。
+     */
+    Q_INVOKABLE bool sendF4FillLightControl(bool turnOn)
+    {
+        const quint16 cycleId = (m_f4AutoRunning || m_f4AutoPaused) ? m_f4AutoCycleId : 0U; /* 绑定当前自动检测件。 */
+        const quint8 action = turnOn ? 1U : 0U; /* action 使用绝对目标语义，1=开灯、0=关灯。 */
+        QByteArray payload;                     /* 保存补光协议固定 4 字节负载。 */
+
+        if (cycleId == 0U) /* 没有活动流程时禁止随意转动补光机构。 */
+        {
+            emit f4FillLightCommandFinished(false,
+                                            action,
+                                            cycleId,
+                                            QStringLiteral("没有活动自动检测 cycle，不能控制补光灯"));
+            return false;
+        }
+
+        appendLe16(&payload, cycleId);                    /* cycle_id：用于 ACK 和完成事件双重匹配。 */
+        payload.append(static_cast<char>(action));        /* action：0 回 0 度关灯，1 到 270 度开灯。 */
+        payload.append(static_cast<char>(0U));            /* flags：首版固定为 0。 */
+
+        if (payload.size() != BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_SIZE) /* 防止未来改字段时负载长度静默漂移。 */
+        {
+            emit f4FillLightCommandFinished(false,
+                                            action,
+                                            cycleId,
+                                            QStringLiteral("补光控制负载长度错误"));
+            return false;
+        }
+
+        return startF4FillLightCommand(action, cycleId, payload); /* 后台严格等待 F4 ACK 和真实完成事件。 */
+    }
+
+    /*
      * sendF4ActuatorVelocityMove 的作用：
      *   让 QML 通过统一二进制协议请求 F4 控制某个执行器持续速度运动。
      *
@@ -9455,6 +9517,9 @@ signals:
     /* f4ActuatorCommandFinished 通知 QML 执行器位置运动或停止命令完成，并带回 ACK/NACK 详情。 */
     void f4ActuatorCommandFinished(bool ok, const QString &action, quint16 cycleId, const QString &detail);
 
+    /* f4FillLightCommandFinished 通知 QML 补光舵机已收到匹配 ACK 和 0x16 完成事件，或返回明确失败。 */
+    void f4FillLightCommandFinished(bool ok, quint8 action, quint16 cycleId, const QString &detail);
+
     /* f4ArmInspectionFlowFinished 通知 QML 已收齐称重和电感上下文，可以启动云端完整上传。 */
     void f4ArmInspectionFlowFinished(bool ok,
                                      const QString &detail,
@@ -9985,6 +10050,37 @@ private slots:
     }
 
     /*
+     * handleF4FillLightCommandFinished 的作用：
+     *   接收补光后台线程的 ACK+完成事件结果，释放串口忙标志并通知 QML 状态机。
+     *
+     * 参数：
+     *   ok 为 true 表示同一 cycle/sequence 的 ACK 和 EVENT_REPORT 0x16 均已匹配；
+     *   action 为 0 表示关灯完成，为 1 表示开灯完成；
+     *   cycleId 是动作所属自动检测轮次；detail 是完整串口诊断文本。
+     *
+     * 返回值：
+     *   无返回值；结果通过 f4FillLightCommandFinished 信号异步发送给 QML。
+     */
+    void handleF4FillLightCommandFinished(bool ok, quint8 action, quint16 cycleId, const QString &detail)
+    {
+        m_f4CommandRunning = false; /* 补光线程已结束，允许后续关灯、Z 回升或其它命令使用串口。 */
+
+        if (ok) /* 只有严格匹配完成事件时才保持 F4 在线并显示动作完成。 */
+        {
+            setF4Status(QStringLiteral("接入"), QStringLiteral("#35d07f"));
+            setDetailText((action == 1U ? QStringLiteral("F4补光灯已打开：")
+                                        : QStringLiteral("F4补光灯已关闭：")) + detail);
+        }
+        else /* ACK/NACK、事件超时或串口错误都保留失败详情，禁止 QML 猜测物理状态。 */
+        {
+            setDetailText((action == 1U ? QStringLiteral("F4补光灯打开失败：")
+                                        : QStringLiteral("F4补光灯关闭失败：")) + detail);
+        }
+
+        emit f4FillLightCommandFinished(ok, action, cycleId, detail); /* 把原始动作和轮次交给 QML 做状态门禁。 */
+    }
+
+    /*
      * handleF4ActuatorStopNowFinished 的作用：
      *   接收手动强制 STOP 写入线程结果，并通知 QML 更新按钮反馈。
      *
@@ -10324,6 +10420,8 @@ private:
             return QStringLiteral("VISION_LOST");
         case BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED:
             return QStringLiteral("BELT_STOP_CENTERED");
+        case BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL:
+            return QStringLiteral("FILL_LIGHT_CONTROL");
         case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:
             return QStringLiteral("WEIGHT_CALIBRATE");
         case BINARY_PROTOCOL_CMD_ARM_JOB_START:
@@ -10412,6 +10510,8 @@ private:
             return QStringLiteral("WEIGHT");
         case 6:
             return QStringLiteral("LDC");
+        case 7:
+            return QStringLiteral("FILL_LIGHT");
         default:
             return QStringLiteral("SOURCE_") + QString::number(source);
         }
@@ -10480,6 +10580,42 @@ private:
     }
 
     /*
+     * describeF4Nack 的作用：
+     *   把固定 9 字节 NACK 负载转换成补光和其它异步命令可共用的诊断文本。
+     *
+     * 参数：
+     *   reply 是已经通过 CRC 校验的 NACK 帧。
+     *
+     * 返回值：
+     *   返回 cycle、被拒绝序号、命令、错误码、状态和 detail；长度错误时返回原始帧摘要。
+     */
+    static QString describeF4Nack(const F4BinaryReply &reply)
+    {
+        if (reply.payload.size() != 9) /* NACK 负载长度不符时不能安全读取后续字段。 */
+        {
+            return QStringLiteral("NACK负载长度错误：")
+                    + QString::number(reply.payload.size())
+                    + QStringLiteral(" raw=")
+                    + hexByteString(reply.rawFrame);
+        }
+
+        const quint16 cycleId = readLe16(reply.payload, 0);                  /* 解析被拒绝命令所属 cycle。 */
+        const quint16 rejectedSequence = readLe16(reply.payload, 2);         /* 解析被拒绝命令序号。 */
+        const quint8 rejectedCommand = static_cast<quint8>(reply.payload.at(4)); /* 解析被拒绝命令码。 */
+        const quint8 errorCode = static_cast<quint8>(reply.payload.at(5));    /* 解析结构化错误码。 */
+        const quint8 state = static_cast<quint8>(reply.payload.at(6));        /* 解析 F4 当前主状态。 */
+        const quint16 nackDetail = readLe16(reply.payload, 7);               /* 解析错误字段附加值。 */
+
+        return QStringLiteral("NACK ")
+                + f4BinaryCommandName(rejectedCommand)
+                + QStringLiteral(" cycle=") + QString::number(cycleId)
+                + QStringLiteral(" seq=") + QString::number(rejectedSequence)
+                + QStringLiteral(" error=") + f4NackErrorName(errorCode)
+                + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                + QStringLiteral(" detail=") + QString::number(nackDetail);
+    }
+
+    /*
      * f4EventCodeName 的作用：
      *   把 F4 EVENT_REPORT 中的事件编号转换成界面、日志和测试脚本都能识别的短名称。
      *
@@ -10496,6 +10632,8 @@ private:
             return QStringLiteral("actuator-move-done");
         case BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT:
             return QStringLiteral("actuator-move-timeout");
+        case BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE:
+            return QStringLiteral("fill-light-move-done");
         default:
             return QStringLiteral("EVENT_") + QString::number(eventCode);
         }
@@ -10556,10 +10694,24 @@ private:
         const quint8 stepCode = static_cast<quint8>(reply.payload.at(4));
         const quint8 source = static_cast<quint8>(reply.payload.at(5));
         const qint32 detailValue = readLe32Signed(reply.payload, 6);
-        const quint32 detailBits = static_cast<quint32>(detailValue);
         const quint16 relatedSequence = readLe16(reply.payload, 10);
         const quint16 faultBits = readLe16(reply.payload, 12);
         const quint16 reserved = readLe16(reply.payload, 14);
+        if (eventCode == BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE) /* 补光事件的 detail 是最终角度，不能按执行器位域拆解。 */
+        {
+            return QStringLiteral("EVENT_REPORT ")
+                    + f4EventCodeName(eventCode)
+                    + QStringLiteral(" cycle=") + QString::number(cycleId)
+                    + QStringLiteral(" state=") + f4ProtocolStateName(state)
+                    + QStringLiteral(" action=") + QString::number(stepCode)
+                    + QStringLiteral(" source=") + f4FaultSourceName(source)
+                    + QStringLiteral(" angle=") + QString::number(detailValue)
+                    + QStringLiteral(" related_seq=") + QString::number(relatedSequence)
+                    + QStringLiteral(" fault=0x") + QString::number(faultBits, 16).toUpper()
+                    + QStringLiteral(" reserved=") + QString::number(reserved);
+        }
+
+        const quint32 detailBits = static_cast<quint32>(detailValue); /* 其它执行器事件仍按既有压缩位域解析。 */
         const quint8 actuator = static_cast<quint8>((detailBits >> 24) & 0xFFU);
         const quint8 direction = static_cast<quint8>((detailBits >> 16) & 0xFFU);
         const quint16 statusCode = static_cast<quint16>(detailBits & 0xFFFFU);
@@ -11280,6 +11432,96 @@ private:
      * 返回值：
      *   true 表示后台任务已启动；false 表示串口忙或线程创建失败。
      */
+    /*
+     * startF4FillLightCommand 的作用：
+     *   为补光灯开关动作创建独立后台线程，避免 2 秒舵机动作和串口等待阻塞 Qt 主线程。
+     *
+     * 参数：
+     *   action 是补光绝对目标动作，0=关灯、1=开灯；
+     *   cycleId 是当前自动检测轮次；payload 是已编码的固定 4 字节负载。
+     *
+     * 返回值：
+     *   true 表示线程已启动；false 表示串口忙、健康探测进行中或线程创建失败。
+     */
+    bool startF4FillLightCommand(quint8 action,
+                                 quint16 cycleId,
+                                 const QByteArray &payload)
+    {
+        if (m_f4CommandRunning) /* 同一 TTY 已被其它正式命令占用时不能并发读写 ACK。 */
+        {
+            emit f4FillLightCommandFinished(false,
+                                            action,
+                                            cycleId,
+                                            QStringLiteral("上一条F4串口命令仍在发送中"));
+            return false;
+        }
+
+        if (m_f4ProbeRunning) /* 健康探测正在收心跳 ACK 时，补光命令必须等待下一次状态机重试。 */
+        {
+            emit f4FillLightCommandFinished(false,
+                                            action,
+                                            cycleId,
+                                            QStringLiteral("F4状态刷新仍在进行，请稍后再控制补光灯"));
+            return false;
+        }
+
+        const quint16 sequence = m_f4BinarySequence++; /* 为开灯或关灯动作分配唯一命令序号。 */
+        const QByteArray frame = buildF4BinaryFrame(BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL, /* 组装 CRC 完整帧。 */
+                                                    sequence,
+                                                    payload);
+        const QString dev = m_f4Device;                            /* 复制串口路径，后台线程不直接访问可变成员。 */
+        const int baud = m_f4Baud;                                 /* 复制波特率，保证本次线程配置一致。 */
+        const QSharedPointer<QMutex> serialWriteMutex = m_f4SerialWriteMutex; /* 复用跨线程串口写互斥。 */
+        m_f4CommandRunning = true;                                 /* 线程启动前占用正式命令通道。 */
+
+        QPointer<DeviceHealthController> self(this); /* 防止对象销毁后后台线程回调悬空对象。 */
+        QThread *workerThread = QThread::create([self,
+                                                  dev,
+                                                  baud,
+                                                  frame,
+                                                  sequence,
+                                                  cycleId,
+                                                  action,
+                                                  serialWriteMutex]() {
+            QString detail; /* 保存 ACK、完成事件或失败原因，回到主线程显示。 */
+            const bool ok = runF4FillLightControlAndWaitDone(dev,
+                                                             baud,
+                                                             frame,
+                                                             sequence,
+                                                             cycleId,
+                                                             action,
+                                                             &detail,
+                                                             serialWriteMutex);
+
+            if (!self) /* Qt 控制器已销毁时不再投递回调。 */
+            {
+                return;
+            }
+
+            QMetaObject::invokeMethod(self.data(),
+                                      "handleF4FillLightCommandFinished",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(bool, ok),
+                                      Q_ARG(quint8, action),
+                                      Q_ARG(quint16, cycleId),
+                                      Q_ARG(QString, detail));
+        });
+
+        if (workerThread == nullptr) /* 系统资源不足导致线程创建失败时立即释放串口忙状态。 */
+        {
+            m_f4CommandRunning = false;
+            emit f4FillLightCommandFinished(false,
+                                            action,
+                                            cycleId,
+                                            QStringLiteral("F4补光控制线程创建失败"));
+            return false;
+        }
+
+        connect(workerThread, &QThread::finished, workerThread, &QObject::deleteLater); /* 线程退出后自动释放 QObject。 */
+        workerThread->start(); /* 启动后台 ACK+完成事件等待。 */
+        return true;
+    }
+
     bool startF4ActuatorCommand(const QString &action,
                                 quint8 command,
                                 quint16 cycleId,
@@ -12736,6 +12978,281 @@ private:
                     + QString::number(expectedSequence)
                     + QStringLiteral(" last=")
                     + lastReadDetail;
+        }
+        ::close(fd);
+        return false;
+    }
+
+    /*
+     * runF4FillLightControlAndWaitDone 的作用：
+     *   在同一串口连接内发送补光控制帧，先等待匹配 ACK，再等待 F4 的真实舵机完成事件。
+     *
+     * 主要流程：
+     *   1. 以 raw 57600 8N1 打开 F4 主链路，并在写互斥内清理旧数据、写完整帧、tcdrain；
+     *   2. 最多等待 2500 ms，严格匹配 cycle_id、sequence 和 FILL_LIGHT_CONTROL 命令码；
+     *   3. ACK 成功后最多等待 7000 ms，只接受相同 cycle/related_seq 的 EVENT_REPORT 0x16；
+     *   4. 再核对 source、action 和最终角度，来源必须是补光服务，开灯必须为 270 度，关灯必须为 0 度。
+     *
+     * 参数：
+     *   device/baud 是 F4 串口配置；frame 是完整补光控制帧；
+     *   expectedSequence/expectedCycleId/expectedAction 是本次严格匹配上下文；
+     *   detail 返回完整 ACK 和事件诊断；serialWriteMutex 保护同一 TTY 写入阶段。
+     *
+     * 返回值：
+     *   只有 ACK 和真实完成事件全部匹配时返回 true；不提供本地估算成功路径。
+     */
+    static bool runF4FillLightControlAndWaitDone(const QString &device,
+                                                 int baud,
+                                                 const QByteArray &frame,
+                                                 quint16 expectedSequence,
+                                                 quint16 expectedCycleId,
+                                                 quint8 expectedAction,
+                                                 QString *detail,
+                                                 const QSharedPointer<QMutex> &serialWriteMutex = QSharedPointer<QMutex>())
+    {
+        const QByteArray devBytes = device.toLocal8Bit(); /* 保存系统 open() 使用的本地编码设备路径。 */
+        const qint32 expectedAngle = (expectedAction == 1U) ? 270 : 0; /* 固化 F4 首版开关动作对应的绝对角度。 */
+        int fd = -1;                     /* 保存本次补光命令独占的串口描述符。 */
+        struct termios tio;              /* 保存 raw 串口参数，避免行规程改写二进制帧。 */
+        QString ackDetail;               /* 保存已经严格匹配的 ACK 摘要。 */
+        QString lastReadDetail;          /* 保存最近一次非目标帧或短读错误，超时时用于诊断。 */
+        bool ackMatched = false;         /* 标记 ACK 阶段是否已经完成。 */
+        QElapsedTimer ackTimer;          /* 限制 ACK 等待不超过 2500 ms。 */
+        QElapsedTimer moveTimer;         /* 限制补光完成事件等待不超过 7000 ms。 */
+
+        if (frame.isEmpty()) /* 空帧说明上层组帧失败，禁止访问串口。 */
+        {
+            if (detail) {
+                *detail = QStringLiteral("FILL_LIGHT_CONTROL帧为空");
+            }
+            return false;
+        }
+
+        fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK); /* 非阻塞打开，读取超时由 select 路径控制。 */
+        if (fd < 0) /* 设备节点不存在、权限不足或串口被内核拒绝时直接失败。 */
+        {
+            if (detail) {
+                *detail = QStringLiteral("无法打开 ") + device;
+            }
+            return false;
+        }
+
+        if (tcgetattr(fd, &tio) != 0) /* 读取当前 termios 失败时不能安全覆盖配置。 */
+        {
+            if (detail) {
+                *detail = QStringLiteral("读取补光控制串口属性失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        cfmakeraw(&tio);                          /* 关闭回显、换行转换和软件流控。 */
+        cfsetispeed(&tio, baudToSpeed(baud));     /* 设置输入波特率。 */
+        cfsetospeed(&tio, baudToSpeed(baud));     /* 设置输出波特率。 */
+        tio.c_cflag |= CLOCAL | CREAD;            /* 忽略调制解调器控制线并启用接收。 */
+#ifdef CRTSCTS
+        tio.c_cflag &= ~CRTSCTS;                  /* 当前三线串口没有 RTS/CTS，必须关闭硬件流控。 */
+#endif
+        tio.c_cc[VMIN] = 0;                       /* read() 不要求固定最小字节数。 */
+        tio.c_cc[VTIME] = 0;                      /* 读取等待统一交给 readF4BinaryReply()。 */
+
+        if (tcsetattr(fd, TCSANOW, &tio) != 0) /* 写入 raw 8N1 配置失败时关闭描述符。 */
+        {
+            if (detail) {
+                *detail = QStringLiteral("配置补光控制串口失败");
+            }
+            ::close(fd);
+            return false;
+        }
+
+        {
+            QMutexLocker writeLocker(serialWriteMutex.data()); /* 只在 flush/write/drain 阶段占用跨线程写锁。 */
+
+            tcflush(fd, TCIOFLUSH); /* 清理本连接建立前残留的旧帧，降低误匹配概率。 */
+            if (!writeAllToFd(fd, frame)) /* 处理短写并确保完整帧进入内核发送队列。 */
+            {
+                if (detail) {
+                    *detail = QStringLiteral("写入 FILL_LIGHT_CONTROL 失败：") + hexByteString(frame);
+                }
+                ::close(fd);
+                return false;
+            }
+
+            if (tcdrain(fd) != 0) /* 必须等内核输出队列排空后才进入 ACK 阶段。 */
+            {
+                if (detail) {
+                    *detail = QStringLiteral("等待 FILL_LIGHT_CONTROL 发送完成失败");
+                }
+                ::close(fd);
+                return false;
+            }
+        }
+
+        ackTimer.start(); /* 从帧发送完成后开始计算 ACK 窗口。 */
+        while (ackTimer.elapsed() < 2500) /* 遍历串口回复，跳过回显和其它无关帧。 */
+        {
+            F4BinaryReply reply;   /* 保存一帧 CRC 已验证的 F4 回复。 */
+            QString readErrorText; /* 保存本轮读超时或解析失败原因。 */
+
+            if (!readF4BinaryReply(fd, &reply, &readErrorText)) /* 短读失败不立刻终止，允许在总窗口内继续等待。 */
+            {
+                lastReadDetail = readErrorText;
+                continue;
+            }
+
+            if (reply.command == BINARY_PROTOCOL_CMD_ACK) /* ACK 还必须严格核对负载字段。 */
+            {
+                if (reply.payload.size() != 7) /* ACK 固定负载长度错误说明协议版本不一致。 */
+                {
+                    lastReadDetail = QStringLiteral("ACK负载长度错误：") + QString::number(reply.payload.size());
+                    continue;
+                }
+
+                const quint16 cycleId = readLe16(reply.payload, 0);                       /* 解析 ACK 所属 cycle。 */
+                const quint16 ackedSequence = readLe16(reply.payload, 2);                 /* 解析被确认命令序号。 */
+                const quint8 ackedCommand = static_cast<quint8>(reply.payload.at(4));      /* 解析被确认命令码。 */
+                const quint8 status = static_cast<quint8>(reply.payload.at(5));            /* 解析接受状态。 */
+                const quint8 state = static_cast<quint8>(reply.payload.at(6));             /* 解析 F4 当前流程状态。 */
+
+                if (cycleId != expectedCycleId ||
+                    ackedSequence != expectedSequence ||
+                    ackedCommand != BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL) /* 三个键必须全部匹配本次补光命令。 */
+                {
+                    lastReadDetail = QStringLiteral("跳过非本次补光ACK：cycle=") + QString::number(cycleId)
+                            + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                            + QStringLiteral(" cmd=") + f4BinaryCommandName(ackedCommand);
+                    continue;
+                }
+
+                ackDetail = QStringLiteral("ACK FILL_LIGHT_CONTROL cycle=") + QString::number(cycleId)
+                        + QStringLiteral(" seq=") + QString::number(ackedSequence)
+                        + QStringLiteral(" status=") + QString::number(status)
+                        + QStringLiteral(" state=") + f4ProtocolStateName(state);
+                if (status != 0U) /* 非零 ACK status 不代表动作被正常接收。 */
+                {
+                    if (detail) {
+                        *detail = QStringLiteral("ACK未确认补光动作：") + ackDetail;
+                    }
+                    ::close(fd);
+                    return false;
+                }
+
+                ackMatched = true; /* 匹配 ACK 后才能进入完成事件阶段。 */
+                break;
+            }
+
+            if (reply.command == BINARY_PROTOCOL_CMD_NACK) /* NACK 只有匹配本次命令才终止等待。 */
+            {
+                if (reply.payload.size() != 9) /* 非标准 NACK 不能作为本次拒绝依据。 */
+                {
+                    lastReadDetail = QStringLiteral("NACK负载长度错误：") + QString::number(reply.payload.size());
+                    continue;
+                }
+
+                const quint16 cycleId = readLe16(reply.payload, 0);                  /* 解析被拒绝命令的 cycle。 */
+                const quint16 rejectedSequence = readLe16(reply.payload, 2);         /* 解析被拒绝序号。 */
+                const quint8 rejectedCommand = static_cast<quint8>(reply.payload.at(4)); /* 解析被拒绝命令码。 */
+                if (cycleId != expectedCycleId ||
+                    rejectedSequence != expectedSequence ||
+                    rejectedCommand != BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL) /* 旧 NACK 不得取消当前动作。 */
+                {
+                    lastReadDetail = QStringLiteral("跳过非本次补光NACK：") + describeF4Nack(reply);
+                    continue;
+                }
+
+                if (detail) {
+                    *detail = describeF4Nack(reply); /* 匹配 NACK 直接把结构化错误交给 QML。 */
+                }
+                ::close(fd);
+                return false;
+            }
+
+            lastReadDetail = QStringLiteral("等待补光ACK时收到：")
+                    + ((reply.command == BINARY_PROTOCOL_CMD_EVENT_REPORT)
+                       ? describeF4EventReport(reply)
+                       : f4BinaryCommandName(reply.command));
+        }
+
+        if (!ackMatched) /* 总 ACK 窗口结束仍未匹配时明确失败。 */
+        {
+            if (detail) {
+                *detail = QStringLiteral("FILL_LIGHT_CONTROL未收到匹配ACK seq=")
+                        + QString::number(expectedSequence)
+                        + QStringLiteral(" last=") + lastReadDetail;
+            }
+            ::close(fd);
+            return false;
+        }
+
+        moveTimer.start();      /* ACK 后才开始等待 F4 真实 2 秒动作完成。 */
+        lastReadDetail.clear(); /* 清除 ACK 阶段无关帧，只保留完成阶段最新诊断。 */
+        while (moveTimer.elapsed() < F4_FILL_LIGHT_MOVE_DONE_TIMEOUT_MS) /* 不使用本地角度/时间估算成功。 */
+        {
+            F4BinaryReply reply;   /* 保存完成阶段收到的一帧 F4 回复。 */
+            QString readErrorText; /* 保存本轮短读失败文本。 */
+
+            if (!readF4BinaryReply(fd, &reply, &readErrorText)) /* 单次读取失败时继续等到总超时。 */
+            {
+                lastReadDetail = readErrorText;
+                continue;
+            }
+
+            if (reply.command != BINARY_PROTOCOL_CMD_EVENT_REPORT) /* ACK 后其它状态帧不代表舵机完成。 */
+            {
+                lastReadDetail = QStringLiteral("等待补光完成时收到：") + f4BinaryCommandName(reply.command);
+                continue;
+            }
+
+            if (reply.payload.size() != 16) /* EVENT_REPORT 固定 16 字节，长度不符时跳过。 */
+            {
+                lastReadDetail = describeF4EventReport(reply);
+                continue;
+            }
+
+            const quint16 cycleId = readLe16(reply.payload, 0);                  /* 解析完成事件所属 cycle。 */
+            const quint8 eventCode = static_cast<quint8>(reply.payload.at(2));   /* 解析事件编号。 */
+            const quint8 action = static_cast<quint8>(reply.payload.at(4));      /* step_code 对补光事件承载 action。 */
+            const quint8 source = static_cast<quint8>(reply.payload.at(5));      /* source 必须标识 PB6/TIM4_CH1 补光服务。 */
+            const qint32 angle = readLe32Signed(reply.payload, 6);               /* detail_i32 对补光事件承载最终角度。 */
+            const quint16 relatedSequence = readLe16(reply.payload, 10);         /* 解析触发该动作的原命令序号。 */
+            const QString eventDetail = describeF4EventReport(reply);            /* 生成可显示的完整事件摘要。 */
+
+            if (cycleId != expectedCycleId || relatedSequence != expectedSequence) /* 旧 cycle 或旧序号事件不能推进当前流程。 */
+            {
+                lastReadDetail = QStringLiteral("跳过非本次补光事件：") + eventDetail;
+                continue;
+            }
+
+            if (eventCode != BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE) /* 同一命令期间的其它事件也不能代表补光完成。 */
+            {
+                lastReadDetail = QStringLiteral("等待补光完成时收到其它事件：") + eventDetail;
+                continue;
+            }
+
+            if (source != BINARY_PROTOCOL_EVENT_SOURCE_FILL_LIGHT || /* 其它服务不能伪装成补光动作完成。 */
+                action != expectedAction ||                           /* action 必须和本次开灯或关灯请求一致。 */
+                angle != expectedAngle)                               /* 最终绝对角度必须符合首版机械开关契约。 */
+            {
+                if (detail) {
+                    *detail = ackDetail + QStringLiteral("；补光完成字段不匹配：") + eventDetail;
+                }
+                ::close(fd);
+                return false;
+            }
+
+            if (detail) {
+                *detail = ackDetail + QStringLiteral("；") + eventDetail; /* 返回 ACK 和真实完成双重证据。 */
+            }
+            ::close(fd);
+            return true; /* 只有全部匹配后，QML 才能开始 5 秒等待或继续 Z 回升。 */
+        }
+
+        if (detail) /* 总等待窗口结束仍无匹配完成事件时明确失败。 */
+        {
+            *detail = ackDetail
+                    + QStringLiteral("；等待 fill-light-move-done 超时 seq=")
+                    + QString::number(expectedSequence)
+                    + QStringLiteral(" last=") + lastReadDetail;
         }
         ::close(fd);
         return false;

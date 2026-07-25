@@ -132,6 +132,7 @@ SOF0 SOF1 VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H EOF
 | `0x20` | `VISION_POS` | MP157 -> F4 | 是 | 发送零件视觉坐标，F4 根据坐标控制传送带纠偏，成功返回 `ACK`。 |
 | `0x21` | `VISION_LOST` | MP157 -> F4 | 是 | 视觉目标丢失或置信度不足，F4 回扫描或停机后返回 `ACK`。 |
 | `0x22` | `BELT_STOP_CENTERED` | MP157 -> F4 | 是 | MP157 判断零件已进入中心 ROI，要求 F4 停传送带。 |
+| `0x23` | `FILL_LIGHT_CONTROL` | MP157 -> F4 | 是 | 控制 PB6/TIM4_CH1 的 270 度舵机机械开灯或关灯；ACK 只代表入队，真实完成必须等 `EVENT_REPORT event=0x16`。 |
 | `0x30` | `WEIGHT_CALIBRATE` | MP157 -> F4 | 是 | 参数页称重标定命令，负载写入已知砝码克重。 |
 | `0x31` | `ARM_JOB_START` | MP157 -> F4 | 是 | 要求 F4 通过 ESP32 机械臂执行称重、电感检测和分拣动作组。 |
 | `0x32` | `MODEL_READY` | MP157 -> F4 | 是 | MP157 模型检测完成且图片已落 SD 卡后，把结果暂存在 F4/流程上下文里。 |
@@ -157,7 +158,8 @@ SOF0 SOF1 VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H EOF
 | 规则 | 说明 |
 |---|---|
 | 当前调试阶段不使用弱 ACK | 为了现场排查“命令成功但电机不动”，已实现的 MP157->F4 控制命令成功都必须有二进制回包。 |
-| 关键命令必须 ACK | `HEARTBEAT`、`START_CYCLE`、`PAUSE_CYCLE`、`RESUME_CYCLE`、`STOP_CYCLE`、`VISION_POS`、`VISION_LOST`、`BELT_STOP_CENTERED`、`WEIGHT_CALIBRATE`、`ARM_JOB_START`、`MODEL_READY`、`FINAL_SORT_RESULT`、`STEPPER_PARAM_SET`、`ACTUATOR_POS_MOVE`、`ACTUATOR_STOP`、`ACTUATOR_VEL_MOVE`、`ACTUATOR_HOME` 必须等 ACK 或 NACK。 |
+| 关键命令必须 ACK | `HEARTBEAT`、`START_CYCLE`、`PAUSE_CYCLE`、`RESUME_CYCLE`、`STOP_CYCLE`、`VISION_POS`、`VISION_LOST`、`BELT_STOP_CENTERED`、`FILL_LIGHT_CONTROL`、`WEIGHT_CALIBRATE`、`ARM_JOB_START`、`MODEL_READY`、`FINAL_SORT_RESULT`、`STEPPER_PARAM_SET`、`ACTUATOR_POS_MOVE`、`ACTUATOR_STOP`、`ACTUATOR_VEL_MOVE`、`ACTUATOR_HOME` 必须等 ACK 或 NACK。 |
+| 补光 ACK 不是动作完成 | `FILL_LIGHT_CONTROL` 的 `ACK status=0` 只表示命令进入补光任务队列。F4 必须在输出目标 PWM 2000 ms、停止 TIM4_CH1 并清零 CCR1 后发送 `EVENT_REPORT event=0x16`；MP157 收到匹配事件后才开始 5000 ms 补光稳定计时。 |
 | 执行器 ACK 不是到位完成 | `ACTUATOR_POS_MOVE` 的 `ACK status=0` 只表示 F4 已接收并投递运动命令，不表示传送带、左右轴或上下轴已经走完；F4 必须在张大头 Emm42 返回 `[addr FD 9F 6B]` 后发送 `EVENT_REPORT event=0x14 ACTUATOR_MOVE_DONE`，或在等待超时/串口异常时发送 `event=0x15 ACTUATOR_MOVE_TIMEOUT`。MP157 自动流程只能用该事件推进 Z 轴下降复查、Z 轴回升机械臂抓取等后续步骤。 |
 | 结果帧必须 ACK | `WEIGHT_RESULT`、`LDC_RESULT`、`CYCLE_DONE` 和 `FAULT_REPORT` 必须由 MP157 ACK，避免结果丢失。 |
 
@@ -168,7 +170,7 @@ SOF0 SOF1 VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H EOF
 | 场景 | F4 返回帧 | 负载长度 | MP157 处理规则 |
 |---|---|---:|---|
 | `HELLO/HEARTBEAT` 成功 | `ACK 0x80` | 7 | `acked_seq` 和 `acked_cmd` 匹配，`status=0`，F4 显示接入。 |
-| `START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/BELT_MANUAL_CONTROL/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 成功 | `ACK 0x80` | 7 | `cycle_id`、`acked_seq`、`acked_cmd` 匹配，`status=0`，Qt 才推进本地自动流程、手动页或参数页状态；其中 `ACTUATOR_POS_MOVE` 的 ACK 只能理解为“命令已被 F4 接收/投递”，不是“电机已到位”。MP157 必须继续等待同一 `cycle_id` 且 `related_seq=acked_seq` 的 `EVENT_REPORT event=0x14`；F4 不允许把 `actuator` 填进 ACK `status`，否则左右轴会显示 `status=1`、上下轴会显示 `status=2` 并被 Qt 判定失败。 |
+| `START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/FILL_LIGHT_CONTROL/BELT_MANUAL_CONTROL/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 成功 | `ACK 0x80` | 7 | `cycle_id`、`acked_seq`、`acked_cmd` 匹配且 `status=0`；`ACTUATOR_POS_MOVE` 还要等 `event=0x14`，`FILL_LIGHT_CONTROL` 还要等 `event=0x16`，两者都不能把 ACK 当成物理完成。 |
 | `QUERY_STATUS` 成功 | `STATUS_REPORT 0x82` | 24 | `cycle_id`、`replied_seq`、`replied_cmd=QUERY_STATUS` 匹配，Qt 显示 F4 状态、传送带模式、速度、误差和故障位。 |
 | 命令不支持、CRC 错、长度错、字段越界、状态不允许、cycle 不匹配、硬件队列未就绪 | `NACK 0x81` | 9 | Qt 显示 `error_code/state/detail`，不再查找文本中的 `ERROR`。 |
 | LDC 未接、称重异常、传送带不可用、摄像头电机异常、机械臂链路异常等模块故障 | `FAULT_REPORT 0x87` | 16 | Qt 解析 `fault_source/severity/fault_code/detail_i32/fault_bits`，作为故障提示和云端 `sensor_context` 来源。 |
@@ -404,6 +406,28 @@ F4 接收后必须停传送带，并上报：
 | `ACK` | 表示停止命令已接受。 |
 | `EVENT_REPORT event=TARGET_CENTERED` | 表示目标已居中。 |
 | `EVENT_REPORT event=BELT_STOPPED` | 表示传送带已下发停止命令。 |
+
+### 9.9.1 FILL_LIGHT_CONTROL `0x23`
+
+固定负载长度为 4 字节：
+
+| 偏移 | 字段 | 类型 | 合法值 | 说明 |
+|---:|---|---|---|---|
+| 0 | `cycle_id` | `u16` | 当前活动流程 | 小端序；必须与 F4 `active_cycle_id` 匹配。 |
+| 2 | `action` | `u8` | `0/1` | `0=绝对0度关灯`，`1=绝对270度开灯`。 |
+| 3 | `flags` | `u8` | `0` | 首版保留字段，非零返回字段越界 NACK。 |
+
+动作时序：
+
+| 步骤 | MP157 | F4 |
+|---:|---|---|
+| 1 | ROI 对齐和约 3 秒对焦结束后发送 action=1。 | 校验负载、cycle 和队列，成功入队立即回 ACK。 |
+| 2 | ACK 后继续等待相同 `cycle_id`、`related_seq` 的 `event=0x16`。 | PB6/TIM4_CH1 输出 50 Hz、默认 2500 us 高脉宽 2000 ms，让舵机到 270 度，然后停止 PWM。 |
+| 3 | 收到 action=1、angle=270 的完成事件后启动非阻塞 5000 ms 定时器；到期只启动一次模型检测。 | 上报 `EVENT_REPORT event=0x16 step_code=1 source=7 detail_i32=270`。 |
+| 4 | 模型检测成功或失败都发送 action=0，且在关灯完成前不回升 Z 轴、不启动机械臂。 | 输出默认 500 us 高脉宽 2000 ms，让舵机回 0 度，然后停止 PWM。 |
+| 5 | 收到 action=0、angle=0 的匹配事件后才进入原 Z 轴回升流程。 | 上报 `EVENT_REPORT event=0x16 step_code=0 source=7 detail_i32=0`。 |
+
+舵机角度使用可标定公式 `pulse_us = min_us + angle_deg * (max_us - min_us) / 270`，默认 `min_us=500`、`max_us=2500`。协议首版只传开关动作，实际开关角度通过 F4 的 `FILL_LIGHT_SERVO_OFF_ANGLE_DEG` 和 `FILL_LIGHT_SERVO_ON_ANGLE_DEG` 修改。
 
 ### 9.10 STEPPER_PARAM_SET `0x42`
 
@@ -662,7 +686,7 @@ F4 接收后的动作：
 | `event_code` | `u8` | 事件编号，见下表。 |
 | `state` | `u8` | 事件发生后的 F4 主状态。 |
 | `step_code` | `u8` | 当前自动流程步骤编号；执行器运动完成事件当前填 `0`。 |
-| `source` | `u8` | 事件来源，复用故障来源编号：`1=UART`，`2=CONVEYOR`，`3=CAMERA_MOTOR`，`4=ARM`，`5=WEIGHT`，`6=LDC`。 |
+| `source` | `u8` | 事件来源，复用故障来源编号：`1=UART`，`2=CONVEYOR`，`3=CAMERA_MOTOR`，`4=ARM`，`5=WEIGHT`，`6=LDC`，`7=FILL_LIGHT`。 |
 | `detail_i32` | `i32` | 事件细节。执行器运动事件按 `bit31..24 actuator`、`bit23..16 direction`、`bit15..0 status_code` 打包。 |
 | `related_seq` | `u16` | 触发该事件的命令序号，没有则填 `0`。 |
 | `fault_bits` | `u16` | F4 当前故障位图。 |
@@ -677,6 +701,7 @@ F4 接收后的动作：
 | `0x13` | `EVENT_BELT_STOPPED` | 传送带已停止。 |
 | `0x14` | `EVENT_ACTUATOR_MOVE_DONE` | 执行器位置运动真实到位；F4 必须已收到目标 Emm42 `[addr FD 9F 6B]`。 |
 | `0x15` | `EVENT_ACTUATOR_MOVE_TIMEOUT` | 执行器位置运动等待到位失败；常见原因是 Response 未设为 `Reached/Both`、RX 接线异常、地址错误或堵转。 |
+| `0x16` | `EVENT_FILL_LIGHT_MOVE_DONE` | 补光舵机已到目标绝对角度并停止 PWM；`step_code=action`，`detail_i32=0/270`，`related_seq` 对应原 `0x23` 命令。 |
 | `0x20` | `EVENT_ARM_PICK_DONE` | 机械臂已取到零件。 |
 | `0x21` | `EVENT_ARM_WEIGHT_PLACED` | 机械臂已把零件放到称重模块。 |
 | `0x22` | `EVENT_ARM_LDC_PLACED` | 机械臂已把零件放到电感模块。 |
@@ -802,7 +827,7 @@ F4 接收后的动作：
 | 3 | MP157 发现零件，周期发送坐标。 | F4 根据坐标控制传送带调速。 | `VISION_POS` |
 | 4 | MP157 发现零件进入中心 ROI，发送居中停机。 | F4 停止传送带并保持。 | `BELT_STOP_CENTERED` -> `EVENT_TARGET_CENTERED` |
 | 5 | MP157 下发摄像头上下轴下降固定步数；下降 ACK 后不直接推进，必须等同一 `related_seq` 的 `EVENT_REPORT event=0x14`；DONE 后重新读取 ROI，若 `errorY` 偏离中心，用传送带短步前后微调；若 `errorX` 偏离中心，用摄像头左右轴短步微调；X/Y 都进入 ROI 中央后，再等待约 `3s` 稳定对焦。 | F4 用 Emm42 位置模式移动 `addr=0x02` 上下轴、`addr=0x03` 左右轴和 `addr=0x01` 传送带，每条位置命令先返回 ACK，真实到位后再返回 `EVENT_REPORT event=0x14`。 | `ACTUATOR_POS_MOVE` -> `ACK` -> `EVENT_REPORT 0x14` |
-| 6 | 对焦稳定后，MP157 运行模型检测，把 source/annotated 图片和模型结果先写入 SD 卡本地历史；检测完成后自动下发上下轴回升固定步数。 | F4 保持传送带静止，执行 Z 轴回升位置命令，等待模型结果或机械臂任务。 | `ACTUATOR_POS_MOVE` -> `ACK` -> `EVENT_REPORT 0x14` |
+| 6 | 对焦稳定后，MP157 下发 `FILL_LIGHT_CONTROL action=1`；收到 ACK 和严格匹配的 `EVENT_REPORT event=0x16` 后等待 5000 ms，再运行模型检测并写本地历史；检测成功或失败都下发 action=0，收到关灯完成事件后才自动回升 Z 轴。 | F4 用 PB6/TIM4_CH1 输出 50 Hz PWM 2 秒，把舵机依次转到 270 度开灯或 0 度关灯，每次停止 PWM 后上报真实完成事件。 | `0x23` -> `ACK` -> `EVENT_REPORT 0x16` -> 5s -> 检测 -> `0x23` -> `ACK` -> `EVENT_REPORT 0x16` |
 | 7 | Z 轴回升 `EVENT_REPORT event=0x14` 后，MP157 先下发 `MODEL_READY` 缓存模型结果，再下发机械臂检测任务。 | F4 缓存模型结果，然后通过 ESP32 控制机械臂取件。 | `MODEL_READY` -> `ARM_JOB_START` |
 | 8 | MP157 等待重量。 | F4 收到 ESP32 “已放到称重模块”后自动读取 HX711。 | `EVENT_ARM_WEIGHT_PLACED` -> `WEIGHT_RESULT` |
 | 9 | MP157 等待电感。 | F4 收到 ESP32 “已放到电感模块”后自动读取 LDC1614。 | `EVENT_ARM_LDC_PLACED` -> `LDC_RESULT` |
@@ -1034,6 +1059,7 @@ MP157 收到 F4 的二进制结果后，再组装云端 JSON。F4 不直接拼 J
 | 验证当前位置设零 | Qt 参数设置页步进电机弹窗 | 切到任一电机页，点击 `设当前位置为零点`。 | MP157 发送 `ACTUATOR_HOME actuator=<当前页>`，F4 返回 `ACK status=0`，对应电机不运动但当前位置被设为零点。 | 查 `emm42_motor.c` 是否发送 `[addr 0A 6D 6B]`，并确认不是 `ACTUATOR_STOP actuator=0xFF` 或运动回零流程。 |
 | 验证模拟急停 | Qt 手动页点击模拟急停 | MP157 发送 `ACTUATOR_STOP actuator=0xFF`。 | 传送带、左右轴、上下轴都收到停止动作，F4 返回 ACK 或明确 NACK。 | 查 `ACT_ALL` 分支、各服务停止函数和故障位。 |
 | 验证 Z 轴下探/回升 | Qt 首页自动流程或参数页调小步数后实测 | 居中 ACK 后观察 `ACTUATOR_POS_MOVE actuator=2 direction=DOWN`，下降 ACK 后继续等 `EVENT_REPORT actuator-move-done`；模型检测完成后观察 `direction=UP`，回升 ACK 后继续等 `EVENT_REPORT actuator-move-done`。 | 上下轴先下降固定步数，F4 到位事件后才 ROI 复查，ROI 到中心后才对焦稳定和模型检测；检测完成后回升固定步数，F4 到位事件后才通知机械臂。 | 查 `zDownFixedSteps/zUpFixedSteps` 是否为 0、方向是否反、上下轴地址是否为 `0x02`，再查张大头 Response、USART6 RX、QML `autoVisionHandleActuatorMoveDone` 和 C++ `runF4ActuatorPositionMoveAndWaitDone`。 |
+| 验证补光开关与 5 秒门禁 | Qt 首页、F4 USART1 日志、PB6 示波器 | 启动一轮自动检测，ROI 对齐并完成对焦后观察 `FILL_LIGHT_CONTROL action=1`；模型完成后观察 action=0。 | 开灯 ACK 后还要收到 `event=0x16 action=1 angle=270`，随后整整等待约 5 秒才启动模型；检测成功或失败都发送关灯，收到 `event=0x16 action=0 angle=0` 后才回升 Z 轴。PB6 每次输出约 2 秒的 50 Hz 波形后停止。 | 查 MP157 `related_seq/cycle_id/action` 匹配、QML `autoVisionFillLightSettleTimer`、F4 补光任务、PB6 AF2、TIM4 时钟、舵机外部供电与共地；若停止先于关灯，检查 STOP_CYCLE 是否过早清除了 active cycle。 |
 | 验证摄像头左右微调极限 | MP157 视觉闭环 | 在 ROI 附近让 F4 点动摄像头左右轴，再观察连续 X 坐标。 | X 坐标改善时继续小步；连续无改善后停止该方向微调。 | 查点动方向、相机坐标轴定义、机械行程和电机地址。 |
 | 验证居中停止 | MP157 | 发送 `BELT_STOP_CENTERED hold_ms=2000`。 | F4 停传送带并上报 `EVENT_TARGET_CENTERED`。 | 查 ACK、F4 状态和 Emm42 停止命令。 |
 | 验证称重结果 | F4 自动流程 | ESP32 放到称重模块后，F4 上报 `WEIGHT_RESULT`。 | MP157 得到 `net_weight_mg` 和 `stable=1`。 | 查 HX711 接线、去皮、稳定窗口和采样超时。 |

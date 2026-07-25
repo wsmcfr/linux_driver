@@ -625,8 +625,8 @@ fi
 if grep -Eq 'manualBeltSpeed|belt-forward|belt-reverse|belt-speed|正向点动|反向点动|速度档位|夹爪开|夹爪关|manualArmPanel|manualArmButtonGrid|arm-home|arm-standby|arm-pick|arm-good|arm-bad|actuator-on|actuator-off|待F4协议|等待CAM协议|"name": "双轴"' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "手动控制页必须使用新的三轴二进制协议弹窗，不能恢复旧速度档、机械臂、夹爪或待接入假按钮"
 fi
-if grep -Eq "背光|补光|亮度|manualLight|manualTopLight|backlight|toplight|light-low|light-mid|light-high" "$SCRIPT_DIR/qml/Main.qml"; then
-    fail "qml/Main.qml 当前不需要背光/补光/亮度配置，界面和状态栏必须完全删除相关展示"
+if grep -Eq "manualLight|manualTopLight|manualFillLight|backlight-toggle|toplight|light-low|light-mid|light-high" "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "qml/Main.qml 不能恢复手动补光或亮度配置；补光只允许由自动检测状态机控制"
 fi
 require_grep "settingsPageVisible" "qml/Main.qml"
 require_grep "alarmPageVisible" "qml/Main.qml"
@@ -946,8 +946,8 @@ if grep -Eq '摄像头前后轴|前进/后退轴|前进/后退电机|forward_add
     "$REPO_ROOT/docs/stm32mp157-f407-auto-detect-debug-roadmap.md"; then
     fail "核心联调文档必须使用摄像头左右轴语义；旧前后轴或 forward_addr 只能留在 F4 兼容接口文档里"
 fi
-if grep -Eq '背光|补光|光源' "$SCRIPT_DIR/README.md"; then
-    fail "README 当前也不能继续保留背光、补光或光源文案，避免文档和界面再次漂移"
+if grep -Eq 'manualLight|manualTopLight|manualFillLight|backlight-toggle|toplight' "$SCRIPT_DIR/README.md"; then
+    fail "README 不能重新声明已经删除的手动补光 UI"
 fi
 if grep -Eq '平垫圈A|异形垫片B|冲压片C|旧演示|垫片B' "$SCRIPT_DIR/qml/Main.qml"; then
     fail "参数设置页不能继续显示旧演示零件名，必须只在波形垫圈、平垫圈、弹性垫圈之间切换"
@@ -1006,8 +1006,8 @@ require_grep "ALM-NET-001" "qml/Main.qml"
 require_grep "ALM-CLOUD-001" "qml/Main.qml"
 require_grep "ALM-F4-001" "qml/Main.qml"
 require_grep "保存诊断" "qml/Main.qml"
-if grep -Eq "吸盘|背光|补光|亮度|backlight-toggle|manualBacklightEnabled" "$SCRIPT_DIR/qml/Main.qml"; then
-    fail "qml/Main.qml 手动控制页显示必须符合硬件事实：不显示吸盘、夹爪、背光、补光或亮度配置"
+if grep -Eq "吸盘|backlight-toggle|manualBacklightEnabled|manualFillLight" "$SCRIPT_DIR/qml/Main.qml"; then
+    fail "qml/Main.qml 手动控制页显示必须符合硬件事实：不显示吸盘、夹爪或手动补光配置"
 fi
 require_grep "上下滑动查看更多" "qml/Main.qml"
 require_grep "uploadHistory" "qml/Main.qml"
@@ -1094,6 +1094,70 @@ require_grep "BINARY_PROTOCOL_CMD_EVENT_REPORT" "main.cpp"
 require_grep "BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE" "main.cpp"
 require_grep "BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT" "main.cpp"
 require_grep "runF4ActuatorPositionMoveAndWaitDone" "main.cpp"
+require_grep "BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL" "main.cpp"
+require_grep "BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_SIZE" "main.cpp"
+require_grep "BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE" "main.cpp"
+require_grep "BINARY_PROTOCOL_EVENT_SOURCE_FILL_LIGHT = 7U" "main.cpp"
+require_grep "sendF4FillLightControl" "main.cpp"
+require_grep "runF4FillLightControlAndWaitDone" "main.cpp"
+require_grep "f4FillLightCommandFinished" "main.cpp"
+fill_light_wait_block="$(sed -n '/static bool runF4FillLightControlAndWaitDone/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'ackedCommand != BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL'; then
+    fail "补光命令必须等待 cycle_id、sequence 和命令码都匹配的 ACK，不能发完即开始 5 秒计时"
+fi
+if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'eventCode != BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE'; then
+    fail "补光命令收到 ACK 后仍必须等待 EVENT_REPORT 0x16，不能使用执行器本地估算完成"
+fi
+if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'relatedSequence != expectedSequence'; then
+    fail "补光完成事件必须匹配原始 related_seq，防止旧开灯或关灯事件推进当前流程"
+fi
+if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'source != BINARY_PROTOCOL_EVENT_SOURCE_FILL_LIGHT'; then
+    fail "补光完成事件必须匹配 source=7，不能让其它服务的 EVENT_REPORT 推进补光状态机"
+fi
+if printf '%s\n' "$fill_light_wait_block" | grep -q 'estimated-done\|fallbackMoveMs'; then
+    fail "补光灯动作禁止复用执行器 estimated-done，本地不能猜测灯已经打开或关闭"
+fi
+require_grep "property int autoVisionFillLightSettleMs: 5000" "qml/Main.qml"
+require_grep "property string autoVisionFillLightPhase" "qml/Main.qml"
+require_grep "property bool autoVisionFillLightOn" "qml/Main.qml"
+require_grep "property bool autoVisionFillLightClosePending" "qml/Main.qml"
+require_grep "function autoVisionRequestFillLightOn" "qml/Main.qml"
+require_grep "function autoVisionRequestFillLightOff" "qml/Main.qml"
+require_grep "function autoVisionFinishDetectionAndCloseFillLight" "qml/Main.qml"
+require_grep "function autoVisionContinueAfterFillLightOff" "qml/Main.qml"
+require_grep "id: autoVisionFillLightSettleTimer" "qml/Main.qml"
+require_grep "onF4FillLightCommandFinished" "qml/Main.qml"
+fill_light_detect_start_block="$(sed -n '/function autoVisionStartDetectDelay()/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fill_light_detect_start_block" | grep -q 'autoVisionRequestFillLightOn()'; then
+    fail "autoVisionStartDetectDelay() 必须先请求 F4 打开补光灯，不能直接启动模型检测延时"
+fi
+if printf '%s\n' "$fill_light_detect_start_block" | grep -q 'autoVisionDetectDelayTimer.restart'; then
+    fail "autoVisionStartDetectDelay() 不能绕过 F4 补光完成事件直接启动旧检测延时"
+fi
+fill_light_settle_block="$(sed -n '/id: autoVisionFillLightSettleTimer/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fill_light_settle_block" | grep -q 'interval: root.autoVisionFillLightSettleMs'; then
+    fail "补光稳定定时器必须使用独立的 5000ms 参数"
+fi
+if ! printf '%s\n' "$fill_light_settle_block" | grep -q 'root.autoVisionFillLightPhase = "detecting"'; then
+    fail "5 秒到期后必须先切到 detecting，防止同一轮重复启动模型检测"
+fi
+if ! printf '%s\n' "$fill_light_settle_block" | grep -q 'root.handleDetectAction()'; then
+    fail "补光稳定 5 秒到期后必须调用一次现有模型检测入口"
+fi
+fill_light_finished_count="$(grep -c 'autoVisionFinishDetectionAndCloseFillLight()' "$SCRIPT_DIR/qml/Main.qml" || true)"
+if [ "$fill_light_finished_count" -lt 3 ]; then
+    fail "检测完成统一关灯函数必须定义一次，并同时接入保存完成和模型检测完成出口"
+fi
+fill_light_callback_block="$(sed -n '/onF4FillLightCommandFinished:/,/^        }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'cycleId !== root.autoCycleId'; then
+    fail "补光完成回调必须校验 cycle_id，旧轮次事件不能推进当前模型检测"
+fi
+if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'autoVisionFillLightSettleTimer.restart'; then
+    fail "只有 F4 开灯完成事件成功后才能启动 5 秒补光稳定计时"
+fi
+if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'root.autoVisionContinueAfterFillLightOff()'; then
+    fail "F4 关灯完成后必须先经过统一收口函数，再决定 Z 轴回升或停止流程"
+fi
 require_grep "BINARY_PROTOCOL_CMD_WEIGHT_RESULT" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_LDC_RESULT" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_CYCLE_DONE" "main.cpp"

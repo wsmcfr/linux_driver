@@ -301,6 +301,36 @@ Rectangle {
     /* autoVisionDefaultDetectDelayMs 是没有执行 Z 轴下探时保留的默认静止检测延时。 */
     property int autoVisionDefaultDetectDelayMs: 2000
 
+    /* autoVisionFillLightSettleMs 是 F4 确认舵机已经打开补光灯后，到模型检测真正开始前的固定稳定时间。 */
+    property int autoVisionFillLightSettleMs: 5000
+
+    /* autoVisionFillLightPhase 保存补光链路阶段：idle/opening/settling/detecting/closing/close-failed。 */
+    property string autoVisionFillLightPhase: "idle"
+
+    /* autoVisionFillLightOn 只在收到 F4 真实 0x16 开灯完成事件后置 true，不能用本地时间估算。 */
+    property bool autoVisionFillLightOn: false
+
+    /* autoVisionFillLightClosePending 表示检测、暂停、停止或故障已经要求关灯，关灯完成前禁止推进后续流程。 */
+    property bool autoVisionFillLightClosePending: false
+
+    /* autoVisionFillLightCommandBusy 表示一条开灯或关灯命令正在严格等待 ACK 和 F4 完成事件。 */
+    property bool autoVisionFillLightCommandBusy: false
+
+    /* autoVisionFillLightCloseRetryCount 记录本次绝对关灯命令重试次数，避免串口短暂忙导致补光常亮。 */
+    property int autoVisionFillLightCloseRetryCount: 0
+
+    /* autoVisionFillLightCloseMaxRetries 限制关灯重试次数；超限后保留故障状态并等待人工处理。 */
+    property int autoVisionFillLightCloseMaxRetries: 20
+
+    /* autoVisionFillLightCloseRetryMs 是关灯失败后的非阻塞重试间隔，单位毫秒。 */
+    property int autoVisionFillLightCloseRetryMs: 150
+
+    /* autoVisionFillLightAbortReason 保存开灯失败等中止原因，关灯收口后仍保留该诊断，不能误启动检测。 */
+    property string autoVisionFillLightAbortReason: ""
+
+    /* autoForcedActuatorStopDone 表示暂停/停止抢占中的三轴强制停止已经得到 F4 回执。 */
+    property bool autoForcedActuatorStopDone: false
+
     /* autoVisionShortSettleMs 是跳过下探或短步微调后的短机械稳定等待时间，单位 ms。 */
     property int autoVisionShortSettleMs: 450
 
@@ -973,6 +1003,14 @@ Rectangle {
      *   无返回值；只修改 QML 本地状态，不直接下发 F4 命令。
      */
     function resetAutoVisionStateBeforeStart() {
+        autoVisionFillLightSettleTimer.stop()
+        autoVisionFillLightCloseRetryTimer.stop()
+        autoVisionFillLightPhase = "idle"
+        autoVisionFillLightOn = false
+        autoVisionFillLightClosePending = false
+        autoVisionFillLightCommandBusy = false
+        autoVisionFillLightCloseRetryCount = 0
+        autoVisionFillLightAbortReason = ""
         autoVisionNeedsZUp = false
         autoVisionZDownStepsUsed = 0
         autoVisionLateralReturnOffsetSteps = 0
@@ -1006,6 +1044,17 @@ Rectangle {
      */
     function handleControlAction(action, stateText) {
         var forceRetry = arguments.length >= 3 && arguments[2] === true
+
+        /* 上一轮补光未确认关闭时禁止创建新 cycle，避免旧灯态被新流程本地复位掩盖。 */
+        if (action === "start"
+                && (autoVisionFillLightOn
+                    || autoVisionFillLightClosePending
+                    || autoVisionFillLightCommandBusy)) {
+            workflowState = "补光待关闭"
+            storageState = "补光灯尚未确认关闭，请先按停止完成关灯收口后再开始新一轮"
+            showStorageToast()
+            return
+        }
 
         /*
          * 暂停/停止属于安全抢占动作：
@@ -1239,7 +1288,8 @@ Rectangle {
         resetDetectResultPanel("等待上料", "未检测", "未检测")
         workflowState = "视觉居中"
         storageState = autoVisionLastText
-        autoVisionDetectDelayTimer.stop()
+        autoVisionFillLightSettleTimer.stop()
+        autoVisionFillLightCloseRetryTimer.stop()
         autoVisionActuatorSettleTimer.stop()
         autoVisionTimer.interval = 100
         autoVisionTimer.restart()
@@ -1254,6 +1304,7 @@ Rectangle {
         autoForcedControlAction = ""
         autoForcedControlStateText = ""
         autoForcedControlRetryCount = 0
+        autoForcedActuatorStopDone = false
         autoForcedControlRetryTimer.stop()
     }
 
@@ -1354,6 +1405,7 @@ Rectangle {
         clearForcedAutoControlRequest()
         autoForcedControlAction = action
         autoForcedControlStateText = stateText
+        autoForcedActuatorStopDone = false
 
         /*
          * 先本地打断所有自动流程异步阶段，不等待 F4 当前指令自然完成。
@@ -1362,7 +1414,7 @@ Rectangle {
         stopAutoVisionLoop(localReason)
         autoVisionRealtimeFineTunePendingNextStage = "none"
         autoVisionRealtimeFineTuneStopReason = localReason
-        autoVisionDetectDelayTimer.stop()
+        autoVisionFillLightSettleTimer.stop()
         autoVisionActuatorSettleTimer.stop()
         detectImageBusy = false
 
@@ -1405,7 +1457,24 @@ Rectangle {
      */
     function stopAutoVisionLoop(reason) {
         autoVisionTimer.stop()
-        autoVisionDetectDelayTimer.stop()
+        autoVisionFillLightSettleTimer.stop()
+
+        /* 已开始开灯、已确认开灯或正在检测时必须记录关灯请求，后续完成事件只能进入关灯收口。 */
+        if (autoVisionFillLightPhase === "opening"
+                || autoVisionFillLightPhase === "settling"
+                || autoVisionFillLightPhase === "detecting"
+                || autoVisionFillLightPhase === "closing"
+                || autoVisionFillLightPhase === "close-failed"
+                || autoVisionFillLightOn) {
+            autoVisionFillLightClosePending = true
+
+            /* 非首页强制暂停/停止场景可以直接异步关灯；强制流程要先让三轴 ACTUATOR_STOP_NOW 抢占串口。 */
+            if (autoForcedControlAction === "" && !autoVisionFillLightCommandBusy) {
+                Qt.callLater(function() {
+                    root.autoVisionRequestFillLightOff()
+                })
+            }
+        }
         autoVisionRunning = false
         autoVisionLocateBusy = false
         autoVisionCommandBusy = false
@@ -3008,21 +3077,145 @@ Rectangle {
 
     /*
      * autoVisionStartDetectDelay 的作用：
-     *   根据本轮是否已经完成 Z 轴 3 秒对焦等待，选择模型检测前的延时。
+     *   在 ROI 对齐和对焦完成后先请求 F4 打开补光灯，不再直接启动模型检测延时。
      *
      * 主要流程：
-     *   1. 如果 autoVisionZFocusSettled 为 true，说明刚才已经等待过 3 秒对焦，此时只等 300ms 刷新一帧。
-     *   2. 如果没有执行 Z 轴下探或没有完成对焦等待，保留旧的 2000ms 静止等待。
-     *   3. 统一重启 autoVisionDetectDelayTimer，避免各分支手写不同延时。
+     *   1. 校验自动流程仍在运行且没有被暂停/停止抢占；
+     *   2. 调用 autoVisionRequestFillLightOn() 下发绝对 270 度开灯动作；
+     *   3. 必须等待 onF4FillLightCommandFinished 收到真实完成事件后，才启动独立 5 秒稳定计时器。
      *
      * 返回值：
-     *   无返回值；定时器触发后会调用 handleDetectAction()。
+     *   无返回值；开灯失败时停留在故障状态，不会调用模型检测。
      */
     function autoVisionStartDetectDelay() {
-        autoVisionDetectDelayTimer.interval = autoVisionZFocusSettled
-                ? autoVisionPostFocusDetectDelayMs
-                : autoVisionDefaultDetectDelayMs
-        autoVisionDetectDelayTimer.restart()
+        if (!autoWorkflowRunning || !autoCycleRunning || autoWorkflowPaused
+                || autoForcedControlAction !== "") {
+            workflowState = "补光未启动"
+            storageState = "自动流程已暂停或停止，取消本轮补光和模型检测"
+            showStorageToast()
+            return
+        }
+
+        autoVisionRequestFillLightOn()
+    }
+
+    /*
+     * autoVisionRequestFillLightOn 的作用：
+     *   请求 F4 让 PB6/TIM4_CH1 驱动 270 度舵机转到 270 度，机械打开补光灯。
+     *
+     * 主要流程：
+     *   1. 防止 opening/settling/detecting 阶段重复下发；
+     *   2. 先写入 opening 和命令忙状态，再调用 C++ 严格 ACK+完成事件接口；
+     *   3. 本函数不启动 5 秒计时，计时只能由真实开灯完成回调启动。
+     *
+     * 返回值：
+     *   true 表示请求已交给 C++；false 表示当前阶段不允许重复请求或 C++ 未能启动命令。
+     */
+    function autoVisionRequestFillLightOn() {
+        if (autoVisionFillLightCommandBusy
+                || autoVisionFillLightPhase === "opening"
+                || autoVisionFillLightPhase === "settling"
+                || autoVisionFillLightPhase === "detecting") {
+            return false
+        }
+
+        autoVisionFillLightSettleTimer.stop()
+        autoVisionFillLightCloseRetryTimer.stop()
+        autoVisionFillLightPhase = "opening"
+        autoVisionFillLightOn = false
+        autoVisionFillLightClosePending = false
+        autoVisionFillLightCommandBusy = true
+        autoVisionFillLightCloseRetryCount = 0
+        autoVisionFillLightAbortReason = ""
+        workflowState = "打开补光灯"
+        storageState = "正在等待F4把补光舵机转到270度并停止PWM"
+        showStorageToast()
+
+        return deviceHealth.sendF4FillLightControl(true)
+    }
+
+    /*
+     * autoVisionRequestFillLightOff 的作用：
+     *   请求 F4 让补光舵机回到绝对 0 度并停止 PWM，机械关闭补光灯。
+     *
+     * 主要流程：
+     *   1. 停止 5 秒稳定计时并保持 closePending，阻止模型检测或机械臂继续；
+     *   2. 命令不在途时下发绝对关灯动作；
+     *   3. 失败由完成回调启动有限次非阻塞重试，成功后进入统一收口函数。
+     *
+     * 返回值：
+     *   true 表示已经处于关灯等待或命令已启动；false 表示本次调用未能启动 C++ 命令。
+     */
+    function autoVisionRequestFillLightOff() {
+        autoVisionFillLightSettleTimer.stop()
+        autoVisionFillLightClosePending = true
+
+        if (autoVisionFillLightCommandBusy) {
+            return true
+        }
+
+        autoVisionFillLightPhase = "closing"
+        autoVisionFillLightCommandBusy = true
+        workflowState = "关闭补光灯"
+        storageState = "正在等待F4把补光舵机回到0度并停止PWM"
+        showStorageToast()
+
+        return deviceHealth.sendF4FillLightControl(false)
+    }
+
+    /*
+     * autoVisionFinishDetectionAndCloseFillLight 的作用：
+     *   把模型检测成功、失败和旧保存完成出口统一收敛为“先关灯，再回升 Z 轴”。
+     *
+     * 返回值：
+     *   无返回值；重复完成信号只会保持同一条关灯命令，不会重复下发。
+     */
+    function autoVisionFinishDetectionAndCloseFillLight() {
+        if (!autoVisionDetectFromZFlow) {
+            return
+        }
+
+        autoVisionFillLightClosePending = true
+        autoVisionRequestFillLightOff()
+    }
+
+    /*
+     * autoVisionContinueAfterFillLightOff 的作用：
+     *   只在 F4 确认补光舵机已回 0 度后，恢复暂停/停止抢占或执行模型检测后的 Z 轴回升。
+     *
+     * 主要流程：
+     *   1. 首页暂停/停止场景先确保 ACTUATOR_STOP_NOW 已完成，再恢复 PAUSE/STOP_CYCLE 重试；
+     *   2. 正常检测场景清除 detectFromZFlow 后请求 Z 轴回升；
+     *   3. 开灯失败收口只保留错误提示，不会误启动检测或机械臂。
+     *
+     * 返回值：
+     *   无返回值；后续异步结果仍由现有 F4 回调推进。
+     */
+    function autoVisionContinueAfterFillLightOff() {
+        if (autoVisionFillLightOn || autoVisionFillLightClosePending) {
+            return
+        }
+
+        if (autoForcedControlAction !== "") {
+            if (autoForcedActuatorStopDone) {
+                autoForcedControlRetryTimer.restart()
+            } else if (!deviceHealth.sendF4ActuatorStopNow(255, 0)) {
+                autoForcedControlRetryTimer.restart()
+            }
+            return
+        }
+
+        if (autoVisionFillLightAbortReason !== "") {
+            workflowState = "补光控制失败"
+            storageState = autoVisionFillLightAbortReason
+            showStorageToast()
+            return
+        }
+
+        if (autoVisionDetectFromZFlow) {
+            autoVisionDetectFromZFlow = false
+            autoVisionRequestZUp()
+        }
     }
 
     /*
@@ -7744,19 +7937,67 @@ Rectangle {
         }
     }
 
-    /* autoVisionDetectDelayTimer 等对焦或静止延时结束后，再复用现有当前帧检测链路。 */
+    /* autoVisionFillLightSettleTimer 只在 F4 确认开灯完成后计时 5 秒，到期后最多启动一次模型检测。 */
     Timer {
-        id: autoVisionDetectDelayTimer
-        interval: root.autoVisionDefaultDetectDelayMs
+        id: autoVisionFillLightSettleTimer
+        interval: root.autoVisionFillLightSettleMs
         repeat: false
         running: false
 
         onTriggered: {
+            /* 晚到的定时事件必须同时通过阶段和自动流程门禁，暂停/停止后不能误启动检测。 */
+            if (root.autoVisionFillLightPhase !== "settling"
+                    || !root.autoVisionFillLightOn
+                    || root.autoVisionFillLightClosePending
+                    || !root.autoWorkflowRunning
+                    || !root.autoCycleRunning
+                    || root.autoWorkflowPaused
+                    || root.autoForcedControlAction !== "") {
+                root.autoVisionFillLightClosePending = root.autoVisionFillLightOn
+                if (root.autoVisionFillLightClosePending && !root.autoVisionFillLightCommandBusy) {
+                    root.autoVisionRequestFillLightOff()
+                }
+                return
+            }
+
+            /* 先切换阶段再调用检测入口，避免重复触发信号造成同一帧启动两次模型线程。 */
+            root.autoVisionFillLightPhase = "detecting"
             root.autoVisionDetectFromZFlow = true
             root.workflowState = "模型检测"
-            root.storageState = "零件已在检测高度，开始模型检测"
+            root.storageState = "补光灯已稳定5秒，开始模型检测"
             root.showStorageToast()
             root.handleDetectAction()
+        }
+    }
+
+    /* autoVisionFillLightCloseRetryTimer 在串口忙、F4 队列忙或关灯完成事件超时时有限重试绝对 0 度命令。 */
+    Timer {
+        id: autoVisionFillLightCloseRetryTimer
+        interval: root.autoVisionFillLightCloseRetryMs
+        repeat: false
+        running: false
+
+        onTriggered: {
+            if (!root.autoVisionFillLightClosePending) {
+                return
+            }
+
+            if (root.autoVisionFillLightCommandBusy) {
+                autoVisionFillLightCloseRetryTimer.restart()
+                return
+            }
+
+            if (root.autoVisionFillLightCloseRetryCount >= root.autoVisionFillLightCloseMaxRetries) {
+                root.autoVisionFillLightPhase = "close-failed"
+                root.workflowState = "补光关闭失败"
+                root.storageState = "补光舵机关灯重试已达上限，保留Z轴待回升状态，禁止启动机械臂，请检查F4串口和PB6舵机"
+                root.autoVisionLastText = root.storageState
+                root.showStorageToast()
+                return
+            }
+
+            root.autoVisionFillLightCloseRetryCount += 1
+            root.autoVisionRequestFillLightOff()
         }
     }
 
@@ -7867,6 +8108,31 @@ Rectangle {
 
         onTriggered: {
             if (!root.autoForcedControlAction) {
+                return
+            }
+
+            /* F4 的 STOP_CYCLE 会清空 active_cycle_id，补光关灯必须在它之前完成。 */
+            if (root.autoVisionFillLightCommandBusy
+                    || root.autoVisionFillLightClosePending
+                    || root.autoVisionFillLightOn
+                    || root.autoVisionFillLightPhase === "opening"
+                    || root.autoVisionFillLightPhase === "settling"
+                    || root.autoVisionFillLightPhase === "detecting"
+                    || root.autoVisionFillLightPhase === "closing"
+                    || root.autoVisionFillLightPhase === "close-failed") {
+                root.autoVisionFillLightClosePending = true
+                if (!root.autoVisionFillLightCommandBusy) {
+                    root.autoVisionRequestFillLightOff()
+                }
+                autoForcedControlRetryTimer.restart()
+                return
+            }
+
+            /* 首页抢占必须先确认三轴 ACTUATOR_STOP_NOW，再发送 PAUSE_CYCLE 或 STOP_CYCLE。 */
+            if (!root.autoForcedActuatorStopDone) {
+                if (!deviceHealth.sendF4ActuatorStopNow(255, 0)) {
+                    autoForcedControlRetryTimer.restart()
+                }
                 return
             }
 
@@ -8293,6 +8559,91 @@ Rectangle {
         }
 
         /*
+         * onF4FillLightCommandFinished 的作用：
+         *   接收 C++ 严格匹配 ACK 和 EVENT_REPORT 0x16 后的补光舵机结果，并推进 5 秒计时或关灯收口。
+         *
+         * 参数：
+         *   ok 表示 ACK 与真实动作完成事件均匹配；action 为 1 表示开灯、0 表示关灯；
+         *   cycleId 是动作所属自动轮次；detail 保存串口、NACK 或完成事件诊断。
+         */
+        onF4FillLightCommandFinished: {
+            /* 旧 cycle 的晚到事件不能启动当前轮次检测；若它确实打开了灯，则立即进入绝对关灯收口。 */
+            if (cycleId !== root.autoCycleId) {
+                root.autoVisionFillLightCommandBusy = false
+                root.autoVisionFillLightAbortReason = "收到旧轮次补光事件：cycle=" + cycleId
+                        + "，当前cycle=" + root.autoCycleId + "；禁止启动模型检测"
+                root.autoVisionFillLightClosePending = true
+                root.autoVisionFillLightPhase = "close-failed"
+                if (ok && action === 1) {
+                    root.autoVisionFillLightOn = true
+                }
+                root.storageState = root.autoVisionFillLightAbortReason
+                root.showStorageToast()
+                autoVisionFillLightCloseRetryTimer.restart()
+                return
+            }
+
+            root.autoVisionFillLightCommandBusy = false
+
+            if (action === 1) {
+                if (!ok) {
+                    /* 开灯失败时物理位置可能不确定，先用绝对 0 度命令收口，且无论关灯结果如何都不检测。 */
+                    root.autoVisionFillLightAbortReason = "F4补光灯打开失败：" + detail
+                    root.autoVisionFillLightClosePending = true
+                    root.autoVisionFillLightPhase = "close-failed"
+                    root.workflowState = "补光打开失败"
+                    root.storageState = root.autoVisionFillLightAbortReason + "；正在尝试回0度关灯"
+                    root.showStorageToast()
+                    autoVisionFillLightCloseRetryTimer.restart()
+                    return
+                }
+
+                root.autoVisionFillLightOn = true
+
+                /* 暂停、停止或故障请求可能在开灯动作的 2 秒期间到达，晚到完成事件只能触发关灯。 */
+                if (root.autoVisionFillLightClosePending
+                        || root.autoForcedControlAction !== ""
+                        || !root.autoWorkflowRunning
+                        || !root.autoCycleRunning
+                        || root.autoWorkflowPaused) {
+                    root.autoVisionFillLightClosePending = true
+                    root.autoVisionRequestFillLightOff()
+                    return
+                }
+
+                root.autoVisionFillLightPhase = "settling"
+                root.workflowState = "补光稳定"
+                root.storageState = "补光舵机已到270度且PWM已停止，等待5秒后开始模型检测"
+                root.showStorageToast()
+                autoVisionFillLightSettleTimer.interval = root.autoVisionFillLightSettleMs
+                autoVisionFillLightSettleTimer.restart()
+                return
+            }
+
+            if (action === 0) {
+                if (!ok) {
+                    root.autoVisionFillLightPhase = "close-failed"
+                    root.autoVisionFillLightClosePending = true
+                    root.workflowState = "补光关闭重试"
+                    root.storageState = "F4补光灯关闭失败：" + detail + "；禁止Z轴回升和机械臂启动，正在重试"
+                    root.autoVisionLastText = root.storageState
+                    root.showStorageToast()
+                    autoVisionFillLightCloseRetryTimer.restart()
+                    return
+                }
+
+                autoVisionFillLightCloseRetryTimer.stop()
+                root.autoVisionFillLightOn = false
+                root.autoVisionFillLightClosePending = false
+                root.autoVisionFillLightPhase = "idle"
+                root.autoVisionFillLightCloseRetryCount = 0
+                root.storageState = "补光舵机已回0度且PWM已停止，补光灯已关闭"
+                root.showStorageToast()
+                root.autoVisionContinueAfterFillLightOff()
+            }
+        }
+
+        /*
          * onF4ActuatorCommandFinished 的作用：
          *   接收 ACTUATOR_POS_MOVE 的完成事件结果或其它执行器命令 ACK/NACK，并按阶段推进。
          *
@@ -8413,13 +8764,24 @@ Rectangle {
             }
 
             if (root.autoForcedControlAction !== "" && action === "ACTUATOR_STOP_NOW") {
+                root.autoForcedActuatorStopDone = ok
                 var forcedStopResult = ok
                         ? ("首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止") + " 已硬停电机，等待 F4 流程状态同步：" + detail)
                         : ("首页" + (root.autoForcedControlAction === "pause" ? "暂停" : "停止") + " 的强制 STOP 写入失败：" + detail + "；请立即检查 F4 串口与电机状态")
                 root.autoLastAckText = forcedStopResult
                 root.storageState = root.formatF4ToastText(forcedStopResult)
                 root.showStorageToast()
-                if (!root.autoControlBusy) {
+                /* 三轴停止后若补光仍在打开或等待开灯完成，必须先关灯，不能先清掉 F4 active cycle。 */
+                if (root.autoVisionFillLightClosePending
+                        || root.autoVisionFillLightOn
+                        || root.autoVisionFillLightPhase === "opening"
+                        || root.autoVisionFillLightPhase === "settling"
+                        || root.autoVisionFillLightPhase === "detecting") {
+                    root.autoVisionFillLightClosePending = true
+                    if (!root.autoVisionFillLightCommandBusy) {
+                        root.autoVisionRequestFillLightOff()
+                    }
+                } else if (!root.autoControlBusy) {
                     autoForcedControlRetryTimer.restart()
                 }
                 root.evaluateRuntimeAlarms()
@@ -8620,8 +8982,7 @@ Rectangle {
             showStorageToast()
 
             if (root.autoVisionDetectFromZFlow) {
-                root.autoVisionDetectFromZFlow = false
-                root.autoVisionRequestZUp()
+                root.autoVisionFinishDetectionAndCloseFillLight()
             }
         }
 
@@ -8685,8 +9046,7 @@ Rectangle {
             showStorageToast()
 
             if (root.autoVisionDetectFromZFlow) {
-                root.autoVisionDetectFromZFlow = false
-                root.autoVisionRequestZUp()
+                root.autoVisionFinishDetectionAndCloseFillLight()
             }
         }
 
