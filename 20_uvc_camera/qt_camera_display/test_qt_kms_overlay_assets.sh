@@ -1101,9 +1101,16 @@ require_grep "BINARY_PROTOCOL_EVENT_SOURCE_FILL_LIGHT = 7U" "main.cpp"
 require_grep "sendF4FillLightControl" "main.cpp"
 require_grep "runF4FillLightControlAndWaitDone" "main.cpp"
 require_grep "f4FillLightCommandFinished" "main.cpp"
+fill_light_reply_reader_block="$(sed -n '/static bool readF4BinaryReply/,/static bool exchangeF4BinaryFrame/p' "$SCRIPT_DIR/main.cpp")"
+if ! printf '%s\n' "$fill_light_reply_reader_block" | grep -q 'QByteArray \*receiveBuffer'; then
+    fail "F4 二进制读取函数必须接收串口会话级 receiveBuffer，不能在每次读取时重建局部缓存"
+fi
+if printf '%s\n' "$fill_light_reply_reader_block" | grep -q 'QByteArray buffer;'; then
+    fail "readF4BinaryReply() 禁止创建一次调用即销毁的局部 buffer，否则粘包中的第二帧会丢失"
+fi
 fill_light_wait_block="$(sed -n '/static bool runF4FillLightControlAndWaitDone/,/^    }/p' "$SCRIPT_DIR/main.cpp")"
 if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'ackedCommand != BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL'; then
-    fail "补光命令必须等待 cycle_id、sequence 和命令码都匹配的 ACK，不能发完即开始 5 秒计时"
+    fail "补光命令必须等待 cycle_id、sequence 和命令码都匹配的 ACK，不能发完即开始 10 秒计时"
 fi
 if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'eventCode != BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE'; then
     fail "补光命令收到 ACK 后仍必须等待 EVENT_REPORT 0x16，不能使用执行器本地估算完成"
@@ -1117,14 +1124,26 @@ fi
 if printf '%s\n' "$fill_light_wait_block" | grep -q 'estimated-done\|fallbackMoveMs'; then
     fail "补光灯动作禁止复用执行器 estimated-done，本地不能猜测灯已经打开或关闭"
 fi
-require_grep "property int autoVisionFillLightSettleMs: 5000" "qml/Main.qml"
+if ! printf '%s\n' "$fill_light_wait_block" | grep -q 'QByteArray receiveBuffer'; then
+    fail "补光 ACK 与完成事件等待必须由同一串口会话持有 receiveBuffer"
+fi
+fill_light_receive_buffer_use_count="$(printf '%s\n' "$fill_light_wait_block" | grep -c 'readF4BinaryReply(fd, &receiveBuffer' || true)"
+if [ "$fill_light_receive_buffer_use_count" -lt 2 ]; then
+    fail "补光 ACK 阶段和完成事件阶段必须复用同一个 receiveBuffer，防止同批 EVENT_REPORT 被丢弃"
+fi
+require_grep "property int autoVisionFillLightSettleMs: 10000" "qml/Main.qml"
+require_absent "property int autoVisionFillLightSettleMs: 5000" "qml/Main.qml"
 require_grep "property string autoVisionFillLightPhase" "qml/Main.qml"
 require_grep "property bool autoVisionFillLightOn" "qml/Main.qml"
 require_grep "property bool autoVisionFillLightClosePending" "qml/Main.qml"
+require_grep "property int autoForcedFillLightCloseTimeoutMs: 12000" "qml/Main.qml"
+require_grep "property double autoForcedControlStartedAtMs" "qml/Main.qml"
+require_grep "property bool autoVisionFillLightStopBypassActive" "qml/Main.qml"
 require_grep "function autoVisionRequestFillLightOn" "qml/Main.qml"
 require_grep "function autoVisionRequestFillLightOff" "qml/Main.qml"
 require_grep "function autoVisionFinishDetectionAndCloseFillLight" "qml/Main.qml"
 require_grep "function autoVisionContinueAfterFillLightOff" "qml/Main.qml"
+require_grep "function autoForcedStopReleaseFillLightGateIfTimedOut" "qml/Main.qml"
 require_grep "id: autoVisionFillLightSettleTimer" "qml/Main.qml"
 require_grep "onF4FillLightCommandFinished" "qml/Main.qml"
 fill_light_detect_start_block="$(sed -n '/function autoVisionStartDetectDelay()/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
@@ -1136,13 +1155,13 @@ if printf '%s\n' "$fill_light_detect_start_block" | grep -q 'autoVisionDetectDel
 fi
 fill_light_settle_block="$(sed -n '/id: autoVisionFillLightSettleTimer/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
 if ! printf '%s\n' "$fill_light_settle_block" | grep -q 'interval: root.autoVisionFillLightSettleMs'; then
-    fail "补光稳定定时器必须使用独立的 5000ms 参数"
+    fail "补光稳定定时器必须使用独立的 10000ms 参数"
 fi
 if ! printf '%s\n' "$fill_light_settle_block" | grep -q 'root.autoVisionFillLightPhase = "detecting"'; then
-    fail "5 秒到期后必须先切到 detecting，防止同一轮重复启动模型检测"
+    fail "10 秒到期后必须先切到 detecting，防止同一轮重复启动模型检测"
 fi
 if ! printf '%s\n' "$fill_light_settle_block" | grep -q 'root.handleDetectAction()'; then
-    fail "补光稳定 5 秒到期后必须调用一次现有模型检测入口"
+    fail "补光稳定 10 秒到期后必须调用一次现有模型检测入口"
 fi
 fill_light_finished_count="$(grep -c 'autoVisionFinishDetectionAndCloseFillLight()' "$SCRIPT_DIR/qml/Main.qml" || true)"
 if [ "$fill_light_finished_count" -lt 3 ]; then
@@ -1153,10 +1172,24 @@ if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'cycleId !== root.auto
     fail "补光完成回调必须校验 cycle_id，旧轮次事件不能推进当前模型检测"
 fi
 if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'autoVisionFillLightSettleTimer.restart'; then
-    fail "只有 F4 开灯完成事件成功后才能启动 5 秒补光稳定计时"
+    fail "只有 F4 开灯完成事件成功后才能启动 10 秒补光稳定计时"
 fi
 if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'root.autoVisionContinueAfterFillLightOff()'; then
     fail "F4 关灯完成后必须先经过统一收口函数，再决定 Z 轴回升或停止流程"
+fi
+if ! printf '%s\n' "$fill_light_callback_block" | grep -q 'root.autoVisionFillLightStopBypassActive'; then
+    fail "停止超时放行后的补光晚到回调必须单独收口，不能复活检测或无限重启关灯"
+fi
+forced_control_retry_block="$(sed -n '/id: autoForcedControlRetryTimer/,/^    }/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$forced_control_retry_block" | grep -q 'autoForcedStopReleaseFillLightGateIfTimedOut'; then
+    fail "等待补光关闭时按停止必须有 12 秒边界，超时后仍要继续发送 STOP_CYCLE"
+fi
+if ! printf '%s\n' "$forced_control_retry_block" | grep -q 'root.handleControlAction(root.autoForcedControlAction'; then
+    fail "补光关闭门禁释放后必须进入现有强制 STOP_CYCLE 下发入口"
+fi
+forced_actuator_callback_block="$(sed -n '/onF4ActuatorCommandFinished:/,/onF4InspectionFlowFinished:/p' "$SCRIPT_DIR/qml/Main.qml")"
+if ! printf '%s\n' "$forced_actuator_callback_block" | grep -q 'root.autoVisionFillLightStopBypassActive'; then
+    fail "停止关灯门禁已超时放行后，晚到的 ACTUATOR_STOP_NOW 回调不能再次发起关灯并卡住 STOP_CYCLE"
 fi
 require_grep "BINARY_PROTOCOL_CMD_WEIGHT_RESULT" "main.cpp"
 require_grep "BINARY_PROTOCOL_CMD_LDC_RESULT" "main.cpp"

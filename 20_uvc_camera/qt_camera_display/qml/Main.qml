@@ -67,6 +67,12 @@ Rectangle {
     /* autoForcedControlRetryIntervalMs 是强制暂停/停止自动重试 F4 抢占命令的时间间隔。 */
     property int autoForcedControlRetryIntervalMs: 120
 
+    /* autoForcedControlStartedAtMs 保存本次强制暂停/停止开始时间戳，用于计算补光关闭门禁的真实累计等待时间。 */
+    property double autoForcedControlStartedAtMs: 0
+
+    /* autoForcedFillLightCloseTimeoutMs 限制停止流程最多等待补光关闭确认 12 秒，避免 EVENT_REPORT 丢失后永远挡住 STOP_CYCLE。 */
+    property int autoForcedFillLightCloseTimeoutMs: 12000
+
     /* autoCycleId 保存 MP157 当前自动检测流程号，由 C++ 在 F4 ACK/NACK 回调中返回。 */
     property int autoCycleId: 0
 
@@ -302,7 +308,7 @@ Rectangle {
     property int autoVisionDefaultDetectDelayMs: 2000
 
     /* autoVisionFillLightSettleMs 是 F4 确认舵机已经打开补光灯后，到模型检测真正开始前的固定稳定时间。 */
-    property int autoVisionFillLightSettleMs: 5000
+    property int autoVisionFillLightSettleMs: 10000
 
     /* autoVisionFillLightPhase 保存补光链路阶段：idle/opening/settling/detecting/closing/close-failed。 */
     property string autoVisionFillLightPhase: "idle"
@@ -312,6 +318,9 @@ Rectangle {
 
     /* autoVisionFillLightClosePending 表示检测、暂停、停止或故障已经要求关灯，关灯完成前禁止推进后续流程。 */
     property bool autoVisionFillLightClosePending: false
+
+    /* autoVisionFillLightStopBypassActive 表示停止等待关灯确认已到 12 秒边界，晚到回调只能更新诊断，不能再次阻塞 STOP_CYCLE。 */
+    property bool autoVisionFillLightStopBypassActive: false
 
     /* autoVisionFillLightCommandBusy 表示一条开灯或关灯命令正在严格等待 ACK 和 F4 完成事件。 */
     property bool autoVisionFillLightCommandBusy: false
@@ -1008,6 +1017,7 @@ Rectangle {
         autoVisionFillLightPhase = "idle"
         autoVisionFillLightOn = false
         autoVisionFillLightClosePending = false
+        autoVisionFillLightStopBypassActive = false
         autoVisionFillLightCommandBusy = false
         autoVisionFillLightCloseRetryCount = 0
         autoVisionFillLightAbortReason = ""
@@ -1304,8 +1314,52 @@ Rectangle {
         autoForcedControlAction = ""
         autoForcedControlStateText = ""
         autoForcedControlRetryCount = 0
+        autoForcedControlStartedAtMs = 0
         autoForcedActuatorStopDone = false
         autoForcedControlRetryTimer.stop()
+    }
+
+    /*
+     * autoForcedStopReleaseFillLightGateIfTimedOut 的作用：
+     *   当用户已经按下停止、但补光关闭完成事件长期未确认时，释放 STOP_CYCLE 的前置门禁。
+     *
+     * 主要流程：
+     *   1. 只处理 stop，不改变 pause 的原有语义；
+     *   2. 使用 Date.now() 计算从按下停止开始的累计时间，避免重试次数被命令忙状态冻结；
+     *   3. 超过 12 秒后停止补光重试并标记晚到回调隔离，保留“物理状态待确认”的告警；
+     *   4. 返回 true 让强制控制定时器继续执行现有 STOP_CYCLE 下发路径。
+     *
+     * 返回值：
+     *   true 表示停止流程已经达到补光等待边界，可以继续发送 STOP_CYCLE；false 表示仍应等待关灯确认。
+     */
+    function autoForcedStopReleaseFillLightGateIfTimedOut() {
+        if (autoForcedControlAction !== "stop") {
+            return false
+        }
+
+        if (autoVisionFillLightStopBypassActive) {
+            return true
+        }
+
+        if (autoForcedControlStartedAtMs <= 0
+                || Date.now() - autoForcedControlStartedAtMs < autoForcedFillLightCloseTimeoutMs) {
+            return false
+        }
+
+        /*
+         * 这里只释放“能否发送 STOP_CYCLE”的门禁，不把舵机伪报为已经回到 0 度。
+         * autoVisionFillLightOn 保留最后一次真实完成事件确认的值，供现场判断是否需要人工断电或复位。
+         */
+        autoVisionFillLightStopBypassActive = true
+        autoVisionFillLightClosePending = false
+        autoVisionFillLightPhase = "close-failed"
+        autoVisionFillLightSettleTimer.stop()
+        autoVisionFillLightCloseRetryTimer.stop()
+        autoVisionFillLightAbortReason = "停止等待补光关闭确认已超过12秒，继续发送STOP_CYCLE；补光灯物理状态未确认，请人工检查"
+        autoLastAckText = autoVisionFillLightAbortReason
+        storageState = formatF4ToastText(autoLastAckText)
+        showStorageToast()
+        return true
     }
 
     /*
@@ -1405,7 +1459,9 @@ Rectangle {
         clearForcedAutoControlRequest()
         autoForcedControlAction = action
         autoForcedControlStateText = stateText
+        autoForcedControlStartedAtMs = Date.now()
         autoForcedActuatorStopDone = false
+        autoVisionFillLightStopBypassActive = false
 
         /*
          * 先本地打断所有自动流程异步阶段，不等待 F4 当前指令自然完成。
@@ -3082,7 +3138,7 @@ Rectangle {
      * 主要流程：
      *   1. 校验自动流程仍在运行且没有被暂停/停止抢占；
      *   2. 调用 autoVisionRequestFillLightOn() 下发绝对 270 度开灯动作；
-     *   3. 必须等待 onF4FillLightCommandFinished 收到真实完成事件后，才启动独立 5 秒稳定计时器。
+     *   3. 必须等待 onF4FillLightCommandFinished 收到真实完成事件后，才启动独立 10 秒稳定计时器。
      *
      * 返回值：
      *   无返回值；开灯失败时停留在故障状态，不会调用模型检测。
@@ -3106,7 +3162,7 @@ Rectangle {
      * 主要流程：
      *   1. 防止 opening/settling/detecting 阶段重复下发；
      *   2. 先写入 opening 和命令忙状态，再调用 C++ 严格 ACK+完成事件接口；
-     *   3. 本函数不启动 5 秒计时，计时只能由真实开灯完成回调启动。
+     *   3. 本函数不启动 10 秒计时，计时只能由真实开灯完成回调启动。
      *
      * 返回值：
      *   true 表示请求已交给 C++；false 表示当前阶段不允许重复请求或 C++ 未能启动命令。
@@ -3139,7 +3195,7 @@ Rectangle {
      *   请求 F4 让补光舵机回到绝对 0 度并停止 PWM，机械关闭补光灯。
      *
      * 主要流程：
-     *   1. 停止 5 秒稳定计时并保持 closePending，阻止模型检测或机械臂继续；
+     *   1. 停止 10 秒稳定计时并保持 closePending，阻止模型检测或机械臂继续；
      *   2. 命令不在途时下发绝对关灯动作；
      *   3. 失败由完成回调启动有限次非阻塞重试，成功后进入统一收口函数。
      *
@@ -7937,7 +7993,7 @@ Rectangle {
         }
     }
 
-    /* autoVisionFillLightSettleTimer 只在 F4 确认开灯完成后计时 5 秒，到期后最多启动一次模型检测。 */
+    /* autoVisionFillLightSettleTimer 只在 F4 确认开灯完成后计时 10 秒，到期后最多启动一次模型检测。 */
     Timer {
         id: autoVisionFillLightSettleTimer
         interval: root.autoVisionFillLightSettleMs
@@ -7964,7 +8020,7 @@ Rectangle {
             root.autoVisionFillLightPhase = "detecting"
             root.autoVisionDetectFromZFlow = true
             root.workflowState = "模型检测"
-            root.storageState = "补光灯已稳定5秒，开始模型检测"
+            root.storageState = "补光灯已稳定10秒，开始模型检测"
             root.showStorageToast()
             root.handleDetectAction()
         }
@@ -8111,21 +8167,27 @@ Rectangle {
                 return
             }
 
-            /* F4 的 STOP_CYCLE 会清空 active_cycle_id，补光关灯必须在它之前完成。 */
-            if (root.autoVisionFillLightCommandBusy
+            /*
+             * F4 的 STOP_CYCLE 会清空 active_cycle_id，所以正常情况优先在当前 cycle 内完成关灯。
+             * 但停止等待达到 12 秒边界后必须释放门禁，不能因丢失完成事件而无限阻塞 STOP_CYCLE。
+             */
+            var fillLightGateActive = root.autoVisionFillLightCommandBusy
                     || root.autoVisionFillLightClosePending
                     || root.autoVisionFillLightOn
                     || root.autoVisionFillLightPhase === "opening"
                     || root.autoVisionFillLightPhase === "settling"
                     || root.autoVisionFillLightPhase === "detecting"
                     || root.autoVisionFillLightPhase === "closing"
-                    || root.autoVisionFillLightPhase === "close-failed") {
-                root.autoVisionFillLightClosePending = true
-                if (!root.autoVisionFillLightCommandBusy) {
-                    root.autoVisionRequestFillLightOff()
+                    || root.autoVisionFillLightPhase === "close-failed"
+            if (fillLightGateActive && !root.autoVisionFillLightStopBypassActive) {
+                if (!root.autoForcedStopReleaseFillLightGateIfTimedOut()) {
+                    root.autoVisionFillLightClosePending = true
+                    if (!root.autoVisionFillLightCommandBusy) {
+                        root.autoVisionRequestFillLightOff()
+                    }
+                    autoForcedControlRetryTimer.restart()
+                    return
                 }
-                autoForcedControlRetryTimer.restart()
-                return
             }
 
             /* 首页抢占必须先确认三轴 ACTUATOR_STOP_NOW，再发送 PAUSE_CYCLE 或 STOP_CYCLE。 */
@@ -8560,13 +8622,40 @@ Rectangle {
 
         /*
          * onF4FillLightCommandFinished 的作用：
-         *   接收 C++ 严格匹配 ACK 和 EVENT_REPORT 0x16 后的补光舵机结果，并推进 5 秒计时或关灯收口。
+         *   接收 C++ 严格匹配 ACK 和 EVENT_REPORT 0x16 后的补光舵机结果，并推进 10 秒计时或关灯收口。
          *
          * 参数：
          *   ok 表示 ACK 与真实动作完成事件均匹配；action 为 1 表示开灯、0 表示关灯；
          *   cycleId 是动作所属自动轮次；detail 保存串口、NACK 或完成事件诊断。
          */
         onF4FillLightCommandFinished: {
+            /*
+             * 停止等待关灯确认超过 12 秒后，STOP_CYCLE 已允许继续下发。
+             * 此后的晚到回调只能记录真实物理结果，禁止启动模型、重启关灯重试或恢复自动流程。
+             */
+            if (root.autoVisionFillLightStopBypassActive) {
+                root.autoVisionFillLightCommandBusy = false
+                autoVisionFillLightCloseRetryTimer.stop()
+                root.autoVisionFillLightClosePending = false
+
+                if (action === 0 && ok) {
+                    root.autoVisionFillLightOn = false
+                    root.autoVisionFillLightPhase = "idle"
+                    root.autoLastAckText = "停止流程继续后收到补光关灯完成事件，舵机已回0度并停止PWM：" + detail
+                } else {
+                    if (action === 1 && ok) {
+                        root.autoVisionFillLightOn = true
+                    }
+                    root.autoVisionFillLightPhase = "close-failed"
+                    root.autoLastAckText = "停止流程已继续，补光晚到结果未确认关灯完成：" + detail + "；请人工检查补光灯"
+                }
+
+                root.storageState = root.formatF4ToastText(root.autoLastAckText)
+                root.showStorageToast()
+                root.evaluateRuntimeAlarms()
+                return
+            }
+
             /* 旧 cycle 的晚到事件不能启动当前轮次检测；若它确实打开了灯，则立即进入绝对关灯收口。 */
             if (cycleId !== root.autoCycleId) {
                 root.autoVisionFillLightCommandBusy = false
@@ -8613,7 +8702,7 @@ Rectangle {
 
                 root.autoVisionFillLightPhase = "settling"
                 root.workflowState = "补光稳定"
-                root.storageState = "补光舵机已到270度且PWM已停止，等待5秒后开始模型检测"
+                root.storageState = "补光舵机已到270度且PWM已停止，等待10秒后开始模型检测"
                 root.showStorageToast()
                 autoVisionFillLightSettleTimer.interval = root.autoVisionFillLightSettleMs
                 autoVisionFillLightSettleTimer.restart()
@@ -8771,8 +8860,13 @@ Rectangle {
                 root.autoLastAckText = forcedStopResult
                 root.storageState = root.formatF4ToastText(forcedStopResult)
                 root.showStorageToast()
-                /* 三轴停止后若补光仍在打开或等待开灯完成，必须先关灯，不能先清掉 F4 active cycle。 */
-                if (root.autoVisionFillLightClosePending
+                /*
+                 * 如果补光关闭门禁已经达到 12 秒边界，晚到的三轴 STOP 回调必须直接恢复 STOP_CYCLE 重试。
+                 * 此时不能因为 autoVisionFillLightOn 保存了“最后一次确认打开”又重新发关灯，否则会再次形成无限前置条件。
+                 */
+                if (root.autoVisionFillLightStopBypassActive) {
+                    autoForcedControlRetryTimer.restart()
+                } else if (root.autoVisionFillLightClosePending
                         || root.autoVisionFillLightOn
                         || root.autoVisionFillLightPhase === "opening"
                         || root.autoVisionFillLightPhase === "settling"

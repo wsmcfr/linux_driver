@@ -12052,28 +12052,69 @@ private:
      *
      * 主要流程：
      *   1. 通过 select 进行短周期等待，避免 F4 没回复时后台线程长时间阻塞。
-     *   2. 把多次 read 的数据追加到 buffer，允许串口粘包、半包和上电调试日志。
-     *   3. 调用 parseF4BinaryFrameFromBuffer() 找到第一帧合法二进制帧。
+     *   2. 优先解析调用方会话缓存中已经收到的完整帧，避免 ACK 后面的粘包事件被丢弃。
+     *   3. 缓存中没有完整帧时，再把 read 数据追加到同一个会话缓存并继续解析。
      *
      * 参数：
      *   fd 是已经打开并配置好的 F4 串口文件描述符。
+     *   receiveBuffer 由当前串口会话持有，保存半包和已读入但尚未消费的后续完整帧，不能为 NULL。
      *   reply 用于返回合法二进制帧解析结果，不能为 NULL。
      *   errorText 用于返回失败原因，可为 NULL。
      *
      * 返回值：
      *   成功解析出合法帧返回 true；超时、read 失败或只收到坏帧返回 false。
      */
-    static bool readF4BinaryReply(int fd, F4BinaryReply *reply, QString *errorText)
+    static bool readF4BinaryReply(int fd,
+                                  QByteArray *receiveBuffer,
+                                  F4BinaryReply *reply,
+                                  QString *errorText)
     {
-        QByteArray buffer;       /* buffer 保存累计收到的串口字节，解析函数会从中丢弃噪声和已消费帧。 */
         char chunk[128];         /* chunk 是单次 read 的临时缓冲，大小足够容纳首版 58 字节以内短帧。 */
         QElapsedTimer elapsed;   /* elapsed 限制总等待时间，避免 F4 未回 ACK 时后台线程长时间占用。 */
         QString lastFrameError;  /* lastFrameError 保存最近一帧坏帧原因，超时时优先反馈给界面。 */
+
+        if (receiveBuffer == nullptr || reply == nullptr) /* 缓存和输出对象缺失时无法安全解析协议帧。 */
+        {
+            if (errorText) {
+                *errorText = QStringLiteral("F4二进制接收缓存或回复对象为空");
+            }
+            return false;
+        }
 
         elapsed.start();
         while (elapsed.elapsed() < 700) {
             fd_set rfds;         /* rfds 是 select 读取集合，只等待当前串口 fd 可读。 */
             struct timeval tv;   /* tv 是每轮 80ms 短等待，兼顾 ACK 及时性和 CPU 占用。 */
+
+            /*
+             * 必须先消费会话缓存，再等待串口产生新字节。
+             * 如果上一次 read 同时收到了 ACK 和 EVENT_REPORT，第一次调用只取走 ACK，
+             * 第二次调用会在这里直接取走保留的 EVENT_REPORT，不会因 select 无新数据而超时。
+             */
+            if (parseF4BinaryFrameFromBuffer(receiveBuffer, reply, &lastFrameError)) {
+                /*
+                 * FAULT_REPORT 是 F4 的异步故障上报，不一定对应当前按钮命令。
+                 * 例如当前未接 LDC 时，F4 会周期上报 LDC 故障；此时 Qt 记录故障摘要，
+                 * 但继续等待当前 HEARTBEAT/ACK/NACK/STATUS_REPORT，避免把异步故障帧误当作控制命令失败。
+                 */
+                if (reply->command == BINARY_PROTOCOL_CMD_FAULT_REPORT) {
+                    lastFrameError = describeF4FaultReport(*reply);
+                    continue;
+                }
+                /*
+                 * 如果读到 HEARTBEAT/START_CYCLE 等小于 0x80 的合法帧，
+                 * 说明当前串口链路把 MP157 自己发出的请求帧回显到了 RX，
+                 * 或者读取到了写入前遗留的旧请求帧。它不是 F4 回包，必须丢弃后继续等 ACK/NACK。
+                 */
+                if (isMp157ToF4RequestCommand(reply->command)) {
+                    lastFrameError = QStringLiteral("跳过MP157请求帧/串口回显：")
+                            + f4BinaryCommandName(reply->command)
+                            + QStringLiteral(" raw=")
+                            + hexByteString(reply->rawFrame);
+                    continue;
+                }
+                return true;
+            }
 
             FD_ZERO(&rfds);
             FD_SET(fd, &rfds);
@@ -12097,31 +12138,7 @@ private:
 
             const ssize_t nread = ::read(fd, chunk, sizeof(chunk));
             if (nread > 0) {
-                buffer.append(chunk, static_cast<int>(nread));
-                if (parseF4BinaryFrameFromBuffer(&buffer, reply, &lastFrameError)) {
-                    /*
-                     * FAULT_REPORT 是 F4 的异步故障上报，不一定对应当前按钮命令。
-                     * 例如当前未接 LDC 时，F4 会周期上报 LDC 故障；此时 Qt 记录故障摘要，
-                     * 但继续等待当前 HEARTBEAT/ACK/NACK/STATUS_REPORT，避免把异步故障帧误当作控制命令失败。
-                     */
-                    if (reply->command == BINARY_PROTOCOL_CMD_FAULT_REPORT) {
-                        lastFrameError = describeF4FaultReport(*reply);
-                        continue;
-                    }
-                    /*
-                     * 如果读到 HEARTBEAT/START_CYCLE 等小于 0x80 的合法帧，
-                     * 说明当前串口链路把 MP157 自己发出的请求帧回显到了 RX，
-                     * 或者读取到了写入前遗留的旧请求帧。它不是 F4 回包，必须丢弃后继续等 ACK/NACK。
-                     */
-                    if (isMp157ToF4RequestCommand(reply->command)) {
-                        lastFrameError = QStringLiteral("跳过MP157请求帧/串口回显：")
-                                + f4BinaryCommandName(reply->command)
-                                + QStringLiteral(" raw=")
-                                + hexByteString(reply->rawFrame);
-                        continue;
-                    }
-                    return true;
-                }
+                receiveBuffer->append(chunk, static_cast<int>(nread)); /* 尾帧和半包继续归当前串口会话所有。 */
                 continue;
             }
 
@@ -12142,8 +12159,8 @@ private:
         if (errorText) {
             if (!lastFrameError.isEmpty()) {
                 *errorText = lastFrameError;
-            } else if (!buffer.isEmpty()) {
-                *errorText = QStringLiteral("F4二进制回复不完整：") + hexByteString(buffer);
+            } else if (!receiveBuffer->isEmpty()) {
+                *errorText = QStringLiteral("F4二进制回复不完整：") + hexByteString(*receiveBuffer);
             } else {
                 *errorText = QStringLiteral("未收到 F4 二进制 ACK/NACK");
             }
@@ -12183,6 +12200,7 @@ private:
         const QByteArray devBytes = device.toLocal8Bit();
         int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
         struct termios tio;
+        QByteArray receiveBuffer; /* 当前短命令串口会话的接收缓存，保留一次 read 中 ACK 后面的尾帧。 */
         QString readErrorText;
 
         if (frame.isEmpty()) {
@@ -12266,7 +12284,7 @@ private:
             }
         }
 
-        if (!readF4BinaryReply(fd, reply, &readErrorText)) {
+        if (!readF4BinaryReply(fd, &receiveBuffer, reply, &readErrorText)) {
             if (detail) {
                 *detail = readErrorText.isEmpty() ? QStringLiteral("F4二进制回复为空") : readErrorText;
             }
@@ -12678,6 +12696,7 @@ private:
         QString ackDetail;                   /* ackDetail 保存 F4 接收命令后的 ACK 文本。 */
         QString lastReadDetail;              /* lastReadDetail 保存等待过程中最近一次非目标帧或读失败原因。 */
         QString fallbackEstimateDetail;       /* fallbackEstimateDetail 保存 MP157 用帧内速度和步数算出的兜底等待依据。 */
+        QByteArray receiveBuffer;            /* 同一位置运动会话在 ACK 和完成阶段复用的接收缓存。 */
         bool ackMatched = false;             /* ackMatched 标记是否已经收到本命令对应的 ACK。 */
         QElapsedTimer ackTimer;              /* ackTimer 限制 ACK 阶段等待时间。 */
         QElapsedTimer moveTimer;             /* moveTimer 限制到位事件阶段等待时间。 */
@@ -12773,7 +12792,7 @@ private:
                 return false;
             }
 
-            if (!readF4BinaryReply(fd, &reply, &readErrorText)) {
+            if (!readF4BinaryReply(fd, &receiveBuffer, &reply, &readErrorText)) {
                 lastReadDetail = readErrorText;
                 continue;
             }
@@ -12906,7 +12925,7 @@ private:
                 return true;
             }
 
-            if (!readF4BinaryReply(fd, &reply, &readErrorText)) {
+            if (!readF4BinaryReply(fd, &receiveBuffer, &reply, &readErrorText)) {
                 lastReadDetail = readErrorText;
                 if (fallbackMoveMs > 0 && moveTimer.elapsed() >= fallbackMoveMs) {
                     /*
@@ -13016,6 +13035,7 @@ private:
         struct termios tio;              /* 保存 raw 串口参数，避免行规程改写二进制帧。 */
         QString ackDetail;               /* 保存已经严格匹配的 ACK 摘要。 */
         QString lastReadDetail;          /* 保存最近一次非目标帧或短读错误，超时时用于诊断。 */
+        QByteArray receiveBuffer;        /* 同一补光会话在 ACK 和 0x16 完成事件阶段复用的接收缓存。 */
         bool ackMatched = false;         /* 标记 ACK 阶段是否已经完成。 */
         QElapsedTimer ackTimer;          /* 限制 ACK 等待不超过 2500 ms。 */
         QElapsedTimer moveTimer;         /* 限制补光完成事件等待不超过 7000 ms。 */
@@ -13094,7 +13114,7 @@ private:
             F4BinaryReply reply;   /* 保存一帧 CRC 已验证的 F4 回复。 */
             QString readErrorText; /* 保存本轮读超时或解析失败原因。 */
 
-            if (!readF4BinaryReply(fd, &reply, &readErrorText)) /* 短读失败不立刻终止，允许在总窗口内继续等待。 */
+            if (!readF4BinaryReply(fd, &receiveBuffer, &reply, &readErrorText)) /* 短读失败不立刻终止，允许在总窗口内继续等待。 */
             {
                 lastReadDetail = readErrorText;
                 continue;
@@ -13191,7 +13211,7 @@ private:
             F4BinaryReply reply;   /* 保存完成阶段收到的一帧 F4 回复。 */
             QString readErrorText; /* 保存本轮短读失败文本。 */
 
-            if (!readF4BinaryReply(fd, &reply, &readErrorText)) /* 单次读取失败时继续等到总超时。 */
+            if (!readF4BinaryReply(fd, &receiveBuffer, &reply, &readErrorText)) /* 单次读取失败时继续等到总超时。 */
             {
                 lastReadDetail = readErrorText;
                 continue;
@@ -13244,7 +13264,7 @@ private:
                 *detail = ackDetail + QStringLiteral("；") + eventDetail; /* 返回 ACK 和真实完成双重证据。 */
             }
             ::close(fd);
-            return true; /* 只有全部匹配后，QML 才能开始 5 秒等待或继续 Z 回升。 */
+            return true; /* 只有全部匹配后，QML 才能开始 10 秒等待或继续 Z 回升。 */
         }
 
         if (detail) /* 总等待窗口结束仍无匹配完成事件时明确失败。 */
@@ -13428,6 +13448,7 @@ private:
         int fd = ::open(devBytes.constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
         struct termios tio;
         QElapsedTimer elapsed;
+        QByteArray receiveBuffer; /* 主动帧等待会话持续复用缓存，避免一批数据中的后续结果帧被丢弃。 */
         QString lastReadError;
 
         if (contextJson) {
@@ -13471,7 +13492,7 @@ private:
         while (elapsed.elapsed() < timeoutMs) {
             F4BinaryReply reply;
 
-            if (!readF4BinaryReply(fd, &reply, &lastReadError)) {
+            if (!readF4BinaryReply(fd, &receiveBuffer, &reply, &lastReadError)) {
                 continue;
             }
 
